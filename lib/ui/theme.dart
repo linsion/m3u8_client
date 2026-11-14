@@ -1,0 +1,349 @@
+import 'package:flutter/material.dart';
+
+class AppThemePalette {
+  final String id;
+  final String name;
+  final String subtitle;
+  final Brightness brightness;
+  final Color bgPrimary;
+  final Color bgElevated;
+  final Color bgCard;
+  final Color bgHover;
+  final Color bgInput;
+  final Color borderSubtle;
+  final Color borderStrong;
+  final Color accent;
+  final Color accentHover;
+  final Color badgeHot;
+  final Color success;
+  final Color warning;
+  final Color danger;
+  final Color textPrimary;
+  final Color textSecondary;
+  final Color textMuted;
+
+  const AppThemePalette({
+    required this.id,
+    required this.name,
+    required this.subtitle,
+    required this.brightness,
+    required this.bgPrimary,
+    required this.bgElevated,
+    required this.bgCard,
+    required this.bgHover,
+    required this.bgInput,
+    required this.borderSubtle,
+    required this.borderStrong,
+    required this.accent,
+    required this.accentHover,
+    required this.badgeHot,
+    required this.success,
+    required this.warning,
+    required this.danger,
+    required this.textPrimary,
+    required this.textSecondary,
+    required this.textMuted,
+  });
+}
+
+/// Conventional video streaming platform design tokens (Bilibili / Infuse / Netflix / iQIYI style).
+/// Supports multiple switchable dark & light themes with zero AI-generated visual clichés.
+class VideoPlatformTheme {
+  static const List<AppThemePalette> presets = [
+    AppThemePalette(
+      id: 'ocean_dark',
+      name: '深空蓝',
+      subtitle: '经典暗黑蓝青配色',
+      brightness: Brightness.dark,
+      bgPrimary: Color(0xFF0F1014),
+      bgElevated: Color(0xFF17181E),
+      bgCard: Color(0xFF1D1F27),
+      bgHover: Color(0xFF252833),
+      bgInput: Color(0xFF22242E),
+      borderSubtle: Color(0xFF262934),
+      borderStrong: Color(0xFF343846),
+      accent: Color(0xFF00AEEC),
+      accentHover: Color(0xFF26BEFF),
+      badgeHot: Color(0xFFFF5C38),
+      success: Color(0xFF2EBE70),
+      warning: Color(0xFFF5A623),
+      danger: Color(0xFFE54D42),
+      textPrimary: Color(0xFFF1F2F5),
+      textSecondary: Color(0xFF9EA3B0),
+      textMuted: Color(0xFF686D7A),
+    ),
+    AppThemePalette(
+      id: 'cinema_red',
+      name: '剧院红',
+      subtitle: '沉浸式纯黑影院风格',
+      brightness: Brightness.dark,
+      bgPrimary: Color(0xFF0B0B0D),
+      bgElevated: Color(0xFF141418),
+      bgCard: Color(0xFF1B1B21),
+      bgHover: Color(0xFF24242C),
+      bgInput: Color(0xFF202028),
+      borderSubtle: Color(0xFF272730),
+      borderStrong: Color(0xFF383845),
+      accent: Color(0xFFE5222E),
+      accentHover: Color(0xFFFF3B47),
+      badgeHot: Color(0xFFFF7A29),
+      success: Color(0xFF2EBE70),
+      warning: Color(0xFFF5A623),
+      danger: Color(0xFFE54D42),
+      textPrimary: Color(0xFFF4F4F6),
+      textSecondary: Color(0xFFA3A3AE),
+      textMuted: Color(0xFF6E6E7A),
+    ),
+    AppThemePalette(
+      id: 'amber_gold',
+      name: '流光金',
+      subtitle: 'Infuse 暖调客厅影院',
+      brightness: Brightness.dark,
+      bgPrimary: Color(0xFF11100E),
+      bgElevated: Color(0xFF191714),
+      bgCard: Color(0xFF211F1B),
+      bgHover: Color(0xFF2B2822),
+      bgInput: Color(0xFF26231E),
+      borderSubtle: Color(0xFF2E2A24),
+      borderStrong: Color(0xFF403B33),
+      accent: Color(0xFFF09A1A),
+      accentHover: Color(0xFFFFB03A),
+      badgeHot: Color(0xFFFF5C38),
+      success: Color(0xFF34C77B),
+      warning: Color(0xFFF5A623),
+      danger: Color(0xFFE54D42),
+      textPrimary: Color(0xFFF5F2EB),
+      textSecondary: Color(0xFFA8A196),
+      textMuted: Color(0xFF736D63),
+    ),
+    AppThemePalette(
+      id: 'jade_night',
+      name: '翡翠绿',
+      subtitle: '低疲劳夜间护眼暗色',
+      brightness: Brightness.dark,
+      bgPrimary: Color(0xFF0C110F),
+      bgElevated: Color(0xFF131A17),
+      bgCard: Color(0xFF1A231F),
+      bgHover: Color(0xFF222E29),
+      bgInput: Color(0xFF1E2924),
+      borderSubtle: Color(0xFF24322C),
+      borderStrong: Color(0xFF32463D),
+      accent: Color(0xFF14B866),
+      accentHover: Color(0xFF2CD17E),
+      badgeHot: Color(0xFFFF6438),
+      success: Color(0xFF2EBE70),
+      warning: Color(0xFFF5A623),
+      danger: Color(0xFFE54D42),
+      textPrimary: Color(0xFFEEF4F1),
+      textSecondary: Color(0xFF98AAA2),
+      textMuted: Color(0xFF63756D),
+    ),
+    AppThemePalette(
+      id: 'daylight_clean',
+      name: '晴空白',
+      subtitle: '清爽日间桌面浅色模式',
+      brightness: Brightness.light,
+      bgPrimary: Color(0xFFF3F5F8),
+      bgElevated: Color(0xFFFFFFFF),
+      bgCard: Color(0xFFFFFFFF),
+      bgHover: Color(0xFFEAECEF),
+      bgInput: Color(0xFFF0F2F5),
+      borderSubtle: Color(0xFFE2E5EC),
+      borderStrong: Color(0xFFCFD4DF),
+      accent: Color(0xFF0098D4),
+      accentHover: Color(0xFF00AEEC),
+      badgeHot: Color(0xFFFF522B),
+      success: Color(0xFF1FA85F),
+      warning: Color(0xFFE08E0B),
+      danger: Color(0xFFD9382E),
+      textPrimary: Color(0xFF18191C),
+      textSecondary: Color(0xFF59606D),
+      textMuted: Color(0xFF8A919F),
+    ),
+  ];
+
+  static AppThemePalette _currentPalette = presets.first;
+
+  static AppThemePalette get currentPalette => _currentPalette;
+
+  static AppThemePalette paletteById(String id) {
+    for (final p in presets) {
+      if (p.id == id) return p;
+    }
+    return presets.first;
+  }
+
+  static void setTheme(String id) {
+    _currentPalette = paletteById(id);
+  }
+
+  static bool get isDark => _currentPalette.brightness == Brightness.dark;
+
+  // Core surfaces
+  static Color get bgPrimary => _currentPalette.bgPrimary;
+  static Color get bgElevated => _currentPalette.bgElevated;
+  static Color get bgCard => _currentPalette.bgCard;
+  static Color get bgHover => _currentPalette.bgHover;
+  static Color get bgInput => _currentPalette.bgInput;
+
+  // Borders & dividers
+  static Color get borderSubtle => _currentPalette.borderSubtle;
+  static Color get borderStrong => _currentPalette.borderStrong;
+
+  // Brand & status colors
+  static Color get accent => _currentPalette.accent;
+  static Color get accentHover => _currentPalette.accentHover;
+  static Color get badgeHot => _currentPalette.badgeHot;
+  static Color get success => _currentPalette.success;
+  static Color get warning => _currentPalette.warning;
+  static Color get danger => _currentPalette.danger;
+
+  // Text hierarchy
+  static Color get textPrimary => _currentPalette.textPrimary;
+  static Color get textSecondary => _currentPalette.textSecondary;
+  static Color get textMuted => _currentPalette.textMuted;
+
+  static ThemeData buildDarkTheme() => buildTheme(_currentPalette.id);
+
+  static ThemeData buildTheme([String? themeId]) {
+    if (themeId != null) {
+      _currentPalette = paletteById(themeId);
+    }
+    final p = _currentPalette;
+    final isLight = p.brightness == Brightness.light;
+    final colorScheme = isLight
+        ? ColorScheme.light(
+            primary: p.accent,
+            secondary: p.accent,
+            surface: p.bgElevated,
+            error: p.danger,
+            onPrimary: Colors.white,
+            onSecondary: Colors.white,
+            onSurface: p.textPrimary,
+            onError: Colors.white,
+          )
+        : ColorScheme.dark(
+            primary: p.accent,
+            secondary: p.accent,
+            surface: p.bgElevated,
+            error: p.danger,
+            onPrimary: Colors.white,
+            onSecondary: Colors.white,
+            onSurface: p.textPrimary,
+            onError: Colors.white,
+          );
+
+    return ThemeData(
+      useMaterial3: true,
+      brightness: p.brightness,
+      scaffoldBackgroundColor: p.bgPrimary,
+      colorScheme: colorScheme,
+      dividerColor: p.borderSubtle,
+      splashFactory: NoSplash.splashFactory,
+      highlightColor: Colors.transparent,
+      appBarTheme: AppBarTheme(
+        backgroundColor: p.bgElevated,
+        foregroundColor: p.textPrimary,
+        elevation: 0,
+        scrolledUnderElevation: 0,
+        centerTitle: false,
+        titleTextStyle: TextStyle(
+          color: p.textPrimary,
+          fontSize: 16,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+      cardTheme: CardThemeData(
+        color: p.bgCard,
+        elevation: 0,
+        margin: EdgeInsets.zero,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(6),
+          side: BorderSide(color: p.borderSubtle, width: 1),
+        ),
+      ),
+      dialogTheme: DialogThemeData(
+        backgroundColor: p.bgElevated,
+        elevation: 8,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(8),
+          side: BorderSide(color: p.borderStrong, width: 1),
+        ),
+      ),
+      inputDecorationTheme: InputDecorationTheme(
+        filled: true,
+        fillColor: p.bgInput,
+        isDense: true,
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 12,
+          vertical: 10,
+        ),
+        hintStyle: TextStyle(color: p.textMuted, fontSize: 13),
+        labelStyle: TextStyle(color: p.textSecondary, fontSize: 13),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(6),
+          borderSide: BorderSide(color: p.borderSubtle),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(6),
+          borderSide: BorderSide(color: p.borderSubtle),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(6),
+          borderSide: BorderSide(color: p.accent, width: 1.2),
+        ),
+      ),
+      filledButtonTheme: FilledButtonThemeData(
+        style: FilledButton.styleFrom(
+          backgroundColor: p.accent,
+          foregroundColor: Colors.white,
+          elevation: 0,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(6),
+          ),
+          textStyle: const TextStyle(
+            fontSize: 13,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ),
+      outlinedButtonTheme: OutlinedButtonThemeData(
+        style: OutlinedButton.styleFrom(
+          foregroundColor: p.textPrimary,
+          side: BorderSide(color: p.borderStrong),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(6),
+          ),
+          textStyle: const TextStyle(
+            fontSize: 13,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+      ),
+      textButtonTheme: TextButtonThemeData(
+        style: TextButton.styleFrom(
+          foregroundColor: p.textSecondary,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(6),
+          ),
+          textStyle: const TextStyle(
+            fontSize: 13,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+      ),
+      snackBarTheme: SnackBarThemeData(
+        backgroundColor: p.bgCard,
+        contentTextStyle: TextStyle(color: p.textPrimary, fontSize: 13),
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(6),
+          side: BorderSide(color: p.borderStrong),
+        ),
+      ),
+    );
+  }
+}
