@@ -363,6 +363,7 @@ class VodPosterCard extends StatefulWidget {
   final ApiClient api;
   final VoidCallback onTap;
   final bool showSourceBadge;
+  final bool autofocus;
 
   const VodPosterCard({
     super.key,
@@ -370,6 +371,7 @@ class VodPosterCard extends StatefulWidget {
     required this.api,
     required this.onTap,
     this.showSourceBadge = false,
+    this.autofocus = false,
   });
 
   @override
@@ -379,6 +381,19 @@ class VodPosterCard extends StatefulWidget {
 class _VodPosterCardState extends State<VodPosterCard> {
   bool _hovered = false;
   bool _focused = false;
+
+  void _handleFocusChanged(bool focused) {
+    if (_focused == focused) return;
+    setState(() => _focused = focused);
+    if (focused && mounted) {
+      Scrollable.ensureVisible(
+        context,
+        alignment: 0.35,
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOutCubic,
+      );
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -393,21 +408,19 @@ class _VodPosterCardState extends State<VodPosterCard> {
     final subtitle = subtitleParts.join(' · ');
 
     return FocusableActionDetector(
+      autofocus: widget.autofocus,
       mouseCursor: SystemMouseCursors.click,
       onShowHoverHighlight: (v) => setState(() => _hovered = v),
-      onShowFocusHighlight: (v) {
-        setState(() => _focused = v);
-        if (v && mounted) {
-          Scrollable.ensureVisible(
-            context,
-            alignment: 0.35,
-            duration: const Duration(milliseconds: 180),
-            curve: Curves.easeOutCubic,
-          );
-        }
-      },
+      onShowFocusHighlight: _handleFocusChanged,
+      onFocusChange: _handleFocusChanged,
       actions: <Type, Action<Intent>>{
         ActivateIntent: CallbackAction<ActivateIntent>(
+          onInvoke: (_) {
+            widget.onTap();
+            return null;
+          },
+        ),
+        ButtonActivateIntent: CallbackAction<ButtonActivateIntent>(
           onInvoke: (_) {
             widget.onTap();
             return null;

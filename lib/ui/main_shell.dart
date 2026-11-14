@@ -170,7 +170,8 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
         if (!state.isAuthenticated) {
           return LoginScreen(appState: state);
         }
-        final isDesktop = MediaQuery.sizeOf(context).width >= 860;
+        final isDesktop =
+            MediaQuery.sizeOf(context).width >= 860 || state.tvMode;
         final miniSession = state.miniPlayerSession;
 
         return CallbackShortcuts(
@@ -292,6 +293,9 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
           // Source selector button
           InkWell(
             borderRadius: BorderRadius.circular(6),
+            onFocusChange: (_) {
+              if (mounted) setState(() {});
+            },
             onTap: state.sources.isEmpty
                 ? null
                 : () {
@@ -305,124 +309,139 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                       },
                     );
                   },
-            child: Container(
-              height: 34,
-              padding: const EdgeInsets.symmetric(horizontal: 10),
-              decoration: BoxDecoration(
-                color: VideoPlatformTheme.bgCard,
-                borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: VideoPlatformTheme.borderSubtle),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    Icons.layers_outlined,
-                    size: 15,
-                    color: VideoPlatformTheme.accent,
-                  ),
-                  const SizedBox(width: 6),
-                  ConstrainedBox(
-                    constraints: BoxConstraints(
-                      maxWidth: isDesktop ? 160 : 96,
+            child: Builder(
+              builder: (ctx) {
+                final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                return Container(
+                  height: 34,
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                  decoration: BoxDecoration(
+                    color: isFocused
+                        ? VideoPlatformTheme.accent.withValues(alpha: 0.24)
+                        : VideoPlatformTheme.bgCard,
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(
+                      color: isFocused
+                          ? VideoPlatformTheme.accent
+                          : VideoPlatformTheme.borderSubtle,
+                      width: isFocused ? 2.0 : 1.0,
                     ),
-                    child: Text(
-                      activeSource?.name ??
-                          (state.isConnecting ? '加载片源...' : '选择片源'),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w500,
-                        color: VideoPlatformTheme.textPrimary,
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.layers_outlined,
+                        size: 15,
+                        color: VideoPlatformTheme.accent,
                       ),
-                    ),
+                      const SizedBox(width: 6),
+                      ConstrainedBox(
+                        constraints: BoxConstraints(
+                          maxWidth: isDesktop ? 160 : 96,
+                        ),
+                        child: Text(
+                          activeSource?.name ??
+                              (state.isConnecting ? '加载片源...' : '选择片源'),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w500,
+                            color: VideoPlatformTheme.textPrimary,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 4),
+                      Icon(
+                        Icons.keyboard_arrow_down,
+                        size: 16,
+                        color: VideoPlatformTheme.textMuted,
+                      ),
+                    ],
                   ),
-                  const SizedBox(width: 4),
-                  Icon(
-                    Icons.keyboard_arrow_down,
-                    size: 16,
-                    color: VideoPlatformTheme.textMuted,
-                  ),
-                ],
-              ),
+                );
+              },
             ),
           ),
           const SizedBox(width: 12),
 
-          // Integrated Search Bar
+          // Integrated Search Bar (TV Remote Safe Button in TV Mode, Inline TextField on Desktop/Mobile)
           Expanded(
             child: ConstrainedBox(
               constraints: const BoxConstraints(maxWidth: 460),
-              child: SizedBox(
-                height: 36,
-                child: TextField(
-                  controller: _searchController,
-                  onSubmitted: _submitSearch,
-                  style: const TextStyle(fontSize: 13),
-                  decoration: InputDecoration(
-                    hintText: state.aggregatedSearch
-                        ? '全网多源搜索电影、剧集、综艺、动漫...'
-                        : '搜索当前站点影视资源...',
-                    prefixIcon: Icon(
-                      Icons.search,
-                      size: 17,
-                      color: VideoPlatformTheme.textMuted,
-                    ),
-                    suffixIcon: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        if (_searchController.text.isNotEmpty ||
-                            state.searchKeyword.isNotEmpty)
-                          IconButton(
-                            tooltip: '清除搜索',
-                            icon: const Icon(Icons.clear, size: 15),
-                            onPressed: () {
-                              _searchController.clear();
-                              state.clearSearch();
-                              setState(() {});
-                            },
+              child: state.tvMode
+                  ? _buildTvRemoteSearchButton(state)
+                  : SizedBox(
+                      height: 36,
+                      child: TextField(
+                        controller: _searchController,
+                        onSubmitted: _submitSearch,
+                        style: const TextStyle(fontSize: 13),
+                        decoration: InputDecoration(
+                          hintText: state.aggregatedSearch
+                              ? '全网多源搜索电影、剧集、综艺、动漫...'
+                              : '搜索当前站点影视资源...',
+                          prefixIcon: Icon(
+                            Icons.search,
+                            size: 17,
+                            color: VideoPlatformTheme.textMuted,
                           ),
-                        InkWell(
-                          onTap: () =>
-                              state.setAggregatedSearch(!state.aggregatedSearch),
-                          child: Container(
-                            margin: const EdgeInsets.only(right: 6),
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 7,
-                              vertical: 3,
-                            ),
-                            decoration: BoxDecoration(
-                              color: state.aggregatedSearch
-                                  ? VideoPlatformTheme.accent
-                                      .withValues(alpha: 0.2)
-                                  : VideoPlatformTheme.bgCard,
-                              borderRadius: BorderRadius.circular(4),
-                              border: Border.all(
-                                color: state.aggregatedSearch
-                                    ? VideoPlatformTheme.accent
-                                    : VideoPlatformTheme.borderStrong,
+                          suffixIcon: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (_searchController.text.isNotEmpty ||
+                                  state.searchKeyword.isNotEmpty)
+                                IconButton(
+                                  tooltip: '清除搜索',
+                                  icon: const Icon(Icons.clear, size: 15),
+                                  onPressed: () {
+                                    _searchController.clear();
+                                    state.clearSearch();
+                                    setState(() {});
+                                  },
+                                ),
+                              InkWell(
+                                onTap: () => state.setAggregatedSearch(
+                                  !state.aggregatedSearch,
+                                ),
+                                child: Container(
+                                  margin: const EdgeInsets.only(right: 6),
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 7,
+                                    vertical: 3,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: state.aggregatedSearch
+                                        ? VideoPlatformTheme.accent
+                                            .withValues(alpha: 0.2)
+                                        : VideoPlatformTheme.bgCard,
+                                    borderRadius: BorderRadius.circular(4),
+                                    border: Border.all(
+                                      color: state.aggregatedSearch
+                                          ? VideoPlatformTheme.accent
+                                          : VideoPlatformTheme.borderStrong,
+                                    ),
+                                  ),
+                                  child: Text(
+                                    '全网搜',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: state.aggregatedSearch
+                                          ? VideoPlatformTheme.accent
+                                          : VideoPlatformTheme.textSecondary,
+                                      fontWeight: state.aggregatedSearch
+                                          ? FontWeight.w600
+                                          : FontWeight.w400,
+                                    ),
+                                  ),
+                                ),
                               ),
-                            ),
-                            child: Text(
-                              '全网搜',
-                              style: TextStyle(
-                                fontSize: 11,
-                                color: state.aggregatedSearch
-                                    ? VideoPlatformTheme.accent
-                                    : VideoPlatformTheme.textSecondary,
-                                fontWeight: state.aggregatedSearch
-                                    ? FontWeight.w600
-                                    : FontWeight.w400,
-                              ),
-                            ),
+                            ],
                           ),
                         ),
-                      ],
+                      ),
                     ),
-                  ),
-                ),
-              ),
             ),
           ),
 
@@ -542,6 +561,138 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
         ],
       ),
     );
+  }
+
+  Widget _buildTvRemoteSearchButton(AppState state) {
+    return Row(
+      children: [
+        Expanded(
+          child: InkWell(
+            borderRadius: BorderRadius.circular(6),
+            onFocusChange: (_) {
+              if (mounted) setState(() {});
+            },
+            onTap: () => _showTvSearchInputDialog(state),
+            child: Builder(
+              builder: (ctx) {
+                final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                return Container(
+                  height: 36,
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  decoration: BoxDecoration(
+                    color: isFocused
+                        ? VideoPlatformTheme.accent.withValues(alpha: 0.22)
+                        : VideoPlatformTheme.bgCard,
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(
+                      color: isFocused
+                          ? VideoPlatformTheme.accent
+                          : VideoPlatformTheme.borderSubtle,
+                      width: isFocused ? 2.0 : 1.0,
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        Icons.search_rounded,
+                        size: 17,
+                        color: isFocused
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.textMuted,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          state.searchKeyword.isNotEmpty
+                              ? '当前搜索: ${state.searchKeyword} (按OK修改)'
+                              : (state.aggregatedSearch
+                                  ? '按遥控器 OK 键全网搜索影视...'
+                                  : '按遥控器 OK 键搜索影视...'),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 12.5,
+                            color: state.searchKeyword.isNotEmpty
+                                ? VideoPlatformTheme.textPrimary
+                                : VideoPlatformTheme.textMuted,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+          ),
+        ),
+        if (state.searchKeyword.isNotEmpty) ...[
+          const SizedBox(width: 6),
+          IconButton(
+            tooltip: '清除搜索',
+            icon: const Icon(Icons.clear_rounded, size: 17),
+            onPressed: () {
+              _searchController.clear();
+              state.clearSearch();
+              setState(() {});
+            },
+          ),
+        ],
+      ],
+    );
+  }
+
+  Future<void> _showTvSearchInputDialog(AppState state) async {
+    final ctrl = TextEditingController(text: _searchController.text);
+    final submitted = await showDialog<String>(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          backgroundColor: VideoPlatformTheme.bgElevated,
+          title: Row(
+            children: [
+              Icon(
+                Icons.search_rounded,
+                size: 20,
+                color: VideoPlatformTheme.accent,
+              ),
+              const SizedBox(width: 8),
+              const Text(
+                '搜索影视资源',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+              ),
+            ],
+          ),
+          content: SizedBox(
+            width: 420,
+            child: TextField(
+              controller: ctrl,
+              autofocus: true,
+              textInputAction: TextInputAction.search,
+              onSubmitted: (v) => Navigator.of(ctx).pop(v),
+              decoration: const InputDecoration(
+                hintText: '输入片名、主演或关键词...',
+                prefixIcon: Icon(Icons.search_rounded),
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('取消'),
+            ),
+            FilledButton.icon(
+              onPressed: () => Navigator.of(ctx).pop(ctrl.text),
+              icon: const Icon(Icons.search_rounded, size: 16),
+              label: const Text('开始搜索'),
+            ),
+          ],
+        );
+      },
+    );
+    if (submitted != null && mounted) {
+      _searchController.text = submitted;
+      _submitSearch(submitted);
+    }
   }
 
   Widget _buildProxyQuickBadge(AppState state) {
@@ -802,59 +953,77 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       child: InkWell(
         borderRadius: BorderRadius.circular(6),
         focusColor: VideoPlatformTheme.accent.withValues(alpha: 0.28),
+        onFocusChange: (_) {
+          if (mounted) setState(() {});
+        },
         onTap: () => _selectTab(index),
-        child: Container(
-          height: 38,
-          padding: const EdgeInsets.symmetric(horizontal: 12),
-          decoration: BoxDecoration(
-            color: selected
-                ? VideoPlatformTheme.accent.withValues(alpha: 0.15)
-                : Colors.transparent,
-            borderRadius: BorderRadius.circular(6),
-          ),
-          child: Row(
-            children: [
-              Icon(
-                icon,
-                size: 18,
-                color: selected
-                    ? VideoPlatformTheme.accent
-                    : VideoPlatformTheme.textSecondary,
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Text(
-                  label,
-                  style: TextStyle(
-                    fontSize: 13,
-                    fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
-                    color: selected
-                        ? VideoPlatformTheme.accent
-                        : VideoPlatformTheme.textPrimary,
-                  ),
+        child: Builder(
+          builder: (ctx) {
+            final isFocused = Focus.of(ctx).hasPrimaryFocus;
+            return Container(
+              height: 38,
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              decoration: BoxDecoration(
+                color: isFocused
+                    ? VideoPlatformTheme.accent.withValues(alpha: 0.26)
+                    : (selected
+                        ? VideoPlatformTheme.accent.withValues(alpha: 0.15)
+                        : Colors.transparent),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(
+                  color: isFocused
+                      ? VideoPlatformTheme.accent
+                      : Colors.transparent,
+                  width: isFocused ? 2.0 : 1.0,
                 ),
               ),
-              if (badgeCount > 0)
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 6,
-                    vertical: 1,
+              child: Row(
+                children: [
+                  Icon(
+                    icon,
+                    size: 18,
+                    color: (selected || isFocused)
+                        ? VideoPlatformTheme.accent
+                        : VideoPlatformTheme.textSecondary,
                   ),
-                  decoration: BoxDecoration(
-                    color: VideoPlatformTheme.accent,
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: Text(
-                    '$badgeCount',
-                    style: const TextStyle(
-                      fontSize: 10,
-                      color: Colors.white,
-                      fontWeight: FontWeight.w600,
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      label,
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: (selected || isFocused)
+                            ? FontWeight.w600
+                            : FontWeight.w400,
+                        color: (selected || isFocused)
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.textPrimary,
+                      ),
                     ),
                   ),
-                ),
-            ],
-          ),
+                  if (badgeCount > 0)
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 1,
+                      ),
+                      decoration: BoxDecoration(
+                        color: VideoPlatformTheme.accent,
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Text(
+                        '$badgeCount',
+                        style: const TextStyle(
+                          fontSize: 10,
+                          color: Colors.white,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            );
+          },
         ),
       ),
     );
@@ -1607,9 +1776,11 @@ class _FloatingMiniPlayerOverlayState
 
   @override
   Widget build(BuildContext context) {
-    final width = _isLargeSize ? 420.0 : 320.0;
-    final height = _isLargeSize ? 236.0 : 180.0;
     final screenSize = MediaQuery.sizeOf(context);
+    final width = _isLargeSize
+        ? (screenSize.width - 20).clamp(320.0, 440.0)
+        : 340.0;
+    final height = _isLargeSize ? 248.0 : 200.0;
 
     return Positioned(
       right: _right.clamp(8.0, (screenSize.width - width - 8).clamp(8.0, 4000.0)),
@@ -1798,11 +1969,69 @@ class _FloatingMiniPlayerOverlayState
                         colors: [Color(0xDD000000), Color(0x00000000)],
                       ),
                     ),
-                    child: Row(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
                       children: [
-                        StreamBuilder<bool>(
-                          stream: _player.stream.playing,
-                          initialData: _player.state.playing,
+                        if (!widget.session.isLive)
+                          StreamBuilder<Duration>(
+                            stream: _player.stream.position,
+                            initialData: _player.state.position,
+                            builder: (_, posSnap) {
+                              return StreamBuilder<Duration>(
+                                stream: _player.stream.duration,
+                                initialData: _player.state.duration,
+                                builder: (_, durSnap) {
+                                  final pos = posSnap.data ?? Duration.zero;
+                                  final dur = durSnap.data ?? Duration.zero;
+                                  final maxMs = dur.inMilliseconds > 0
+                                      ? dur.inMilliseconds.toDouble()
+                                      : 1.0;
+                                  final curMs = pos.inMilliseconds
+                                      .toDouble()
+                                      .clamp(0.0, maxMs);
+                                  return SizedBox(
+                                    height: 16,
+                                    child: SliderTheme(
+                                      data: SliderTheme.of(context).copyWith(
+                                        trackHeight: 2.8,
+                                        thumbShape:
+                                            const RoundSliderThumbShape(
+                                          enabledThumbRadius: 5.5,
+                                        ),
+                                        overlayShape:
+                                            const RoundSliderOverlayShape(
+                                          overlayRadius: 10.0,
+                                        ),
+                                        activeTrackColor:
+                                            VideoPlatformTheme.accent,
+                                        inactiveTrackColor: Colors.white24,
+                                        thumbColor: Colors.white,
+                                      ),
+                                      child: Slider(
+                                        value: curMs,
+                                        min: 0.0,
+                                        max: maxMs,
+                                        onChanged: (val) {
+                                          if (dur.inMilliseconds > 0) {
+                                            _player.seek(
+                                              Duration(
+                                                milliseconds: val.round(),
+                                              ),
+                                            );
+                                          }
+                                        },
+                                      ),
+                                    ),
+                                  );
+                                },
+                              );
+                            },
+                          ),
+                        Row(
+                          children: [
+                            StreamBuilder<bool>(
+                              stream: _player.stream.playing,
+                              initialData: _player.state.playing,
                           builder: (_, snap) {
                             final playing = snap.data ?? true;
                             return IconButton(
@@ -1950,6 +2179,8 @@ class _FloatingMiniPlayerOverlayState
                             ),
                           ),
                         ),
+                      ],
+                    ),
                       ],
                     ),
                   ),

@@ -70,6 +70,12 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
   bool _useServerProxy = false;
   double _playbackSpeed = 1.0;
   bool _isLongPressFastForward = false;
+  bool _isFullscreenMode = false;
+  bool _isHorizontalSeeking = false;
+  double _seekStartSeconds = 0.0;
+  double _seekPreviewSeconds = 0.0;
+  bool _isSliderDragging = false;
+  double _sliderPreviewSeconds = 0.0;
   String _videoAspectMode = 'fit'; // 'fit', '16:9', '4:3', 'cover'
   String? _externalSubtitleName;
   double _pendingSeekSeconds = 0;
@@ -315,8 +321,32 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     _showAdToast('已快退 ${seconds}s');
   }
 
+  void _toggleFullscreenMode({bool? forceValue}) {
+    final next = forceValue ?? !_isFullscreenMode;
+    if (next == _isFullscreenMode) return;
+    setState(() => _isFullscreenMode = next);
+    if ((Platform.isAndroid || Platform.isIOS) && !widget.appState.tvMode) {
+      if (next) {
+        SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+        SystemChrome.setPreferredOrientations(const [
+          DeviceOrientation.landscapeLeft,
+          DeviceOrientation.landscapeRight,
+        ]);
+      } else {
+        SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+        SystemChrome.setPreferredOrientations(const []);
+      }
+    }
+  }
+
   @override
   void dispose() {
+    if (_isFullscreenMode &&
+        (Platform.isAndroid || Platform.isIOS) &&
+        !widget.appState.tvMode) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+      SystemChrome.setPreferredOrientations(const []);
+    }
     _adToastTimer?.cancel();
     _sleepTimer?.cancel();
     _startupWatchdogTimer?.cancel();
@@ -2076,170 +2106,468 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         ? _detail!.vodName
         : (widget.initialTitle.isNotEmpty ? widget.initialTitle : '视频播放');
 
-    return CallbackShortcuts(
-      bindings: <ShortcutActivator, VoidCallback>{
-        const SingleActivator(LogicalKeyboardKey.mediaPlayPause): () =>
-            _player.playOrPause(),
-        const SingleActivator(LogicalKeyboardKey.space): () =>
-            _player.playOrPause(),
-        const SingleActivator(LogicalKeyboardKey.mediaFastForward): () =>
-            _skipForwardSeconds(30),
-        const SingleActivator(LogicalKeyboardKey.mediaRewind): () =>
-            _rewindSeconds(15),
-        const SingleActivator(LogicalKeyboardKey.channelUp): () =>
-            _skipForwardSeconds(30),
-        const SingleActivator(LogicalKeyboardKey.pageUp): () =>
-            _skipForwardSeconds(30),
-        const SingleActivator(LogicalKeyboardKey.channelDown): () =>
-            _playNextEpisodeIfAvailable(),
-        const SingleActivator(LogicalKeyboardKey.pageDown): () =>
-            _playNextEpisodeIfAvailable(),
+    return PopScope(
+      canPop: !_isFullscreenMode,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _isFullscreenMode) {
+          _toggleFullscreenMode(forceValue: false);
+        }
       },
-      child: Scaffold(
-        backgroundColor: VideoPlatformTheme.bgPrimary,
-      appBar: AppBar(
-        toolbarHeight: 50,
-        titleSpacing: 4,
-        title: Row(
-          children: [
-            Flexible(
-              child: Text(
-                title,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-            if (_currentEpisode != null) ...[
-              const SizedBox(width: 8),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                decoration: BoxDecoration(
-                  color: VideoPlatformTheme.bgCard,
-                  borderRadius: BorderRadius.circular(4),
-                  border: Border.all(color: VideoPlatformTheme.borderSubtle),
-                ),
-                child: Text(
-                  _currentEpisode!.title,
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: VideoPlatformTheme.textSecondary,
-                  ),
-                ),
-              ),
-            ],
-          ],
-        ),
-        actions: [
-          Center(
-            child: Padding(
-              padding: const EdgeInsets.only(right: 4),
-              child: VideoProxyNodeSelector(
-                proxyService: widget.appState.proxyService,
-                scenario: RequestScenario.vodStream,
-                overlayStyle: false,
-                onProxyChanged: _onProxyNodeSwitched,
-              ),
-            ),
-          ),
-          TextButton.icon(
-            onPressed: _showCrossSiteSourceSwitchDialog,
-            icon: Icon(
-              Icons.swap_horiz_rounded,
-              size: 16,
-              color: VideoPlatformTheme.accent,
-            ),
-            label: Text(
-              '换源 (${_activeSource.name})',
-              style: TextStyle(
-                fontSize: 12.5,
-                color: VideoPlatformTheme.textPrimary,
-              ),
-            ),
-          ),
-          IconButton(
-            tooltip: '小窗悬浮播放（切回首页/Telegram 不中断视频）',
-            onPressed: _activeStreamUrl.isEmpty ? null : _enterMiniPlayerMode,
-            icon: const Icon(Icons.picture_in_picture_alt_rounded, size: 19),
-          ),
-          const SizedBox(width: 6),
-        ],
-      ),
-      body: LayoutBuilder(
-        builder: (context, constraints) {
-          final isDesktopWide = constraints.maxWidth >= 980;
-          if (isDesktopWide) {
-            return Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Expanded(
-                  flex: 7,
-                  child: SingleChildScrollView(
-                    padding: const EdgeInsets.fromLTRB(20, 16, 12, 24),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        _buildVideoPlayerStage(),
-                        const SizedBox(height: 12),
-                        _buildPlayerToolbar(),
-                        const SizedBox(height: 16),
-                        _buildMetadataPanel(),
-                      ],
-                    ),
-                  ),
-                ),
-                Container(
-                  width: 360,
-                  height: constraints.maxHeight,
-                  decoration: BoxDecoration(
-                    color: VideoPlatformTheme.bgElevated,
-                    border: Border(
-                      left: BorderSide(color: VideoPlatformTheme.borderSubtle),
-                    ),
-                  ),
-                  child: _buildRightSideEpisodePanel(),
-                ),
-              ],
-            );
-          }
-
-          // Mobile / Tablet stacked layout
-          return Column(
-            children: [
-              _buildVideoPlayerStage(fullBleed: true),
-              Expanded(
-                child: SingleChildScrollView(
-                  padding: const EdgeInsets.all(14),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
+      child: CallbackShortcuts(
+        bindings: <ShortcutActivator, VoidCallback>{
+          const SingleActivator(LogicalKeyboardKey.mediaPlayPause): () =>
+              _player.playOrPause(),
+          const SingleActivator(LogicalKeyboardKey.space): () =>
+              _player.playOrPause(),
+          const SingleActivator(LogicalKeyboardKey.mediaFastForward): () =>
+              _skipForwardSeconds(30),
+          const SingleActivator(LogicalKeyboardKey.mediaRewind): () =>
+              _rewindSeconds(15),
+          const SingleActivator(LogicalKeyboardKey.channelUp): () =>
+              _skipForwardSeconds(30),
+          const SingleActivator(LogicalKeyboardKey.pageUp): () =>
+              _skipForwardSeconds(30),
+          const SingleActivator(LogicalKeyboardKey.channelDown): () =>
+              _playNextEpisodeIfAvailable(),
+          const SingleActivator(LogicalKeyboardKey.pageDown): () =>
+              _playNextEpisodeIfAvailable(),
+        },
+        child: Scaffold(
+          backgroundColor:
+              _isFullscreenMode ? Colors.black : VideoPlatformTheme.bgPrimary,
+          appBar: _isFullscreenMode
+              ? null
+              : AppBar(
+                  toolbarHeight: 50,
+                  titleSpacing: 4,
+                  title: Row(
                     children: [
-                      _buildPlayerToolbar(),
-                      const SizedBox(height: 14),
-                      _buildInlineEpisodeSection(),
-                      const SizedBox(height: 16),
-                      _buildMetadataPanel(),
+                      Flexible(
+                        child: Text(
+                          title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      if (_currentEpisode != null) ...[
+                        const SizedBox(width: 8),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: VideoPlatformTheme.bgCard,
+                            borderRadius: BorderRadius.circular(4),
+                            border: Border.all(
+                              color: VideoPlatformTheme.borderSubtle,
+                            ),
+                          ),
+                          child: Text(
+                            _currentEpisode!.title,
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: VideoPlatformTheme.textSecondary,
+                            ),
+                          ),
+                        ),
+                      ],
                     ],
                   ),
+                  actions: [
+                    Center(
+                      child: Padding(
+                        padding: const EdgeInsets.only(right: 4),
+                        child: VideoProxyNodeSelector(
+                          proxyService: widget.appState.proxyService,
+                          scenario: RequestScenario.vodStream,
+                          overlayStyle: false,
+                          onProxyChanged: _onProxyNodeSwitched,
+                        ),
+                      ),
+                    ),
+                    TextButton.icon(
+                      onPressed: _showCrossSiteSourceSwitchDialog,
+                      icon: Icon(
+                        Icons.swap_horiz_rounded,
+                        size: 16,
+                        color: VideoPlatformTheme.accent,
+                      ),
+                      label: Text(
+                        '换源 (${_activeSource.name})',
+                        style: TextStyle(
+                          fontSize: 12.5,
+                          color: VideoPlatformTheme.textPrimary,
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: '小窗悬浮播放（切回首页/Telegram 不中断视频）',
+                      onPressed:
+                          _activeStreamUrl.isEmpty ? null : _enterMiniPlayerMode,
+                      icon: const Icon(
+                        Icons.picture_in_picture_alt_rounded,
+                        size: 19,
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                  ],
                 ),
-              ),
-            ],
-          );
-        },
-      ),
+          body: _isFullscreenMode
+              ? SafeArea(
+                  child: Column(
+                    children: [
+                      Expanded(
+                        child: _buildVideoPlayerStage(
+                          fullBleed: true,
+                          isFullscreen: true,
+                        ),
+                      ),
+                      _buildInteractiveProgressBar(isFullscreen: true),
+                    ],
+                  ),
+                )
+              : LayoutBuilder(
+                  builder: (context, constraints) {
+                    final isDesktopWide = constraints.maxWidth >= 980;
+                    if (isDesktopWide) {
+                      return Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Expanded(
+                            flex: 7,
+                            child: SingleChildScrollView(
+                              padding: const EdgeInsets.fromLTRB(
+                                20,
+                                16,
+                                12,
+                                24,
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  _buildVideoPlayerStage(),
+                                  const SizedBox(height: 6),
+                                  _buildInteractiveProgressBar(),
+                                  const SizedBox(height: 10),
+                                  _buildPlayerToolbar(),
+                                  const SizedBox(height: 16),
+                                  _buildMetadataPanel(),
+                                ],
+                              ),
+                            ),
+                          ),
+                          Container(
+                            width: 360,
+                            height: constraints.maxHeight,
+                            decoration: BoxDecoration(
+                              color: VideoPlatformTheme.bgElevated,
+                              border: Border(
+                                left: BorderSide(
+                                  color: VideoPlatformTheme.borderSubtle,
+                                ),
+                              ),
+                            ),
+                            child: _buildRightSideEpisodePanel(),
+                          ),
+                        ],
+                      );
+                    }
+
+                    // Mobile / Tablet stacked layout
+                    return Column(
+                      children: [
+                        _buildVideoPlayerStage(fullBleed: true),
+                        _buildInteractiveProgressBar(fullBleed: true),
+                        Expanded(
+                          child: SingleChildScrollView(
+                            padding: const EdgeInsets.all(14),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                _buildPlayerToolbar(),
+                                const SizedBox(height: 14),
+                                _buildInlineEpisodeSection(),
+                                const SizedBox(height: 16),
+                                _buildMetadataPanel(),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
+                    );
+                  },
+                ),
+        ),
       ),
     );
   }
 
-  Widget _buildVideoPlayerStage({bool fullBleed = false}) {
+  Widget _buildInteractiveProgressBar({
+    bool fullBleed = false,
+    bool isFullscreen = false,
+  }) {
+    return StreamBuilder<Duration>(
+      stream: _player.stream.position,
+      initialData: _player.state.position,
+      builder: (context, posSnap) {
+        return StreamBuilder<Duration>(
+          stream: _player.stream.duration,
+          initialData: _player.state.duration,
+          builder: (context, durSnap) {
+            final rawPos = posSnap.data ?? _lastValidPosition;
+            final rawDur = (durSnap.data != null && durSnap.data! > Duration.zero)
+                ? durSnap.data!
+                : _lastValidDuration;
+            final maxSec =
+                rawDur.inSeconds > 0 ? rawDur.inSeconds.toDouble() : 1.0;
+            final curSec = _isSliderDragging
+                ? _sliderPreviewSeconds.clamp(0.0, maxSec)
+                : (_isHorizontalSeeking
+                    ? _seekPreviewSeconds.clamp(0.0, maxSec)
+                    : rawPos.inSeconds.toDouble().clamp(0.0, maxSec));
+
+            return Focus(
+              onKeyEvent: (node, event) {
+                if (event is KeyDownEvent || event is KeyRepeatEvent) {
+                  if (event.logicalKey == LogicalKeyboardKey.arrowLeft) {
+                    _rewindSeconds(15);
+                    return KeyEventResult.handled;
+                  } else if (event.logicalKey ==
+                      LogicalKeyboardKey.arrowRight) {
+                    _skipForwardSeconds(15, customReason: '已快进 15s');
+                    return KeyEventResult.handled;
+                  } else if (event.logicalKey == LogicalKeyboardKey.select ||
+                      event.logicalKey == LogicalKeyboardKey.enter ||
+                      event.logicalKey == LogicalKeyboardKey.gameButtonA) {
+                    _player.playOrPause();
+                    return KeyEventResult.handled;
+                  }
+                }
+                return KeyEventResult.ignored;
+              },
+              child: Builder(
+                builder: (ctx) {
+                  final hasFocus = Focus.of(ctx).hasFocus;
+                  return Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 4,
+                    ),
+                    decoration: BoxDecoration(
+                      color: isFullscreen
+                          ? const Color(0xEE090E14)
+                          : VideoPlatformTheme.bgElevated,
+                      borderRadius: (fullBleed || isFullscreen)
+                          ? BorderRadius.zero
+                          : BorderRadius.circular(6),
+                      border: Border.all(
+                        color: hasFocus
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.borderSubtle,
+                        width: hasFocus ? 1.8 : 1.0,
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        StreamBuilder<bool>(
+                          stream: _player.stream.playing,
+                          initialData: _player.state.playing,
+                          builder: (_, playSnap) {
+                            final playing = playSnap.data ?? false;
+                            return IconButton(
+                              visualDensity: VisualDensity.compact,
+                              padding: EdgeInsets.zero,
+                              constraints: const BoxConstraints(
+                                minWidth: 34,
+                                minHeight: 34,
+                              ),
+                              tooltip: playing ? '暂停' : '播放',
+                              onPressed: () => _player.playOrPause(),
+                              icon: Icon(
+                                playing
+                                    ? Icons.pause_rounded
+                                    : Icons.play_arrow_rounded,
+                                size: 22,
+                                color: VideoPlatformTheme.accent,
+                              ),
+                            );
+                          },
+                        ),
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          padding: EdgeInsets.zero,
+                          constraints: const BoxConstraints(
+                            minWidth: 30,
+                            minHeight: 34,
+                          ),
+                          tooltip: '快退 15 秒',
+                          onPressed: () => _rewindSeconds(15),
+                          icon: Icon(
+                            Icons.replay_10_rounded,
+                            size: 18,
+                            color: VideoPlatformTheme.textSecondary,
+                          ),
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          _formatDurationLabel(curSec.round()),
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                            color: VideoPlatformTheme.textPrimary,
+                          ),
+                        ),
+                        Expanded(
+                          child: SliderTheme(
+                            data: SliderTheme.of(context).copyWith(
+                              trackHeight: 4.0,
+                              thumbShape: const RoundSliderThumbShape(
+                                enabledThumbRadius: 7.5,
+                              ),
+                              overlayShape: const RoundSliderOverlayShape(
+                                overlayRadius: 15.0,
+                              ),
+                              activeTrackColor: VideoPlatformTheme.accent,
+                              inactiveTrackColor:
+                                  VideoPlatformTheme.borderStrong,
+                              thumbColor: Colors.white,
+                            ),
+                            child: Slider(
+                              value: curSec,
+                              min: 0.0,
+                              max: maxSec,
+                              onChangeStart: (val) {
+                                setState(() {
+                                  _isSliderDragging = true;
+                                  _sliderPreviewSeconds = val;
+                                });
+                              },
+                              onChanged: (val) {
+                                setState(() {
+                                  _isSliderDragging = true;
+                                  _sliderPreviewSeconds = val;
+                                });
+                              },
+                              onChangeEnd: (val) {
+                                setState(() {
+                                  _isSliderDragging = false;
+                                  _sliderPreviewSeconds = val;
+                                });
+                                _player.seek(
+                                  Duration(seconds: val.round()),
+                                );
+                              },
+                            ),
+                          ),
+                        ),
+                        Text(
+                          _formatDurationLabel(
+                            rawDur.inSeconds > 0 ? rawDur.inSeconds : 0,
+                          ),
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: VideoPlatformTheme.textSecondary,
+                          ),
+                        ),
+                        const SizedBox(width: 4),
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          padding: EdgeInsets.zero,
+                          constraints: const BoxConstraints(
+                            minWidth: 30,
+                            minHeight: 34,
+                          ),
+                          tooltip: '快进 15 秒',
+                          onPressed: () =>
+                              _skipForwardSeconds(15, customReason: '已快进 15s'),
+                          icon: Icon(
+                            Icons.forward_10_rounded,
+                            size: 18,
+                            color: VideoPlatformTheme.textSecondary,
+                          ),
+                        ),
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          padding: EdgeInsets.zero,
+                          constraints: const BoxConstraints(
+                            minWidth: 34,
+                            minHeight: 34,
+                          ),
+                          tooltip: _isFullscreenMode ? '退出全屏' : '全屏放大播放',
+                          onPressed: () => _toggleFullscreenMode(),
+                          icon: Icon(
+                            _isFullscreenMode
+                                ? Icons.fullscreen_exit_rounded
+                                : Icons.fullscreen_rounded,
+                            size: 22,
+                            color: VideoPlatformTheme.textPrimary,
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildVideoPlayerStage({
+    bool fullBleed = false,
+    bool isFullscreen = false,
+  }) {
     final BoxFit videoFit =
         _videoAspectMode == 'cover' ? BoxFit.cover : BoxFit.contain;
     final double? customAspectRatio = _videoAspectMode == '16:9'
         ? 16 / 9
         : (_videoAspectMode == '4:3' ? 4 / 3 : null);
 
-    return AspectRatio(
-      aspectRatio: 16 / 9,
-      child: GestureDetector(
+    final screenSize = MediaQuery.sizeOf(context);
+    final mobileStageHeight =
+        (screenSize.height * 0.35).clamp(255.0, 380.0);
+
+    final Widget stageContent = GestureDetector(
         behavior: HitTestBehavior.translucent,
+        onDoubleTap: () => _player.playOrPause(),
+        onHorizontalDragStart: (_) {
+          if (_currentEpisode == null || _isResolvingPlay) return;
+          final curSec = _player.state.position.inSeconds > 0
+              ? _player.state.position.inSeconds.toDouble()
+              : _lastValidPosition.inSeconds.toDouble();
+          setState(() {
+            _isHorizontalSeeking = true;
+            _seekStartSeconds = curSec;
+            _seekPreviewSeconds = curSec;
+          });
+        },
+        onHorizontalDragUpdate: (details) {
+          if (!_isHorizontalSeeking) return;
+          final width = screenSize.width.clamp(260.0, 1920.0);
+          final rawDurSec = _player.state.duration.inSeconds > 0
+              ? _player.state.duration.inSeconds.toDouble()
+              : (_lastValidDuration.inSeconds > 0
+                  ? _lastValidDuration.inSeconds.toDouble()
+                  : 3600.0);
+          final spanSec = rawDurSec.clamp(90.0, 300.0);
+          final deltaSec = (details.delta.dx / width) * spanSec;
+          final nextSec =
+              (_seekPreviewSeconds + deltaSec).clamp(0.0, rawDurSec);
+          setState(() {
+            _seekPreviewSeconds = nextSec;
+          });
+        },
+        onHorizontalDragEnd: (_) {
+          if (!_isHorizontalSeeking) return;
+          final targetSec = _seekPreviewSeconds.round();
+          setState(() {
+            _isHorizontalSeeking = false;
+          });
+          _player.seek(Duration(seconds: targetSec));
+        },
         onLongPressStart: (_) {
           if (_currentEpisode == null || _isResolvingPlay) return;
           setState(() => _isLongPressFastForward = true);
@@ -2274,6 +2602,47 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                 fit: videoFit,
                 aspectRatio: customAspectRatio,
               ),
+              if (_isHorizontalSeeking)
+                Center(
+                  child: IgnorePointer(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 18,
+                        vertical: 10,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xE0090E14),
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(
+                          color: VideoPlatformTheme.accent,
+                          width: 1.4,
+                        ),
+                      ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            '${_seekPreviewSeconds >= _seekStartSeconds ? '⏩ 快进' : '⏪ 快退'}  ${_formatDurationLabel(_seekPreviewSeconds.round())} / ${_formatDurationLabel((_player.state.duration.inSeconds > 0 ? _player.state.duration.inSeconds : _lastValidDuration.inSeconds))}',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 15,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            '${(_seekPreviewSeconds - _seekStartSeconds) >= 0 ? '+' : ''}${(_seekPreviewSeconds - _seekStartSeconds).round()} 秒 (左右滑动调节进度)',
+                            style: TextStyle(
+                              color: VideoPlatformTheme.accent,
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
               if (_isLongPressFastForward)
                 Positioned(
                   top: 14,
@@ -2547,7 +2916,21 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
           ],
         ),
         ),
-      ),
+    );
+
+    if (isFullscreen) {
+      return SizedBox.expand(child: stageContent);
+    }
+    if (fullBleed) {
+      return SizedBox(
+        width: double.infinity,
+        height: mobileStageHeight,
+        child: stageContent,
+      );
+    }
+    return AspectRatio(
+      aspectRatio: 16 / 9,
+      child: stageContent,
     );
   }
 
@@ -3492,52 +3875,80 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     return InkWell(
       borderRadius: BorderRadius.circular(5),
       focusColor: VideoPlatformTheme.accent.withValues(alpha: 0.35),
+      onFocusChange: (focused) {
+        if (focused && mounted) {
+          setState(() {});
+        }
+      },
       onTap: () => _selectAndPlayEpisode(
         ep,
         resumeSeconds:
             isSavedEpisode ? savedProg.positionSeconds.toDouble() : 0,
       ),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: isPlaying
-              ? VideoPlatformTheme.accent.withValues(alpha: 0.16)
-              : VideoPlatformTheme.bgCard,
-          borderRadius: BorderRadius.circular(5),
-          border: Border.all(
-            color: isPlaying
-                ? VideoPlatformTheme.accent
-                : (isSavedEpisode
-                    ? VideoPlatformTheme.accent.withValues(alpha: 0.5)
-                    : VideoPlatformTheme.borderSubtle),
-          ),
-        ),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Text(
-              ep.title,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontSize: 12,
-                color: isPlaying
+      child: Builder(
+        builder: (ctx) {
+          final isFocused = Focus.of(ctx).hasPrimaryFocus;
+          if (isFocused) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (ctx.mounted) {
+                Scrollable.ensureVisible(
+                  ctx,
+                  alignment: 0.5,
+                  duration: const Duration(milliseconds: 140),
+                );
+              }
+            });
+          }
+          return Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: isFocused
+                  ? VideoPlatformTheme.accent.withValues(alpha: 0.28)
+                  : (isPlaying
+                      ? VideoPlatformTheme.accent.withValues(alpha: 0.16)
+                      : VideoPlatformTheme.bgCard),
+              borderRadius: BorderRadius.circular(5),
+              border: Border.all(
+                color: isFocused
                     ? VideoPlatformTheme.accent
-                    : VideoPlatformTheme.textPrimary,
-                fontWeight: isPlaying ? FontWeight.w600 : FontWeight.w400,
+                    : (isPlaying
+                        ? VideoPlatformTheme.accent
+                        : (isSavedEpisode
+                            ? VideoPlatformTheme.accent.withValues(alpha: 0.5)
+                            : VideoPlatformTheme.borderSubtle)),
+                width: isFocused ? 2.0 : 1.0,
               ),
             ),
-            if (isSavedEpisode)
-              Text(
-                _formatDurationLabel(savedProg.positionSeconds),
-                style: TextStyle(
-                  fontSize: 9.5,
-                  color: VideoPlatformTheme.accent,
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(
+                  ep.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: (isPlaying || isFocused)
+                        ? VideoPlatformTheme.accent
+                        : VideoPlatformTheme.textPrimary,
+                    fontWeight: (isPlaying || isFocused)
+                        ? FontWeight.w600
+                        : FontWeight.w400,
+                  ),
                 ),
-              ),
-          ],
-        ),
+                if (isSavedEpisode)
+                  Text(
+                    _formatDurationLabel(savedProg.positionSeconds),
+                    style: TextStyle(
+                      fontSize: 9.5,
+                      color: VideoPlatformTheme.accent,
+                    ),
+                  ),
+              ],
+            ),
+          );
+        },
       ),
     );
   }
