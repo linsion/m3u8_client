@@ -7,12 +7,15 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Release tag version (e.g. v1.0.0)'
+        description: 'Release tag version (e.g. v1.0.2)'
         required: false
-        default: 'v1.0.0'
+        default: 'v1.0.2'
 
 permissions:
   contents: write
+
+env:
+  VERSION_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v1.0.2' }}
 
 jobs:
   build-android:
@@ -29,17 +32,19 @@ jobs:
           channel: 'stable'
       - name: Build Universal, Split-ABI APKs & AppBundle
         run: |
+          BUILD_NAME="${VERSION_TAG#v}"
+          BUILD_NUM=$((100 + GITHUB_RUN_NUMBER))
           flutter pub get
-          flutter build apk --release
-          flutter build apk --split-per-abi --release
-          flutter build appbundle --release
+          flutter build apk --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM"
+          flutter build apk --split-per-abi --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM"
+          flutter build appbundle --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM"
           mkdir -p dist
-          cp build/app/outputs/flutter-apk/app-release.apk dist/LiuguangVideo-Android-Universal-v1.0.0.apk
-          cp build/app/outputs/flutter-apk/app-release.apk dist/LiuguangVideo-AndroidTV-Universal-v1.0.0.apk
-          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk dist/LiuguangVideo-Android-arm64-v8a-v1.0.0.apk
-          cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk dist/LiuguangVideo-Android-armeabi-v7a-v1.0.0.apk
-          cp build/app/outputs/flutter-apk/app-x86_64-release.apk dist/LiuguangVideo-Android-x86_64-v1.0.0.apk
-          cp build/app/outputs/bundle/release/app-release.aab dist/LiuguangVideo-Android-Release-v1.0.0.aab
+          cp build/app/outputs/flutter-apk/app-release.apk "dist/LiuguangVideo-Android-Universal-${VERSION_TAG}.apk"
+          cp build/app/outputs/flutter-apk/app-release.apk "dist/LiuguangVideo-AndroidTV-Universal-${VERSION_TAG}.apk"
+          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk "dist/LiuguangVideo-Android-arm64-v8a-${VERSION_TAG}.apk"
+          cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk "dist/LiuguangVideo-Android-armeabi-v7a-${VERSION_TAG}.apk"
+          cp build/app/outputs/flutter-apk/app-x86_64-release.apk "dist/LiuguangVideo-Android-x86_64-${VERSION_TAG}.apk"
+          cp build/app/outputs/bundle/release/app-release.aab "dist/LiuguangVideo-Android-Release-${VERSION_TAG}.aab"
       - uses: actions/upload-artifact@v4
         with:
           name: android-release
@@ -57,22 +62,26 @@ jobs:
           channel: 'stable'
       - name: Build macOS DMG & ZIP
         run: |
+          BUILD_NAME="${VERSION_TAG#v}"
+          BUILD_NUM=$((100 + GITHUB_RUN_NUMBER))
           flutter pub get
-          flutter build macos --release
+          flutter build macos --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM"
           mkdir -p dist
           APP_PATH="$(find build/macos/Build/Products/Release -maxdepth 1 -name "*.app" | head -n 1)"
-          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" dist/LiuguangVideo-macOS-universal-v1.0.0.zip
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "dist/LiuguangVideo-macOS-universal-${VERSION_TAG}.zip"
           DMG_STAGE="$(mktemp -d)"
           cp -R "$APP_PATH" "$DMG_STAGE/流光视频.app"
           ln -s /Applications "$DMG_STAGE/Applications"
-          hdiutil create -volname "流光视频" -srcfolder "$DMG_STAGE" -ov -format UDZO dist/LiuguangVideo-macOS-universal-v1.0.0.dmg
+          hdiutil create -volname "流光视频 ${VERSION_TAG}" -srcfolder "$DMG_STAGE" -ov -format UDZO "dist/LiuguangVideo-macOS-universal-${VERSION_TAG}.dmg"
       - name: Build iOS Unsigned IPA
         run: |
-          flutter build ios --release --no-codesign
+          BUILD_NAME="${VERSION_TAG#v}"
+          BUILD_NUM=$((100 + GITHUB_RUN_NUMBER))
+          flutter build ios --release --no-codesign --build-name="$BUILD_NAME" --build-number="$BUILD_NUM"
           IPA_STAGE="$(mktemp -d)"
           mkdir -p "$IPA_STAGE/Payload"
           cp -R build/ios/iphoneos/Runner.app "$IPA_STAGE/Payload/Runner.app"
-          (cd "$IPA_STAGE" && zip -qry "$GITHUB_WORKSPACE/dist/LiuguangVideo-iOS-v1.0.0-unsigned.ipa" Payload)
+          (cd "$IPA_STAGE" && zip -qry "$GITHUB_WORKSPACE/dist/LiuguangVideo-iOS-${VERSION_TAG}-unsigned.ipa" Payload)
       - uses: actions/upload-artifact@v4
         with:
           name: apple-release
@@ -92,10 +101,12 @@ jobs:
       - name: Build Windows Release
         shell: bash
         run: |
+          BUILD_NAME="${VERSION_TAG#v}"
+          BUILD_NUM=$((100 + GITHUB_RUN_NUMBER))
           flutter pub get
-          flutter build windows --release
+          flutter build windows --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM"
           mkdir -p dist
-          (cd build/windows/x64/runner/Release && 7z a -tzip "$GITHUB_WORKSPACE/dist/LiuguangVideo-Windows-x64-v1.0.0.zip" .)
+          (cd build/windows/x64/runner/Release && 7z a -tzip "$GITHUB_WORKSPACE/dist/LiuguangVideo-Windows-x64-${VERSION_TAG}.zip" .)
       - uses: actions/upload-artifact@v4
         with:
           name: windows-release
@@ -115,10 +126,12 @@ jobs:
           channel: 'stable'
       - name: Build Linux Release
         run: |
+          BUILD_NAME="${VERSION_TAG#v}"
+          BUILD_NUM=$((100 + GITHUB_RUN_NUMBER))
           flutter pub get
-          flutter build linux --release
+          flutter build linux --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM"
           mkdir -p dist
-          tar -czf dist/LiuguangVideo-Linux-x64-v1.0.0.tar.gz -C build/linux/x64/release/bundle .
+          tar -czf "dist/LiuguangVideo-Linux-x64-${VERSION_TAG}.tar.gz" -C build/linux/x64/release/bundle .
       - uses: actions/upload-artifact@v4
         with:
           name: linux-release
@@ -139,7 +152,7 @@ jobs:
           sha256sum * > SHA256SUMS.txt
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v1.0.0' }}
-          name: "流光视频 (LiuguangVideo) ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v1.0.0' }}"
+          tag_name: ${{ env.VERSION_TAG }}
+          name: "流光视频 (LiuguangVideo) ${{ env.VERSION_TAG }}"
           files: release-assets/*
           generate_release_notes: true

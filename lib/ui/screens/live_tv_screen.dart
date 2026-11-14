@@ -67,8 +67,30 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
 
   // Collapsible & resizable channel list state
   bool _isSidebarCollapsed = false;
+  bool _isLiveFullscreen = false;
   double _sidebarWidth = 340.0;
   final Set<String> _collapsedGroups = {};
+
+  void _toggleLiveFullscreen({bool? forceValue}) {
+    final next = forceValue ?? !_isLiveFullscreen;
+    if (next == _isLiveFullscreen) return;
+    setState(() {
+      _isLiveFullscreen = next;
+      if (next) {
+        _isSidebarCollapsed = true;
+      }
+    });
+    if (Platform.isAndroid || Platform.isIOS) {
+      if (next) {
+        SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+      } else {
+        SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+      }
+    }
+    if (next) {
+      _playerFocusNode.requestFocus();
+    }
+  }
 
   // Player focus, mouse wheel channel switching & number pad channel jump state
   final FocusNode _playerFocusNode = FocusNode(debugLabel: 'LivePlayerStage');
@@ -762,7 +784,9 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
         widget.appState.closeMiniPlayer();
       }
       _showChannelOsd(channel);
-      _playerFocusNode.requestFocus();
+      if (_isLiveFullscreen || !widget.appState.tvMode) {
+        _playerFocusNode.requestFocus();
+      }
     }
 
     setState(() {
@@ -1117,30 +1141,38 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
           c.group.toLowerCase().contains(kw);
     }).toList();
 
-    return CallbackShortcuts(
-      bindings: <ShortcutActivator, VoidCallback>{
-        const SingleActivator(LogicalKeyboardKey.channelUp): () =>
-            _stepChannel(filteredChannels, -1),
-        const SingleActivator(LogicalKeyboardKey.pageUp): () =>
-            _stepChannel(filteredChannels, -1),
-        const SingleActivator(LogicalKeyboardKey.channelDown): () =>
-            _stepChannel(filteredChannels, 1),
-        const SingleActivator(LogicalKeyboardKey.pageDown): () =>
-            _stepChannel(filteredChannels, 1),
-        const SingleActivator(LogicalKeyboardKey.mediaPlayPause): () =>
-            _player.playOrPause(),
+    return PopScope(
+      canPop: !_isLiveFullscreen,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _isLiveFullscreen) {
+          _toggleLiveFullscreen(forceValue: false);
+        }
       },
-      child: Column(
-        children: [
-          _buildTopBar(state, filteredChannels),
-        Expanded(
-          child: LayoutBuilder(
-            builder: (context, constraints) {
-              final isDesktop = constraints.maxWidth >= 900;
-              if (isDesktop) {
-                return Row(
-                  children: [
-                    if (!_isSidebarCollapsed) ...[
+      child: CallbackShortcuts(
+        bindings: <ShortcutActivator, VoidCallback>{
+          const SingleActivator(LogicalKeyboardKey.channelUp): () =>
+              _stepChannel(filteredChannels, -1),
+          const SingleActivator(LogicalKeyboardKey.pageUp): () =>
+              _stepChannel(filteredChannels, -1),
+          const SingleActivator(LogicalKeyboardKey.channelDown): () =>
+              _stepChannel(filteredChannels, 1),
+          const SingleActivator(LogicalKeyboardKey.pageDown): () =>
+              _stepChannel(filteredChannels, 1),
+          const SingleActivator(LogicalKeyboardKey.mediaPlayPause): () =>
+              _player.playOrPause(),
+        },
+        child: Column(
+          children: [
+            if (!_isLiveFullscreen) _buildTopBar(state, filteredChannels),
+            Expanded(
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final isDesktop =
+                      constraints.maxWidth >= 860 || widget.appState.tvMode;
+                  if (isDesktop) {
+                    return Row(
+                      children: [
+                        if (!_isSidebarCollapsed && !_isLiveFullscreen) ...[
                       SizedBox(
                         width: _sidebarWidth.clamp(
                           220.0,
@@ -1284,6 +1316,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
           ),
         ),
       ],
+      ),
       ),
     );
   }
@@ -1995,21 +2028,30 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
       focusNode: _playerFocusNode,
       onKeyEvent: (node, event) {
         if (event is KeyDownEvent) {
-          if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
-            _stepChannel(activeList, -1);
+          if (event.logicalKey == LogicalKeyboardKey.select ||
+              event.logicalKey == LogicalKeyboardKey.enter ||
+              event.logicalKey == LogicalKeyboardKey.numpadEnter ||
+              event.logicalKey == LogicalKeyboardKey.gameButtonA) {
+            _toggleLiveFullscreen();
             return KeyEventResult.handled;
           }
-          if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
-            _stepChannel(activeList, 1);
-            return KeyEventResult.handled;
-          }
-          if (event.logicalKey == LogicalKeyboardKey.arrowLeft) {
-            _stepSignalLine(-1);
-            return KeyEventResult.handled;
-          }
-          if (event.logicalKey == LogicalKeyboardKey.arrowRight) {
-            _stepSignalLine(1);
-            return KeyEventResult.handled;
+          if (_isLiveFullscreen || !widget.appState.tvMode) {
+            if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
+              _stepChannel(activeList, -1);
+              return KeyEventResult.handled;
+            }
+            if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
+              _stepChannel(activeList, 1);
+              return KeyEventResult.handled;
+            }
+            if (event.logicalKey == LogicalKeyboardKey.arrowLeft) {
+              _stepSignalLine(-1);
+              return KeyEventResult.handled;
+            }
+            if (event.logicalKey == LogicalKeyboardKey.arrowRight) {
+              _stepSignalLine(1);
+              return KeyEventResult.handled;
+            }
           }
           final char = event.character;
           if (char != null &&
@@ -2059,6 +2101,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                             Video(
                               controller: _videoController,
                               fill: Colors.black,
+                              controls: NoVideoControls,
                             ),
                        // Top-left OSD banner when switching channels via wheel/keys
                       if (_channelOsdText != null)
@@ -2109,7 +2152,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                             ),
                           ),
                         ),
-                      // Top-right proxy selector + real-time download speed HUD
+                      // Top-right proxy selector + real-time download speed HUD + Fullscreen button
                       if (ch != null && _digitInputBuffer.isEmpty)
                         Positioned(
                           top: 14,
@@ -2132,6 +2175,45 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                               ),
                               const SizedBox(width: 8),
                               VideoDownloadSpeedBadge(player: _player),
+                              const SizedBox(width: 8),
+                              InkWell(
+                                borderRadius: BorderRadius.circular(18),
+                                onTap: () => _toggleLiveFullscreen(),
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 10,
+                                    vertical: 5,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xBB090E14),
+                                    borderRadius: BorderRadius.circular(18),
+                                    border: Border.all(
+                                      color: VideoPlatformTheme.accent,
+                                    ),
+                                  ),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(
+                                        _isLiveFullscreen
+                                            ? Icons.fullscreen_exit_rounded
+                                            : Icons.fullscreen_rounded,
+                                        size: 15,
+                                        color: VideoPlatformTheme.accent,
+                                      ),
+                                      const SizedBox(width: 4),
+                                      Text(
+                                        _isLiveFullscreen ? '退出全屏' : '全屏放大',
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 11.5,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
                             ],
                           ),
                         ),
@@ -2248,7 +2330,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
               ],
             ),
           ),
-          if (!compact && ch != null)
+          if (!compact && !_isLiveFullscreen && ch != null)
             Container(
               height: 54,
               padding: const EdgeInsets.symmetric(horizontal: 14),
@@ -2471,6 +2553,18 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                           size: 15,
                         ),
                         label: Text(_activeRouteLabel),
+                      ),
+                      const SizedBox(width: 6),
+                      FilledButton.tonalIcon(
+                        onPressed: () => _toggleLiveFullscreen(),
+                        icon: Icon(
+                          _isLiveFullscreen
+                              ? Icons.fullscreen_exit_rounded
+                              : Icons.fullscreen_rounded,
+                          size: 17,
+                          color: VideoPlatformTheme.accent,
+                        ),
+                        label: Text(_isLiveFullscreen ? '退出全屏' : '全屏放大'),
                       ),
                     ],
                   );

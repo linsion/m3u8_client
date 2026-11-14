@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
@@ -9,6 +10,80 @@ import '../../models/models.dart';
 import '../../services/proxy_routing_service.dart';
 import '../../state/app_state.dart';
 import '../theme.dart';
+
+const MethodChannel _qrScannerChannel =
+    MethodChannel('com.linsion.m3u8_client/qr_scanner');
+
+({String url, String name})? _tryParseSubscriptionFromQrText(String rawInput) {
+  final raw = rawInput.trim();
+  if (raw.isEmpty) return null;
+
+  // 1. Direct http:// or https:// subscription URL
+  if (raw.startsWith('http://') || raw.startsWith('https://')) {
+    final uri = Uri.tryParse(raw);
+    if (uri != null && uri.host.isNotEmpty) {
+      final fragName =
+          uri.fragment.isNotEmpty ? Uri.decodeComponent(uri.fragment) : '';
+      final cleanUrl = raw.split('#').first.trim();
+      final name = fragName.isNotEmpty ? fragName : '扫码订阅 (${uri.host})';
+      return (url: cleanUrl, name: name);
+    }
+  }
+
+  // 2. clash://install-config?url=... or sing-box://import-remote-profile?url=...
+  final lower = raw.toLowerCase();
+  if (lower.startsWith('clash://') ||
+      lower.startsWith('sing-box://') ||
+      lower.startsWith('shadowrocket://')) {
+    final uri = Uri.tryParse(raw);
+    if (uri != null) {
+      final embeddedUrl = uri.queryParameters['url'] ?? '';
+      if (embeddedUrl.startsWith('http://') ||
+          embeddedUrl.startsWith('https://')) {
+        final embeddedUri = Uri.tryParse(embeddedUrl);
+        final name = uri.queryParameters['name']?.trim().isNotEmpty == true
+            ? uri.queryParameters['name']!.trim()
+            : (uri.fragment.isNotEmpty
+                ? Uri.decodeComponent(uri.fragment)
+                : '扫码订阅 (${embeddedUri?.host ?? "Clash"})');
+        return (url: embeddedUrl.trim(), name: name);
+      }
+    }
+  }
+
+  // 3. sub://base64_url#name or sub://https://...
+  if (lower.startsWith('sub://')) {
+    var body = raw.substring(6).trim();
+    String subName = '';
+    final hashIdx = body.indexOf('#');
+    if (hashIdx >= 0) {
+      subName = Uri.decodeComponent(body.substring(hashIdx + 1).trim());
+      body = body.substring(0, hashIdx).trim();
+    }
+    if (body.startsWith('http://') || body.startsWith('https://')) {
+      final uri = Uri.tryParse(body);
+      return (
+        url: body,
+        name: subName.isNotEmpty ? subName : '扫码订阅 (${uri?.host ?? "sub"})',
+      );
+    }
+    try {
+      final normalized = base64Url.normalize(
+        body.replaceAll('-', '+').replaceAll('_', '/'),
+      );
+      final decoded = utf8.decode(base64.decode(normalized)).trim();
+      if (decoded.startsWith('http://') || decoded.startsWith('https://')) {
+        final uri = Uri.tryParse(decoded);
+        return (
+          url: decoded.split('#').first.trim(),
+          name: subName.isNotEmpty ? subName : '扫码订阅 (${uri?.host ?? "sub"})',
+        );
+      }
+    } catch (_) {}
+  }
+
+  return null;
+}
 
 class ProxyServerScreen extends StatefulWidget {
   final AppState appState;
@@ -223,6 +298,177 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
     );
     if (!mounted) return;
     unawaited(_proxySvc.refreshSubscription(sub.id));
+  }
+
+  Future<void> _showQrScanAddSubscriptionSheet() async {
+    if (!Platform.isAndroid && !Platform.isIOS) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('当前桌面环境请使用「新增订阅链接」或「粘贴导入节点」'),
+        ),
+      );
+      return;
+    }
+
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: VideoPlatformTheme.bgElevated,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(14)),
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(
+                      Icons.qr_code_scanner_rounded,
+                      size: 20,
+                      color: VideoPlatformTheme.accent,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      '扫码添加代理订阅 / 节点',
+                      style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
+                        color: VideoPlatformTheme.textPrimary,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '支持识别机场订阅链接二维码 (HTTP/HTTPS、sub://、clash://) 以及单节点二维码 (ss://、trojan://、vmess://、vless://、socks5://)',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: VideoPlatformTheme.textSecondary,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                ListTile(
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  tileColor: VideoPlatformTheme.bgCard,
+                  leading: Icon(
+                    Icons.camera_alt_rounded,
+                    color: VideoPlatformTheme.accent,
+                  ),
+                  title: Text(
+                    '摄像头实时扫码添加',
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
+                      color: VideoPlatformTheme.textPrimary,
+                    ),
+                  ),
+                  subtitle: Text(
+                    '打开手机相机对准订阅或节点二维码自动添加',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: VideoPlatformTheme.textSecondary,
+                    ),
+                  ),
+                  onTap: () => Navigator.of(ctx).pop('scanCamera'),
+                ),
+                const SizedBox(height: 8),
+                ListTile(
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  tileColor: VideoPlatformTheme.bgCard,
+                  leading: Icon(
+                    Icons.photo_library_rounded,
+                    color: VideoPlatformTheme.accent,
+                  ),
+                  title: Text(
+                    '从手机相册选择二维码图片识别',
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
+                      color: VideoPlatformTheme.textPrimary,
+                    ),
+                  ),
+                  subtitle: Text(
+                    '选择保存在相册中的订阅二维码截图直接导入',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: VideoPlatformTheme.textSecondary,
+                    ),
+                  ),
+                  onTap: () => Navigator.of(ctx).pop('scanGallery'),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+
+    if (choice == null || !mounted) return;
+    await _scanQrCodeAndImport(choice);
+  }
+
+  Future<void> _scanQrCodeAndImport(String method) async {
+    try {
+      final scanned = await _qrScannerChannel.invokeMethod<String>(method);
+      if (!mounted || scanned == null) return;
+      final trimmed = scanned.trim();
+      final messenger = ScaffoldMessenger.of(context);
+      if (trimmed.isEmpty) {
+        messenger.showSnackBar(
+          const SnackBar(content: Text('未在图片中识别到有效二维码，请重试')),
+        );
+        return;
+      }
+
+      // Check if it's a subscription URL QR code
+      final parsedSub = _tryParseSubscriptionFromQrText(trimmed);
+      if (parsedSub != null) {
+        final sub = await _proxySvc.upsertSubscription(
+          name: parsedSub.name,
+          url: parsedSub.url,
+          enabled: true,
+          autoUpdateHours: 12,
+        );
+        if (!mounted) return;
+        messenger.showSnackBar(
+          SnackBar(
+            content: Text('扫码成功：已添加订阅「${sub.name}」，正在自动拉取节点...'),
+          ),
+        );
+        unawaited(_proxySvc.refreshSubscription(sub.id));
+        return;
+      }
+
+      // Otherwise treat as proxy node URI(s) or Base64 node list
+      final count = await _proxySvc.importNodesFromRawText(trimmed);
+      if (!mounted) return;
+      if (count > 0) {
+        messenger.showSnackBar(
+          SnackBar(content: Text('扫码成功：已解析并导入 $count 个代理节点')),
+        );
+      } else {
+        messenger.showSnackBar(
+          SnackBar(
+            content: Text(
+              '未能识别该二维码为代理订阅或节点：${trimmed.length > 60 ? "${trimmed.substring(0, 60)}..." : trimmed}',
+            ),
+          ),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('调用扫码失败：$e')),
+      );
+    }
   }
 
   Future<void> _showPasteImportDialog() async {
@@ -730,6 +976,12 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
                 spacing: 8,
                 runSpacing: 8,
                 children: [
+                  if (Platform.isAndroid || Platform.isIOS)
+                    FilledButton.tonalIcon(
+                      onPressed: _showQrScanAddSubscriptionSheet,
+                      icon: const Icon(Icons.qr_code_scanner_rounded, size: 16),
+                      label: const Text('扫码添加'),
+                    ),
                   OutlinedButton.icon(
                     onPressed: () => _showUpsertSubscriptionDialog(),
                     icon: const Icon(Icons.add_link_rounded, size: 16),
@@ -768,10 +1020,26 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
                     style: TextStyle(color: VideoPlatformTheme.textMuted),
                   ),
                   const SizedBox(height: 8),
-                  FilledButton.icon(
-                    onPressed: () => _showUpsertSubscriptionDialog(),
-                    icon: const Icon(Icons.add_rounded, size: 16),
-                    label: const Text('添加良心云默认订阅'),
+                  Wrap(
+                    spacing: 10,
+                    runSpacing: 8,
+                    alignment: WrapAlignment.center,
+                    children: [
+                      if (Platform.isAndroid || Platform.isIOS)
+                        FilledButton.icon(
+                          onPressed: _showQrScanAddSubscriptionSheet,
+                          icon: const Icon(
+                            Icons.qr_code_scanner_rounded,
+                            size: 16,
+                          ),
+                          label: const Text('扫码添加订阅'),
+                        ),
+                      FilledButton.tonalIcon(
+                        onPressed: () => _showUpsertSubscriptionDialog(),
+                        icon: const Icon(Icons.add_rounded, size: 16),
+                        label: const Text('添加良心云默认订阅'),
+                      ),
+                    ],
                   ),
                 ],
               ),
@@ -2910,6 +3178,66 @@ class _UpsertSubscriptionDialogState extends State<_UpsertSubscriptionDialog> {
                 spacing: 8,
                 runSpacing: 6,
                 children: [
+                  if (Platform.isAndroid || Platform.isIOS) ...[
+                    ActionChip(
+                      avatar: const Icon(
+                        Icons.qr_code_scanner_rounded,
+                        size: 15,
+                      ),
+                      label: const Text(
+                        '摄像头扫码填入',
+                        style: TextStyle(fontSize: 11.5),
+                      ),
+                      onPressed: () async {
+                        final raw = await _qrScannerChannel
+                            .invokeMethod<String>('scanCamera');
+                        if (!mounted || raw == null || raw.trim().isEmpty) {
+                          return;
+                        }
+                        final parsed = _tryParseSubscriptionFromQrText(raw);
+                        if (parsed != null) {
+                          _urlCtrl.text = parsed.url;
+                          if (_nameCtrl.text.trim().isEmpty) {
+                            _nameCtrl.text = parsed.name;
+                          }
+                        } else {
+                          _urlCtrl.text = raw.trim();
+                        }
+                        if (_validationError != null) {
+                          setState(() => _validationError = null);
+                        }
+                      },
+                    ),
+                    ActionChip(
+                      avatar: const Icon(
+                        Icons.photo_library_outlined,
+                        size: 15,
+                      ),
+                      label: const Text(
+                        '相册选图识别二维码',
+                        style: TextStyle(fontSize: 11.5),
+                      ),
+                      onPressed: () async {
+                        final raw = await _qrScannerChannel
+                            .invokeMethod<String>('scanGallery');
+                        if (!mounted || raw == null || raw.trim().isEmpty) {
+                          return;
+                        }
+                        final parsed = _tryParseSubscriptionFromQrText(raw);
+                        if (parsed != null) {
+                          _urlCtrl.text = parsed.url;
+                          if (_nameCtrl.text.trim().isEmpty) {
+                            _nameCtrl.text = parsed.name;
+                          }
+                        } else {
+                          _urlCtrl.text = raw.trim();
+                        }
+                        if (_validationError != null) {
+                          setState(() => _validationError = null);
+                        }
+                      },
+                    ),
+                  ],
                   ActionChip(
                     avatar: const Icon(Icons.bolt_rounded, size: 15),
                     label: const Text(
