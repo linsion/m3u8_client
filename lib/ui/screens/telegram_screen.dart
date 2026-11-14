@@ -287,6 +287,32 @@ class _TelegramScreenState extends State<TelegramScreen> {
   String _chatFilter = '';
 
   TelegramChat? _selectedChat;
+  bool _userExitedChat = false;
+
+  bool get _isMobileLayout {
+    final isMobilePlatform =
+        (Platform.isAndroid || Platform.isIOS) && !widget.appState.tvMode;
+    if (!mounted) return isMobilePlatform;
+    final mq = MediaQuery.maybeSizeOf(context);
+    if (mq != null) {
+      return mq.width < 860;
+    }
+    return isMobilePlatform;
+  }
+
+  void _exitCurrentChatOnMobile() {
+    _saveCurrentDraft();
+    _stopOutgoingTyping();
+    setState(() {
+      _userExitedChat = true;
+      _selectedChat = null;
+      _showRightInfoPanel = false;
+      _selectionMode = false;
+      _selectedMessageIds.clear();
+    });
+    _cachedSelectedChatByAccount.remove(_activeAccountId);
+    _syncReadingContext();
+  }
   List<TelegramMessage> _messages = [];
   int _nextMessageOffset = 0;
   bool _isLoadingMessages = false;
@@ -580,15 +606,19 @@ class _TelegramScreenState extends State<TelegramScreen> {
     }
     final folderKey = '$_activeAccountId|$_selectedFolderKey';
     final cachedChatData = _cachedChatsByAccountFolder[folderKey];
+    final isMobilePlatform =
+        (Platform.isAndroid || Platform.isIOS) && !widget.appState.tvMode;
+    final cachedSel = isMobilePlatform
+        ? null
+        : _cachedSelectedChatByAccount[_activeAccountId];
     if (cachedChatData != null) {
       _chats = _applyReadStateToChats(
         cachedChatData.chats,
-        activeSelectedPeer: _cachedSelectedChatByAccount[_activeAccountId]?.peer,
+        activeSelectedPeer: cachedSel?.peer,
       );
       _nextChatCursor = cachedChatData.nextCursor;
       _statusBanner = '${_chats.length} 个会话';
     }
-    final cachedSel = _cachedSelectedChatByAccount[_activeAccountId];
     if (cachedSel != null) {
       _selectedChat = cachedSel;
       final peerKey = _peerReadKey(cachedSel.peer);
@@ -638,6 +668,8 @@ class _TelegramScreenState extends State<TelegramScreen> {
           scrollOffset: currentScroll,
         );
       }
+    } else {
+      _cachedSelectedChatByAccount.remove(_activeAccountId);
     }
   }
 
@@ -1337,13 +1369,18 @@ class _TelegramScreenState extends State<TelegramScreen> {
             ...incoming,
           ];
         } else {
+          final shouldAutoSelectFirst = !_isMobileLayout &&
+              !silent &&
+              !_userExitedChat &&
+              _selectedChat == null &&
+              res.chats.isNotEmpty;
           final initialTargetPeer = _selectedChat?.peer ??
-              (res.chats.isNotEmpty ? res.chats.first.peer : null);
+              (shouldAutoSelectFirst ? res.chats.first.peer : null);
           _chats = _applyReadStateToChats(
             res.chats,
             activeSelectedPeer: initialTargetPeer,
           );
-          if (_selectedChat == null && _chats.isNotEmpty) {
+          if (shouldAutoSelectFirst && _chats.isNotEmpty) {
             _selectedChat = _chats.first;
             _restoreDraftForChat(_selectedChat!);
             _markChatAsRead(_selectedChat!);
@@ -1384,6 +1421,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
   }
 
   Future<void> _selectChat(TelegramChat chat) async {
+    _userExitedChat = false;
     _saveCurrentDraft();
     _saveCurrentChatToMemoryCache();
     _stopOutgoingTyping();
@@ -3601,7 +3639,15 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
           // Mobile / Compact layout
           if (_selectedChat != null) {
-            return _buildConversationPane(tg, isMobile: true);
+            return PopScope(
+              canPop: false,
+              onPopInvokedWithResult: (didPop, _) {
+                if (!didPop) {
+                  _exitCurrentChatOnMobile();
+                }
+              },
+              child: _buildConversationPane(tg, isMobile: true),
+            );
           }
           return _buildDialogsSidebar(tg, isMobile: true);
         },
@@ -4474,7 +4520,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
                     size: 20,
                     color: tg.textSecondary,
                   ),
-                  onPressed: () => setState(() => _selectedChat = null),
+                  onPressed: _exitCurrentChatOnMobile,
                 ),
               GestureDetector(
                 onTap: () =>
@@ -7041,7 +7087,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
           GestureDetector(
             onTap: () => _openMediaGalleryViewer(chat, msg),
             child: Container(
-              height: 220,
+              height: isVideo ? 280 : 230,
               margin: const EdgeInsets.fromLTRB(4, 4, 4, 0),
               decoration: BoxDecoration(
                 color: const Color(0xFF0A1017),
@@ -11367,6 +11413,18 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
     await _inlinePlayer?.setVolume(clamped);
   }
 
+  bool _isInlineHorizontalSeeking = false;
+  Duration _inlineSeekStartPos = Duration.zero;
+  Duration _inlineSeekPreviewPos = Duration.zero;
+
+  String _fmtInlineClock(Duration d) {
+    final total = d.inSeconds;
+    if (total <= 0) return '00:00';
+    final m = (total ~/ 60).toString().padLeft(2, '0');
+    final s = (total % 60).toString().padLeft(2, '0');
+    return '$m:$s';
+  }
+
   @override
   Widget build(BuildContext context) {
     super.build(context);
@@ -11386,7 +11444,9 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
         : '';
 
     final totalMs = _duration.inMilliseconds > 0 ? _duration.inMilliseconds : 1;
-    final progress = (_position.inMilliseconds / totalMs).clamp(0.0, 1.0);
+    final activePos =
+        _isInlineHorizontalSeeking ? _inlineSeekPreviewPos : _position;
+    final progress = (activePos.inMilliseconds / totalMs).clamp(0.0, 1.0);
 
     return GestureDetector(
       onTap: () {
@@ -11399,6 +11459,45 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
         }
         widget.onOpenGallery();
       },
+      onHorizontalDragStart: (isVideo && _isInlineMode && _inlinePlayer != null)
+          ? (_) {
+              setState(() {
+                _isInlineHorizontalSeeking = true;
+                _inlineSeekStartPos = _position;
+                _inlineSeekPreviewPos = _position;
+              });
+            }
+          : null,
+      onHorizontalDragUpdate: (isVideo && _isInlineMode && _inlinePlayer != null)
+          ? (details) {
+              if (!_isInlineHorizontalSeeking) return;
+              final boxWidth = context.size?.width ?? 220.0;
+              final maxSec = _duration.inSeconds > 0
+                  ? _duration.inSeconds
+                  : (att?.duration != null && att!.duration > 0
+                      ? att.duration
+                      : 120);
+              final spanSec = maxSec.clamp(30, 180);
+              final deltaMs =
+                  ((details.delta.dx / boxWidth) * spanSec * 1000).round();
+              final nextMs = (_inlineSeekPreviewPos.inMilliseconds + deltaMs)
+                  .clamp(0, maxSec * 1000);
+              setState(() {
+                _inlineSeekPreviewPos = Duration(milliseconds: nextMs);
+              });
+            }
+          : null,
+      onHorizontalDragEnd: (isVideo && _isInlineMode && _inlinePlayer != null)
+          ? (_) {
+              if (!_isInlineHorizontalSeeking) return;
+              final target = _inlineSeekPreviewPos;
+              setState(() {
+                _isInlineHorizontalSeeking = false;
+                _position = target;
+              });
+              _inlinePlayer?.seek(target);
+            }
+          : null,
       onSecondaryTapDown: (d) => widget.onShowContextMenu(d.globalPosition),
       onLongPressStart: (d) => widget.onShowContextMenu(d.globalPosition),
       child: ClipRRect(
@@ -11637,8 +11736,30 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
                 ),
               ),
 
-            // 5. Center Official Telegram Play Button (when not actively playing inline)
-            if (isVideo && !(_isInlineMode && _isPlaying))
+            // 5. Center Official Telegram Play Button (when not actively playing inline) or Seek HUD
+            if (isVideo && _isInlineHorizontalSeeking)
+              Center(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 6,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xCC000000),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: Colors.white24),
+                  ),
+                  child: Text(
+                    '${_inlineSeekPreviewPos >= _inlineSeekStartPos ? '⏩' : '⏪'} ${_fmtInlineClock(_inlineSeekPreviewPos)} / ${_fmtInlineClock(_duration)}',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              )
+            else if (isVideo && !(_isInlineMode && _isPlaying))
               Center(
                 child: Container(
                   width: 42,
@@ -11810,12 +11931,37 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
                     ),
                   ),
                   if (isVideo && _isInlineMode)
-                    LinearProgressIndicator(
-                      value: progress,
-                      minHeight: 2.5,
-                      backgroundColor: Colors.white24,
-                      valueColor: AlwaysStoppedAnimation<Color>(
-                        widget.tg.tgBlueBright,
+                    SizedBox(
+                      height: 16,
+                      child: SliderTheme(
+                        data: SliderTheme.of(context).copyWith(
+                          trackHeight: 3.0,
+                          thumbShape: const RoundSliderThumbShape(
+                            enabledThumbRadius: 5.0,
+                          ),
+                          overlayShape: const RoundSliderOverlayShape(
+                            overlayRadius: 9.0,
+                          ),
+                          activeTrackColor: widget.tg.tgBlueBright,
+                          inactiveTrackColor: Colors.white30,
+                          thumbColor: Colors.white,
+                        ),
+                        child: Slider(
+                          value: progress,
+                          min: 0.0,
+                          max: 1.0,
+                          onChanged: (val) {
+                            final maxMs = _duration.inMilliseconds > 0
+                                ? _duration.inMilliseconds
+                                : ((att?.duration ?? 0) * 1000);
+                            if (maxMs > 0) {
+                              final target =
+                                  Duration(milliseconds: (val * maxMs).round());
+                              setState(() => _position = target);
+                              _inlinePlayer?.seek(target);
+                            }
+                          },
+                        ),
                       ),
                     ),
                 ],
@@ -11884,6 +12030,9 @@ class _TelegramPhotoGalleryDialogState
   bool _isMuted = false;
   double _volume = 100.0;
   double _preMuteVolume = 100.0;
+  bool _isGalleryHorizontalSeeking = false;
+  Duration _gallerySeekStartPos = Duration.zero;
+  Duration _gallerySeekPreviewPos = Duration.zero;
 
   // Per-message download/save visual feedback inside the gallery lightbox
   final Set<int> _queueingIds = {};
@@ -12256,9 +12405,12 @@ class _TelegramPhotoGalleryDialogState
     );
     final hasAlbumGroup =
         widget.albumMessages != null && widget.albumMessages!.length > 1;
+    final isMobileDialog = MediaQuery.sizeOf(context).width < 760;
     final totalMs =
         _videoDuration.inMilliseconds > 0 ? _videoDuration.inMilliseconds : 1;
-    final posMs = _videoPosition.inMilliseconds.clamp(0, totalMs);
+    final activePos =
+        _isGalleryHorizontalSeeking ? _gallerySeekPreviewPos : _videoPosition;
+    final posMs = activePos.inMilliseconds.clamp(0, totalMs);
 
     return KeyboardListener(
       focusNode: _focusNode,
@@ -12266,33 +12418,50 @@ class _TelegramPhotoGalleryDialogState
       onKeyEvent: (event) {
         if (event is KeyDownEvent) {
           if (event.logicalKey == LogicalKeyboardKey.arrowLeft) {
-            _step(-1);
+            if (isVideo) {
+              _seekRelative(-5);
+            } else {
+              _step(-1);
+            }
           } else if (event.logicalKey == LogicalKeyboardKey.arrowRight) {
-            _step(1);
+            if (isVideo) {
+              _seekRelative(5);
+            } else {
+              _step(1);
+            }
           } else if (event.logicalKey == LogicalKeyboardKey.arrowUp && isVideo) {
             _stepVolume(5);
           } else if (event.logicalKey == LogicalKeyboardKey.arrowDown &&
               isVideo) {
             _stepVolume(-5);
-          } else if (event.logicalKey == LogicalKeyboardKey.space && isVideo) {
+          } else if ((event.logicalKey == LogicalKeyboardKey.space ||
+                  event.logicalKey == LogicalKeyboardKey.select ||
+                  event.logicalKey == LogicalKeyboardKey.enter) &&
+              isVideo) {
             _videoPlayer?.playOrPause();
           } else if (event.logicalKey == LogicalKeyboardKey.keyM && isVideo) {
             _toggleMute();
-          } else if (event.logicalKey == LogicalKeyboardKey.escape) {
+          } else if (event.logicalKey == LogicalKeyboardKey.escape ||
+              event.logicalKey == LogicalKeyboardKey.goBack) {
             Navigator.of(context).pop();
           }
         }
       },
       child: Dialog(
-        backgroundColor: Colors.transparent,
-        insetPadding: const EdgeInsets.all(14),
+        backgroundColor: isMobileDialog ? Colors.black : Colors.transparent,
+        insetPadding:
+            isMobileDialog ? EdgeInsets.zero : const EdgeInsets.all(14),
         child: Stack(
           alignment: Alignment.center,
           children: [
             // 1. Main Media Stage (Video Player OR Interactive Zoomable Photo)
             Positioned.fill(
-              top: 56,
-              bottom: list.length > 1 ? (isVideo ? 136 : 84) : (isVideo ? 68 : 16),
+              top: isMobileDialog ? 0 : 56,
+              bottom: isMobileDialog
+                  ? 0
+                  : (list.length > 1
+                      ? (isVideo ? 136 : 84)
+                      : (isVideo ? 68 : 16)),
               child: isVideo
                   ? Listener(
                       onPointerSignal: (signal) {
@@ -12303,6 +12472,48 @@ class _TelegramPhotoGalleryDialogState
                       child: GestureDetector(
                         behavior: HitTestBehavior.opaque,
                         onTap: () => _videoPlayer?.playOrPause(),
+                        onDoubleTap: () => _videoPlayer?.playOrPause(),
+                        onHorizontalDragStart: (_) {
+                          if (_videoPlayer == null) return;
+                          setState(() {
+                            _isGalleryHorizontalSeeking = true;
+                            _gallerySeekStartPos = _videoPosition;
+                            _gallerySeekPreviewPos = _videoPosition;
+                          });
+                        },
+                        onHorizontalDragUpdate: (details) {
+                          if (!_isGalleryHorizontalSeeking ||
+                              _videoPlayer == null) {
+                            return;
+                          }
+                          final screenWidth =
+                              MediaQuery.sizeOf(context).width.clamp(240.0, 1920.0);
+                          final maxSec = _videoDuration.inSeconds > 0
+                              ? _videoDuration.inSeconds
+                              : (att?.duration != null && att!.duration > 0
+                                  ? att.duration
+                                  : 300);
+                          final spanSec = maxSec.clamp(60, 240);
+                          final deltaMs =
+                              ((details.delta.dx / screenWidth) * spanSec * 1000)
+                                  .round();
+                          final nextMs =
+                              (_gallerySeekPreviewPos.inMilliseconds + deltaMs)
+                                  .clamp(0, maxSec * 1000);
+                          setState(() {
+                            _gallerySeekPreviewPos =
+                                Duration(milliseconds: nextMs);
+                          });
+                        },
+                        onHorizontalDragEnd: (_) {
+                          if (!_isGalleryHorizontalSeeking) return;
+                          final target = _gallerySeekPreviewPos;
+                          setState(() {
+                            _isGalleryHorizontalSeeking = false;
+                            _videoPosition = target;
+                          });
+                          _videoPlayer?.seek(target);
+                        },
                         child: Stack(
                           alignment: Alignment.center,
                           children: [
@@ -12322,7 +12533,47 @@ class _TelegramPhotoGalleryDialogState
                               fill: Colors.black,
                               controls: NoVideoControls,
                             ),
-                          if (_isVideoBuffering)
+                          if (_isGalleryHorizontalSeeking)
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 18,
+                                vertical: 10,
+                              ),
+                              decoration: BoxDecoration(
+                                color: const Color(0xD90B121A),
+                                borderRadius: BorderRadius.circular(14),
+                                border: Border.all(
+                                  color: const Color(0xFF5EB5F7),
+                                  width: 1.2,
+                                ),
+                              ),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(
+                                    '${_gallerySeekPreviewPos >= _gallerySeekStartPos ? '⏩ 快进' : '⏪ 快退'}  ${_fmtClock(_gallerySeekPreviewPos)} / ${_fmtClock(_videoDuration)}',
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.w700,
+                                      fontFeatures: [
+                                        ui.FontFeature.tabularFigures(),
+                                      ],
+                                    ),
+                                  ),
+                                  const SizedBox(height: 3),
+                                  Text(
+                                    '${(_gallerySeekPreviewPos.inSeconds - _gallerySeekStartPos.inSeconds) >= 0 ? '+' : ''}${_gallerySeekPreviewPos.inSeconds - _gallerySeekStartPos.inSeconds} 秒',
+                                    style: const TextStyle(
+                                      color: Color(0xFF5EB5F7),
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            )
+                          else if (_isVideoBuffering)
                             Container(
                               padding: const EdgeInsets.all(14),
                               decoration: const BoxDecoration(
@@ -12382,273 +12633,230 @@ class _TelegramPhotoGalleryDialogState
 
             // 2. Top Official Telegram Action & Counter Bar
             Positioned(
-              top: 6,
-              left: 12,
-              right: 12,
+              top: isMobileDialog ? 10 : 6,
+              left: isMobileDialog ? 8 : 12,
+              right: isMobileDialog ? 8 : 12,
               child: Row(
                 children: [
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 6,
-                    ),
-                    decoration: BoxDecoration(
-                      color: const Color(0xCC0F1720),
-                      borderRadius: BorderRadius.circular(18),
-                      border: Border.all(color: Colors.white12),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          isVideo
-                              ? Icons.videocam_rounded
-                              : Icons.photo_outlined,
-                          size: 15,
-                          color: const Color(0xFF5EB5F7),
-                        ),
-                        const SizedBox(width: 6),
-                        ConstrainedBox(
-                          constraints: const BoxConstraints(maxWidth: 320),
-                          child: Text(
-                            [
-                              '${_currentIndex + 1} / ${list.length}',
-                              att?.displayName ?? (isVideo ? '视频' : '图片'),
-                              if (att != null && att.formattedSize.isNotEmpty)
-                                att.formattedSize,
-                            ].join('  ·  '),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 12.5,
-                              fontWeight: FontWeight.w600,
+                  Expanded(
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 6,
+                            ),
+                            decoration: BoxDecoration(
+                              color: const Color(0xCC0F1720),
+                              borderRadius: BorderRadius.circular(18),
+                              border: Border.all(color: Colors.white12),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  isVideo
+                                      ? Icons.videocam_rounded
+                                      : Icons.photo_outlined,
+                                  size: 15,
+                                  color: const Color(0xFF5EB5F7),
+                                ),
+                                const SizedBox(width: 6),
+                                ConstrainedBox(
+                                  constraints: BoxConstraints(
+                                    maxWidth: isMobileDialog ? 150 : 320,
+                                  ),
+                                  child: Text(
+                                    [
+                                      '${_currentIndex + 1} / ${list.length}',
+                                      att?.displayName ??
+                                          (isVideo ? '视频' : '图片'),
+                                      if (att != null &&
+                                          att.formattedSize.isNotEmpty)
+                                        att.formattedSize,
+                                    ].join(' · '),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 12.0,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  if (isVideo && _videoPlayer != null) ...[
-                    const SizedBox(width: 8),
-                    VideoProxyNodeSelector(
-                      proxyService: widget.appState.proxyService,
-                      scenario: RequestScenario.telegram,
-                      overlayStyle: true,
-                      onProxyChanged: (statusMsg) {
-                        _showGalleryHud(statusMsg, state: 'success');
-                        final curSec = _videoPosition.inSeconds;
-                        _syncVideoPlayerForCurrentItem().then((_) {
-                          if (curSec > 2) {
-                            _pendingGalleryResumeSeconds = curSec;
-                          }
-                        });
-                      },
-                    ),
-                    const SizedBox(width: 8),
-                    VideoDownloadSpeedBadge(player: _videoPlayer!),
-                  ],
-                  if (hasAlbumGroup) ...[
-                    const SizedBox(width: 8),
-                    InkWell(
-                      borderRadius: BorderRadius.circular(16),
-                      onTap: _toggleScopeMode,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 6,
-                        ),
-                        decoration: BoxDecoration(
-                          color: _albumScopeOnly
-                              ? const Color(0xFF3E99EE)
-                              : const Color(0xCC0F1720),
-                          borderRadius: BorderRadius.circular(16),
-                          border: Border.all(color: Colors.white24),
-                        ),
-                        child: Text(
-                          _albumScopeOnly
-                              ? '当前相册分组 (${widget.albumMessages!.length}) · 点击切全群 (${widget.photoMessages.length})'
-                              : '会话全部媒体 (${widget.photoMessages.length}) · 点击仅看本组 (${widget.albumMessages!.length})',
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 11.5,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                  const Spacer(),
-                  if (isVideo && widget.onOpenMiniPlayer != null) ...[
-                    FilledButton.tonalIcon(
-                      onPressed: () {
-                        final posSec = _videoPosition.inSeconds;
-                        _videoPlayer?.pause();
-                        Navigator.of(context).pop();
-                        widget.onOpenMiniPlayer!(msg, posSec);
-                      },
-                      icon: const Icon(
-                        Icons.picture_in_picture_alt_rounded,
-                        size: 16,
-                      ),
-                      label: const Text('小窗播放'),
-                    ),
-                    const SizedBox(width: 8),
-                  ],
-                  if (hasAlbumGroup && widget.onQueueAlbumDownload != null) ...[
-                    FilledButton.tonalIcon(
-                      style: FilledButton.styleFrom(
-                        backgroundColor: _queuedAlbum
-                            ? const Color(0xFF1F6E43)
-                            : const Color(0xCC1E2C3A),
-                        foregroundColor: Colors.white,
-                      ),
-                      onPressed: _queueingAlbum
-                          ? null
-                          : () => _handleQueueAlbum(widget.albumMessages!),
-                      icon: AnimatedSwitcher(
-                        duration: const Duration(milliseconds: 220),
-                        transitionBuilder: (child, anim) =>
-                            ScaleTransition(scale: anim, child: child),
-                        child: _queueingAlbum
-                            ? const SizedBox(
-                                key: ValueKey('alb_loading'),
-                                width: 14,
-                                height: 14,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                  color: Colors.white,
+                          if (isVideo && _videoPlayer != null) ...[
+                            const SizedBox(width: 6),
+                            VideoProxyNodeSelector(
+                              proxyService: widget.appState.proxyService,
+                              scenario: RequestScenario.telegram,
+                              overlayStyle: true,
+                              onProxyChanged: (statusMsg) {
+                                _showGalleryHud(statusMsg, state: 'success');
+                                final curSec = _videoPosition.inSeconds;
+                                _syncVideoPlayerForCurrentItem().then((_) {
+                                  if (curSec > 2) {
+                                    _pendingGalleryResumeSeconds = curSec;
+                                  }
+                                });
+                              },
+                            ),
+                            const SizedBox(width: 6),
+                            VideoDownloadSpeedBadge(
+                              player: _videoPlayer!,
+                              compact: isMobileDialog,
+                            ),
+                          ],
+                          if (hasAlbumGroup) ...[
+                            const SizedBox(width: 6),
+                            InkWell(
+                              borderRadius: BorderRadius.circular(16),
+                              onTap: _toggleScopeMode,
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 6,
                                 ),
-                              )
-                            : Icon(
+                                decoration: BoxDecoration(
+                                  color: _albumScopeOnly
+                                      ? const Color(0xFF3E99EE)
+                                      : const Color(0xCC0F1720),
+                                  borderRadius: BorderRadius.circular(16),
+                                  border: Border.all(color: Colors.white24),
+                                ),
+                                child: Text(
+                                  _albumScopeOnly
+                                      ? '本组 (${widget.albumMessages!.length})'
+                                      : '全部 (${widget.photoMessages.length})',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 11.5,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+                          if (isVideo && widget.onOpenMiniPlayer != null) ...[
+                            const SizedBox(width: 6),
+                            FilledButton.tonalIcon(
+                              onPressed: () {
+                                final posSec = _videoPosition.inSeconds;
+                                _videoPlayer?.pause();
+                                Navigator.of(context).pop();
+                                widget.onOpenMiniPlayer!(msg, posSec);
+                              },
+                              icon: const Icon(
+                                Icons.picture_in_picture_alt_rounded,
+                                size: 15,
+                              ),
+                              label: const Text('小窗'),
+                            ),
+                          ],
+                          if (hasAlbumGroup &&
+                              widget.onQueueAlbumDownload != null) ...[
+                            const SizedBox(width: 6),
+                            FilledButton.tonalIcon(
+                              style: FilledButton.styleFrom(
+                                backgroundColor: _queuedAlbum
+                                    ? const Color(0xFF1F6E43)
+                                    : const Color(0xCC1E2C3A),
+                                foregroundColor: Colors.white,
+                              ),
+                              onPressed: _queueingAlbum
+                                  ? null
+                                  : () =>
+                                      _handleQueueAlbum(widget.albumMessages!),
+                              icon: Icon(
                                 _queuedAlbum
                                     ? Icons.check_circle_rounded
                                     : Icons.collections_bookmark_outlined,
-                                key: ValueKey(
-                                  _queuedAlbum ? 'alb_done' : 'alb_idle',
-                                ),
-                                size: 16,
+                                size: 15,
                                 color: _queuedAlbum
                                     ? const Color(0xFF69F0AE)
                                     : Colors.white,
                               ),
-                      ),
-                      label: Text(
-                        _queueingAlbum
-                            ? '正在转存...'
-                            : (_queuedAlbum
-                                ? '已整组入队 ✓'
-                                : '整组转存 (${widget.albumMessages!.length})'),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                  ],
-                  FilledButton.tonalIcon(
-                    style: FilledButton.styleFrom(
-                      backgroundColor: _savedLocalIds.contains(msg.id)
-                          ? const Color(0xFF1F6E43)
-                          : const Color(0xCC1E2C3A),
-                      foregroundColor: Colors.white,
-                    ),
-                    onPressed: _savingLocalIds.contains(msg.id)
-                        ? null
-                        : () => _handleSaveLocal(msg),
-                    icon: AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 220),
-                      transitionBuilder: (child, anim) =>
-                          ScaleTransition(scale: anim, child: child),
-                      child: _savingLocalIds.contains(msg.id)
-                          ? const SizedBox(
-                              key: ValueKey('loc_loading'),
-                              width: 14,
-                              height: 14,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: Colors.white,
+                              label: Text(
+                                _queueingAlbum
+                                    ? '转存中...'
+                                    : (_queuedAlbum
+                                        ? '已入队 ✓'
+                                        : '整组(${widget.albumMessages!.length})'),
                               ),
-                            )
-                          : Icon(
+                            ),
+                          ],
+                          const SizedBox(width: 6),
+                          FilledButton.tonalIcon(
+                            style: FilledButton.styleFrom(
+                              backgroundColor: _savedLocalIds.contains(msg.id)
+                                  ? const Color(0xFF1F6E43)
+                                  : const Color(0xCC1E2C3A),
+                              foregroundColor: Colors.white,
+                            ),
+                            onPressed: _savingLocalIds.contains(msg.id)
+                                ? null
+                                : () => _handleSaveLocal(msg),
+                            icon: Icon(
                               _savedLocalIds.contains(msg.id)
                                   ? Icons.check_circle_rounded
                                   : Icons.download_rounded,
-                              key: ValueKey(
-                                _savedLocalIds.contains(msg.id)
-                                    ? 'loc_done'
-                                    : 'loc_idle',
-                              ),
-                              size: 16,
+                              size: 15,
                               color: _savedLocalIds.contains(msg.id)
                                   ? const Color(0xFF69F0AE)
                                   : Colors.white,
                             ),
-                    ),
-                    label: Text(
-                      _savingLocalIds.contains(msg.id)
-                          ? '保存中...'
-                          : (_savedLocalIds.contains(msg.id)
-                              ? '已存本机 ✓'
-                              : '保存本机'),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  if (att?.url.isNotEmpty ?? false) ...[
-                    FilledButton.tonalIcon(
-                      style: FilledButton.styleFrom(
-                        backgroundColor: _queuedIds.contains(msg.id)
-                            ? const Color(0xFF1F6E43)
-                            : (_failedIds.contains(msg.id)
-                                ? const Color(0xFF8B2635)
-                                : const Color(0xFF2B5278)),
-                        foregroundColor: Colors.white,
-                      ),
-                      onPressed: _queueingIds.contains(msg.id)
-                          ? null
-                          : () => _handleQueueSingle(msg),
-                      icon: AnimatedSwitcher(
-                        duration: const Duration(milliseconds: 220),
-                        transitionBuilder: (child, anim) =>
-                            ScaleTransition(scale: anim, child: child),
-                        child: _queueingIds.contains(msg.id)
-                            ? const SizedBox(
-                                key: ValueKey('q_loading'),
-                                width: 14,
-                                height: 14,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                  color: Colors.white,
-                                ),
-                              )
-                            : Icon(
+                            label: Text(
+                              _savingLocalIds.contains(msg.id)
+                                  ? '保存中...'
+                                  : (_savedLocalIds.contains(msg.id)
+                                      ? '已存 ✓'
+                                      : '存本机'),
+                            ),
+                          ),
+                          if (att?.url.isNotEmpty ?? false) ...[
+                            const SizedBox(width: 6),
+                            FilledButton.tonalIcon(
+                              style: FilledButton.styleFrom(
+                                backgroundColor: _queuedIds.contains(msg.id)
+                                    ? const Color(0xFF1F6E43)
+                                    : (_failedIds.contains(msg.id)
+                                        ? const Color(0xFF8B2635)
+                                        : const Color(0xFF2B5278)),
+                                foregroundColor: Colors.white,
+                              ),
+                              onPressed: _queueingIds.contains(msg.id)
+                                  ? null
+                                  : () => _handleQueueSingle(msg),
+                              icon: Icon(
                                 _queuedIds.contains(msg.id)
                                     ? Icons.check_circle_rounded
                                     : (_failedIds.contains(msg.id)
                                         ? Icons.error_outline_rounded
                                         : Icons.cloud_download_outlined),
-                                key: ValueKey(
-                                  _queuedIds.contains(msg.id)
-                                      ? 'q_done'
-                                      : (_failedIds.contains(msg.id)
-                                          ? 'q_err'
-                                          : 'q_idle'),
-                                ),
-                                size: 16,
+                                size: 15,
                                 color: _queuedIds.contains(msg.id)
                                     ? const Color(0xFF69F0AE)
                                     : Colors.white,
                               ),
-                      ),
-                      label: Text(
-                        _queueingIds.contains(msg.id)
-                            ? '添加中...'
-                            : (_queuedIds.contains(msg.id)
-                                ? '已入队 ✓'
-                                : (_failedIds.contains(msg.id)
-                                    ? '失败·重试'
-                                    : '转存下载')),
+                              label: Text(
+                                _queueingIds.contains(msg.id)
+                                    ? '添加中...'
+                                    : (_queuedIds.contains(msg.id)
+                                        ? '已入队 ✓'
+                                        : '转存'),
+                              ),
+                            ),
+                          ],
+                        ],
                       ),
                     ),
-                    const SizedBox(width: 8),
-                  ],
+                  ),
+                  const SizedBox(width: 6),
                   IconButton.filledTonal(
                     onPressed: () => Navigator.of(context).pop(),
                     icon: const Icon(Icons.close, size: 18),
@@ -12919,58 +13127,60 @@ class _TelegramPhotoGalleryDialogState
                             child: Row(
                               mainAxisSize: MainAxisSize.min,
                               children: [
-                                IconButton(
-                                  visualDensity: VisualDensity.compact,
-                                  onPressed: _toggleMute,
-                                  icon: Icon(
-                                    _isMuted || _volume <= 0
-                                        ? Icons.volume_off_rounded
-                                        : (_volume < 50
-                                            ? Icons.volume_down_rounded
-                                            : Icons.volume_up_rounded),
-                                    color: Colors.white,
-                                    size: 20,
+                            IconButton(
+                              visualDensity: VisualDensity.compact,
+                              onPressed: _toggleMute,
+                              icon: Icon(
+                                _isMuted || _volume <= 0
+                                    ? Icons.volume_off_rounded
+                                    : (_volume < 50
+                                        ? Icons.volume_down_rounded
+                                        : Icons.volume_up_rounded),
+                                color: Colors.white,
+                                size: 20,
+                              ),
+                            ),
+                            if (!isMobileDialog) ...[
+                              SizedBox(
+                                width: 88,
+                                child: SliderTheme(
+                                  data: SliderTheme.of(context).copyWith(
+                                    trackHeight: 3.0,
+                                    thumbShape: const RoundSliderThumbShape(
+                                      enabledThumbRadius: 5.5,
+                                    ),
+                                    overlayShape:
+                                        const RoundSliderOverlayShape(
+                                      overlayRadius: 10,
+                                    ),
+                                    activeTrackColor:
+                                        const Color(0xFF5EB5F7),
+                                    inactiveTrackColor: Colors.white24,
+                                    thumbColor: Colors.white,
+                                  ),
+                                  child: Slider(
+                                    value: (_isMuted ? 0.0 : _volume)
+                                        .clamp(0.0, 100.0),
+                                    min: 0,
+                                    max: 100,
+                                    onChanged: _setVolume,
                                   ),
                                 ),
-                                SizedBox(
-                                  width: 88,
-                                  child: SliderTheme(
-                                    data: SliderTheme.of(context).copyWith(
-                                      trackHeight: 3.0,
-                                      thumbShape: const RoundSliderThumbShape(
-                                        enabledThumbRadius: 5.5,
-                                      ),
-                                      overlayShape:
-                                          const RoundSliderOverlayShape(
-                                        overlayRadius: 10,
-                                      ),
-                                      activeTrackColor:
-                                          const Color(0xFF5EB5F7),
-                                      inactiveTrackColor: Colors.white24,
-                                      thumbColor: Colors.white,
-                                    ),
-                                    child: Slider(
-                                      value: (_isMuted ? 0.0 : _volume)
-                                          .clamp(0.0, 100.0),
-                                      min: 0,
-                                      max: 100,
-                                      onChanged: _setVolume,
-                                    ),
+                              ),
+                              SizedBox(
+                                width: 34,
+                                child: Text(
+                                  '${(_isMuted ? 0 : _volume.round())}%',
+                                  style: const TextStyle(
+                                    color: Colors.white70,
+                                    fontSize: 11,
+                                    fontFeatures: [
+                                      ui.FontFeature.tabularFigures(),
+                                    ],
                                   ),
                                 ),
-                                SizedBox(
-                                  width: 34,
-                                  child: Text(
-                                    '${(_isMuted ? 0 : _volume.round())}%',
-                                    style: const TextStyle(
-                                      color: Colors.white70,
-                                      fontSize: 11,
-                                      fontFeatures: [
-                                        ui.FontFeature.tabularFigures(),
-                                      ],
-                                    ),
-                                  ),
-                                ),
+                              ),
+                            ],
                               ],
                             ),
                           ),

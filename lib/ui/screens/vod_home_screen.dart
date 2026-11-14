@@ -814,43 +814,56 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
   }) {
     return InkWell(
       borderRadius: BorderRadius.circular(7),
+      onFocusChange: (_) {
+        if (mounted) setState(() {});
+      },
       onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
-        decoration: BoxDecoration(
-          color: selected
-              ? VideoPlatformTheme.accent.withValues(alpha: 0.18)
-              : VideoPlatformTheme.bgCard,
-          borderRadius: BorderRadius.circular(7),
-          border: Border.all(
-            color: selected
-                ? VideoPlatformTheme.accent
-                : VideoPlatformTheme.borderSubtle,
-          ),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              icon,
-              size: 13.5,
-              color: selected
-                  ? VideoPlatformTheme.accent
-                  : VideoPlatformTheme.textSecondary,
-            ),
-            const SizedBox(width: 5),
-            Text(
-              label,
-              style: TextStyle(
-                fontSize: 12,
-                fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
-                color: selected
+      child: Builder(
+        builder: (ctx) {
+          final isFocused = Focus.of(ctx).hasPrimaryFocus;
+          return Container(
+            padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
+            decoration: BoxDecoration(
+              color: isFocused
+                  ? VideoPlatformTheme.accent.withValues(alpha: 0.28)
+                  : (selected
+                      ? VideoPlatformTheme.accent.withValues(alpha: 0.18)
+                      : VideoPlatformTheme.bgCard),
+              borderRadius: BorderRadius.circular(7),
+              border: Border.all(
+                color: (selected || isFocused)
                     ? VideoPlatformTheme.accent
-                    : VideoPlatformTheme.textSecondary,
+                    : VideoPlatformTheme.borderSubtle,
+                width: isFocused ? 2.0 : 1.0,
               ),
             ),
-          ],
-        ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  icon,
+                  size: 13.5,
+                  color: (selected || isFocused)
+                      ? VideoPlatformTheme.accent
+                      : VideoPlatformTheme.textSecondary,
+                ),
+                const SizedBox(width: 5),
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: (selected || isFocused)
+                        ? FontWeight.w700
+                        : FontWeight.w500,
+                    color: (selected || isFocused)
+                        ? VideoPlatformTheme.accent
+                        : VideoPlatformTheme.textSecondary,
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
       ),
     );
   }
@@ -863,67 +876,95 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
   }) {
     return InkWell(
       borderRadius: BorderRadius.circular(8),
+      onFocusChange: (_) {
+        if (mounted) setState(() {});
+      },
       onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-        decoration: BoxDecoration(
-          color: selected
-              ? VideoPlatformTheme.accent
-              : VideoPlatformTheme.bgCard,
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(
-            color: selected
-                ? VideoPlatformTheme.accent
-                : VideoPlatformTheme.borderSubtle,
-            width: selected ? 1.3 : 1.0,
-          ),
-          boxShadow: selected
-              ? [
-                  BoxShadow(
-                    color: VideoPlatformTheme.accent.withValues(alpha: 0.35),
-                    blurRadius: 8,
-                    offset: const Offset(0, 2),
-                  ),
-                ]
-              : null,
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (icon != null) ...[
-              Icon(
-                icon,
-                size: 14,
-                color: selected ? Colors.white : VideoPlatformTheme.accent,
+      child: Builder(
+        builder: (ctx) {
+          final isFocused = Focus.of(ctx).hasPrimaryFocus;
+          if (isFocused) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (ctx.mounted) {
+                Scrollable.ensureVisible(
+                  ctx,
+                  alignment: 0.5,
+                  duration: const Duration(milliseconds: 140),
+                );
+              }
+            });
+          }
+          return Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+            decoration: BoxDecoration(
+              color: selected
+                  ? VideoPlatformTheme.accent
+                  : (isFocused
+                      ? VideoPlatformTheme.accent.withValues(alpha: 0.24)
+                      : VideoPlatformTheme.bgCard),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: (selected || isFocused)
+                    ? VideoPlatformTheme.accent
+                    : VideoPlatformTheme.borderSubtle,
+                width: isFocused ? 2.2 : (selected ? 1.3 : 1.0),
               ),
-              const SizedBox(width: 5),
-            ] else if (selected) ...[
-              const Icon(
-                Icons.check_circle_rounded,
-                size: 13.5,
-                color: Colors.white,
-              ),
-              const SizedBox(width: 5),
-            ] else ...[
-              Icon(
-                Icons.label_outline_rounded,
-                size: 13,
-                color: VideoPlatformTheme.textMuted,
-              ),
-              const SizedBox(width: 5),
-            ],
-            Text(
-              label,
-              style: TextStyle(
-                fontSize: 12.5,
-                fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
-                color: selected
-                    ? Colors.white
-                    : VideoPlatformTheme.textPrimary,
-              ),
+              boxShadow: (selected || isFocused)
+                  ? [
+                      BoxShadow(
+                        color:
+                            VideoPlatformTheme.accent.withValues(alpha: 0.35),
+                        blurRadius: 8,
+                        offset: const Offset(0, 2),
+                      ),
+                    ]
+                  : null,
             ),
-          ],
-        ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (icon != null) ...[
+                  Icon(
+                    icon,
+                    size: 14,
+                    color: selected ? Colors.white : VideoPlatformTheme.accent,
+                  ),
+                  const SizedBox(width: 5),
+                ] else if (selected) ...[
+                  const Icon(
+                    Icons.check_circle_rounded,
+                    size: 13.5,
+                    color: Colors.white,
+                  ),
+                  const SizedBox(width: 5),
+                ] else ...[
+                  Icon(
+                    Icons.label_outline_rounded,
+                    size: 13,
+                    color: isFocused
+                        ? VideoPlatformTheme.accent
+                        : VideoPlatformTheme.textMuted,
+                  ),
+                  const SizedBox(width: 5),
+                ],
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    fontWeight: (selected || isFocused)
+                        ? FontWeight.w700
+                        : FontWeight.w500,
+                    color: selected
+                        ? Colors.white
+                        : (isFocused
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.textPrimary),
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
       ),
     );
   }
@@ -938,26 +979,57 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
       widthFactor: 1.0,
       child: InkWell(
         borderRadius: BorderRadius.circular(6),
+        onFocusChange: (_) {
+          if (mounted) setState(() {});
+        },
         onTap: onTap,
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 160),
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
-          decoration: BoxDecoration(
-            color: selected
-                ? VideoPlatformTheme.accent
-                : Colors.transparent,
-            borderRadius: BorderRadius.circular(6),
-          ),
-          child: Text(
-            label,
-            style: TextStyle(
-              fontSize: 13,
-              color: selected
-                  ? Colors.white
-                  : VideoPlatformTheme.textSecondary,
-              fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
-            ),
-          ),
+        child: Builder(
+          builder: (ctx) {
+            final isFocused = Focus.of(ctx).hasPrimaryFocus;
+            if (isFocused) {
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (ctx.mounted) {
+                  Scrollable.ensureVisible(
+                    ctx,
+                    alignment: 0.5,
+                    duration: const Duration(milliseconds: 140),
+                  );
+                }
+              });
+            }
+            return AnimatedContainer(
+              duration: const Duration(milliseconds: 160),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+              decoration: BoxDecoration(
+                color: selected
+                    ? VideoPlatformTheme.accent
+                    : (isFocused
+                        ? VideoPlatformTheme.accent.withValues(alpha: 0.25)
+                        : Colors.transparent),
+                borderRadius: BorderRadius.circular(6),
+                border: isFocused
+                    ? Border.all(
+                        color: VideoPlatformTheme.accent,
+                        width: 2.0,
+                      )
+                    : null,
+              ),
+              child: Text(
+                label,
+                style: TextStyle(
+                  fontSize: 13,
+                  color: selected
+                      ? Colors.white
+                      : (isFocused
+                          ? VideoPlatformTheme.accent
+                          : VideoPlatformTheme.textSecondary),
+                  fontWeight: (selected || isFocused)
+                      ? FontWeight.w600
+                      : FontWeight.w400,
+                ),
+              ),
+            );
+          },
         ),
       ),
     );
@@ -1344,6 +1416,7 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                         ),
                         item: item,
                         api: state.api,
+                        autofocus: state.tvMode && index == 0,
                         showSourceBadge: state.searchKeyword.isNotEmpty &&
                             state.aggregatedSearch,
                         onTap: () => _openVodItem(item),

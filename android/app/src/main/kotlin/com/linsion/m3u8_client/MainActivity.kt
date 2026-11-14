@@ -224,6 +224,8 @@ class MainActivity : FlutterActivity() {
         }
         val pm = packageManager
         return pm.hasSystemFeature(PackageManager.FEATURE_LEANBACK) ||
-            pm.hasSystemFeature("android.hardware.type.television")
+            pm.hasSystemFeature("android.software.leanback_only") ||
+            pm.hasSystemFeature("android.hardware.type.television") ||
+            !pm.hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN)
     }
 }
