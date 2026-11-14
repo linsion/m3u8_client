@@ -1,6 +1,6 @@
 # 流光视频 (M3U8 Client) — 全平台客户端
 
-基于 `https://jp2.linsionwinwin.top:8081/` 后端接口构建的 **iOS / Android / macOS / Windows / Linux** 五端统一视频流媒体与离线下载客户端。
+基于 `https://xxxx.top:8081/` 后端接口构建的 **iOS / Android / macOS / Windows / Linux** 五端统一视频流媒体与离线下载客户端。
 
 ## 界面设计原则
 
