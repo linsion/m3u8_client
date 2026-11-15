@@ -265,9 +265,12 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
 
   Widget _buildCategoryFilterBar(AppState state) {
     final categories = state.categories;
+    final screenWidth = MediaQuery.sizeOf(context).width;
+    final isCompactMobile = screenWidth < 580;
+
     return Container(
       height: 48,
-      padding: const EdgeInsets.symmetric(horizontal: 16),
+      padding: EdgeInsets.symmetric(horizontal: isCompactMobile ? 10 : 16),
       decoration: BoxDecoration(
         color: VideoPlatformTheme.bgElevated,
         border: Border(
@@ -322,7 +325,7 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
               ),
             ),
           ),
-          if (categories.length > 5) ...[
+          if (!isCompactMobile && categories.length > 5) ...[
             const SizedBox(width: 6),
             InkWell(
               borderRadius: BorderRadius.circular(6),
@@ -403,11 +406,13 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                             ? Colors.white
                             : VideoPlatformTheme.accent,
                       ),
-                      const SizedBox(width: 5),
+                      const SizedBox(width: 4),
                       Text(
                         _categoriesExpanded
-                            ? '收起分类'
-                            : '全部分类 (${categories.length + 1})',
+                            ? '收起'
+                            : (isCompactMobile
+                                ? '分类 (${categories.length + 1})'
+                                : '全部分类 (${categories.length + 1})'),
                         style: TextStyle(
                           fontSize: 12,
                           fontWeight: FontWeight.w600,
@@ -436,7 +441,7 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
               },
             ),
           ),
-          if (state.totalCount > 0) ...[
+          if (!isCompactMobile && state.totalCount > 0) ...[
             const SizedBox(width: 10),
             Text(
               '共 ${state.totalCount} 部',
@@ -446,71 +451,74 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
               ),
             ),
           ],
-          const SizedBox(width: 8),
-          Tooltip(
-            message: state.aggregatedSearch
-                ? '当前：全网多站点聚合搜索（点击切换为单站搜索）'
-                : '当前：仅搜索当前站点（点击开启全网聚合搜索）',
-            child: InkWell(
-              borderRadius: BorderRadius.circular(5),
-              onFocusChange: (_) {
-                if (mounted) setState(() {});
-              },
-              onTap: () => state.setAggregatedSearch(!state.aggregatedSearch),
-              child: Builder(
-                builder: (ctx) {
-                  final isFocused = Focus.of(ctx).hasPrimaryFocus;
-                  return Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 8,
-                      vertical: 4,
-                    ),
-                    decoration: BoxDecoration(
-                      color: isFocused
-                          ? VideoPlatformTheme.accent.withValues(alpha: 0.28)
-                          : (state.aggregatedSearch
-                              ? VideoPlatformTheme.accent.withValues(alpha: 0.16)
-                              : VideoPlatformTheme.bgCard),
-                      borderRadius: BorderRadius.circular(5),
-                      border: Border.all(
-                        color: (state.aggregatedSearch || isFocused)
-                            ? VideoPlatformTheme.accent
-                            : VideoPlatformTheme.borderSubtle,
-                        width: isFocused ? 2.0 : 1.0,
+          if (!isCompactMobile) ...[
+            const SizedBox(width: 8),
+            Tooltip(
+              message: state.aggregatedSearch
+                  ? '当前：全网多站点聚合搜索（点击切换为单站搜索）'
+                  : '当前：仅搜索当前站点（点击开启全网聚合搜索）',
+              child: InkWell(
+                borderRadius: BorderRadius.circular(5),
+                onFocusChange: (_) {
+                  if (mounted) setState(() {});
+                },
+                onTap: () => state.setAggregatedSearch(!state.aggregatedSearch),
+                child: Builder(
+                  builder: (ctx) {
+                    final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                    return Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 4,
                       ),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          state.aggregatedSearch
-                              ? Icons.travel_explore_rounded
-                              : Icons.location_on_outlined,
-                          size: 14,
+                      decoration: BoxDecoration(
+                        color: isFocused
+                            ? VideoPlatformTheme.accent.withValues(alpha: 0.28)
+                            : (state.aggregatedSearch
+                                ? VideoPlatformTheme.accent
+                                    .withValues(alpha: 0.16)
+                                : VideoPlatformTheme.bgCard),
+                        borderRadius: BorderRadius.circular(5),
+                        border: Border.all(
                           color: (state.aggregatedSearch || isFocused)
                               ? VideoPlatformTheme.accent
-                              : VideoPlatformTheme.textSecondary,
+                              : VideoPlatformTheme.borderSubtle,
+                          width: isFocused ? 2.0 : 1.0,
                         ),
-                        const SizedBox(width: 4),
-                        Text(
-                          state.aggregatedSearch ? '全网搜' : '单站搜',
-                          style: TextStyle(
-                            fontSize: 11.5,
-                            fontWeight: (state.aggregatedSearch || isFocused)
-                                ? FontWeight.w600
-                                : FontWeight.w400,
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            state.aggregatedSearch
+                                ? Icons.travel_explore_rounded
+                                : Icons.location_on_outlined,
+                            size: 14,
                             color: (state.aggregatedSearch || isFocused)
                                 ? VideoPlatformTheme.accent
                                 : VideoPlatformTheme.textSecondary,
                           ),
-                        ),
-                      ],
-                    ),
-                  );
-                },
+                          const SizedBox(width: 4),
+                          Text(
+                            state.aggregatedSearch ? '全网搜' : '单站搜',
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              fontWeight: (state.aggregatedSearch || isFocused)
+                                  ? FontWeight.w600
+                                  : FontWeight.w400,
+                              color: (state.aggregatedSearch || isFocused)
+                                  ? VideoPlatformTheme.accent
+                                  : VideoPlatformTheme.textSecondary,
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
               ),
             ),
-          ),
+          ],
         ],
       ),
     );
@@ -599,11 +607,56 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
       }
     }
 
+    final screenSize = MediaQuery.sizeOf(context);
+    final isCompactDrawer = screenSize.width < 620;
+    final maxDrawerHeight = (screenSize.height * 0.62).clamp(240.0, 390.0);
+
+    Widget buildCategoryFilterField() {
+      return SizedBox(
+        width: isCompactDrawer ? double.infinity : 190,
+        height: 30,
+        child: TextField(
+          controller: _categoryFilterCtrl,
+          onChanged: (v) => setState(() => _categoryFilterQuery = v),
+          style: TextStyle(
+            fontSize: 12,
+            color: VideoPlatformTheme.textPrimary,
+          ),
+          decoration: InputDecoration(
+            hintText: '筛选分类名称...',
+            hintStyle: TextStyle(
+              fontSize: 11.5,
+              color: VideoPlatformTheme.textMuted,
+            ),
+            prefixIcon: Icon(
+              Icons.filter_alt_outlined,
+              size: 15,
+              color: VideoPlatformTheme.textMuted,
+            ),
+            suffixIcon: _categoryFilterQuery.isNotEmpty
+                ? IconButton(
+                    padding: EdgeInsets.zero,
+                    icon: const Icon(Icons.close, size: 14),
+                    onPressed: () {
+                      _categoryFilterCtrl.clear();
+                      setState(() => _categoryFilterQuery = '');
+                    },
+                  )
+                : null,
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 8,
+              vertical: 4,
+            ),
+          ),
+        ),
+      );
+    }
+
     return Material(
       color: Colors.transparent,
       child: Container(
         width: double.infinity,
-        constraints: const BoxConstraints(maxHeight: 390),
+        constraints: BoxConstraints(maxHeight: maxDrawerHeight),
         decoration: BoxDecoration(
           color: VideoPlatformTheme.bgElevated,
           borderRadius: const BorderRadius.vertical(
@@ -626,107 +679,101 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // Drawer Header Bar
+            // Drawer Header Bar (responsive so '收起' button never overflows off screen)
             Container(
-              padding: const EdgeInsets.fromLTRB(18, 12, 16, 10),
+              padding: const EdgeInsets.fromLTRB(14, 10, 12, 8),
               decoration: BoxDecoration(
                 border: Border(
                   bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
                 ),
               ),
-              child: Row(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  Container(
-                    padding: const EdgeInsets.all(6),
-                    decoration: BoxDecoration(
-                      color: VideoPlatformTheme.accent.withValues(alpha: 0.14),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Icon(
-                      Icons.grid_view_rounded,
-                      size: 16,
-                      color: VideoPlatformTheme.accent,
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Text(
-                    '全部分类导航',
-                    style: TextStyle(
-                      fontSize: 14,
-                      fontWeight: FontWeight.w700,
-                      color: VideoPlatformTheme.textPrimary,
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 8,
-                      vertical: 2,
-                    ),
-                    decoration: BoxDecoration(
-                      color: VideoPlatformTheme.bgCard,
-                      borderRadius: BorderRadius.circular(10),
-                      border: Border.all(
-                        color: VideoPlatformTheme.borderSubtle,
+                  Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(6),
+                        decoration: BoxDecoration(
+                          color:
+                              VideoPlatformTheme.accent.withValues(alpha: 0.14),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Icon(
+                          Icons.grid_view_rounded,
+                          size: 16,
+                          color: VideoPlatformTheme.accent,
+                        ),
                       ),
-                    ),
-                    child: Text(
-                      '当前：$activeLabel',
-                      style: TextStyle(
-                        fontSize: 11.5,
-                        fontWeight: FontWeight.w600,
-                        color: VideoPlatformTheme.accent,
-                      ),
-                    ),
-                  ),
-                  const Spacer(),
-                  if (categories.length > 6 && !state.tvMode)
-                    SizedBox(
-                      width: 190,
-                      height: 30,
-                      child: TextField(
-                        controller: _categoryFilterCtrl,
-                        onChanged: (v) =>
-                            setState(() => _categoryFilterQuery = v),
+                      const SizedBox(width: 8),
+                      Text(
+                        '全部分类导航',
                         style: TextStyle(
-                          fontSize: 12,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
                           color: VideoPlatformTheme.textPrimary,
                         ),
-                        decoration: InputDecoration(
-                          hintText: '筛选分类名称...',
-                          hintStyle: TextStyle(
-                            fontSize: 11.5,
-                            color: VideoPlatformTheme.textMuted,
-                          ),
-                          prefixIcon: Icon(
-                            Icons.filter_alt_outlined,
-                            size: 15,
-                            color: VideoPlatformTheme.textMuted,
-                          ),
-                          suffixIcon: _categoryFilterQuery.isNotEmpty
-                              ? IconButton(
-                                  padding: EdgeInsets.zero,
-                                  icon: const Icon(Icons.close, size: 14),
-                                  onPressed: () {
-                                    _categoryFilterCtrl.clear();
-                                    setState(() => _categoryFilterQuery = '');
-                                  },
-                                )
-                              : null,
-                          contentPadding: const EdgeInsets.symmetric(
+                      ),
+                      const SizedBox(width: 8),
+                      Flexible(
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
                             horizontal: 8,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: VideoPlatformTheme.bgCard,
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(
+                              color: VideoPlatformTheme.borderSubtle,
+                            ),
+                          ),
+                          child: Text(
+                            '当前：$activeLabel',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w600,
+                              color: VideoPlatformTheme.accent,
+                            ),
+                          ),
+                        ),
+                      ),
+                      const Spacer(),
+                      if (!isCompactDrawer &&
+                          categories.length > 6 &&
+                          !state.tvMode) ...[
+                        buildCategoryFilterField(),
+                        const SizedBox(width: 8),
+                      ],
+                      FilledButton.tonalIcon(
+                        style: FilledButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
                             vertical: 4,
                           ),
                         ),
+                        onPressed: () =>
+                            setState(() => _categoriesExpanded = false),
+                        icon: const Icon(
+                          Icons.keyboard_arrow_up_rounded,
+                          size: 17,
+                        ),
+                        label: const Text(
+                          '收起',
+                          style: TextStyle(fontSize: 12),
+                        ),
                       ),
-                    ),
-                  const SizedBox(width: 10),
-                  TextButton.icon(
-                    onPressed: () =>
-                        setState(() => _categoriesExpanded = false),
-                    icon: const Icon(Icons.keyboard_arrow_up_rounded, size: 17),
-                    label: const Text('收起', style: TextStyle(fontSize: 12.5)),
+                    ],
                   ),
+                  if (isCompactDrawer &&
+                      categories.length > 6 &&
+                      !state.tvMode) ...[
+                    const SizedBox(height: 8),
+                    buildCategoryFilterField(),
+                  ],
                 ],
               ),
             ),
@@ -828,17 +875,52 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                                 }
                               },
                             ),
-                        ],
-                      ),
-                  ],
+                          ],
+                        ),
+                    ],
+                  ),
                 ),
               ),
-            ),
-          ],
+              InkWell(
+                borderRadius: const BorderRadius.vertical(
+                  bottom: Radius.circular(14),
+                ),
+                onTap: () => setState(() => _categoriesExpanded = false),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  decoration: BoxDecoration(
+                    color:
+                        VideoPlatformTheme.bgPrimary.withValues(alpha: 0.55),
+                    border: Border(
+                      top: BorderSide(color: VideoPlatformTheme.borderSubtle),
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.keyboard_arrow_up_rounded,
+                        size: 18,
+                        color: VideoPlatformTheme.accent,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        '点击此处收起分类导航',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: VideoPlatformTheme.accent,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
-      ),
-    );
-  }
+      );
+    }
 
   Widget _buildDrawerGroupTabButton({
     required String label,
@@ -1086,7 +1168,7 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
     }
 
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: BoxDecoration(
         color: VideoPlatformTheme.bgElevated,
         border: Border(
@@ -1097,39 +1179,49 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          Row(
+          Wrap(
+            spacing: 8,
+            runSpacing: 6,
+            crossAxisAlignment: WrapCrossAlignment.center,
             children: [
-              Icon(
-                Icons.search,
-                size: 16,
-                color: VideoPlatformTheme.accent,
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  state.aggregatedSearch
-                      ? '全网聚合搜索 "${state.searchKeyword}" · 已检索 ${state.searchCompletedSources}/${state.searchTotalSources} 个站点 · 找到 ${state.vodItems.length} 条结果'
-                      : '当前源搜索 "${state.searchKeyword}" · 找到 ${state.vodItems.length} 条结果',
-                  style: TextStyle(
-                    fontSize: 13,
-                    color: VideoPlatformTheme.textPrimary,
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.search,
+                    size: 16,
+                    color: VideoPlatformTheme.accent,
                   ),
-                ),
+                  const SizedBox(width: 6),
+                  Flexible(
+                    child: Text(
+                      state.aggregatedSearch
+                          ? '全网搜索 "${state.searchKeyword}" (${state.searchCompletedSources}/${state.searchTotalSources}站 · ${state.vodItems.length}条)'
+                          : '当前源搜索 "${state.searchKeyword}" · ${state.vodItems.length}条',
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        color: VideoPlatformTheme.textPrimary,
+                      ),
+                    ),
+                  ),
+                ],
               ),
               FilterChip(
                 selected: state.aggregatedSearch,
                 onSelected: (v) => state.setAggregatedSearch(v),
                 label: Text(
-                  state.aggregatedSearch ? '🌐 全网聚合搜索' : '📍 切换全网搜索',
-                  style: const TextStyle(fontSize: 12),
+                  state.aggregatedSearch ? '🌐 全网聚合' : '📍 切换全网',
+                  style: const TextStyle(fontSize: 11.5),
                 ),
                 visualDensity: VisualDensity.compact,
               ),
-              const SizedBox(width: 8),
               TextButton.icon(
+                style: TextButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                ),
                 onPressed: state.clearSearch,
                 icon: const Icon(Icons.close, size: 15),
-                label: const Text('返回片库'),
+                label: const Text('返回片库', style: TextStyle(fontSize: 12)),
               ),
             ],
           ),

@@ -700,35 +700,25 @@ class _TerminalScreenState extends State<TerminalScreen> {
       },
       child: Column(
         children: [
-        // Top status, Multi-Tab switcher & action bar
+        // Top status, Multi-Tab switcher & action bar (horizontally scrollable on mobile)
         Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
           decoration: BoxDecoration(
             color: VideoPlatformTheme.bgElevated,
             border: Border(
               bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
             ),
           ),
-          child: Row(
-            children: [
-              // Multi-tab strip
-              Flexible(
-                child: SizedBox(
-                  height: 32,
-                  child: ListView.separated(
-                    scrollDirection: Axis.horizontal,
-                    shrinkWrap: true,
-                    itemCount: _tabs.length + 1,
-                    separatorBuilder: (_, __) => const SizedBox(width: 6),
-                    itemBuilder: (_, idx) {
-                      if (idx == _tabs.length) {
-                        return IconButton(
-                          tooltip: '新建并行终端标签页',
-                          visualDensity: VisualDensity.compact,
-                          onPressed: () => _createNewTab(autoConnect: true),
-                          icon: const Icon(Icons.add_rounded, size: 17),
-                        );
-                      }
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                // Multi-tab strip
+                for (int idx = 0; idx < _tabs.length; idx++) ...[
+                  if (idx > 0) const SizedBox(width: 6),
+                  Builder(
+                    builder: (_) {
                       final t = _tabs[idx];
                       final selected = idx == _activeTabIndex;
                       return InkWell(
@@ -740,7 +730,7 @@ class _TerminalScreenState extends State<TerminalScreen> {
                         child: Container(
                           padding: const EdgeInsets.symmetric(
                             horizontal: 10,
-                            vertical: 4,
+                            vertical: 5,
                           ),
                           decoration: BoxDecoration(
                             color: selected
@@ -799,174 +789,183 @@ class _TerminalScreenState extends State<TerminalScreen> {
                       );
                     },
                   ),
+                ],
+                const SizedBox(width: 4),
+                IconButton(
+                  tooltip: '新建并行终端标签页',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: () => _createNewTab(autoConnect: true),
+                  icon: const Icon(Icons.add_rounded, size: 17),
                 ),
-              ),
-              const SizedBox(width: 10),
-              Text(
-                tab.statusText,
-                style: TextStyle(
-                  fontSize: 12,
-                  color: VideoPlatformTheme.textSecondary,
-                ),
-              ),
-              if (tab.sessionMeta.isNotEmpty) ...[
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    tab.sessionMeta,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: VideoPlatformTheme.textMuted,
-                    ),
-                  ),
-                ),
-              ] else
-                const Spacer(),
-              FilledButton.icon(
-                onPressed: tab.isConnected || tab.isConnecting
-                    ? null
-                    : () => _connectTab(tab),
-                icon: const Icon(Icons.terminal_rounded, size: 16),
-                label: Text(
-                  tab.isConnecting
-                      ? '连接中...'
-                      : (tab.sessionCount > 0 ? '重连会话' : '连接终端'),
-                ),
-              ),
-              const SizedBox(width: 6),
-              OutlinedButton(
-                onPressed: tab.isConnected || tab.isConnecting
-                    ? () => _disconnectTab(tab)
-                    : null,
-                child: const Text('断开'),
-              ),
-              const SizedBox(width: 6),
-              OutlinedButton(
-                onPressed: () => _clearTerminal(tab),
-                child: const Text('清屏'),
-              ),
-              const SizedBox(width: 6),
-              IconButton(
-                tooltip: '搜索终端历史输出',
-                visualDensity: VisualDensity.compact,
-                onPressed: () {
-                  setState(() => _showSearchBar = !_showSearchBar);
-                  if (!_showSearchBar) {
-                    tab.clearHighlights();
-                  }
-                },
-                icon: Icon(
-                  Icons.search_rounded,
-                  size: 18,
-                  color: _showSearchBar
-                      ? VideoPlatformTheme.accent
-                      : VideoPlatformTheme.textSecondary,
-                ),
-              ),
-              IconButton(
-                tooltip: '导出当前终端完整日志 (.log)',
-                visualDensity: VisualDensity.compact,
-                onPressed: _exportActiveTerminalLog,
-                icon: const Icon(Icons.download_outlined, size: 18),
-              ),
-              PopupMenuButton<String>(
-                tooltip: '切换终端配色主题',
-                initialValue: _terminalThemeId,
-                onSelected: (themeId) {
-                  setState(() => _terminalThemeId = themeId);
-                  _saveTerminalAppearance();
-                  tab.focusNode.requestFocus();
-                },
-                itemBuilder: (_) => _terminalThemes.entries
-                    .map(
-                      (e) => PopupMenuItem<String>(
-                        value: e.key,
-                        child: Text(e.value.name),
-                      ),
-                    )
-                    .toList(),
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 6),
-                  child: Icon(
-                    Icons.palette_outlined,
-                    size: 18,
+                const SizedBox(width: 10),
+                Text(
+                  tab.statusText,
+                  style: TextStyle(
+                    fontSize: 12,
                     color: VideoPlatformTheme.textSecondary,
                   ),
                 ),
-              ),
-              PopupMenuButton<TerminalCursorType>(
-                tooltip: '切换光标样式',
-                initialValue: _cursorType,
-                onSelected: (t) {
-                  setState(() => _cursorType = t);
-                  tab.focusNode.requestFocus();
-                },
-                itemBuilder: (_) => const [
-                  PopupMenuItem(
-                    value: TerminalCursorType.block,
-                    child: Text('方块光标 (Block · 默认)'),
-                  ),
-                  PopupMenuItem(
-                    value: TerminalCursorType.verticalBar,
-                    child: Text('竖线光标 (Vertical Bar)'),
-                  ),
-                  PopupMenuItem(
-                    value: TerminalCursorType.underline,
-                    child: Text('下划线光标 (Underline)'),
+                if (tab.sessionMeta.isNotEmpty) ...[
+                  const SizedBox(width: 8),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 200),
+                    child: Text(
+                      tab.sessionMeta,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: VideoPlatformTheme.textMuted,
+                      ),
+                    ),
                   ),
                 ],
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 9,
-                    vertical: 6,
-                  ),
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(6),
-                    border: Border.all(color: VideoPlatformTheme.borderStrong),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Icon(Icons.text_fields_rounded, size: 14),
-                      const SizedBox(width: 4),
-                      Text(
-                        '${_fontSize.toInt()}pt',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: VideoPlatformTheme.textPrimary,
-                        ),
-                      ),
-                    ],
+                const SizedBox(width: 12),
+                FilledButton.icon(
+                  onPressed: tab.isConnected || tab.isConnecting
+                      ? null
+                      : () => _connectTab(tab),
+                  icon: const Icon(Icons.terminal_rounded, size: 16),
+                  label: Text(
+                    tab.isConnecting
+                        ? '连接中...'
+                        : (tab.sessionCount > 0 ? '重连会话' : '连接终端'),
                   ),
                 ),
-              ),
-              IconButton(
-                tooltip: '放大终端字号 (Cmd/Ctrl + =)',
-                visualDensity: VisualDensity.compact,
-                onPressed: () {
-                  setState(
-                    () => _fontSize = (_fontSize + 1.0).clamp(11.0, 22.0),
-                  );
-                  _saveTerminalAppearance();
-                  tab.focusNode.requestFocus();
-                },
-                icon: const Icon(Icons.add_circle_outline, size: 17),
-              ),
-              IconButton(
-                tooltip: '缩小终端字号 (Cmd/Ctrl + -)',
-                visualDensity: VisualDensity.compact,
-                onPressed: () {
-                  setState(
-                    () => _fontSize = (_fontSize - 1.0).clamp(11.0, 22.0),
-                  );
-                  _saveTerminalAppearance();
-                  tab.focusNode.requestFocus();
-                },
-                icon: const Icon(Icons.remove_circle_outline, size: 17),
-              ),
-            ],
+                const SizedBox(width: 6),
+                OutlinedButton(
+                  onPressed: tab.isConnected || tab.isConnecting
+                      ? () => _disconnectTab(tab)
+                      : null,
+                  child: const Text('断开'),
+                ),
+                const SizedBox(width: 6),
+                OutlinedButton(
+                  onPressed: () => _clearTerminal(tab),
+                  child: const Text('清屏'),
+                ),
+                const SizedBox(width: 6),
+                IconButton(
+                  tooltip: '搜索终端历史输出',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: () {
+                    setState(() => _showSearchBar = !_showSearchBar);
+                    if (!_showSearchBar) {
+                      tab.clearHighlights();
+                    }
+                  },
+                  icon: Icon(
+                    Icons.search_rounded,
+                    size: 18,
+                    color: _showSearchBar
+                        ? VideoPlatformTheme.accent
+                        : VideoPlatformTheme.textSecondary,
+                  ),
+                ),
+                IconButton(
+                  tooltip: '导出当前终端完整日志 (.log)',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: _exportActiveTerminalLog,
+                  icon: const Icon(Icons.download_outlined, size: 18),
+                ),
+                PopupMenuButton<String>(
+                  tooltip: '切换终端配色主题',
+                  initialValue: _terminalThemeId,
+                  onSelected: (themeId) {
+                    setState(() => _terminalThemeId = themeId);
+                    _saveTerminalAppearance();
+                    tab.focusNode.requestFocus();
+                  },
+                  itemBuilder: (_) => _terminalThemes.entries
+                      .map(
+                        (e) => PopupMenuItem<String>(
+                          value: e.key,
+                          child: Text(e.value.name),
+                        ),
+                      )
+                      .toList(),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 6),
+                    child: Icon(
+                      Icons.palette_outlined,
+                      size: 18,
+                      color: VideoPlatformTheme.textSecondary,
+                    ),
+                  ),
+                ),
+                PopupMenuButton<TerminalCursorType>(
+                  tooltip: '切换光标样式',
+                  initialValue: _cursorType,
+                  onSelected: (t) {
+                    setState(() => _cursorType = t);
+                    tab.focusNode.requestFocus();
+                  },
+                  itemBuilder: (_) => const [
+                    PopupMenuItem(
+                      value: TerminalCursorType.block,
+                      child: Text('方块光标 (Block · 默认)'),
+                    ),
+                    PopupMenuItem(
+                      value: TerminalCursorType.verticalBar,
+                      child: Text('竖线光标 (Vertical Bar)'),
+                    ),
+                    PopupMenuItem(
+                      value: TerminalCursorType.underline,
+                      child: Text('下划线光标 (Underline)'),
+                    ),
+                  ],
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 9,
+                      vertical: 6,
+                    ),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(6),
+                      border:
+                          Border.all(color: VideoPlatformTheme.borderStrong),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(Icons.text_fields_rounded, size: 14),
+                        const SizedBox(width: 4),
+                        Text(
+                          '${_fontSize.toInt()}pt',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: VideoPlatformTheme.textPrimary,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                IconButton(
+                  tooltip: '放大终端字号 (Cmd/Ctrl + =)',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: () {
+                    setState(
+                      () => _fontSize = (_fontSize + 1.0).clamp(11.0, 22.0),
+                    );
+                    _saveTerminalAppearance();
+                    tab.focusNode.requestFocus();
+                  },
+                  icon: const Icon(Icons.add_circle_outline, size: 17),
+                ),
+                IconButton(
+                  tooltip: '缩小终端字号 (Cmd/Ctrl + -)',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: () {
+                    setState(
+                      () => _fontSize = (_fontSize - 1.0).clamp(11.0, 22.0),
+                    );
+                    _saveTerminalAppearance();
+                    tab.focusNode.requestFocus();
+                  },
+                  icon: const Icon(Icons.remove_circle_outline, size: 17),
+                ),
+              ],
+            ),
           ),
         ),
 

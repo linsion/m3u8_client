@@ -98,6 +98,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
 
   // Episode sorting, chunking & search filter
   bool _episodesReversed = false;
+  bool _isEpisodeSidebarCollapsed = false;
   int _episodeChunkIndex = -1; // -1: 全部, >=0: 50-episode chunk index
   bool _showEpisodeSearch = false;
   String _episodeSearchQuery = '';
@@ -2175,13 +2176,15 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                           title,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 15),
                         ),
                       ),
                       if (_currentEpisode != null) ...[
-                        const SizedBox(width: 8),
+                        const SizedBox(width: 6),
                         Container(
+                          constraints: const BoxConstraints(maxWidth: 96),
                           padding: const EdgeInsets.symmetric(
-                            horizontal: 8,
+                            horizontal: 6,
                             vertical: 2,
                           ),
                           decoration: BoxDecoration(
@@ -2193,8 +2196,10 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                           ),
                           child: Text(
                             _currentEpisode!.title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
                             style: TextStyle(
-                              fontSize: 12,
+                              fontSize: 11.5,
                               color: VideoPlatformTheme.textSecondary,
                             ),
                           ),
@@ -2203,42 +2208,85 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                     ],
                   ),
                   actions: [
-                    Center(
-                      child: Padding(
-                        padding: const EdgeInsets.only(right: 4),
-                        child: VideoProxyNodeSelector(
-                          proxyService: widget.appState.proxyService,
-                          scenario: RequestScenario.vodStream,
-                          overlayStyle: false,
-                          onProxyChanged: _onProxyNodeSwitched,
-                        ),
-                      ),
+                    Builder(
+                      builder: (ctx) {
+                        final w = MediaQuery.sizeOf(ctx).width;
+                        final isNarrow = w < 600;
+                        final isWide = w >= 860 || widget.appState.tvMode;
+                        return Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Center(
+                              child: Padding(
+                                padding: const EdgeInsets.only(right: 4),
+                                child: VideoProxyNodeSelector(
+                                  proxyService: widget.appState.proxyService,
+                                  scenario: RequestScenario.vodStream,
+                                  overlayStyle: false,
+                                  compact: isNarrow,
+                                  onProxyChanged: _onProxyNodeSwitched,
+                                ),
+                              ),
+                            ),
+                            TextButton.icon(
+                              style: TextButton.styleFrom(
+                                visualDensity: VisualDensity.compact,
+                                padding: EdgeInsets.symmetric(
+                                  horizontal: isNarrow ? 6 : 10,
+                                ),
+                              ),
+                              onPressed: _showCrossSiteSourceSwitchDialog,
+                              icon: Icon(
+                                Icons.swap_horiz_rounded,
+                                size: 16,
+                                color: VideoPlatformTheme.accent,
+                              ),
+                              label: Text(
+                                isNarrow
+                                    ? '换源'
+                                    : '换源 (${_activeSource.name})',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: VideoPlatformTheme.textPrimary,
+                                ),
+                              ),
+                            ),
+                            IconButton(
+                              visualDensity: VisualDensity.compact,
+                              tooltip: '小窗悬浮播放（切回首页/Telegram 不中断视频）',
+                              onPressed: _activeStreamUrl.isEmpty
+                                  ? null
+                                  : _enterMiniPlayerMode,
+                              icon: const Icon(
+                                Icons.picture_in_picture_alt_rounded,
+                                size: 18,
+                              ),
+                            ),
+                            if (isWide)
+                              IconButton(
+                                visualDensity: VisualDensity.compact,
+                                tooltip: _isEpisodeSidebarCollapsed
+                                    ? '展开右侧选集栏'
+                                    : '收起右侧选集栏',
+                                onPressed: () => setState(
+                                  () => _isEpisodeSidebarCollapsed =
+                                      !_isEpisodeSidebarCollapsed,
+                                ),
+                                icon: Icon(
+                                  _isEpisodeSidebarCollapsed
+                                      ? Icons.menu_open_rounded
+                                      : Icons.view_sidebar_outlined,
+                                  size: 19,
+                                  color: _isEpisodeSidebarCollapsed
+                                      ? VideoPlatformTheme.accent
+                                      : VideoPlatformTheme.textSecondary,
+                                ),
+                              ),
+                            const SizedBox(width: 4),
+                          ],
+                        );
+                      },
                     ),
-                    TextButton.icon(
-                      onPressed: _showCrossSiteSourceSwitchDialog,
-                      icon: Icon(
-                        Icons.swap_horiz_rounded,
-                        size: 16,
-                        color: VideoPlatformTheme.accent,
-                      ),
-                      label: Text(
-                        '换源 (${_activeSource.name})',
-                        style: TextStyle(
-                          fontSize: 12.5,
-                          color: VideoPlatformTheme.textPrimary,
-                        ),
-                      ),
-                    ),
-                    IconButton(
-                      tooltip: '小窗悬浮播放（切回首页/Telegram 不中断视频）',
-                      onPressed:
-                          _activeStreamUrl.isEmpty ? null : _enterMiniPlayerMode,
-                      icon: const Icon(
-                        Icons.picture_in_picture_alt_rounded,
-                        size: 19,
-                      ),
-                    ),
-                    const SizedBox(width: 6),
                   ],
                 ),
           body: _isFullscreenMode
@@ -2336,19 +2384,20 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                               ),
                             ),
                           ),
-                          Container(
-                            width: 340,
-                            height: constraints.maxHeight,
-                            decoration: BoxDecoration(
-                              color: VideoPlatformTheme.bgElevated,
-                              border: Border(
-                                left: BorderSide(
-                                  color: VideoPlatformTheme.borderSubtle,
+                          if (!_isEpisodeSidebarCollapsed)
+                            Container(
+                              width: constraints.maxWidth < 1050 ? 290 : 340,
+                              height: constraints.maxHeight,
+                              decoration: BoxDecoration(
+                                color: VideoPlatformTheme.bgElevated,
+                                border: Border(
+                                  left: BorderSide(
+                                    color: VideoPlatformTheme.borderSubtle,
+                                  ),
                                 ),
                               ),
+                              child: _buildRightSideEpisodePanel(),
                             ),
-                            child: _buildRightSideEpisodePanel(),
-                          ),
                         ],
                       );
                     }
@@ -2897,78 +2946,89 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                     ),
                   ),
                   const SizedBox(height: 6),
-                  // Row 2: Dedicated Playback & Fullscreen Control Buttons (each button has its own independent Focus!)
+                  // Row 2: Dedicated Playback & Fullscreen Control Buttons (horizontally scrollable on mobile, pinned Fullscreen on right)
                   Row(
                     children: [
-                      StreamBuilder<bool>(
-                        stream: _player.stream.playing,
-                        initialData: _player.state.playing,
-                        builder: (_, playSnap) {
-                          final playing = playSnap.data ?? false;
-                          return _buildTvFocusableControlBtn(
-                            icon: playing
-                                ? Icons.pause_rounded
-                                : Icons.play_arrow_rounded,
-                            label: playing ? '暂停' : '播放',
-                            tooltip: playing ? '暂停' : '播放',
-                            onPressed: () => _player.playOrPause(),
-                          );
-                        },
+                      Expanded(
+                        child: SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          child: Row(
+                            children: [
+                              StreamBuilder<bool>(
+                                stream: _player.stream.playing,
+                                initialData: _player.state.playing,
+                                builder: (_, playSnap) {
+                                  final playing = playSnap.data ?? false;
+                                  return _buildTvFocusableControlBtn(
+                                    icon: playing
+                                        ? Icons.pause_rounded
+                                        : Icons.play_arrow_rounded,
+                                    label: playing ? '暂停' : '播放',
+                                    tooltip: playing ? '暂停' : '播放',
+                                    onPressed: () => _player.playOrPause(),
+                                  );
+                                },
+                              ),
+                              const SizedBox(width: 8),
+                              _buildTvFocusableControlBtn(
+                                icon: Icons.replay_10_rounded,
+                                label: '快退15s',
+                                tooltip: '快退 15 秒',
+                                onPressed: () => _rewindSeconds(15),
+                              ),
+                              const SizedBox(width: 8),
+                              _buildTvFocusableControlBtn(
+                                icon: Icons.forward_10_rounded,
+                                label: '快进15s',
+                                tooltip: '快进 15 秒',
+                                onPressed: () => _skipForwardSeconds(
+                                  15,
+                                  customReason: '已快进 15s',
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              _buildTvFocusableControlBtn(
+                                icon: Icons.skip_next_rounded,
+                                label: '跳广告+30s',
+                                tooltip: '快进跳过 30 秒广告',
+                                onPressed: () => _skipForwardSeconds(30),
+                              ),
+                              if (_detail != null &&
+                                  _detail!.playGroups.any(
+                                    (g) => g.episodes.length > 1,
+                                  )) ...[
+                                const SizedBox(width: 8),
+                                _buildTvFocusableControlBtn(
+                                  icon: Icons.skip_next_outlined,
+                                  label: '下一集',
+                                  tooltip: '播放下一集',
+                                  onPressed: _playNextEpisodeIfAvailable,
+                                ),
+                              ],
+                              if (_detail != null &&
+                                  _detail!.playGroups.isNotEmpty) ...[
+                                const SizedBox(width: 8),
+                                _buildTvFocusableControlBtn(
+                                  icon: Icons.playlist_play_rounded,
+                                  label: '选集/线路',
+                                  tooltip: '弹窗选择剧集或切换播放线路',
+                                  onPressed: _showFullscreenEpisodePickerDialog,
+                                ),
+                              ],
+                              if (isFullscreen) ...[
+                                const SizedBox(width: 8),
+                                _buildTvFocusableControlBtn(
+                                  icon: Icons.swap_horiz_rounded,
+                                  label: '换源',
+                                  tooltip: '跨站点智能切换同名片源',
+                                  onPressed: _showCrossSiteSourceSwitchDialog,
+                                ),
+                              ],
+                            ],
+                          ),
+                        ),
                       ),
                       const SizedBox(width: 8),
-                      _buildTvFocusableControlBtn(
-                        icon: Icons.replay_10_rounded,
-                        label: '快退15s',
-                        tooltip: '快退 15 秒',
-                        onPressed: () => _rewindSeconds(15),
-                      ),
-                      const SizedBox(width: 8),
-                      _buildTvFocusableControlBtn(
-                        icon: Icons.forward_10_rounded,
-                        label: '快进15s',
-                        tooltip: '快进 15 秒',
-                        onPressed: () =>
-                            _skipForwardSeconds(15, customReason: '已快进 15s'),
-                      ),
-                      const SizedBox(width: 8),
-                      _buildTvFocusableControlBtn(
-                        icon: Icons.skip_next_rounded,
-                        label: '跳广告+30s',
-                        tooltip: '快进跳过 30 秒广告',
-                        onPressed: () => _skipForwardSeconds(30),
-                      ),
-                      if (_detail != null &&
-                          _detail!.playGroups.any(
-                            (g) => g.episodes.length > 1,
-                          )) ...[
-                        const SizedBox(width: 8),
-                        _buildTvFocusableControlBtn(
-                          icon: Icons.skip_next_outlined,
-                          label: '下一集',
-                          tooltip: '播放下一集',
-                          onPressed: _playNextEpisodeIfAvailable,
-                        ),
-                      ],
-                      if (_detail != null &&
-                          _detail!.playGroups.isNotEmpty) ...[
-                        const SizedBox(width: 8),
-                        _buildTvFocusableControlBtn(
-                          icon: Icons.playlist_play_rounded,
-                          label: '选集/线路',
-                          tooltip: '弹窗选择剧集或切换播放线路',
-                          onPressed: _showFullscreenEpisodePickerDialog,
-                        ),
-                      ],
-                      if (isFullscreen) ...[
-                        const SizedBox(width: 8),
-                        _buildTvFocusableControlBtn(
-                          icon: Icons.swap_horiz_rounded,
-                          label: '换源',
-                          tooltip: '跨站点智能切换同名片源',
-                          onPressed: _showCrossSiteSourceSwitchDialog,
-                        ),
-                      ],
-                      const Spacer(),
                       _buildTvFocusableControlBtn(
                         icon: _isFullscreenMode
                             ? Icons.fullscreen_exit_rounded
@@ -3203,115 +3263,125 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
               ),
             // Floating proxy node selector + download speed HUD + quick "跳过广告" pill on video stage
             Positioned(
-              top: 14,
-              right: 14,
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  VideoProxyNodeSelector(
-                    proxyService: widget.appState.proxyService,
-                    scenario: RequestScenario.vodStream,
-                    overlayStyle: true,
-                    onProxyChanged: _onProxyNodeSwitched,
-                  ),
-                  const SizedBox(width: 8),
-                  VideoDownloadSpeedBadge(player: _player),
-                  if (_playError == null &&
-                      !_isResolvingPlay &&
-                      _currentEpisode != null) ...[
-                    const SizedBox(width: 8),
-                    Container(
-                        decoration: BoxDecoration(
-                          color: const Color(0xAA000000),
-                          borderRadius: BorderRadius.circular(18),
-                          border: Border.all(
-                            color: Colors.white.withValues(alpha: 0.22),
+              top: 10,
+              left: 10,
+              right: 10,
+              child: Align(
+                alignment: Alignment.topRight,
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      VideoProxyNodeSelector(
+                        proxyService: widget.appState.proxyService,
+                        scenario: RequestScenario.vodStream,
+                        overlayStyle: true,
+                        compact: screenSize.width < 520,
+                        onProxyChanged: _onProxyNodeSwitched,
+                      ),
+                      const SizedBox(width: 6),
+                      VideoDownloadSpeedBadge(player: _player),
+                      if (_playError == null &&
+                          !_isResolvingPlay &&
+                          _currentEpisode != null) ...[
+                        const SizedBox(width: 6),
+                        Container(
+                          decoration: BoxDecoration(
+                            color: const Color(0xAA000000),
+                            borderRadius: BorderRadius.circular(18),
+                            border: Border.all(
+                              color: Colors.white.withValues(alpha: 0.22),
+                            ),
                           ),
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            InkWell(
-                              borderRadius: const BorderRadius.horizontal(
-                                left: Radius.circular(18),
-                              ),
-                              onTap: () => _skipForwardSeconds(30),
-                              child: Padding(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 11,
-                                  vertical: 5,
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              InkWell(
+                                borderRadius: const BorderRadius.horizontal(
+                                  left: Radius.circular(18),
                                 ),
-                                child: Row(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    Icon(
-                                      Icons.skip_next_rounded,
-                                      size: 15,
-                                      color: VideoPlatformTheme.accent,
-                                    ),
-                                    const SizedBox(width: 4),
-                                    const Text(
-                                      '跳过广告 +30s',
-                                      style: TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 11.5,
-                                        fontWeight: FontWeight.w600,
+                                onTap: () => _skipForwardSeconds(30),
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 9,
+                                    vertical: 5,
+                                  ),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(
+                                        Icons.skip_next_rounded,
+                                        size: 14,
+                                        color: VideoPlatformTheme.accent,
                                       ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                            Container(
-                              width: 1,
-                              height: 16,
-                              color: Colors.white.withValues(alpha: 0.18),
-                            ),
-                            InkWell(
-                              onTap: () => _skipForwardSeconds(15),
-                              child: const Padding(
-                                padding: EdgeInsets.symmetric(
-                                  horizontal: 8,
-                                  vertical: 5,
-                                ),
-                                child: Text(
-                                  '+15s',
-                                  style: TextStyle(
-                                    color: Colors.white70,
-                                    fontSize: 11,
+                                      const SizedBox(width: 3),
+                                      Text(
+                                        screenSize.width < 480
+                                            ? '跳广告+30s'
+                                            : '跳过广告 +30s',
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                    ],
                                   ),
                                 ),
                               ),
-                            ),
-                            Container(
-                              width: 1,
-                              height: 16,
-                              color: Colors.white.withValues(alpha: 0.18),
-                            ),
-                            InkWell(
-                              borderRadius: const BorderRadius.horizontal(
-                                right: Radius.circular(18),
+                              Container(
+                                width: 1,
+                                height: 15,
+                                color: Colors.white.withValues(alpha: 0.18),
                               ),
-                              onTap: _showAdSkipSettingsDialog,
-                              child: const Padding(
-                                padding: EdgeInsets.symmetric(
-                                  horizontal: 8,
-                                  vertical: 5,
-                                ),
-                                child: Icon(
-                                  Icons.tune_rounded,
-                                  size: 14,
-                                  color: Colors.white70,
+                              InkWell(
+                                onTap: () => _skipForwardSeconds(15),
+                                child: const Padding(
+                                  padding: EdgeInsets.symmetric(
+                                    horizontal: 7,
+                                    vertical: 5,
+                                  ),
+                                  child: Text(
+                                    '+15s',
+                                    style: TextStyle(
+                                      color: Colors.white70,
+                                      fontSize: 11,
+                                    ),
+                                  ),
                                 ),
                               ),
-                            ),
-                          ],
+                              Container(
+                                width: 1,
+                                height: 15,
+                                color: Colors.white.withValues(alpha: 0.18),
+                              ),
+                              InkWell(
+                                borderRadius: const BorderRadius.horizontal(
+                                  right: Radius.circular(18),
+                                ),
+                                onTap: _showAdSkipSettingsDialog,
+                                child: const Padding(
+                                  padding: EdgeInsets.symmetric(
+                                    horizontal: 7,
+                                    vertical: 5,
+                                  ),
+                                  child: Icon(
+                                    Icons.tune_rounded,
+                                    size: 13.5,
+                                    color: Colors.white70,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
                         ),
-                      ),
+                      ],
                     ],
-                  ],
+                  ),
                 ),
               ),
+            ),
             if (_isResolvingPlay)
               Container(
                 color: const Color(0x99000000),
@@ -3503,19 +3573,10 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     final detail = _detail;
     final isFav =
         detail != null && widget.appState.isFavorite(_activeSource, detail.vodId);
+    final isCompactMobile =
+        MediaQuery.sizeOf(context).width < 680 && !widget.appState.tvMode;
 
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      decoration: BoxDecoration(
-        color: VideoPlatformTheme.bgElevated,
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: VideoPlatformTheme.borderSubtle),
-      ),
-      child: Wrap(
-        spacing: 10,
-        runSpacing: 8,
-        crossAxisAlignment: WrapCrossAlignment.center,
-        children: [
+    final items = <Widget>[
           // Real-time download speed indicator
           VideoDownloadSpeedBadge(
             player: _player,
@@ -4045,8 +4106,37 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                 }
               },
             ),
-        ],
+        ];
+
+    return Container(
+      width: double.infinity,
+      padding: EdgeInsets.symmetric(
+        horizontal: isCompactMobile ? 10 : 12,
+        vertical: isCompactMobile ? 8 : 10,
       ),
+      decoration: BoxDecoration(
+        color: VideoPlatformTheme.bgElevated,
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: VideoPlatformTheme.borderSubtle),
+      ),
+      child: isCompactMobile
+          ? SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  for (int i = 0; i < items.length; i++) ...[
+                    if (i > 0) const SizedBox(width: 8),
+                    items[i],
+                  ],
+                ],
+              ),
+            )
+          : Wrap(
+              spacing: 10,
+              runSpacing: 8,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: items,
+            ),
     );
   }
 
@@ -4316,6 +4406,18 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                     );
                   },
                 ),
+              ),
+              const SizedBox(width: 2),
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                tooltip: '收起右侧选集栏',
+                icon: Icon(
+                  Icons.chevron_right_rounded,
+                  size: 19,
+                  color: VideoPlatformTheme.textSecondary,
+                ),
+                onPressed: () =>
+                    setState(() => _isEpisodeSidebarCollapsed = true),
               ),
             ],
           ),

@@ -1286,14 +1286,52 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
               }
               return Column(
                 children: [
-                  if (_isSidebarCollapsed)
+                  if (_isSidebarCollapsed) ...[
                     Expanded(
                       child: _buildPlayerPanel(
                         compact: false,
                         visibleChannels: filteredChannels,
                       ),
-                    )
-                  else ...[
+                    ),
+                    InkWell(
+                      onTap: () =>
+                          setState(() => _isSidebarCollapsed = false),
+                      child: Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 7,
+                        ),
+                        decoration: BoxDecoration(
+                          color: VideoPlatformTheme.bgElevated,
+                          border: Border(
+                            top: BorderSide(
+                              color: VideoPlatformTheme.borderSubtle,
+                            ),
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(
+                              Icons.expand_less_rounded,
+                              size: 18,
+                              color: VideoPlatformTheme.accent,
+                            ),
+                            const SizedBox(width: 6),
+                            Text(
+                              '展开频道列表 (${filteredChannels.length})',
+                              style: TextStyle(
+                                fontSize: 12.5,
+                                fontWeight: FontWeight.w600,
+                                color: VideoPlatformTheme.accent,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ] else ...[
                     AspectRatio(
                       aspectRatio: 16 / 9,
                       child: _buildPlayerPanel(
@@ -1301,7 +1339,44 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                         visibleChannels: filteredChannels,
                       ),
                     ),
-                    const Divider(height: 1),
+                    InkWell(
+                      onTap: () =>
+                          setState(() => _isSidebarCollapsed = true),
+                      child: Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: VideoPlatformTheme.bgElevated,
+                          border: Border.symmetric(
+                            horizontal: BorderSide(
+                              color: VideoPlatformTheme.borderSubtle,
+                            ),
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(
+                              Icons.expand_more_rounded,
+                              size: 17,
+                              color: VideoPlatformTheme.textSecondary,
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              '收起频道列表（放大画面）',
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w500,
+                                color: VideoPlatformTheme.textSecondary,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
                     Expanded(
                       child: _buildChannelSidebar(
                         state,
@@ -1325,7 +1400,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     final selectedSource = state.selectedLiveSource;
     return Container(
       height: 50,
-      padding: const EdgeInsets.symmetric(horizontal: 16),
+      padding: const EdgeInsets.symmetric(horizontal: 10),
       decoration: BoxDecoration(
         color: VideoPlatformTheme.bgElevated,
         border: Border(
@@ -1335,6 +1410,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
       child: Row(
         children: [
           IconButton(
+            visualDensity: VisualDensity.compact,
             tooltip: _isSidebarCollapsed ? '展开频道列表' : '收起频道列表',
             onPressed: () {
               setState(() => _isSidebarCollapsed = !_isSidebarCollapsed);
@@ -1350,143 +1426,157 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
             ),
           ),
           const SizedBox(width: 4),
-          Text(
-            '电视直播',
-            style: TextStyle(
-              fontSize: 15,
-              fontWeight: FontWeight.w600,
-              color: VideoPlatformTheme.textPrimary,
-            ),
-          ),
-          const SizedBox(width: 16),
-          if (state.liveSources.isNotEmpty)
-            DropdownButtonHideUnderline(
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10),
-                decoration: BoxDecoration(
-                  color: VideoPlatformTheme.bgCard,
-                  borderRadius: BorderRadius.circular(5),
-                  border: Border.all(color: VideoPlatformTheme.borderSubtle),
-                ),
-                child: DropdownButton<LiveSource>(
-                  value: state.liveSources.contains(selectedSource)
-                      ? selectedSource
-                      : state.liveSources.first,
-                  isDense: true,
-                  dropdownColor: VideoPlatformTheme.bgElevated,
-                  style: TextStyle(
-                    fontSize: 13,
-                    color: VideoPlatformTheme.textPrimary,
+          Expanded(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  Text(
+                    '电视直播',
+                    style: TextStyle(
+                      fontSize: 14.5,
+                      fontWeight: FontWeight.w600,
+                      color: VideoPlatformTheme.textPrimary,
+                    ),
                   ),
-                  items: state.liveSources
-                      .map(
-                        (s) => DropdownMenuItem(
-                          value: s,
-                          child: Text(s.displayName),
+                  const SizedBox(width: 12),
+                  if (state.liveSources.isNotEmpty)
+                    DropdownButtonHideUnderline(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10),
+                        decoration: BoxDecoration(
+                          color: VideoPlatformTheme.bgCard,
+                          borderRadius: BorderRadius.circular(5),
+                          border: Border.all(
+                            color: VideoPlatformTheme.borderSubtle,
+                          ),
                         ),
-                      )
-                      .toList(),
-                  onChanged: (val) {
-                    if (val != null) {
-                      setState(() => _selectedGroup = '全部');
-                      state.selectLiveSource(
-                        val,
-                        preferClientDirect: !_useServerProxy,
-                      );
-                    }
-                  },
-                ),
+                        child: DropdownButton<LiveSource>(
+                          value: state.liveSources.contains(selectedSource)
+                              ? selectedSource
+                              : state.liveSources.first,
+                          isDense: true,
+                          dropdownColor: VideoPlatformTheme.bgElevated,
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: VideoPlatformTheme.textPrimary,
+                          ),
+                          items: state.liveSources
+                              .map(
+                                (s) => DropdownMenuItem(
+                                  value: s,
+                                  child: Text(s.displayName),
+                                ),
+                              )
+                              .toList(),
+                          onChanged: (val) {
+                            if (val != null) {
+                              setState(() => _selectedGroup = '全部');
+                              state.selectLiveSource(
+                                val,
+                                preferClientDirect: !_useServerProxy,
+                              );
+                            }
+                          },
+                        ),
+                      ),
+                    ),
+                  if (selectedSource != null && selectedSource.isCustom) ...[
+                    const SizedBox(width: 6),
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: '删除此自定义直播源',
+                      onPressed: () =>
+                          state.removeCustomLiveSource(selectedSource),
+                      icon: Icon(
+                        Icons.delete_outline,
+                        size: 18,
+                        color: VideoPlatformTheme.danger,
+                      ),
+                    ),
+                  ],
+                  const SizedBox(width: 8),
+                  VideoProxyNodeSelector(
+                    proxyService: state.proxyService,
+                    scenario: RequestScenario.liveStream,
+                    overlayStyle: false,
+                    onProxyChanged: (_) {
+                      final ch = _currentChannel;
+                      if (ch != null) {
+                        _playChannel(
+                          ch,
+                          urlIndex: _currentUrlIndex,
+                          resetTried: false,
+                          isAutoReconnect: true,
+                        );
+                      }
+                    },
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton.icon(
+                    onPressed: _showAddCustomLiveDialog,
+                    icon: const Icon(Icons.add_link_rounded, size: 15),
+                    label: const Text('添加直播源'),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton.icon(
+                    onPressed: visibleChannels.isEmpty
+                        ? null
+                        : () => _exportChannelsToM3u(visibleChannels),
+                    icon: const Icon(Icons.file_download_outlined, size: 15),
+                    label: Text(
+                      _favoriteChannelKeys.isNotEmpty ? '导出收藏M3U' : '导出M3U',
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton.icon(
+                    onPressed: _toggleMultiViewMode,
+                    style: _isMultiViewMode
+                        ? OutlinedButton.styleFrom(
+                            backgroundColor: VideoPlatformTheme.accent
+                                .withValues(alpha: 0.16),
+                            side: BorderSide(color: VideoPlatformTheme.accent),
+                          )
+                        : null,
+                    icon: Icon(
+                      _isMultiViewMode
+                          ? Icons.grid_view_rounded
+                          : Icons.grid_on_rounded,
+                      size: 15,
+                      color: _isMultiViewMode
+                          ? VideoPlatformTheme.accent
+                          : VideoPlatformTheme.textSecondary,
+                    ),
+                    label: Text(
+                      _isMultiViewMode
+                          ? '退出四分屏 (槽位${_activeMultiViewSlot + 1})'
+                          : '四分屏同看',
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton.icon(
+                    onPressed:
+                        _currentChannel == null ? null : _captureLiveScreenshot,
+                    icon: const Icon(Icons.camera_alt_outlined, size: 15),
+                    label: const Text('直播截图'),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton.icon(
+                    onPressed: _isCheckingHealth || visibleChannels.isEmpty
+                        ? null
+                        : () => _checkVisibleChannelsHealth(visibleChannels),
+                    icon: const Icon(Icons.network_check_rounded, size: 15),
+                    label: Text(_isCheckingHealth ? '正在测速...' : '检测频道可用性'),
+                  ),
+                  const SizedBox(width: 4),
+                  IconButton(
+                    tooltip: '刷新直播源',
+                    onPressed: state.loadLiveSources,
+                    icon: const Icon(Icons.refresh, size: 18),
+                  ),
+                ],
               ),
             ),
-          if (selectedSource != null && selectedSource.isCustom) ...[
-            const SizedBox(width: 6),
-            IconButton(
-              tooltip: '删除此自定义直播源',
-              onPressed: () => state.removeCustomLiveSource(selectedSource),
-              icon: Icon(
-                Icons.delete_outline,
-                size: 18,
-                color: VideoPlatformTheme.danger,
-              ),
-            ),
-          ],
-          const SizedBox(width: 8),
-          OutlinedButton.icon(
-            onPressed: _showAddCustomLiveDialog,
-            icon: const Icon(Icons.add_link_rounded, size: 15),
-            label: const Text('添加直播源'),
-          ),
-          const SizedBox(width: 8),
-          OutlinedButton.icon(
-            onPressed: visibleChannels.isEmpty
-                ? null
-                : () => _exportChannelsToM3u(visibleChannels),
-            icon: const Icon(Icons.file_download_outlined, size: 15),
-            label: Text(
-              _favoriteChannelKeys.isNotEmpty ? '导出收藏M3U' : '导出M3U',
-            ),
-          ),
-          const SizedBox(width: 8),
-          OutlinedButton.icon(
-            onPressed: _toggleMultiViewMode,
-            style: _isMultiViewMode
-                ? OutlinedButton.styleFrom(
-                    backgroundColor:
-                        VideoPlatformTheme.accent.withValues(alpha: 0.16),
-                    side: BorderSide(color: VideoPlatformTheme.accent),
-                  )
-                : null,
-            icon: Icon(
-              _isMultiViewMode
-                  ? Icons.grid_view_rounded
-                  : Icons.grid_on_rounded,
-              size: 15,
-              color: _isMultiViewMode
-                  ? VideoPlatformTheme.accent
-                  : VideoPlatformTheme.textSecondary,
-            ),
-            label: Text(
-              _isMultiViewMode
-                  ? '退出四分屏 (槽位${_activeMultiViewSlot + 1})'
-                  : '四分屏同看',
-            ),
-          ),
-          const Spacer(),
-          VideoProxyNodeSelector(
-            proxyService: state.proxyService,
-            scenario: RequestScenario.liveStream,
-            overlayStyle: false,
-            onProxyChanged: (_) {
-              final ch = _currentChannel;
-              if (ch != null) {
-                _playChannel(
-                  ch,
-                  urlIndex: _currentUrlIndex,
-                  resetTried: false,
-                  isAutoReconnect: true,
-                );
-              }
-            },
-          ),
-          const SizedBox(width: 8),
-          OutlinedButton.icon(
-            onPressed: _currentChannel == null ? null : _captureLiveScreenshot,
-            icon: const Icon(Icons.camera_alt_outlined, size: 15),
-            label: const Text('直播截图'),
-          ),
-          const SizedBox(width: 8),
-          OutlinedButton.icon(
-            onPressed: _isCheckingHealth || visibleChannels.isEmpty
-                ? null
-                : () => _checkVisibleChannelsHealth(visibleChannels),
-            icon: const Icon(Icons.network_check_rounded, size: 15),
-            label: Text(_isCheckingHealth ? '正在测速...' : '检测频道可用性'),
-          ),
-          const SizedBox(width: 8),
-          IconButton(
-            tooltip: '刷新直播源',
-            onPressed: state.loadLiveSources,
-            icon: const Icon(Icons.refresh, size: 18),
           ),
         ],
       ),

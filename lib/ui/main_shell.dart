@@ -40,6 +40,9 @@ class MainShell extends StatefulWidget {
 
 class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   int _selectedIndex = 0;
+  bool _isSidebarCollapsed = false;
+  bool _isMobileSidebarOpen = false;
+  bool _showMobileSearchInput = false;
   final TextEditingController _searchController = TextEditingController();
   String? _lastSniffedClipboardUrl;
   DateTime? _lastBackPressedAt;
@@ -63,7 +66,14 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   }
 
   void _selectTab(int index) {
-    setState(() => _selectedIndex = index);
+    final screenW = MediaQuery.maybeSizeOf(context)?.width ?? 1024;
+    setState(() {
+      _selectedIndex = index;
+      _isMobileSidebarOpen = false;
+      if (screenW < 920) {
+        _isSidebarCollapsed = true;
+      }
+    });
     widget.appState.updateTelegramReadingContext(
       isTelegramViewActive: index == 5,
     );
@@ -163,6 +173,21 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   }
 
   void _handleRootPop(AppState state) {
+    if (_isMobileSidebarOpen) {
+      setState(() => _isMobileSidebarOpen = false);
+      return;
+    }
+    final screenW = MediaQuery.maybeSizeOf(context)?.width ?? 1024;
+    if ((screenW >= 860 || state.tvMode) &&
+        !_isSidebarCollapsed &&
+        screenW < 960) {
+      setState(() => _isSidebarCollapsed = true);
+      return;
+    }
+    if (_showMobileSearchInput) {
+      setState(() => _showMobileSearchInput = false);
+      return;
+    }
     if (_selectedIndex == 0 && state.searchKeyword.isNotEmpty) {
       _searchController.clear();
       state.clearSearch();
@@ -204,8 +229,11 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
         if (!state.isAuthenticated) {
           return LoginScreen(appState: state);
         }
-        final isDesktop =
-            MediaQuery.sizeOf(context).width >= 860 || state.tvMode;
+        final screenWidth = MediaQuery.sizeOf(context).width;
+        final isDesktop = screenWidth >= 860 || state.tvMode;
+        final isSidebarOpen =
+            isDesktop ? !_isSidebarCollapsed : _isMobileSidebarOpen;
+        final useOverlaySidebar = screenWidth < 860;
         final miniSession = state.miniPlayerSession;
 
         return PopScope(
@@ -229,17 +257,54 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                   children: [
                     Column(
                       children: [
-                        _buildTopHeader(state, isDesktop),
+                        _buildTopHeader(state, isDesktop, screenWidth),
                         Expanded(
-                          child: Row(
+                          child: Stack(
                             children: [
-                              if (isDesktop) _buildDesktopSidebar(state),
-                              Expanded(
-                                child: KeyedSubtree(
-                                  key: ValueKey(state.themeId),
-                                  child: _buildActiveScreen(state),
-                                ),
+                              Row(
+                                children: [
+                                  if (!useOverlaySidebar && isSidebarOpen)
+                                    _buildDesktopSidebar(
+                                      state,
+                                      onCollapse: () => setState(() {
+                                        _isSidebarCollapsed = true;
+                                        _isMobileSidebarOpen = false;
+                                      }),
+                                    ),
+                                  Expanded(
+                                    child: KeyedSubtree(
+                                      key: ValueKey(state.themeId),
+                                      child: _buildActiveScreen(state),
+                                    ),
+                                  ),
+                                ],
                               ),
+                              if (useOverlaySidebar && isSidebarOpen) ...[
+                                Positioned.fill(
+                                  child: GestureDetector(
+                                    behavior: HitTestBehavior.opaque,
+                                    onTap: () => setState(() {
+                                      _isSidebarCollapsed = true;
+                                      _isMobileSidebarOpen = false;
+                                    }),
+                                    child: Container(
+                                      color: Colors.black54,
+                                    ),
+                                  ),
+                                ),
+                                Positioned(
+                                  left: 0,
+                                  top: 0,
+                                  bottom: 0,
+                                  child: _buildDesktopSidebar(
+                                    state,
+                                    onCollapse: () => setState(() {
+                                      _isSidebarCollapsed = true;
+                                      _isMobileSidebarOpen = false;
+                                    }),
+                                  ),
+                                ),
+                              ],
                             ],
                           ),
                         ),
@@ -289,12 +354,412 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildTopHeader(AppState state, bool isDesktop) {
+  Widget _buildTopHeader(AppState state, bool isDesktop, double screenWidth) {
     final activeSource = state.selectedSource;
+    final isCompactMobile = screenWidth < 720;
+    final isSidebarOpen =
+        isDesktop ? !_isSidebarCollapsed : _isMobileSidebarOpen;
+
+    void toggleSidebar() {
+      setState(() {
+        if (isDesktop) {
+          _isSidebarCollapsed = !_isSidebarCollapsed;
+        } else {
+          _isMobileSidebarOpen = !_isMobileSidebarOpen;
+        }
+      });
+    }
+
+    Widget buildSourceSelectorButton({double maxWidth = 140}) {
+      return InkWell(
+        borderRadius: BorderRadius.circular(6),
+        onFocusChange: (_) {
+          if (mounted) setState(() {});
+        },
+        onTap: state.sources.isEmpty
+            ? null
+            : () {
+                SourcePickerDialog.show(
+                  context,
+                  sources: state.visibleSources,
+                  selectedSource: state.selectedSource,
+                  onSelect: (src) {
+                    setState(() => _selectedIndex = 0);
+                    state.selectVodSource(src);
+                  },
+                );
+              },
+        child: Builder(
+          builder: (ctx) {
+            final isFocused = Focus.of(ctx).hasPrimaryFocus;
+            return Container(
+              height: 34,
+              padding: const EdgeInsets.symmetric(horizontal: 9),
+              decoration: BoxDecoration(
+                color: isFocused
+                    ? VideoPlatformTheme.accent.withValues(alpha: 0.24)
+                    : VideoPlatformTheme.bgCard,
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(
+                  color: isFocused
+                      ? VideoPlatformTheme.accent
+                      : VideoPlatformTheme.borderSubtle,
+                  width: isFocused ? 2.0 : 1.0,
+                ),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.layers_outlined,
+                    size: 15,
+                    color: VideoPlatformTheme.accent,
+                  ),
+                  const SizedBox(width: 5),
+                  ConstrainedBox(
+                    constraints: BoxConstraints(maxWidth: maxWidth),
+                    child: Text(
+                      activeSource?.name ??
+                          (state.isConnecting ? '加载片源...' : '选择片源'),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w500,
+                        color: VideoPlatformTheme.textPrimary,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 3),
+                  Icon(
+                    Icons.keyboard_arrow_down,
+                    size: 15,
+                    color: VideoPlatformTheme.textMuted,
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
+      );
+    }
+
+    Widget buildInlineSearchBox() {
+      if (state.tvMode) {
+        return _buildTvRemoteSearchButton(state);
+      }
+      return SizedBox(
+        height: 36,
+        child: TextField(
+          controller: _searchController,
+          onSubmitted: _submitSearch,
+          style: const TextStyle(fontSize: 13),
+          decoration: InputDecoration(
+            hintText: state.aggregatedSearch
+                ? '全网多源搜索电影、剧集、综艺、动漫...'
+                : '搜索当前站点影视资源...',
+            prefixIcon: Icon(
+              Icons.search,
+              size: 17,
+              color: VideoPlatformTheme.textMuted,
+            ),
+            suffixIcon: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (_searchController.text.isNotEmpty ||
+                    state.searchKeyword.isNotEmpty)
+                  IconButton(
+                    tooltip: '清除搜索',
+                    icon: const Icon(Icons.clear, size: 15),
+                    onPressed: () {
+                      _searchController.clear();
+                      state.clearSearch();
+                      setState(() {});
+                    },
+                  ),
+                InkWell(
+                  onTap: () => state.setAggregatedSearch(
+                    !state.aggregatedSearch,
+                  ),
+                  child: Container(
+                    margin: const EdgeInsets.only(right: 6),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 7,
+                      vertical: 3,
+                    ),
+                    decoration: BoxDecoration(
+                      color: state.aggregatedSearch
+                          ? VideoPlatformTheme.accent.withValues(alpha: 0.2)
+                          : VideoPlatformTheme.bgCard,
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(
+                        color: state.aggregatedSearch
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.borderStrong,
+                      ),
+                    ),
+                    child: Text(
+                      '全网搜',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: state.aggregatedSearch
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.textSecondary,
+                        fontWeight: state.aggregatedSearch
+                            ? FontWeight.w600
+                            : FontWeight.w400,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    if (isCompactMobile) {
+      final showSearchRow = _selectedIndex == 0 ||
+          _showMobileSearchInput ||
+          state.searchKeyword.isNotEmpty;
+
+      return Container(
+        decoration: BoxDecoration(
+          color: VideoPlatformTheme.bgElevated,
+          border: Border(
+            bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
+          ),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // Row 1: Sidebar toggle + Logo + Source Selector + Scrollable Action Strip
+            SizedBox(
+              height: 48,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                child: Row(
+                  children: [
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: isSidebarOpen ? '收起侧边导航栏' : '展开侧边导航栏',
+                      onPressed: toggleSidebar,
+                      icon: Icon(
+                        isSidebarOpen
+                            ? Icons.menu_open_rounded
+                            : Icons.menu_rounded,
+                        size: 21,
+                        color: isSidebarOpen
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.textPrimary,
+                      ),
+                    ),
+                    InkWell(
+                      onTap: () {
+                        _selectTab(0);
+                        if (state.searchKeyword.isNotEmpty) {
+                          _searchController.clear();
+                          state.clearSearch();
+                        }
+                      },
+                      child: const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 4),
+                        child: AppBrandLogo(size: 26),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    buildSourceSelectorButton(maxWidth: 105),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Align(
+                        alignment: Alignment.centerRight,
+                        child: SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (_selectedIndex != 0)
+                                IconButton(
+                                  visualDensity: VisualDensity.compact,
+                                  tooltip: '展开/收起顶部搜索栏',
+                                  onPressed: () {
+                                    if (state.tvMode) {
+                                      _showTvSearchInputDialog(state);
+                                    } else {
+                                      setState(
+                                        () => _showMobileSearchInput =
+                                            !_showMobileSearchInput,
+                                      );
+                                    }
+                                  },
+                                  icon: Icon(
+                                    _showMobileSearchInput
+                                        ? Icons.search_off_rounded
+                                        : Icons.search_rounded,
+                                    size: 20,
+                                    color: _showMobileSearchInput
+                                        ? VideoPlatformTheme.accent
+                                        : VideoPlatformTheme.textSecondary,
+                                  ),
+                                ),
+                              _buildProxyQuickBadge(state),
+                              const SizedBox(width: 4),
+                              _buildTvModeButton(state),
+                              _buildThemePickerButton(state),
+                              IconButton(
+                                visualDensity: VisualDensity.compact,
+                                tooltip: '观看历史与收藏',
+                                onPressed: () => _selectTab(4),
+                                icon: Icon(
+                                  Icons.history_rounded,
+                                  size: 20,
+                                  color: _selectedIndex == 4
+                                      ? VideoPlatformTheme.accent
+                                      : VideoPlatformTheme.textSecondary,
+                                ),
+                              ),
+                              IconButton(
+                                visualDensity: VisualDensity.compact,
+                                tooltip: '偏好与服务端设置',
+                                onPressed: () => _selectTab(8),
+                                icon: Icon(
+                                  Icons.settings_outlined,
+                                  size: 19,
+                                  color: _selectedIndex == 8
+                                      ? VideoPlatformTheme.accent
+                                      : VideoPlatformTheme.textSecondary,
+                                ),
+                              ),
+                              PopupMenuButton<int>(
+                                tooltip: '更多功能',
+                                icon: const Icon(
+                                  Icons.more_vert_rounded,
+                                  size: 20,
+                                ),
+                                onSelected: (idx) {
+                                  if (idx == 99) {
+                                    state.logout();
+                                  } else if (idx == 98) {
+                                    _openCommandPalette();
+                                  } else {
+                                    _selectTab(idx);
+                                  }
+                                },
+                                itemBuilder: (_) => const [
+                                  PopupMenuItem(
+                                    value: 98,
+                                    child: Text('全局命令面板'),
+                                  ),
+                                  PopupMenuItem(
+                                    value: 4,
+                                    child: Text('观看历史与收藏'),
+                                  ),
+                                  PopupMenuItem(
+                                    value: 5,
+                                    child: Text('Telegram 会话'),
+                                  ),
+                                  PopupMenuItem(
+                                    value: 6,
+                                    child: Text('代理服务器'),
+                                  ),
+                                  PopupMenuItem(
+                                    value: 7,
+                                    child: Text('终端命令行'),
+                                  ),
+                                  PopupMenuItem(
+                                    value: 8,
+                                    child: Text('偏好与服务端设置'),
+                                  ),
+                                  PopupMenuDivider(),
+                                  PopupMenuItem(
+                                    value: 99,
+                                    child: Text('退出登录'),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            // Row 2: Horizontally Scrollable Top Navigation Strip (ensures all modules are 100% visible & reachable on mobile)
+            Container(
+              height: 36,
+              decoration: BoxDecoration(
+                border: Border(
+                  top: BorderSide(
+                    color:
+                        VideoPlatformTheme.borderSubtle.withValues(alpha: 0.6),
+                  ),
+                ),
+              ),
+              child: ListView(
+                scrollDirection: Axis.horizontal,
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                children: [
+                  _buildMobileTopNavChip(0, Icons.home_filled, '影视片库'),
+                  _buildMobileTopNavChip(1, Icons.live_tv_rounded, '电视直播'),
+                  _buildMobileTopNavChip(
+                    2,
+                    Icons.download_for_offline_outlined,
+                    state.activeTasksCount > 0
+                        ? '下载 (${state.activeTasksCount})'
+                        : '下载工作台',
+                  ),
+                  _buildMobileTopNavChip(
+                    3,
+                    Icons.folder_copy_outlined,
+                    '视频资料库',
+                  ),
+                  _buildMobileTopNavChip(
+                    4,
+                    Icons.bookmarks_outlined,
+                    '历史与收藏',
+                  ),
+                  _buildMobileTopNavChip(
+                    5,
+                    Icons.send_rounded,
+                    state.telegramNotifications.totalUnreadNotificationCount > 0
+                        ? 'Telegram (${state.telegramNotifications.totalUnreadNotificationCount})'
+                        : 'Telegram',
+                  ),
+                  _buildMobileTopNavChip(
+                    6,
+                    Icons.swap_horiz_rounded,
+                    '代理服务器',
+                  ),
+                  _buildMobileTopNavChip(
+                    7,
+                    Icons.terminal_rounded,
+                    '终端命令行',
+                  ),
+                  _buildMobileTopNavChip(
+                    8,
+                    Icons.settings_outlined,
+                    '偏好设置',
+                  ),
+                ],
+              ),
+            ),
+            // Row 3: Full-width Search Bar (shown on VOD home or when search toggled)
+            if (showSearchRow)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(10, 4, 10, 8),
+                child: buildInlineSearchBox(),
+              ),
+          ],
+        ),
+      );
+    }
 
     return Container(
       height: 56,
-      padding: const EdgeInsets.symmetric(horizontal: 16),
+      padding: const EdgeInsets.symmetric(horizontal: 12),
       decoration: BoxDecoration(
         color: VideoPlatformTheme.bgElevated,
         border: Border(
@@ -303,10 +768,23 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       ),
       child: Row(
         children: [
+          IconButton(
+            visualDensity: VisualDensity.compact,
+            tooltip: isSidebarOpen ? '收起侧边导航栏' : '展开侧边导航栏',
+            onPressed: toggleSidebar,
+            icon: Icon(
+              isSidebarOpen ? Icons.menu_open_rounded : Icons.menu_rounded,
+              size: 20,
+              color: isSidebarOpen
+                  ? VideoPlatformTheme.accent
+                  : VideoPlatformTheme.textSecondary,
+            ),
+          ),
+          const SizedBox(width: 4),
           // Brand Logo & Title
           InkWell(
             onTap: () {
-              setState(() => _selectedIndex = 0);
+              _selectTab(0);
               if (state.searchKeyword.isNotEmpty) {
                 _searchController.clear();
                 state.clearSearch();
@@ -316,7 +794,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
               mainAxisSize: MainAxisSize.min,
               children: [
                 const AppBrandLogo(size: 30),
-                if (isDesktop) ...[
+                if (screenWidth >= 900) ...[
                   const SizedBox(width: 10),
                   Text(
                     '流光视频',
@@ -331,313 +809,212 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
               ],
             ),
           ),
-          const SizedBox(width: 14),
-
-          // Source selector button
-          InkWell(
-            borderRadius: BorderRadius.circular(6),
-            onFocusChange: (_) {
-              if (mounted) setState(() {});
-            },
-            onTap: state.sources.isEmpty
-                ? null
-                : () {
-                    SourcePickerDialog.show(
-                      context,
-                      sources: state.visibleSources,
-                      selectedSource: state.selectedSource,
-                      onSelect: (src) {
-                        setState(() => _selectedIndex = 0);
-                        state.selectVodSource(src);
-                      },
-                    );
-                  },
-            child: Builder(
-              builder: (ctx) {
-                final isFocused = Focus.of(ctx).hasPrimaryFocus;
-                return Container(
-                  height: 34,
-                  padding: const EdgeInsets.symmetric(horizontal: 10),
-                  decoration: BoxDecoration(
-                    color: isFocused
-                        ? VideoPlatformTheme.accent.withValues(alpha: 0.24)
-                        : VideoPlatformTheme.bgCard,
-                    borderRadius: BorderRadius.circular(6),
-                    border: Border.all(
-                      color: isFocused
-                          ? VideoPlatformTheme.accent
-                          : VideoPlatformTheme.borderSubtle,
-                      width: isFocused ? 2.0 : 1.0,
-                    ),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        Icons.layers_outlined,
-                        size: 15,
-                        color: VideoPlatformTheme.accent,
-                      ),
-                      const SizedBox(width: 6),
-                      ConstrainedBox(
-                        constraints: BoxConstraints(
-                          maxWidth: isDesktop ? 160 : 96,
-                        ),
-                        child: Text(
-                          activeSource?.name ??
-                              (state.isConnecting ? '加载片源...' : '选择片源'),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 12,
-                            fontWeight: FontWeight.w500,
-                            color: VideoPlatformTheme.textPrimary,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 4),
-                      Icon(
-                        Icons.keyboard_arrow_down,
-                        size: 16,
-                        color: VideoPlatformTheme.textMuted,
-                      ),
-                    ],
-                  ),
-                );
-              },
-            ),
-          ),
           const SizedBox(width: 12),
 
-          // Integrated Search Bar (TV Remote Safe Button in TV Mode, Inline TextField on Desktop/Mobile)
+          // Source selector button
+          buildSourceSelectorButton(maxWidth: isDesktop ? 150 : 110),
+          const SizedBox(width: 10),
+
+          // Integrated Search Bar
           Expanded(
+            flex: 2,
             child: ConstrainedBox(
               constraints: const BoxConstraints(maxWidth: 460),
-              child: state.tvMode
-                  ? _buildTvRemoteSearchButton(state)
-                  : SizedBox(
-                      height: 36,
-                      child: TextField(
-                        controller: _searchController,
-                        onSubmitted: _submitSearch,
-                        style: const TextStyle(fontSize: 13),
-                        decoration: InputDecoration(
-                          hintText: state.aggregatedSearch
-                              ? '全网多源搜索电影、剧集、综艺、动漫...'
-                              : '搜索当前站点影视资源...',
-                          prefixIcon: Icon(
-                            Icons.search,
-                            size: 17,
-                            color: VideoPlatformTheme.textMuted,
-                          ),
-                          suffixIcon: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              if (_searchController.text.isNotEmpty ||
-                                  state.searchKeyword.isNotEmpty)
-                                IconButton(
-                                  tooltip: '清除搜索',
-                                  icon: const Icon(Icons.clear, size: 15),
-                                  onPressed: () {
-                                    _searchController.clear();
-                                    state.clearSearch();
-                                    setState(() {});
-                                  },
-                                ),
-                              InkWell(
-                                onTap: () => state.setAggregatedSearch(
-                                  !state.aggregatedSearch,
-                                ),
-                                child: Container(
-                                  margin: const EdgeInsets.only(right: 6),
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 7,
-                                    vertical: 3,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: state.aggregatedSearch
-                                        ? VideoPlatformTheme.accent
-                                            .withValues(alpha: 0.2)
-                                        : VideoPlatformTheme.bgCard,
-                                    borderRadius: BorderRadius.circular(4),
-                                    border: Border.all(
-                                      color: state.aggregatedSearch
-                                          ? VideoPlatformTheme.accent
-                                          : VideoPlatformTheme.borderStrong,
-                                    ),
-                                  ),
-                                  child: Text(
-                                    '全网搜',
-                                    style: TextStyle(
-                                      fontSize: 11,
-                                      color: state.aggregatedSearch
-                                          ? VideoPlatformTheme.accent
-                                          : VideoPlatformTheme.textSecondary,
-                                      fontWeight: state.aggregatedSearch
-                                          ? FontWeight.w600
-                                          : FontWeight.w400,
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
+              child: buildInlineSearchBox(),
             ),
           ),
+          const SizedBox(width: 8),
 
-          if (isDesktop) ...[
-            const Spacer(),
-            // Global Command Palette (Cmd/Ctrl + K) button
-            if (!state.tvMode) ...[
-              InkWell(
-                borderRadius: BorderRadius.circular(6),
-                onFocusChange: (_) {
-                  if (mounted) setState(() {});
-                },
-                onTap: _openCommandPalette,
-                child: Builder(
-                  builder: (ctx) {
-                    final isFocused = Focus.of(ctx).hasPrimaryFocus;
-                    return Container(
-                      height: 34,
-                      padding: const EdgeInsets.symmetric(horizontal: 10),
-                      decoration: BoxDecoration(
-                        color: isFocused
-                            ? VideoPlatformTheme.accent.withValues(alpha: 0.24)
-                            : VideoPlatformTheme.bgCard,
+          // Scrollable right-side action strip so it never overflows on medium widths
+          Flexible(
+            flex: 3,
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (isDesktop && !state.tvMode) ...[
+                      InkWell(
                         borderRadius: BorderRadius.circular(6),
-                        border: Border.all(
-                          color: isFocused
-                              ? VideoPlatformTheme.accent
-                              : VideoPlatformTheme.borderSubtle,
-                          width: isFocused ? 2.0 : 1.0,
+                        onFocusChange: (_) {
+                          if (mounted) setState(() {});
+                        },
+                        onTap: _openCommandPalette,
+                        child: Builder(
+                          builder: (ctx) {
+                            final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                            return Container(
+                              height: 34,
+                              padding:
+                                  const EdgeInsets.symmetric(horizontal: 10),
+                              decoration: BoxDecoration(
+                                color: isFocused
+                                    ? VideoPlatformTheme.accent
+                                        .withValues(alpha: 0.24)
+                                    : VideoPlatformTheme.bgCard,
+                                borderRadius: BorderRadius.circular(6),
+                                border: Border.all(
+                                  color: isFocused
+                                      ? VideoPlatformTheme.accent
+                                      : VideoPlatformTheme.borderSubtle,
+                                  width: isFocused ? 2.0 : 1.0,
+                                ),
+                              ),
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    Icons.terminal_rounded,
+                                    size: 14,
+                                    color: VideoPlatformTheme.accent,
+                                  ),
+                                  const SizedBox(width: 5),
+                                  Text(
+                                    '命令面板 ⌘K',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      color: isFocused
+                                          ? VideoPlatformTheme.accent
+                                          : VideoPlatformTheme.textSecondary,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            );
+                          },
                         ),
                       ),
-                      child: Row(
-                        children: [
-                          Icon(
-                            Icons.terminal_rounded,
-                            size: 14,
-                            color: VideoPlatformTheme.accent,
-                          ),
-                          const SizedBox(width: 5),
-                          Text(
-                            '命令面板 ⌘K',
-                            style: TextStyle(
-                              fontSize: 12,
+                      const SizedBox(width: 8),
+                    ],
+                    // Quick download indicator button
+                    InkWell(
+                      borderRadius: BorderRadius.circular(6),
+                      onFocusChange: (_) {
+                        if (mounted) setState(() {});
+                      },
+                      onTap: () => _selectTab(2),
+                      child: Builder(
+                        builder: (ctx) {
+                          final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                          return Container(
+                            height: 34,
+                            padding: const EdgeInsets.symmetric(horizontal: 10),
+                            decoration: BoxDecoration(
                               color: isFocused
                                   ? VideoPlatformTheme.accent
-                                  : VideoPlatformTheme.textSecondary,
+                                      .withValues(alpha: 0.24)
+                                  : VideoPlatformTheme.bgCard,
+                              borderRadius: BorderRadius.circular(6),
+                              border: Border.all(
+                                color: isFocused
+                                    ? VideoPlatformTheme.accent
+                                    : VideoPlatformTheme.borderSubtle,
+                                width: isFocused ? 2.0 : 1.0,
+                              ),
                             ),
-                          ),
-                        ],
+                            child: Row(
+                              children: [
+                                Icon(
+                                  Icons.downloading_rounded,
+                                  size: 16,
+                                  color:
+                                      (state.activeTasksCount > 0 || isFocused)
+                                          ? VideoPlatformTheme.accent
+                                          : VideoPlatformTheme.textSecondary,
+                                ),
+                                const SizedBox(width: 6),
+                                Text(
+                                  state.activeTasksCount > 0
+                                      ? '下载中 (${state.activeTasksCount})'
+                                      : '下载队列',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: isFocused
+                                        ? VideoPlatformTheme.accent
+                                        : VideoPlatformTheme.textSecondary,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
                       ),
-                    );
-                  },
+                    ),
+                    const SizedBox(width: 8),
+                    _buildProxyQuickBadge(state),
+                    const SizedBox(width: 6),
+                    _buildTvModeButton(state),
+                    _buildThemePickerButton(state),
+                    IconButton(
+                      tooltip: '观看历史与收藏',
+                      onPressed: () => _selectTab(4),
+                      icon: const Icon(Icons.history_rounded, size: 20),
+                    ),
+                    IconButton(
+                      tooltip: '系统设置',
+                      onPressed: () => _selectTab(8),
+                      icon: const Icon(Icons.settings_outlined, size: 20),
+                    ),
+                    IconButton(
+                      tooltip: '退出登录',
+                      onPressed: state.logout,
+                      icon: const Icon(Icons.logout_rounded, size: 19),
+                    ),
+                  ],
                 ),
               ),
-              const SizedBox(width: 8),
-            ],
-            // Quick download indicator button
-            InkWell(
-              borderRadius: BorderRadius.circular(6),
-              onFocusChange: (_) {
-                if (mounted) setState(() {});
-              },
-              onTap: () => setState(() => _selectedIndex = 2),
-              child: Builder(
-                builder: (ctx) {
-                  final isFocused = Focus.of(ctx).hasPrimaryFocus;
-                  return Container(
-                    height: 34,
-                    padding: const EdgeInsets.symmetric(horizontal: 10),
-                    decoration: BoxDecoration(
-                      color: isFocused
-                          ? VideoPlatformTheme.accent.withValues(alpha: 0.24)
-                          : VideoPlatformTheme.bgCard,
-                      borderRadius: BorderRadius.circular(6),
-                      border: Border.all(
-                        color: isFocused
-                            ? VideoPlatformTheme.accent
-                            : VideoPlatformTheme.borderSubtle,
-                        width: isFocused ? 2.0 : 1.0,
-                      ),
-                    ),
-                    child: Row(
-                      children: [
-                        Icon(
-                          Icons.downloading_rounded,
-                          size: 16,
-                          color: (state.activeTasksCount > 0 || isFocused)
-                              ? VideoPlatformTheme.accent
-                              : VideoPlatformTheme.textSecondary,
-                        ),
-                        const SizedBox(width: 6),
-                        Text(
-                          state.activeTasksCount > 0
-                              ? '下载中 (${state.activeTasksCount})'
-                              : '下载队列',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: isFocused
-                                ? VideoPlatformTheme.accent
-                                : VideoPlatformTheme.textSecondary,
-                          ),
-                        ),
-                      ],
-                    ),
-                  );
-                },
-              ),
             ),
-            const SizedBox(width: 8),
-            _buildProxyQuickBadge(state),
-            const SizedBox(width: 6),
-            _buildTvModeButton(state),
-            _buildThemePickerButton(state),
-            IconButton(
-              tooltip: '观看历史与收藏',
-              onPressed: () => setState(() => _selectedIndex = 4),
-              icon: const Icon(Icons.history_rounded, size: 20),
-            ),
-            IconButton(
-              tooltip: '系统设置',
-              onPressed: () => setState(() => _selectedIndex = 8),
-              icon: const Icon(Icons.settings_outlined, size: 20),
-            ),
-            IconButton(
-              tooltip: '退出登录',
-              onPressed: state.logout,
-              icon: const Icon(Icons.logout_rounded, size: 19),
-            ),
-          ] else ...[
-            _buildTvModeButton(state),
-            _buildThemePickerButton(state),
-            PopupMenuButton<int>(
-              tooltip: '更多功能',
-              icon: const Icon(Icons.more_vert_rounded, size: 20),
-              onSelected: (idx) {
-                if (idx == 99) {
-                  state.logout();
-                } else {
-                  setState(() => _selectedIndex = idx);
-                }
-              },
-              itemBuilder: (_) => const [
-                PopupMenuItem(value: 4, child: Text('观看历史与收藏')),
-                PopupMenuItem(value: 5, child: Text('Telegram 会话')),
-                PopupMenuItem(value: 6, child: Text('代理服务器')),
-                PopupMenuItem(value: 7, child: Text('终端命令行')),
-                PopupMenuItem(value: 8, child: Text('偏好与服务端设置')),
-                PopupMenuDivider(),
-                PopupMenuItem(value: 99, child: Text('退出登录')),
-              ],
-            ),
-          ],
+          ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildMobileTopNavChip(int index, IconData icon, String label) {
+    final selected = _selectedIndex == index;
+    return Padding(
+      padding: const EdgeInsets.only(right: 6),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(14),
+        onTap: () => _selectTab(index),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+          decoration: BoxDecoration(
+            color: selected
+                ? VideoPlatformTheme.accent.withValues(alpha: 0.18)
+                : VideoPlatformTheme.bgCard,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+              color: selected
+                  ? VideoPlatformTheme.accent
+                  : VideoPlatformTheme.borderSubtle,
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                icon,
+                size: 13.5,
+                color: selected
+                    ? VideoPlatformTheme.accent
+                    : VideoPlatformTheme.textSecondary,
+              ),
+              const SizedBox(width: 4),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 11.5,
+                  fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                  color: selected
+                      ? VideoPlatformTheme.accent
+                      : VideoPlatformTheme.textPrimary,
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -989,7 +1366,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildDesktopSidebar(AppState state) {
+  Widget _buildDesktopSidebar(AppState state, {VoidCallback? onCollapse}) {
     return Container(
       width: 196,
       decoration: BoxDecoration(
@@ -1001,63 +1378,124 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const SizedBox(height: 10),
-          _buildSidebarSectionTitle('视频中心'),
-          _buildSidebarItem(
-            index: 0,
-            icon: Icons.home_filled,
-            label: '影视片库',
+          Container(
+            height: 40,
+            padding: const EdgeInsets.fromLTRB(16, 4, 8, 4),
+            decoration: BoxDecoration(
+              border: Border(
+                bottom: BorderSide(
+                  color: VideoPlatformTheme.borderSubtle.withValues(alpha: 0.6),
+                ),
+              ),
+            ),
+            child: Row(
+              children: [
+                Text(
+                  '导航菜单',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                    color: VideoPlatformTheme.textSecondary,
+                  ),
+                ),
+                const Spacer(),
+                if (onCollapse != null)
+                  InkWell(
+                    borderRadius: BorderRadius.circular(5),
+                    onTap: onCollapse,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 4,
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.chevron_left_rounded,
+                            size: 16,
+                            color: VideoPlatformTheme.accent,
+                          ),
+                          Text(
+                            '收起',
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w600,
+                              color: VideoPlatformTheme.accent,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+              ],
+            ),
           ),
-          _buildSidebarItem(
-            index: 1,
-            icon: Icons.live_tv_rounded,
-            label: '电视直播',
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.symmetric(vertical: 6),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _buildSidebarSectionTitle('视频中心'),
+                  _buildSidebarItem(
+                    index: 0,
+                    icon: Icons.home_filled,
+                    label: '影视片库',
+                  ),
+                  _buildSidebarItem(
+                    index: 1,
+                    icon: Icons.live_tv_rounded,
+                    label: '电视直播',
+                  ),
+                  _buildSidebarItem(
+                    index: 4,
+                    icon: Icons.bookmarks_outlined,
+                    label: '历史与收藏',
+                  ),
+                  const SizedBox(height: 8),
+                  _buildSidebarSectionTitle('下载与媒体'),
+                  _buildSidebarItem(
+                    index: 2,
+                    icon: Icons.download_for_offline_outlined,
+                    label: '下载工作台',
+                    badgeCount: state.activeTasksCount,
+                  ),
+                  _buildSidebarItem(
+                    index: 3,
+                    icon: Icons.folder_copy_outlined,
+                    label: '视频资料库',
+                  ),
+                  _buildSidebarItem(
+                    index: 5,
+                    icon: Icons.send_rounded,
+                    label: 'Telegram 会话',
+                    badgeCount: state
+                        .telegramNotifications.totalUnreadNotificationCount,
+                  ),
+                  const SizedBox(height: 8),
+                  _buildSidebarSectionTitle('网络与系统'),
+                  _buildSidebarItem(
+                    index: 6,
+                    icon: Icons.swap_horiz_rounded,
+                    label: '代理服务器',
+                  ),
+                  _buildSidebarItem(
+                    index: 7,
+                    icon: Icons.terminal_rounded,
+                    label: '终端命令行',
+                  ),
+                ],
+              ),
+            ),
           ),
-          _buildSidebarItem(
-            index: 4,
-            icon: Icons.bookmarks_outlined,
-            label: '历史与收藏',
-          ),
-          const SizedBox(height: 8),
-          _buildSidebarSectionTitle('下载与媒体'),
-          _buildSidebarItem(
-            index: 2,
-            icon: Icons.download_for_offline_outlined,
-            label: '下载工作台',
-            badgeCount: state.activeTasksCount,
-          ),
-          _buildSidebarItem(
-            index: 3,
-            icon: Icons.folder_copy_outlined,
-            label: '视频资料库',
-          ),
-          _buildSidebarItem(
-            index: 5,
-            icon: Icons.send_rounded,
-            label: 'Telegram 会话',
-            badgeCount:
-                state.telegramNotifications.totalUnreadNotificationCount,
-          ),
-          const SizedBox(height: 8),
-          _buildSidebarSectionTitle('网络与系统'),
-          _buildSidebarItem(
-            index: 6,
-            icon: Icons.swap_horiz_rounded,
-            label: '代理服务器',
-          ),
-          _buildSidebarItem(
-            index: 7,
-            icon: Icons.terminal_rounded,
-            label: '终端命令行',
-          ),
-          const Spacer(),
           const Divider(height: 1),
           _buildSidebarItem(
             index: 8,
             icon: Icons.settings_outlined,
             label: '偏好设置',
           ),
-          const SizedBox(height: 10),
+          const SizedBox(height: 8),
         ],
       ),
     );

@@ -499,63 +499,19 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
 
     return Column(
       children: [
-        // Top toolbar
+        // Top toolbar (responsive: 2 rows on compact mobile, 1 row on desktop)
         Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
           decoration: BoxDecoration(
             color: VideoPlatformTheme.bgElevated,
             border: Border(
               bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
             ),
           ),
-          child: Row(
-            children: [
-              IconButton(
-                tooltip: '返回上级目录',
-                onPressed: currentPath.isEmpty
-                    ? null
-                    : () => state.loadFiles(path: dir?.parent ?? ''),
-                icon: const Icon(Icons.arrow_upward_rounded, size: 18),
-              ),
-              IconButton(
-                tooltip: '根目录',
-                onPressed: () => state.loadFiles(path: ''),
-                icon: const Icon(Icons.home_outlined, size: 18),
-              ),
-              const SizedBox(width: 6),
-              Expanded(
-                child: _buildClickablePathBreadcrumbs(state, currentPath),
-              ),
-              if (currentPath.isNotEmpty) ...[
-                const SizedBox(width: 4),
-                IconButton(
-                  tooltip: isBookmarked ? '取消收藏此目录' : '收藏此目录到书签栏',
-                  visualDensity: VisualDensity.compact,
-                  onPressed: () => _toggleBookmark(currentPath),
-                  icon: Icon(
-                    isBookmarked
-                        ? Icons.star_rounded
-                        : Icons.star_border_rounded,
-                    size: 19,
-                    color: isBookmarked
-                        ? VideoPlatformTheme.warning
-                        : VideoPlatformTheme.textSecondary,
-                  ),
-                ),
-              ],
-              const SizedBox(width: 8),
-              SizedBox(
-                width: 180,
-                child: TextField(
-                  onChanged: (v) => setState(() => _searchFilter = v),
-                  decoration: const InputDecoration(
-                    hintText: '过滤当前目录...',
-                    prefixIcon: Icon(Icons.search, size: 16),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 8),
-              PopupMenuButton<String>(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final isCompact = constraints.maxWidth < 680;
+              final sortButton = PopupMenuButton<String>(
                 tooltip: '排序方式',
                 initialValue: _sortMode,
                 onSelected: (m) => setState(() => _sortMode = m),
@@ -596,20 +552,158 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
                     ],
                   ),
                 ),
-              ),
-              const SizedBox(width: 8),
-              OutlinedButton.icon(
-                onPressed: () => _showMkdirDialog(currentPath),
-                icon: const Icon(Icons.create_new_folder_outlined, size: 16),
-                label: const Text('新建目录'),
-              ),
-              const SizedBox(width: 4),
-              IconButton(
-                tooltip: '刷新目录',
-                onPressed: () => state.loadFiles(path: currentPath),
-                icon: const Icon(Icons.refresh, size: 18),
-              ),
-            ],
+              );
+
+              if (isCompact) {
+                return Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      children: [
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          tooltip: '返回上级目录',
+                          onPressed: currentPath.isEmpty
+                              ? null
+                              : () => state.loadFiles(path: dir?.parent ?? ''),
+                          icon:
+                              const Icon(Icons.arrow_upward_rounded, size: 18),
+                        ),
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          tooltip: '根目录',
+                          onPressed: () => state.loadFiles(path: ''),
+                          icon: const Icon(Icons.home_outlined, size: 18),
+                        ),
+                        const SizedBox(width: 4),
+                        Expanded(
+                          child: _buildClickablePathBreadcrumbs(
+                            state,
+                            currentPath,
+                          ),
+                        ),
+                        if (currentPath.isNotEmpty)
+                          IconButton(
+                            tooltip:
+                                isBookmarked ? '取消收藏此目录' : '收藏此目录到书签栏',
+                            visualDensity: VisualDensity.compact,
+                            onPressed: () => _toggleBookmark(currentPath),
+                            icon: Icon(
+                              isBookmarked
+                                  ? Icons.star_rounded
+                                  : Icons.star_border_rounded,
+                              size: 19,
+                              color: isBookmarked
+                                  ? VideoPlatformTheme.warning
+                                  : VideoPlatformTheme.textSecondary,
+                            ),
+                          ),
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          tooltip: '刷新目录',
+                          onPressed: () => state.loadFiles(path: currentPath),
+                          icon: const Icon(Icons.refresh, size: 18),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: SizedBox(
+                            height: 34,
+                            child: TextField(
+                              onChanged: (v) =>
+                                  setState(() => _searchFilter = v),
+                              style: const TextStyle(fontSize: 12.5),
+                              decoration: const InputDecoration(
+                                hintText: '过滤当前目录...',
+                                prefixIcon: Icon(Icons.search, size: 16),
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        sortButton,
+                        const SizedBox(width: 8),
+                        OutlinedButton.icon(
+                          onPressed: () => _showMkdirDialog(currentPath),
+                          icon: const Icon(
+                            Icons.create_new_folder_outlined,
+                            size: 15,
+                          ),
+                          label: const Text('新建目录'),
+                        ),
+                      ],
+                    ),
+                  ],
+                );
+              }
+
+              return Row(
+                children: [
+                  IconButton(
+                    tooltip: '返回上级目录',
+                    onPressed: currentPath.isEmpty
+                        ? null
+                        : () => state.loadFiles(path: dir?.parent ?? ''),
+                    icon: const Icon(Icons.arrow_upward_rounded, size: 18),
+                  ),
+                  IconButton(
+                    tooltip: '根目录',
+                    onPressed: () => state.loadFiles(path: ''),
+                    icon: const Icon(Icons.home_outlined, size: 18),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: _buildClickablePathBreadcrumbs(state, currentPath),
+                  ),
+                  if (currentPath.isNotEmpty) ...[
+                    const SizedBox(width: 4),
+                    IconButton(
+                      tooltip: isBookmarked ? '取消收藏此目录' : '收藏此目录到书签栏',
+                      visualDensity: VisualDensity.compact,
+                      onPressed: () => _toggleBookmark(currentPath),
+                      icon: Icon(
+                        isBookmarked
+                            ? Icons.star_rounded
+                            : Icons.star_border_rounded,
+                        size: 19,
+                        color: isBookmarked
+                            ? VideoPlatformTheme.warning
+                            : VideoPlatformTheme.textSecondary,
+                      ),
+                    ),
+                  ],
+                  const SizedBox(width: 8),
+                  SizedBox(
+                    width: 180,
+                    child: TextField(
+                      onChanged: (v) => setState(() => _searchFilter = v),
+                      decoration: const InputDecoration(
+                        hintText: '过滤当前目录...',
+                        prefixIcon: Icon(Icons.search, size: 16),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  sortButton,
+                  const SizedBox(width: 8),
+                  OutlinedButton.icon(
+                    onPressed: () => _showMkdirDialog(currentPath),
+                    icon:
+                        const Icon(Icons.create_new_folder_outlined, size: 16),
+                    label: const Text('新建目录'),
+                  ),
+                  const SizedBox(width: 4),
+                  IconButton(
+                    tooltip: '刷新目录',
+                    onPressed: () => state.loadFiles(path: currentPath),
+                    icon: const Icon(Icons.refresh, size: 18),
+                  ),
+                ],
+              );
+            },
           ),
         ),
 

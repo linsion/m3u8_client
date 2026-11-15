@@ -306,213 +306,222 @@ class _LibraryHistoryScreenState extends State<LibraryHistoryScreen> {
       children: [
         Container(
           height: 50,
-          padding: const EdgeInsets.symmetric(horizontal: 16),
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 12),
           decoration: BoxDecoration(
             color: VideoPlatformTheme.bgElevated,
             border: Border(
               bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
             ),
           ),
-          child: Row(
-            children: [
-              _buildTabButton(0, '观看历史 (${state.history.length})'),
-              const SizedBox(width: 10),
-              _buildTabButton(1, '我的收藏 (${state.favorites.length})'),
-              const SizedBox(width: 14),
-              if (!state.tvMode)
-                SizedBox(
-                  width: 220,
-                  height: 32,
-                  child: TextField(
-                    controller: _searchCtrl,
-                    onChanged: (v) => setState(() => _searchQuery = v),
-                    style: const TextStyle(fontSize: 12.5),
-                    decoration: InputDecoration(
-                      hintText: '搜索片名、集数或站点...',
-                      prefixIcon: const Icon(Icons.search_rounded, size: 16),
-                      suffixIcon: _searchQuery.isNotEmpty
-                          ? IconButton(
-                              padding: EdgeInsets.zero,
-                              icon: const Icon(Icons.clear_rounded, size: 14),
-                              onPressed: () {
-                                _searchCtrl.clear();
-                                setState(() => _searchQuery = '');
-                              },
-                            )
-                          : null,
-                      contentPadding: const EdgeInsets.symmetric(horizontal: 8),
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                _buildTabButton(0, '观看历史 (${state.history.length})'),
+                const SizedBox(width: 10),
+                _buildTabButton(1, '我的收藏 (${state.favorites.length})'),
+                const SizedBox(width: 12),
+                if (!state.tvMode)
+                  SizedBox(
+                    width: 190,
+                    height: 32,
+                    child: TextField(
+                      controller: _searchCtrl,
+                      onChanged: (v) => setState(() => _searchQuery = v),
+                      style: const TextStyle(fontSize: 12.5),
+                      decoration: InputDecoration(
+                        hintText: '搜索片名、集数或站点...',
+                        prefixIcon: const Icon(Icons.search_rounded, size: 16),
+                        suffixIcon: _searchQuery.isNotEmpty
+                            ? IconButton(
+                                padding: EdgeInsets.zero,
+                                icon: const Icon(Icons.clear_rounded, size: 14),
+                                onPressed: () {
+                                  _searchCtrl.clear();
+                                  setState(() => _searchQuery = '');
+                                },
+                              )
+                            : null,
+                        contentPadding:
+                            const EdgeInsets.symmetric(horizontal: 8),
+                      ),
                     ),
                   ),
-                ),
-              const Spacer(),
-              if (_tabIndex == 1 && state.favorites.isNotEmpty)
-                OutlinedButton.icon(
-                  onPressed:
-                      _isCheckingUpdates ? null : _checkFavoritesUpdates,
-                  icon: Icon(
-                    Icons.notifications_active_outlined,
-                    size: 15,
-                    color: VideoPlatformTheme.accent,
+                const SizedBox(width: 12),
+                if (_tabIndex == 1 && state.favorites.isNotEmpty) ...[
+                  OutlinedButton.icon(
+                    onPressed:
+                        _isCheckingUpdates ? null : _checkFavoritesUpdates,
+                    icon: Icon(
+                      Icons.notifications_active_outlined,
+                      size: 15,
+                      color: VideoPlatformTheme.accent,
+                    ),
+                    label: Text(_isCheckingUpdates ? '检测更新中...' : '检测剧集更新'),
                   ),
-                  label: Text(_isCheckingUpdates ? '检测更新中...' : '检测剧集更新'),
-                ),
-              const SizedBox(width: 8),
-              OutlinedButton.icon(
-                onPressed: () {
-                  setState(() {
-                    _isBatchMode = !_isBatchMode;
-                    _selectedKeys.clear();
-                  });
-                },
-                icon: Icon(
-                  _isBatchMode
-                      ? Icons.checklist_rtl_rounded
-                      : Icons.select_all_rounded,
-                  size: 15,
-                ),
-                label: Text(_isBatchMode ? '退出多选' : '批量管理'),
-              ),
-              if (_isBatchMode && items.isNotEmpty) ...[
-                const SizedBox(width: 6),
-                TextButton(
+                  const SizedBox(width: 8),
+                ],
+                OutlinedButton.icon(
                   onPressed: () {
                     setState(() {
-                      if (_selectedKeys.length == items.length) {
-                        _selectedKeys.clear();
-                      } else {
-                        _selectedKeys.addAll(items.map(_itemKey));
-                      }
+                      _isBatchMode = !_isBatchMode;
+                      _selectedKeys.clear();
                     });
                   },
-                  child: Text(
-                    _selectedKeys.length == items.length ? '取消全选' : '全选',
+                  icon: Icon(
+                    _isBatchMode
+                        ? Icons.checklist_rtl_rounded
+                        : Icons.select_all_rounded,
+                    size: 15,
                   ),
+                  label: Text(_isBatchMode ? '退出多选' : '批量管理'),
                 ),
-                if (_selectedKeys.isNotEmpty)
-                  FilledButton.tonalIcon(
+                if (_isBatchMode && items.isNotEmpty) ...[
+                  const SizedBox(width: 6),
+                  TextButton(
+                    onPressed: () {
+                      setState(() {
+                        if (_selectedKeys.length == items.length) {
+                          _selectedKeys.clear();
+                        } else {
+                          _selectedKeys.addAll(items.map(_itemKey));
+                        }
+                      });
+                    },
+                    child: Text(
+                      _selectedKeys.length == items.length ? '取消全选' : '全选',
+                    ),
+                  ),
+                  if (_selectedKeys.isNotEmpty)
+                    FilledButton.tonalIcon(
+                      onPressed: () async {
+                        final toDelete = items
+                            .where((i) => _selectedKeys.contains(_itemKey(i)))
+                            .toList();
+                        setState(() => _selectedKeys.clear());
+                        for (final item in toDelete) {
+                          await state.deleteLibraryEntry(kind, item);
+                        }
+                      },
+                      icon: Icon(
+                        Icons.delete_outline,
+                        size: 15,
+                        color: VideoPlatformTheme.danger,
+                      ),
+                      label: Text('删除 (${_selectedKeys.length})'),
+                    ),
+                ],
+                if (rawItems.isNotEmpty) ...[
+                  const SizedBox(width: 6),
+                  OutlinedButton.icon(
                     onPressed: () async {
-                      final toDelete = items
-                          .where((i) => _selectedKeys.contains(_itemKey(i)))
-                          .toList();
-                      setState(() => _selectedKeys.clear());
-                      for (final item in toDelete) {
-                        await state.deleteLibraryEntry(kind, item);
-                      }
+                      final messenger = ScaffoldMessenger.of(context);
+                      final msg =
+                          _tabIndex == 0 ? '已清空全部观看历史' : '已清空全部收藏记录';
+                      setState(() {
+                        _selectedKeys.clear();
+                        _sourceFilterKey = '';
+                      });
+                      await state.clearLibraryKind(kind);
+                      if (!mounted) return;
+                      messenger.showSnackBar(
+                        SnackBar(content: Text(msg)),
+                      );
                     },
                     icon: Icon(
-                      Icons.delete_outline,
+                      Icons.delete_sweep_outlined,
                       size: 15,
                       color: VideoPlatformTheme.danger,
                     ),
-                    label: Text('删除 (${_selectedKeys.length})'),
+                    label: Text(
+                      _tabIndex == 0 ? '清空历史' : '清空收藏',
+                      style: TextStyle(color: VideoPlatformTheme.danger),
+                    ),
                   ),
-              ],
-              if (rawItems.isNotEmpty) ...[
+                ],
                 const SizedBox(width: 6),
-                OutlinedButton.icon(
-                  onPressed: () async {
-                    final messenger = ScaffoldMessenger.of(context);
-                    final msg = _tabIndex == 0 ? '已清空全部观看历史' : '已清空全部收藏记录';
-                    setState(() {
-                      _selectedKeys.clear();
-                      _sourceFilterKey = '';
-                    });
-                    await state.clearLibraryKind(kind);
-                    if (!mounted) return;
-                    messenger.showSnackBar(
-                      SnackBar(content: Text(msg)),
-                    );
+                PopupMenuButton<String>(
+                  tooltip: '备份导出 / 恢复导入 / 清空',
+                  icon: const Icon(Icons.more_vert_rounded, size: 18),
+                  onSelected: (action) async {
+                    if (action == 'sync') {
+                      state.refreshLibrary();
+                    } else if (action == 'export') {
+                      _exportLibraryBackup();
+                    } else if (action == 'import') {
+                      _showImportLibraryDialog();
+                    } else if (action == 'clear') {
+                      final messenger = ScaffoldMessenger.of(context);
+                      final msg =
+                          _tabIndex == 0 ? '已清空全部观看历史' : '已清空全部收藏记录';
+                      setState(() {
+                        _selectedKeys.clear();
+                        _sourceFilterKey = '';
+                      });
+                      await state.clearLibraryKind(kind);
+                      if (!mounted) return;
+                      messenger.showSnackBar(
+                        SnackBar(content: Text(msg)),
+                      );
+                    }
                   },
-                  icon: Icon(
-                    Icons.delete_sweep_outlined,
-                    size: 15,
-                    color: VideoPlatformTheme.danger,
-                  ),
-                  label: Text(
-                    _tabIndex == 0 ? '清空历史' : '清空收藏',
-                    style: TextStyle(color: VideoPlatformTheme.danger),
-                  ),
-                ),
-              ],
-              const SizedBox(width: 6),
-              PopupMenuButton<String>(
-                tooltip: '备份导出 / 恢复导入 / 清空',
-                icon: const Icon(Icons.more_vert_rounded, size: 18),
-                onSelected: (action) async {
-                  if (action == 'sync') {
-                    state.refreshLibrary();
-                  } else if (action == 'export') {
-                    _exportLibraryBackup();
-                  } else if (action == 'import') {
-                    _showImportLibraryDialog();
-                  } else if (action == 'clear') {
-                    final messenger = ScaffoldMessenger.of(context);
-                    final msg = _tabIndex == 0 ? '已清空全部观看历史' : '已清空全部收藏记录';
-                    setState(() {
-                      _selectedKeys.clear();
-                      _sourceFilterKey = '';
-                    });
-                    await state.clearLibraryKind(kind);
-                    if (!mounted) return;
-                    messenger.showSnackBar(
-                      SnackBar(content: Text(msg)),
-                    );
-                  }
-                },
-                itemBuilder: (_) => [
-                  const PopupMenuItem(
-                    value: 'sync',
-                    child: Row(
-                      children: [
-                        Icon(Icons.sync_rounded, size: 17),
-                        SizedBox(width: 8),
-                        Text('同步云端记录'),
-                      ],
-                    ),
-                  ),
-                  const PopupMenuItem(
-                    value: 'export',
-                    child: Row(
-                      children: [
-                        Icon(Icons.download_rounded, size: 17),
-                        SizedBox(width: 8),
-                        Text('导出本地 JSON 备份'),
-                      ],
-                    ),
-                  ),
-                  const PopupMenuItem(
-                    value: 'import',
-                    child: Row(
-                      children: [
-                        Icon(Icons.upload_file_rounded, size: 17),
-                        SizedBox(width: 8),
-                        Text('从 JSON 备份恢复导入'),
-                      ],
-                    ),
-                  ),
-                  if (rawItems.isNotEmpty) ...[
-                    const PopupMenuDivider(),
-                    PopupMenuItem(
-                      value: 'clear',
+                  itemBuilder: (_) => [
+                    const PopupMenuItem(
+                      value: 'sync',
                       child: Row(
                         children: [
-                          Icon(
-                            Icons.delete_sweep_outlined,
-                            size: 17,
-                            color: VideoPlatformTheme.danger,
-                          ),
-                          const SizedBox(width: 8),
-                          Text(
-                            _tabIndex == 0 ? '清空全部观看历史' : '清空全部收藏',
-                            style: TextStyle(color: VideoPlatformTheme.danger),
-                          ),
+                          Icon(Icons.sync_rounded, size: 17),
+                          SizedBox(width: 8),
+                          Text('同步云端记录'),
                         ],
                       ),
                     ),
+                    const PopupMenuItem(
+                      value: 'export',
+                      child: Row(
+                        children: [
+                          Icon(Icons.download_rounded, size: 17),
+                          SizedBox(width: 8),
+                          Text('导出本地 JSON 备份'),
+                        ],
+                      ),
+                    ),
+                    const PopupMenuItem(
+                      value: 'import',
+                      child: Row(
+                        children: [
+                          Icon(Icons.upload_file_rounded, size: 17),
+                          SizedBox(width: 8),
+                          Text('从 JSON 备份恢复导入'),
+                        ],
+                      ),
+                    ),
+                    if (rawItems.isNotEmpty) ...[
+                      const PopupMenuDivider(),
+                      PopupMenuItem(
+                        value: 'clear',
+                        child: Row(
+                          children: [
+                            Icon(
+                              Icons.delete_sweep_outlined,
+                              size: 17,
+                              color: VideoPlatformTheme.danger,
+                            ),
+                            const SizedBox(width: 8),
+                            Text(
+                              _tabIndex == 0 ? '清空全部观看历史' : '清空全部收藏',
+                              style:
+                                  TextStyle(color: VideoPlatformTheme.danger),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
                   ],
-                ],
-              ),
-            ],
+                ),
+              ],
+            ),
           ),
         ),
         if (sourceCounts.length > 1)

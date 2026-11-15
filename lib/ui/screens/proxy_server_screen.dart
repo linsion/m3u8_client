@@ -801,48 +801,54 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
     final isErr = _proxySvc.lastStatusIsError;
 
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: BoxDecoration(
         color: VideoPlatformTheme.bgElevated,
         border: Border(
           bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
         ),
       ),
-      child: Row(
-        children: [
-          _buildSubNavTab(
-            index: 0,
-            icon: Icons.hub_rounded,
-            label: '订阅与代理节点 (${_proxySvc.nodes.length})',
-          ),
-          const SizedBox(width: 8),
-          _buildSubNavTab(
-            index: 1,
-            icon: Icons.alt_route_rounded,
-            label: '分场景路由策略 (${RequestScenario.values.length})',
-          ),
-          const SizedBox(width: 8),
-          _buildSubNavTab(
-            index: 2,
-            icon: Icons.dns_outlined,
-            label: '服务端代理监听 (${_services.length})',
-          ),
-          const Spacer(),
-          if (statusMsg.isNotEmpty)
-            Flexible(
-              child: Text(
-                statusMsg,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  fontSize: 12,
-                  color: isErr
-                      ? VideoPlatformTheme.danger
-                      : VideoPlatformTheme.textSecondary,
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(
+          children: [
+            _buildSubNavTab(
+              index: 0,
+              icon: Icons.hub_rounded,
+              label: '订阅与代理节点 (${_proxySvc.nodes.length})',
+            ),
+            const SizedBox(width: 8),
+            _buildSubNavTab(
+              index: 1,
+              icon: Icons.alt_route_rounded,
+              label: '分场景路由策略 (${RequestScenario.values.length})',
+            ),
+            const SizedBox(width: 8),
+            _buildSubNavTab(
+              index: 2,
+              icon: Icons.dns_outlined,
+              label: '服务端代理监听 (${_services.length})',
+            ),
+            if (statusMsg.isNotEmpty) ...[
+              const SizedBox(width: 14),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 320),
+                child: Text(
+                  statusMsg,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: isErr
+                        ? VideoPlatformTheme.danger
+                        : VideoPlatformTheme.textSecondary,
+                  ),
                 ),
               ),
-            ),
-        ],
+            ],
+          ],
+        ),
       ),
     );
   }
