@@ -73,6 +73,8 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
   bool _isFullscreenMode = false;
   bool _fullscreenControlsVisible = false;
   Timer? _fullscreenControlsTimer;
+  bool _mobileStageOsdVisible = false;
+  Timer? _mobileStageOsdTimer;
   final FocusNode _fullscreenStageFocusNode =
       FocusNode(debugLabel: 'VodFullscreenStage');
   final FocusNode _fullscreenPlayBtnFocusNode =
@@ -429,6 +431,21 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     }
   }
 
+  void _toggleMobileStageOsd() {
+    _mobileStageOsdTimer?.cancel();
+    final next = !_mobileStageOsdVisible;
+    if (mounted) {
+      setState(() => _mobileStageOsdVisible = next);
+    }
+    if (next) {
+      _mobileStageOsdTimer = Timer(const Duration(seconds: 4), () {
+        if (mounted) {
+          setState(() => _mobileStageOsdVisible = false);
+        }
+      });
+    }
+  }
+
   @override
   void dispose() {
     if (_isFullscreenMode && (Platform.isAndroid || Platform.isIOS)) {
@@ -438,6 +455,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       }
     }
     _fullscreenControlsTimer?.cancel();
+    _mobileStageOsdTimer?.cancel();
     _fullscreenStageFocusNode.dispose();
     _fullscreenPlayBtnFocusNode.dispose();
     _adToastTimer?.cancel();
@@ -2475,8 +2493,10 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                 )
               : LayoutBuilder(
                   builder: (context, constraints) {
-                    final isDesktopWide =
-                        constraints.maxWidth >= 860 || widget.appState.tvMode;
+                    if (widget.appState.tvMode) {
+                      return _buildTvLeanbackDetailLayout(constraints);
+                    }
+                    final isDesktopWide = constraints.maxWidth >= 860;
                     if (isDesktopWide) {
                       return Stack(
                         children: [
@@ -2605,17 +2625,17 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                     return Column(
                       children: [
                         _buildVideoPlayerStage(fullBleed: true),
-                        _buildInteractiveProgressBar(fullBleed: true),
+                        _buildMobileCompactTransportBar(),
                         Expanded(
                           child: SingleChildScrollView(
-                            padding: const EdgeInsets.all(14),
+                            padding: const EdgeInsets.fromLTRB(12, 10, 12, 18),
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                _buildPlayerToolbar(),
-                                const SizedBox(height: 14),
+                                _buildMobileQuickActionBar(),
+                                const SizedBox(height: 12),
                                 _buildInlineEpisodeSection(),
-                                const SizedBox(height: 16),
+                                const SizedBox(height: 14),
                                 _buildMetadataPanel(),
                               ],
                             ),
@@ -2627,6 +2647,399 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                 ),
         ),
       ),
+      ),
+    );
+  }
+
+  Widget _buildTvLeanbackDetailLayout(BoxConstraints constraints) {
+    final detail = _detail;
+    final title = detail?.vodName.isNotEmpty == true
+        ? detail!.vodName
+        : widget.initialTitle;
+    final isFav = detail != null &&
+        widget.appState.isFavorite(_activeSource, detail.vodId);
+    final hasMultipleEps = detail != null &&
+        detail.playGroups.any((g) => g.episodes.length > 1);
+    final tags = <String>[
+      '片源: ${_activeSource.name}',
+      if (detail != null && detail.typeName.isNotEmpty) detail.typeName,
+      if (detail != null &&
+          detail.vodYear.isNotEmpty &&
+          detail.vodYear != '0')
+        detail.vodYear,
+      if (detail != null && detail.vodArea.isNotEmpty) detail.vodArea,
+      if (detail != null && detail.vodRemarks.isNotEmpty) detail.vodRemarks,
+    ];
+    final currentGroup =
+        (detail != null && detail.playGroups.isNotEmpty)
+            ? detail.playGroups[
+                _selectedGroupIndex.clamp(0, detail.playGroups.length - 1)]
+            : null;
+    final displayEpisodes = currentGroup != null
+        ? _getFilteredAndSortedEpisodes(currentGroup.episodes)
+        : const <Episode>[];
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(24, 14, 24, 18),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // 1. Top Hero Row: 16:9 Live Preview Player (left) + TV Metadata & Big D-Pad Action Bar (right)
+          SizedBox(
+            height: 236,
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // 16:9 Preview Player Box
+                AspectRatio(
+                  aspectRatio: 16 / 9,
+                  child: _buildVideoPlayerStage(),
+                ),
+                const SizedBox(width: 22),
+                // Right: Movie Title, Tags, Synopsis, and Big TV Action Buttons
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Flexible(
+                            child: Text(
+                              title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 22,
+                                fontWeight: FontWeight.w800,
+                                color: VideoPlatformTheme.textPrimary,
+                              ),
+                            ),
+                          ),
+                          if (_currentEpisode != null) ...[
+                            const SizedBox(width: 10),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 3,
+                              ),
+                              decoration: BoxDecoration(
+                                color: VideoPlatformTheme.accent
+                                    .withValues(alpha: 0.18),
+                                borderRadius: BorderRadius.circular(6),
+                                border: Border.all(
+                                  color: VideoPlatformTheme.accent,
+                                ),
+                              ),
+                              child: Text(
+                                '正在播放: ${_currentEpisode!.title}',
+                                style: TextStyle(
+                                  fontSize: 12.5,
+                                  fontWeight: FontWeight.w700,
+                                  color: VideoPlatformTheme.accent,
+                                ),
+                              ),
+                            ),
+                          ],
+                          const Spacer(),
+                          VideoDownloadSpeedBadge(
+                            player: _player,
+                            backgroundColor: VideoPlatformTheme.bgCard,
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 6,
+                        children: tags
+                            .map(
+                              (t) => Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 9,
+                                  vertical: 3,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: VideoPlatformTheme.bgCard,
+                                  borderRadius: BorderRadius.circular(5),
+                                  border: Border.all(
+                                    color: VideoPlatformTheme.borderSubtle,
+                                  ),
+                                ),
+                                child: Text(
+                                  t,
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: VideoPlatformTheme.textSecondary,
+                                  ),
+                                ),
+                              ),
+                            )
+                            .toList(),
+                      ),
+                      const SizedBox(height: 8),
+                      Expanded(
+                        child: Text(
+                          (detail != null && detail.vodContent.isNotEmpty)
+                              ? detail.vodContent
+                                  .replaceAll(RegExp(r'<[^>]*>'), '')
+                                  .trim()
+                              : (detail?.vodActor.isNotEmpty == true
+                                  ? '主演：${detail!.vodActor}'
+                                  : '按“全屏观看”即可进入沉浸全屏，全屏下按遥控器左右键快进/快退，上下键唤出控制栏，返回键退出全屏。'),
+                          maxLines: 3,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 13,
+                            height: 1.45,
+                            color: VideoPlatformTheme.textSecondary,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      // Big TV Remote Action Bar
+                      SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        child: Row(
+                          children: [
+                            _buildTvFocusableControlBtn(
+                              icon: Icons.fullscreen_rounded,
+                              label: '全屏观看',
+                              tooltip: '进入 100% 沉浸全屏播放',
+                              isPrimary: true,
+                              autofocus: true,
+                              onPressed: () =>
+                                  _toggleFullscreenMode(forceValue: true),
+                            ),
+                            if (hasMultipleEps) ...[
+                              const SizedBox(width: 10),
+                              _buildTvFocusableControlBtn(
+                                icon: Icons.skip_next_rounded,
+                                label: '下一集',
+                                onPressed: _playNextEpisodeIfAvailable,
+                              ),
+                            ],
+                            const SizedBox(width: 10),
+                            _buildTvFocusableControlBtn(
+                              icon: Icons.swap_horiz_rounded,
+                              label: '同片换源',
+                              onPressed: _showCrossSiteSourceSwitchDialog,
+                            ),
+                            const SizedBox(width: 10),
+                            _buildTvFocusableControlBtn(
+                              icon: Icons.fast_forward_rounded,
+                              label: '跳广告+30s',
+                              onPressed: () => _skipForwardSeconds(30),
+                            ),
+                            const SizedBox(width: 10),
+                            _buildTvFocusableControlBtn(
+                              icon: Icons.verified_user_rounded,
+                              label: widget.appState.vodSkipIntroSeconds > 0
+                                  ? '片头${widget.appState.vodSkipIntroSeconds}s/去广告'
+                                  : '片头/去广告',
+                              onPressed: _showAdSkipSettingsDialog,
+                            ),
+                            const SizedBox(width: 10),
+                            _buildTvFocusableControlBtn(
+                              icon: isFav
+                                  ? Icons.star_rounded
+                                  : Icons.star_border_rounded,
+                              label: isFav ? '已收藏' : '收藏',
+                              onPressed: detail == null
+                                  ? null
+                                  : () async {
+                                      await widget.appState.toggleFavorite(
+                                        source: _activeSource,
+                                        detail: detail,
+                                        currentEpisode:
+                                            _currentEpisode?.title ?? '',
+                                        currentLine:
+                                            _currentEpisode?.groupName ?? '',
+                                      );
+                                      if (mounted) setState(() {});
+                                    },
+                            ),
+                            const SizedBox(width: 10),
+                            VideoProxyNodeSelector(
+                              proxyService: widget.appState.proxyService,
+                              scenario: RequestScenario.vodStream,
+                              overlayStyle: false,
+                              compact: false,
+                              onProxyChanged: _onProxyNodeSwitched,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          // 2. Play Line Bar + Episode Chunk Controls
+          if (detail != null && detail.playGroups.isNotEmpty) ...[
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              decoration: BoxDecoration(
+                color: VideoPlatformTheme.bgElevated,
+                borderRadius:
+                    const BorderRadius.vertical(top: Radius.circular(10)),
+                border: Border.all(color: VideoPlatformTheme.borderSubtle),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(
+                        Icons.playlist_play_rounded,
+                        size: 20,
+                        color: VideoPlatformTheme.accent,
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        '播放线路与选集',
+                        style: TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w700,
+                          color: VideoPlatformTheme.textPrimary,
+                        ),
+                      ),
+                      const SizedBox(width: 14),
+                      Expanded(
+                        child: SizedBox(
+                          height: 36,
+                          child: ListView.separated(
+                            scrollDirection: Axis.horizontal,
+                            itemCount: detail.playGroups.length,
+                            separatorBuilder: (_, __) =>
+                                const SizedBox(width: 8),
+                            itemBuilder: (_, idx) {
+                              final grp = detail.playGroups[idx];
+                              final selected = idx == _selectedGroupIndex;
+                              return InkWell(
+                                borderRadius: BorderRadius.circular(8),
+                                onFocusChange: (_) {
+                                  if (mounted) setState(() {});
+                                },
+                                onTap: () => setState(() {
+                                  _selectedGroupIndex = idx;
+                                  _episodeChunkIndex = -1;
+                                }),
+                                child: Builder(
+                                  builder: (ctx) {
+                                    final isFocused =
+                                        Focus.of(ctx).hasPrimaryFocus;
+                                    return Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 14,
+                                      ),
+                                      alignment: Alignment.center,
+                                      decoration: BoxDecoration(
+                                        color: isFocused
+                                            ? VideoPlatformTheme.accent
+                                            : (selected
+                                                ? VideoPlatformTheme.accent
+                                                    .withValues(alpha: 0.22)
+                                                : VideoPlatformTheme.bgCard),
+                                        borderRadius: BorderRadius.circular(8),
+                                        border: Border.all(
+                                          color: isFocused
+                                              ? Colors.white
+                                              : (selected
+                                                  ? VideoPlatformTheme.accent
+                                                  : VideoPlatformTheme
+                                                      .borderSubtle),
+                                          width: isFocused ? 2.2 : 1.0,
+                                        ),
+                                      ),
+                                      child: Text(
+                                        '${grp.name} (${grp.episodes.length})',
+                                        style: TextStyle(
+                                          fontSize: 13,
+                                          fontWeight: (selected || isFocused)
+                                              ? FontWeight.w700
+                                              : FontWeight.w500,
+                                          color: isFocused
+                                              ? Colors.white
+                                              : (selected
+                                                  ? VideoPlatformTheme.accent
+                                                  : VideoPlatformTheme
+                                                      .textPrimary),
+                                        ),
+                                      ),
+                                    );
+                                  },
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      _buildTvFocusableControlBtn(
+                        icon: Icons.swap_vert_rounded,
+                        label: _episodesReversed ? '倒序' : '正序',
+                        onPressed: () => setState(
+                          () => _episodesReversed = !_episodesReversed,
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (currentGroup != null &&
+                      currentGroup.episodes.length > 50)
+                    _buildEpisodeChunkAndSearchControls(
+                      currentGroup.episodes.length,
+                    ),
+                ],
+              ),
+            ),
+            // 3. Full-Width Large TV Episode Grid
+            Expanded(
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: VideoPlatformTheme.bgElevated,
+                  borderRadius:
+                      const BorderRadius.vertical(bottom: Radius.circular(10)),
+                  border: Border(
+                    left: BorderSide(color: VideoPlatformTheme.borderSubtle),
+                    right: BorderSide(color: VideoPlatformTheme.borderSubtle),
+                    bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
+                  ),
+                ),
+                child: GridView.builder(
+                  gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                    maxCrossAxisExtent: 150,
+                    mainAxisSpacing: 10,
+                    crossAxisSpacing: 10,
+                    childAspectRatio: 2.75,
+                  ),
+                  itemCount: displayEpisodes.length,
+                  itemBuilder: (_, idx) {
+                    final ep = displayEpisodes[idx];
+                    final isPlaying =
+                        _currentEpisode?.groupName == ep.groupName &&
+                            _currentEpisode?.index == ep.index;
+                    return _buildEpisodeButton(ep, isPlaying);
+                  },
+                ),
+              ),
+            ),
+          ] else
+            Expanded(
+              child: Center(
+                child: Text(
+                  _isLoadingDetail ? '正在加载剧集列表...' : '暂无可用播放线路',
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: VideoPlatformTheme.textMuted,
+                  ),
+                ),
+              ),
+            ),
+        ],
       ),
     );
   }
@@ -3293,15 +3706,19 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         : (_videoAspectMode == '4:3' ? 4 / 3 : null);
 
     final screenSize = MediaQuery.sizeOf(context);
+    final isMobilePortrait =
+        screenSize.width < 860 && !widget.appState.tvMode;
     final mobileStageHeight =
-        (screenSize.height * 0.35).clamp(255.0, 380.0);
+        (screenSize.width * 9 / 16).clamp(205.0, 275.0);
 
     final Widget stageContent = GestureDetector(
         behavior: HitTestBehavior.translucent,
         onTap: isFullscreen
             ? null
             : () {
-                if (!widget.appState.tvMode &&
+                if (isMobilePortrait) {
+                  _toggleMobileStageOsd();
+                } else if (!widget.appState.tvMode &&
                     _currentEpisode != null &&
                     !_isResolvingPlay) {
                   _player.playOrPause();
@@ -3599,8 +4016,11 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                 ),
               ),
             // Floating proxy node selector + download speed HUD + quick "跳过广告" pill on video stage
-            // Hidden in fullscreen mode unless controls are woken up by remote/tap!
-            if (!isFullscreen || _fullscreenControlsVisible)
+            // Hidden in fullscreen mode, TV preview window, or mobile portrait unless controls are woken up!
+            if (isFullscreen
+                ? _fullscreenControlsVisible
+                : (!widget.appState.tvMode &&
+                    (!isMobilePortrait || _mobileStageOsdVisible)))
               Positioned(
                 top: 10,
                 left: 10,
@@ -4056,6 +4476,633 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     return AspectRatio(
       aspectRatio: 16 / 9,
       child: focusableStage,
+    );
+  }
+
+  Widget _buildMobileCompactTransportBar() {
+    return StreamBuilder<Duration>(
+      stream: _player.stream.position,
+      initialData: _player.state.position,
+      builder: (context, posSnap) {
+        return StreamBuilder<Duration>(
+          stream: _player.stream.duration,
+          initialData: _player.state.duration,
+          builder: (context, durSnap) {
+            final rawPos = posSnap.data ?? _lastValidPosition;
+            final rawDur =
+                (durSnap.data != null && durSnap.data! > Duration.zero)
+                    ? durSnap.data!
+                    : _lastValidDuration;
+            final maxSec =
+                rawDur.inSeconds > 0 ? rawDur.inSeconds.toDouble() : 1.0;
+            final curSec = _isSliderDragging
+                ? _sliderPreviewSeconds.clamp(0.0, maxSec)
+                : (_isHorizontalSeeking
+                    ? _seekPreviewSeconds.clamp(0.0, maxSec)
+                    : rawPos.inSeconds.toDouble().clamp(0.0, maxSec));
+            final hasMultipleEps = _detail != null &&
+                _detail!.playGroups.any((g) => g.episodes.length > 1);
+
+            return Container(
+              padding: const EdgeInsets.fromLTRB(12, 4, 8, 6),
+              decoration: BoxDecoration(
+                color: VideoPlatformTheme.bgElevated,
+                border: Border(
+                  bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
+                ),
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Row 1: Ultra-slim touch progress bar
+                  SizedBox(
+                    height: 24,
+                    child: Row(
+                      children: [
+                        Text(
+                          _formatDurationLabel(curSec.round()),
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            color: VideoPlatformTheme.textPrimary,
+                          ),
+                        ),
+                        Expanded(
+                          child: SliderTheme(
+                            data: SliderTheme.of(context).copyWith(
+                              trackHeight: 3.0,
+                              thumbShape: const RoundSliderThumbShape(
+                                enabledThumbRadius: 6.5,
+                              ),
+                              overlayShape: const RoundSliderOverlayShape(
+                                overlayRadius: 12.0,
+                              ),
+                              activeTrackColor: VideoPlatformTheme.accent,
+                              inactiveTrackColor:
+                                  VideoPlatformTheme.borderStrong,
+                              thumbColor: Colors.white,
+                            ),
+                            child: Slider(
+                              value: curSec,
+                              min: 0.0,
+                              max: maxSec,
+                              onChangeStart: (val) {
+                                setState(() {
+                                  _isSliderDragging = true;
+                                  _sliderPreviewSeconds = val;
+                                });
+                              },
+                              onChanged: (val) {
+                                setState(() {
+                                  _isSliderDragging = true;
+                                  _sliderPreviewSeconds = val;
+                                });
+                              },
+                              onChangeEnd: (val) {
+                                setState(() {
+                                  _isSliderDragging = false;
+                                  _sliderPreviewSeconds = val;
+                                });
+                                _player.seek(Duration(seconds: val.round()));
+                              },
+                            ),
+                          ),
+                        ),
+                        Text(
+                          _formatDurationLabel(
+                            rawDur.inSeconds > 0 ? rawDur.inSeconds : 0,
+                          ),
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: VideoPlatformTheme.textMuted,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  // Row 2: Clean 1-row mobile transport strip
+                  SizedBox(
+                    height: 34,
+                    child: Row(
+                      children: [
+                        StreamBuilder<bool>(
+                          stream: _player.stream.playing,
+                          initialData: _player.state.playing,
+                          builder: (_, playSnap) {
+                            final playing = playSnap.data ?? false;
+                            return InkWell(
+                              borderRadius: BorderRadius.circular(16),
+                              onTap: () => _player.playOrPause(),
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 6,
+                                  vertical: 4,
+                                ),
+                                child: Icon(
+                                  playing
+                                      ? Icons.pause_rounded
+                                      : Icons.play_arrow_rounded,
+                                  size: 24,
+                                  color: VideoPlatformTheme.textPrimary,
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                        if (hasMultipleEps)
+                          InkWell(
+                            borderRadius: BorderRadius.circular(16),
+                            onTap: _playNextEpisodeIfAvailable,
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 6,
+                                vertical: 4,
+                              ),
+                              child: Icon(
+                                Icons.skip_next_rounded,
+                                size: 22,
+                                color: VideoPlatformTheme.textPrimary,
+                              ),
+                            ),
+                          ),
+                        const SizedBox(width: 4),
+                        InkWell(
+                          borderRadius: BorderRadius.circular(14),
+                          onTap: () => _skipForwardSeconds(30),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 3,
+                            ),
+                            decoration: BoxDecoration(
+                              color: VideoPlatformTheme.bgCard,
+                              borderRadius: BorderRadius.circular(14),
+                              border: Border.all(
+                                color: VideoPlatformTheme.borderSubtle,
+                              ),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  Icons.fast_forward_rounded,
+                                  size: 13,
+                                  color: VideoPlatformTheme.accent,
+                                ),
+                                const SizedBox(width: 3),
+                                Text(
+                                  '跳广告+30s',
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                    color: VideoPlatformTheme.textPrimary,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        const Spacer(),
+                        // Speed selector pill
+                        PopupMenuButton<double>(
+                          tooltip: '倍速播放',
+                          initialValue: _playbackSpeed,
+                          onSelected: (speed) {
+                            setState(() => _playbackSpeed = speed);
+                            _player.setRate(speed);
+                          },
+                          itemBuilder: (_) => const [
+                            PopupMenuItem(value: 0.75, child: Text('0.75x')),
+                            PopupMenuItem(value: 1.0, child: Text('1.0x 正常')),
+                            PopupMenuItem(value: 1.25, child: Text('1.25x')),
+                            PopupMenuItem(value: 1.5, child: Text('1.5x')),
+                            PopupMenuItem(value: 2.0, child: Text('2.0x')),
+                            PopupMenuItem(value: 3.0, child: Text('3.0x 极速')),
+                          ],
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 4,
+                            ),
+                            decoration: BoxDecoration(
+                              color: _playbackSpeed != 1.0
+                                  ? VideoPlatformTheme.accent
+                                      .withValues(alpha: 0.16)
+                                  : VideoPlatformTheme.bgCard,
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: _playbackSpeed != 1.0
+                                    ? VideoPlatformTheme.accent
+                                    : VideoPlatformTheme.borderSubtle,
+                              ),
+                            ),
+                            child: Text(
+                              '${_playbackSpeed}x',
+                              style: TextStyle(
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w600,
+                                color: _playbackSpeed != 1.0
+                                    ? VideoPlatformTheme.accent
+                                    : VideoPlatformTheme.textSecondary,
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        // Fullscreen button
+                        InkWell(
+                          borderRadius: BorderRadius.circular(14),
+                          onTap: () => _toggleFullscreenMode(),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 4,
+                            ),
+                            decoration: BoxDecoration(
+                              color: VideoPlatformTheme.accent
+                                  .withValues(alpha: 0.18),
+                              borderRadius: BorderRadius.circular(14),
+                              border: Border.all(
+                                color: VideoPlatformTheme.accent,
+                              ),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  Icons.fullscreen_rounded,
+                                  size: 16,
+                                  color: VideoPlatformTheme.accent,
+                                ),
+                                const SizedBox(width: 2),
+                                Text(
+                                  '全屏',
+                                  style: TextStyle(
+                                    fontSize: 11.5,
+                                    fontWeight: FontWeight.w700,
+                                    color: VideoPlatformTheme.accent,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildMobileQuickActionBar() {
+    final detail = _detail;
+    final isFav = detail != null &&
+        widget.appState.isFavorite(_activeSource, detail.vodId);
+    final ep = _currentEpisode;
+    final epKey = ep == null ? '' : _episodeDownloadKey(ep);
+    final isAdding = epKey.isNotEmpty && _addingDownloadKeys.contains(epKey);
+    final isQueued = epKey.isNotEmpty && _queuedDownloadKeys.contains(epKey);
+
+    Widget buildActionPill({
+      required IconData icon,
+      required String label,
+      required VoidCallback? onTap,
+      bool highlighted = false,
+      Color? activeColor,
+    }) {
+      final accent = activeColor ?? VideoPlatformTheme.accent;
+      return InkWell(
+        borderRadius: BorderRadius.circular(18),
+        onTap: onTap,
+        child: Container(
+          height: 32,
+          padding: const EdgeInsets.symmetric(horizontal: 11),
+          decoration: BoxDecoration(
+            color: highlighted
+                ? accent.withValues(alpha: 0.16)
+                : VideoPlatformTheme.bgElevated,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(
+              color: highlighted ? accent : VideoPlatformTheme.borderSubtle,
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                icon,
+                size: 15,
+                color: highlighted ? accent : VideoPlatformTheme.textSecondary,
+              ),
+              const SizedBox(width: 5),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight:
+                      highlighted ? FontWeight.w600 : FontWeight.normal,
+                  color: highlighted ? accent : VideoPlatformTheme.textPrimary,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return SizedBox(
+      height: 34,
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        children: [
+          buildActionPill(
+            icon: Icons.swap_horiz_rounded,
+            label: '同片换源',
+            highlighted: true,
+            onTap: _showCrossSiteSourceSwitchDialog,
+          ),
+          const SizedBox(width: 8),
+          buildActionPill(
+            icon: isQueued
+                ? Icons.check_circle_rounded
+                : Icons.download_rounded,
+            label: isAdding
+                ? '入队中...'
+                : (isQueued ? '已加入下载' : '下载本集'),
+            highlighted: isQueued,
+            activeColor: const Color(0xFF22C55E),
+            onTap: (ep == null || isAdding) ? null : _downloadCurrentEpisode,
+          ),
+          if (detail != null && detail.playGroups.isNotEmpty) ...[
+            const SizedBox(width: 8),
+            buildActionPill(
+              icon: Icons.playlist_add_check_rounded,
+              label: '批量下载',
+              onTap: _showBatchDownloadDialog,
+            ),
+          ],
+          const SizedBox(width: 8),
+          buildActionPill(
+            icon: isFav ? Icons.star_rounded : Icons.star_border_rounded,
+            label: isFav ? '已收藏' : '收藏',
+            highlighted: isFav,
+            activeColor: VideoPlatformTheme.warning,
+            onTap: detail == null
+                ? null
+                : () async {
+                    await widget.appState.toggleFavorite(
+                      source: _activeSource,
+                      detail: detail,
+                      currentEpisode: _currentEpisode?.title ?? '',
+                      currentLine: _currentEpisode?.groupName ?? '',
+                    );
+                    if (mounted) setState(() {});
+                  },
+          ),
+          const SizedBox(width: 8),
+          buildActionPill(
+            icon: Icons.verified_user_rounded,
+            label: _removedAdSegments > 0
+                ? '已除广告($_removedAdSegments)'
+                : '片头/去广告',
+            highlighted: widget.appState.vodFilterM3u8Ads,
+            activeColor: VideoPlatformTheme.success,
+            onTap: _showAdSkipSettingsDialog,
+          ),
+          const SizedBox(width: 8),
+          buildActionPill(
+            icon: Icons.tune_rounded,
+            label: '更多设置',
+            onTap: _showMobilePlayerMoreSettingsSheet,
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showMobilePlayerMoreSettingsSheet() {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: VideoPlatformTheme.bgElevated,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+      ),
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setSheetState) {
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 10, 16, 18),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Center(
+                      child: Container(
+                        width: 36,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: VideoPlatformTheme.borderStrong,
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Icon(
+                          Icons.tune_rounded,
+                          size: 18,
+                          color: VideoPlatformTheme.accent,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          '播放高级控制与工具',
+                          style: TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.w700,
+                            color: VideoPlatformTheme.textPrimary,
+                          ),
+                        ),
+                        const Spacer(),
+                        VideoDownloadSpeedBadge(
+                          player: _player,
+                          backgroundColor: VideoPlatformTheme.bgCard,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+                    Text(
+                      '画面比例',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: VideoPlatformTheme.textSecondary,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        for (final entry in const [
+                          ('fit', '适应屏幕'),
+                          ('16:9', '16:9'),
+                          ('4:3', '4:3'),
+                          ('cover', '铺满裁剪'),
+                        ])
+                          Expanded(
+                            child: Padding(
+                              padding: const EdgeInsets.only(right: 6),
+                              child: InkWell(
+                                borderRadius: BorderRadius.circular(8),
+                                onTap: () {
+                                  setState(() => _videoAspectMode = entry.$1);
+                                  setSheetState(() {});
+                                },
+                                child: Container(
+                                  height: 34,
+                                  alignment: Alignment.center,
+                                  decoration: BoxDecoration(
+                                    color: _videoAspectMode == entry.$1
+                                        ? VideoPlatformTheme.accent
+                                            .withValues(alpha: 0.18)
+                                        : VideoPlatformTheme.bgCard,
+                                    borderRadius: BorderRadius.circular(8),
+                                    border: Border.all(
+                                      color: _videoAspectMode == entry.$1
+                                          ? VideoPlatformTheme.accent
+                                          : VideoPlatformTheme.borderSubtle,
+                                    ),
+                                  ),
+                                  child: Text(
+                                    entry.$2,
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: _videoAspectMode == entry.$1
+                                          ? FontWeight.w600
+                                          : FontWeight.normal,
+                                      color: _videoAspectMode == entry.$1
+                                          ? VideoPlatformTheme.accent
+                                          : VideoPlatformTheme.textPrimary,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        OutlinedButton.icon(
+                          onPressed: _resolvedPlayback == null
+                              ? null
+                              : () {
+                                  Navigator.of(ctx).pop();
+                                  final nextMode = !_useServerProxy;
+                                  setState(() => _useServerProxy = nextMode);
+                                  _openResolvedStream(
+                                    _resolvedPlayback!,
+                                    forceProxy: nextMode,
+                                  );
+                                },
+                          icon: Icon(
+                            _useServerProxy
+                                ? Icons.dns_rounded
+                                : Icons.bolt_rounded,
+                            size: 16,
+                          ),
+                          label: Text(
+                            _useServerProxy ? '当前：服务端中转' : '当前：客户端直连',
+                          ),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed: () {
+                            Navigator.of(ctx).pop();
+                            _showExternalSubtitleDialog();
+                          },
+                          icon: const Icon(Icons.subtitles_rounded, size: 16),
+                          label: Text(
+                            _externalSubtitleName != null
+                                ? '字幕: $_externalSubtitleName'
+                                : '加载外挂字幕',
+                          ),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed: () {
+                            Navigator.of(ctx).pop();
+                            _showAudioSleepAbDialog();
+                          },
+                          icon: const Icon(Icons.graphic_eq_rounded, size: 16),
+                          label: const Text('音轨 / 睡眠定时 / AB循环'),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed: _currentEpisode == null
+                              ? null
+                              : () {
+                                  Navigator.of(ctx).pop();
+                                  _captureVideoScreenshot();
+                                },
+                          icon: const Icon(Icons.camera_alt_outlined, size: 16),
+                          label: const Text('视频画面截图'),
+                        ),
+                        if (_resolvedPlayback != null &&
+                            _resolvedPlayback!.directUrl.isNotEmpty) ...[
+                          OutlinedButton.icon(
+                            onPressed: () {
+                              Clipboard.setData(
+                                ClipboardData(
+                                  text: _resolvedPlayback!.directUrl,
+                                ),
+                              );
+                              Navigator.of(ctx).pop();
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text('已复制流媒体地址到剪贴板'),
+                                ),
+                              );
+                            },
+                            icon: const Icon(Icons.link_rounded, size: 16),
+                            label: const Text('复制流地址'),
+                          ),
+                          OutlinedButton.icon(
+                            onPressed: () {
+                              final uri = Uri.tryParse(
+                                _resolvedPlayback!.directUrl,
+                              );
+                              Navigator.of(ctx).pop();
+                              if (uri != null) {
+                                launchUrl(
+                                  uri,
+                                  mode: LaunchMode.externalApplication,
+                                );
+                              }
+                            },
+                            icon: const Icon(
+                              Icons.open_in_new_rounded,
+                              size: 16,
+                            ),
+                            label: const Text('外部播放器打开'),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
     );
   }
 

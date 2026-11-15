@@ -345,7 +345,7 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
               ),
             ),
           ),
-          if (!isCompactMobile && categories.length > 5) ...[
+          if (!isCompactMobile && !state.tvMode && categories.length > 5) ...[
             const SizedBox(width: 6),
             InkWell(
               borderRadius: BorderRadius.circular(6),
@@ -1133,35 +1133,52 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                 }
               });
             }
-            return AnimatedContainer(
-              duration: const Duration(milliseconds: 160),
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
-              decoration: BoxDecoration(
-                color: selected
-                    ? VideoPlatformTheme.accent
-                    : (isFocused
-                        ? VideoPlatformTheme.accent.withValues(alpha: 0.25)
-                        : Colors.transparent),
-                borderRadius: BorderRadius.circular(6),
-                border: isFocused
-                    ? Border.all(
-                        color: VideoPlatformTheme.accent,
-                        width: 2.0,
-                      )
-                    : null,
-              ),
-              child: Text(
-                label,
-                style: TextStyle(
-                  fontSize: 13,
-                  color: selected
-                      ? Colors.white
-                      : (isFocused
-                          ? VideoPlatformTheme.accent
-                          : VideoPlatformTheme.textSecondary),
-                  fontWeight: (selected || isFocused)
-                      ? FontWeight.w600
-                      : FontWeight.w400,
+            final isTv = widget.appState.tvMode;
+            return AnimatedScale(
+              scale: (isFocused && isTv) ? 1.07 : 1.0,
+              duration: const Duration(milliseconds: 140),
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 160),
+                padding: EdgeInsets.symmetric(
+                  horizontal: isTv ? 15 : 12,
+                  vertical: isTv ? 6 : 5,
+                ),
+                decoration: BoxDecoration(
+                  color: isFocused && isTv
+                      ? VideoPlatformTheme.accent
+                      : (selected
+                          ? (isTv
+                              ? VideoPlatformTheme.accent.withValues(alpha: 0.24)
+                              : VideoPlatformTheme.accent)
+                          : (isFocused
+                              ? VideoPlatformTheme.accent.withValues(alpha: 0.25)
+                              : Colors.transparent)),
+                  borderRadius: BorderRadius.circular(isTv ? 8 : 6),
+                  border: isFocused
+                      ? Border.all(
+                          color: isTv ? Colors.white : VideoPlatformTheme.accent,
+                          width: isTv ? 2.2 : 2.0,
+                        )
+                      : (selected && isTv
+                          ? Border.all(
+                              color: VideoPlatformTheme.accent,
+                              width: 1.5,
+                            )
+                          : null),
+                ),
+                child: Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: isTv ? 14 : 13,
+                    color: (isFocused && isTv) || (selected && !isTv)
+                        ? Colors.white
+                        : ((selected || isFocused)
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.textSecondary),
+                    fontWeight: (selected || isFocused)
+                        ? FontWeight.w700
+                        : FontWeight.w400,
+                  ),
                 ),
               ),
             );

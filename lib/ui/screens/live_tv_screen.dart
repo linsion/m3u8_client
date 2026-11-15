@@ -1408,54 +1408,15 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                   }
                   return Column(
                     children: [
-                      if (_isSidebarCollapsed || _isLiveFullscreen) ...[
+                      if (_isLiveFullscreen)
                         Expanded(
                           child: _buildPlayerPanel(
                             compact: false,
                             groups: groups.toList(),
                             visibleChannels: filteredChannels,
                           ),
-                        ),
-                        if (!_isLiveFullscreen)
-                          InkWell(
-                            onTap: () =>
-                                setState(() => _isSidebarCollapsed = false),
-                            child: Container(
-                              width: double.infinity,
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 14,
-                                vertical: 7,
-                              ),
-                              decoration: BoxDecoration(
-                                color: VideoPlatformTheme.bgElevated,
-                                border: Border(
-                                  top: BorderSide(
-                                    color: VideoPlatformTheme.borderSubtle,
-                                  ),
-                                ),
-                              ),
-                              child: Row(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  Icon(
-                                    Icons.expand_less_rounded,
-                                    size: 18,
-                                    color: VideoPlatformTheme.accent,
-                                  ),
-                                  const SizedBox(width: 6),
-                                  Text(
-                                    '展开频道列表 (${filteredChannels.length})',
-                                    style: TextStyle(
-                                      fontSize: 12.5,
-                                      fontWeight: FontWeight.w600,
-                                      color: VideoPlatformTheme.accent,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                      ] else ...[
+                        )
+                      else ...[
                         AspectRatio(
                           aspectRatio: 16 / 9,
                           child: _buildPlayerPanel(
@@ -1464,64 +1425,423 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                             visibleChannels: filteredChannels,
                           ),
                         ),
-                    InkWell(
-                      onTap: () =>
-                          setState(() => _isSidebarCollapsed = true),
-                      child: Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 14,
-                          vertical: 6,
-                        ),
-                        decoration: BoxDecoration(
-                          color: VideoPlatformTheme.bgElevated,
-                          border: Border.symmetric(
-                            horizontal: BorderSide(
-                              color: VideoPlatformTheme.borderSubtle,
-                            ),
+                        if (_currentChannel != null)
+                          _buildMobileLiveControlStrip(
+                            _currentChannel!,
+                            filteredChannels,
+                          ),
+                        Expanded(
+                          child: _buildChannelSidebar(
+                            state,
+                            groups.toList(),
+                            filteredChannels,
                           ),
                         ),
-                        child: Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            Icon(
-                              Icons.expand_more_rounded,
-                              size: 17,
-                              color: VideoPlatformTheme.textSecondary,
-                            ),
-                            const SizedBox(width: 4),
-                            Text(
-                              '收起频道列表（放大画面）',
-                              style: TextStyle(
-                                fontSize: 12,
-                                fontWeight: FontWeight.w500,
-                                color: VideoPlatformTheme.textSecondary,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
+                      ],
+                    ],
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+  Widget _buildMobileLiveControlStrip(
+    LiveChannel ch,
+    List<LiveChannel> visibleChannels,
+  ) {
+    final epg = _getChannelEpgInfo(ch);
+    final isFav = _favoriteChannelKeys.contains(_channelKey(ch));
+    final activeList = visibleChannels.isNotEmpty
+        ? visibleChannels
+        : widget.appState.liveChannels;
+
+    return Container(
+      height: 44,
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      decoration: BoxDecoration(
+        color: VideoPlatformTheme.bgElevated,
+        border: Border(
+          bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
+        ),
+      ),
+      child: Row(
+        children: [
+          IconButton(
+            visualDensity: VisualDensity.compact,
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+            tooltip: isFav ? '取消收藏' : '收藏频道',
+            onPressed: () => _toggleFavoriteChannel(ch),
+            icon: Icon(
+              isFav ? Icons.star_rounded : Icons.star_border_rounded,
+              size: 19,
+              color: isFav
+                  ? VideoPlatformTheme.warning
+                  : VideoPlatformTheme.textSecondary,
+            ),
+          ),
+          const SizedBox(width: 4),
+          Expanded(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  ch.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                    color: VideoPlatformTheme.textPrimary,
+                  ),
+                ),
+                Text(
+                  '${epg.timeSlot} ${epg.currentTitle}',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 10.5,
+                    color: VideoPlatformTheme.textMuted,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          // Prev / Next channel buttons
+          IconButton(
+            visualDensity: VisualDensity.compact,
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+            tooltip: '上一频道',
+            onPressed: () => _stepChannel(activeList, -1),
+            icon: const Icon(Icons.skip_previous_rounded, size: 20),
+          ),
+          IconButton(
+            visualDensity: VisualDensity.compact,
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+            tooltip: '下一频道',
+            onPressed: () => _stepChannel(activeList, 1),
+            icon: const Icon(Icons.skip_next_rounded, size: 20),
+          ),
+          if (ch.urls.length > 1) ...[
+            const SizedBox(width: 4),
+            InkWell(
+              borderRadius: BorderRadius.circular(14),
+              onTap: () => _playChannel(
+                ch,
+                urlIndex: (_currentUrlIndex + 1) % ch.urls.length,
+              ),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: VideoPlatformTheme.bgCard,
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: VideoPlatformTheme.borderSubtle),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.swap_calls_rounded,
+                      size: 13,
+                      color: VideoPlatformTheme.accent,
                     ),
-                    Expanded(
-                      child: _buildChannelSidebar(
-                        state,
-                        groups.toList(),
-                        filteredChannels,
+                    const SizedBox(width: 3),
+                    Text(
+                      '源${_currentUrlIndex + 1}/${ch.urls.length}',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                        color: VideoPlatformTheme.textPrimary,
                       ),
                     ),
                   ],
+                ),
+              ),
+            ),
+          ],
+          const SizedBox(width: 6),
+          InkWell(
+            borderRadius: BorderRadius.circular(14),
+            onTap: () => _toggleLiveFullscreen(),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+              decoration: BoxDecoration(
+                color: VideoPlatformTheme.accent.withValues(alpha: 0.18),
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: VideoPlatformTheme.accent),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.fullscreen_rounded,
+                    size: 15,
+                    color: VideoPlatformTheme.accent,
+                  ),
+                  const SizedBox(width: 2),
+                  Text(
+                    '全屏',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                      color: VideoPlatformTheme.accent,
+                    ),
+                  ),
                 ],
-              );
-            },
+              ),
+            ),
           ),
-        ),
-      ],
+        ],
       ),
     );
   }
 
   Widget _buildTopBar(AppState state, List<LiveChannel> visibleChannels) {
     final selectedSource = state.selectedLiveSource;
+    final isMobile =
+        MediaQuery.sizeOf(context).width < 860 && !state.tvMode;
+
+    if (isMobile) {
+      return Container(
+        height: 48,
+        padding: const EdgeInsets.symmetric(horizontal: 10),
+        decoration: BoxDecoration(
+          color: VideoPlatformTheme.bgElevated,
+          border: Border(
+            bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
+          ),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              Icons.live_tv_rounded,
+              size: 18,
+              color: VideoPlatformTheme.accent,
+            ),
+            const SizedBox(width: 6),
+            if (state.liveSources.isNotEmpty)
+              Flexible(
+                child: DropdownButtonHideUnderline(
+                  child: Container(
+                    height: 32,
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    decoration: BoxDecoration(
+                      color: VideoPlatformTheme.bgCard,
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(
+                        color: VideoPlatformTheme.borderSubtle,
+                      ),
+                    ),
+                    child: DropdownButton<LiveSource>(
+                      value: state.liveSources.contains(selectedSource)
+                          ? selectedSource
+                          : state.liveSources.first,
+                      isDense: true,
+                      isExpanded: false,
+                      dropdownColor: VideoPlatformTheme.bgElevated,
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w600,
+                        color: VideoPlatformTheme.textPrimary,
+                      ),
+                      items: state.liveSources
+                          .map(
+                            (s) => DropdownMenuItem(
+                              value: s,
+                              child: ConstrainedBox(
+                                constraints:
+                                    const BoxConstraints(maxWidth: 120),
+                                child: Text(
+                                  s.displayName,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ),
+                          )
+                          .toList(),
+                      onChanged: (val) {
+                        if (val != null) {
+                          setState(() => _selectedGroup = '全部');
+                          state.selectLiveSource(
+                            val,
+                            preferClientDirect: !_useServerProxy,
+                          );
+                        }
+                      },
+                    ),
+                  ),
+                ),
+              )
+            else
+              Text(
+                '电视直播',
+                style: TextStyle(
+                  fontSize: 14.5,
+                  fontWeight: FontWeight.w700,
+                  color: VideoPlatformTheme.textPrimary,
+                ),
+              ),
+            const Spacer(),
+            VideoProxyNodeSelector(
+              proxyService: state.proxyService,
+              scenario: RequestScenario.liveStream,
+              overlayStyle: false,
+              compact: true,
+              onProxyChanged: (_) {
+                final ch = _currentChannel;
+                if (ch != null) {
+                  _playChannel(
+                    ch,
+                    urlIndex: _currentUrlIndex,
+                    resetTried: false,
+                    isAutoReconnect: true,
+                  );
+                }
+              },
+            ),
+            const SizedBox(width: 4),
+            PopupMenuButton<String>(
+              tooltip: '更多直播工具',
+              icon: const Icon(Icons.more_vert_rounded, size: 20),
+              onSelected: (action) {
+                switch (action) {
+                  case 'add':
+                    _showAddCustomLiveDialog();
+                    break;
+                  case 'health':
+                    if (!_isCheckingHealth && visibleChannels.isNotEmpty) {
+                      _checkVisibleChannelsHealth(visibleChannels);
+                    }
+                    break;
+                  case 'multiview':
+                    _toggleMultiViewMode();
+                    break;
+                  case 'screenshot':
+                    if (_currentChannel != null) {
+                      _captureLiveScreenshot();
+                    }
+                    break;
+                  case 'export':
+                    if (visibleChannels.isNotEmpty) {
+                      _exportChannelsToM3u(visibleChannels);
+                    }
+                    break;
+                  case 'refresh':
+                    state.loadLiveSources();
+                    break;
+                  case 'delete':
+                    if (selectedSource != null && selectedSource.isCustom) {
+                      state.removeCustomLiveSource(selectedSource);
+                    }
+                    break;
+                }
+              },
+              itemBuilder: (_) => [
+                const PopupMenuItem(
+                  value: 'add',
+                  child: Row(
+                    children: [
+                      Icon(Icons.add_link_rounded, size: 17),
+                      SizedBox(width: 8),
+                      Text('添加 M3U 直播源'),
+                    ],
+                  ),
+                ),
+                PopupMenuItem(
+                  value: 'health',
+                  enabled: !_isCheckingHealth && visibleChannels.isNotEmpty,
+                  child: Row(
+                    children: [
+                      const Icon(Icons.network_check_rounded, size: 17),
+                      const SizedBox(width: 8),
+                      Text(_isCheckingHealth ? '正在检测延迟...' : '检测频道可用性'),
+                    ],
+                  ),
+                ),
+                PopupMenuItem(
+                  value: 'multiview',
+                  child: Row(
+                    children: [
+                      Icon(
+                        _isMultiViewMode
+                            ? Icons.grid_view_rounded
+                            : Icons.grid_on_rounded,
+                        size: 17,
+                      ),
+                      const SizedBox(width: 8),
+                      Text(_isMultiViewMode ? '退出四分屏同看' : '开启四分屏同看'),
+                    ],
+                  ),
+                ),
+                PopupMenuItem(
+                  value: 'screenshot',
+                  enabled: _currentChannel != null,
+                  child: const Row(
+                    children: [
+                      Icon(Icons.camera_alt_outlined, size: 17),
+                      SizedBox(width: 8),
+                      Text('直播画面截图'),
+                    ],
+                  ),
+                ),
+                PopupMenuItem(
+                  value: 'export',
+                  enabled: visibleChannels.isNotEmpty,
+                  child: Row(
+                    children: [
+                      const Icon(Icons.file_download_outlined, size: 17),
+                      const SizedBox(width: 8),
+                      Text(
+                        _favoriteChannelKeys.isNotEmpty
+                            ? '导出收藏 M3U'
+                            : '导出频道 M3U',
+                      ),
+                    ],
+                  ),
+                ),
+                const PopupMenuItem(
+                  value: 'refresh',
+                  child: Row(
+                    children: [
+                      Icon(Icons.refresh_rounded, size: 17),
+                      SizedBox(width: 8),
+                      Text('刷新直播源列表'),
+                    ],
+                  ),
+                ),
+                if (selectedSource != null && selectedSource.isCustom) ...[
+                  const PopupMenuDivider(),
+                  const PopupMenuItem(
+                    value: 'delete',
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.delete_outline,
+                          size: 17,
+                          color: Color(0xFFEF4444),
+                        ),
+                        SizedBox(width: 8),
+                        Text(
+                          '删除此自定义源',
+                          style: TextStyle(color: Color(0xFFEF4444)),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ],
+        ),
+      );
+    }
     return Container(
       height: 50,
       padding: const EdgeInsets.symmetric(horizontal: 10),
@@ -1770,87 +2090,104 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
       );
     }
 
+    final isMobile =
+        MediaQuery.sizeOf(context).width < 860 && !state.tvMode;
+
     return Container(
       color: VideoPlatformTheme.bgElevated,
       child: Column(
         children: [
           Padding(
-            padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+            padding: EdgeInsets.fromLTRB(
+              12,
+              isMobile ? 6 : 10,
+              12,
+              isMobile ? 6 : 8,
+            ),
             child: Row(
               children: [
                 Expanded(
                   child: state.tvMode
                       ? _buildTvChannelSearchButton()
-                      : TextField(
-                          onChanged: (v) => setState(() => _channelSearch = v),
-                          decoration: InputDecoration(
-                            hintText: '搜索频道名称（如：CCTV、卫视）...',
-                            prefixIcon: Icon(
-                              Icons.search,
-                              size: 17,
-                              color: VideoPlatformTheme.textMuted,
+                      : SizedBox(
+                          height: isMobile ? 34 : null,
+                          child: TextField(
+                            onChanged: (v) =>
+                                setState(() => _channelSearch = v),
+                            style: TextStyle(fontSize: isMobile ? 12.5 : 13),
+                            decoration: InputDecoration(
+                              isDense: isMobile,
+                              hintText: '搜索频道名称（如：CCTV、卫视）...',
+                              prefixIcon: Icon(
+                                Icons.search,
+                                size: isMobile ? 16 : 17,
+                                color: VideoPlatformTheme.textMuted,
+                              ),
                             ),
                           ),
                         ),
                 ),
-                const SizedBox(width: 6),
-                InkWell(
-                  borderRadius: BorderRadius.circular(6),
-                  onFocusChange: (_) {
-                    if (mounted) setState(() {});
-                  },
-                  onTap: () {
-                    setState(() => _isSidebarCollapsed = true);
-                    WidgetsBinding.instance.addPostFrameCallback((_) {
-                      if (mounted) _playerFocusNode.requestFocus();
-                    });
-                  },
-                  child: Builder(
-                    builder: (ctx) {
-                      final isFocused = Focus.of(ctx).hasPrimaryFocus;
-                      return Container(
-                        height: 36,
-                        padding: const EdgeInsets.symmetric(horizontal: 8),
-                        decoration: BoxDecoration(
-                          color: isFocused
-                              ? VideoPlatformTheme.accent.withValues(alpha: 0.28)
-                              : VideoPlatformTheme.bgCard,
-                          borderRadius: BorderRadius.circular(6),
-                          border: Border.all(
+                if (!isMobile) ...[
+                  const SizedBox(width: 6),
+                  InkWell(
+                    borderRadius: BorderRadius.circular(6),
+                    onFocusChange: (_) {
+                      if (mounted) setState(() {});
+                    },
+                    onTap: () {
+                      setState(() => _isSidebarCollapsed = true);
+                      WidgetsBinding.instance.addPostFrameCallback((_) {
+                        if (mounted) _playerFocusNode.requestFocus();
+                      });
+                    },
+                    child: Builder(
+                      builder: (ctx) {
+                        final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                        return Container(
+                          height: 36,
+                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                          decoration: BoxDecoration(
                             color: isFocused
-                                ? Colors.white
-                                : VideoPlatformTheme.borderSubtle,
-                            width: isFocused ? 2.0 : 1.0,
-                          ),
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(
-                              Icons.chevron_left_rounded,
-                              size: 16,
+                                ? VideoPlatformTheme.accent
+                                    .withValues(alpha: 0.28)
+                                : VideoPlatformTheme.bgCard,
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(
                               color: isFocused
                                   ? Colors.white
-                                  : VideoPlatformTheme.textSecondary,
+                                  : VideoPlatformTheme.borderSubtle,
+                              width: isFocused ? 2.0 : 1.0,
                             ),
-                            Text(
-                              '收起',
-                              style: TextStyle(
-                                fontSize: 11.5,
-                                fontWeight: isFocused
-                                    ? FontWeight.w700
-                                    : FontWeight.w500,
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.chevron_left_rounded,
+                                size: 16,
                                 color: isFocused
                                     ? Colors.white
                                     : VideoPlatformTheme.textSecondary,
                               ),
-                            ),
-                          ],
-                        ),
-                      );
-                    },
+                              Text(
+                                '收起',
+                                style: TextStyle(
+                                  fontSize: 11.5,
+                                  fontWeight: isFocused
+                                      ? FontWeight.w700
+                                      : FontWeight.w500,
+                                  color: isFocused
+                                      ? Colors.white
+                                      : VideoPlatformTheme.textSecondary,
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
                   ),
-                ),
+                ],
               ],
             ),
           ),
@@ -2756,6 +3093,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                               ),
                             // Top-right proxy selector + real-time download speed HUD + Fullscreen button
                             if (ch != null &&
+                                !compact &&
                                 _digitInputBuffer.isEmpty &&
                                 (!_isLiveFullscreen || _liveOsdVisible))
                               Positioned(
@@ -3119,7 +3457,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                           ],
                         ),
                 ),
-                if (!_isLiveFullscreen && ch != null)
+                if (!_isLiveFullscreen && !compact && ch != null)
                   _buildLiveBottomControlBar(
                     ch,
                     activeList,
@@ -3180,7 +3518,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
             children: [
               // Drawer header
               Container(
-                height: 46,
+                height: 48,
                 padding: const EdgeInsets.symmetric(horizontal: 14),
                 decoration: BoxDecoration(
                   color: const Color(0xFF0F1824),
@@ -3198,7 +3536,9 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                     const SizedBox(width: 8),
                     const Expanded(
                       child: Text(
-                        '全屏快速换台 · OK键选台 / 返回键关闭',
+                        '快速换台 · OK选台 / 返回关闭',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
                         style: TextStyle(
                           color: Colors.white,
                           fontSize: 13,
@@ -3206,6 +3546,79 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                         ),
                       ),
                     ),
+                    if (widget.appState.liveSources.length > 1)
+                      InkWell(
+                        borderRadius: BorderRadius.circular(6),
+                        onFocusChange: (_) {
+                          if (mounted) setState(() {});
+                        },
+                        onTap: () {
+                          final sources = widget.appState.liveSources;
+                          final cur = widget.appState.selectedLiveSource;
+                          final curIdx =
+                              cur != null ? sources.indexOf(cur) : 0;
+                          final nextSrc =
+                              sources[(curIdx + 1) % sources.length];
+                          setState(() => _selectedGroup = '全部');
+                          widget.appState.selectLiveSource(
+                            nextSrc,
+                            preferClientDirect: !_useServerProxy,
+                          );
+                        },
+                        child: Builder(
+                          builder: (ctx) {
+                            final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                            return Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 4,
+                              ),
+                              decoration: BoxDecoration(
+                                color: isFocused
+                                    ? VideoPlatformTheme.accent
+                                    : const Color(0xFF1A2636),
+                                borderRadius: BorderRadius.circular(6),
+                                border: Border.all(
+                                  color: isFocused
+                                      ? Colors.white
+                                      : VideoPlatformTheme.accent,
+                                  width: isFocused ? 2.0 : 1.0,
+                                ),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    Icons.swap_horiz_rounded,
+                                    size: 14,
+                                    color: isFocused
+                                        ? Colors.white
+                                        : VideoPlatformTheme.accent,
+                                  ),
+                                  const SizedBox(width: 4),
+                                  ConstrainedBox(
+                                    constraints:
+                                        const BoxConstraints(maxWidth: 96),
+                                    child: Text(
+                                      widget.appState.selectedLiveSource
+                                              ?.displayName ??
+                                          '换直播源',
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 11.5,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                    const SizedBox(width: 4),
                     IconButton(
                       visualDensity: VisualDensity.compact,
                       tooltip: '关闭频道抽屉',

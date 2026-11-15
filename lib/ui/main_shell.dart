@@ -42,7 +42,6 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   int _selectedIndex = 0;
   bool _isSidebarCollapsed = false;
   bool _isMobileSidebarOpen = false;
-  bool _showMobileSearchInput = false;
   final TextEditingController _searchController = TextEditingController();
   String? _lastSniffedClipboardUrl;
   DateTime? _lastBackHandledAt;
@@ -343,13 +342,9 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       return;
     }
 
-    // Step 3: Close mobile overlay drawer or mobile search input if open
+    // Step 3: Close mobile overlay drawer if open
     if (_isMobileSidebarOpen) {
       setState(() => _isMobileSidebarOpen = false);
-      return;
-    }
-    if (_showMobileSearchInput) {
-      setState(() => _showMobileSearchInput = false);
       return;
     }
 
@@ -367,11 +362,11 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       return;
     }
 
-    // Step 5: On TV / Desktop layout, step focus back from Right Content Area -> Left Navigation Sidebar -> Main Tab 0 Focus
+    // Step 5: On TV / Desktop layout, step focus back from Content Area -> Main Navigation Bar/Sidebar -> Tab 0 Focus
     final screenW = MediaQuery.maybeSizeOf(context)?.width ?? 1024;
     final isDesktopOrTv = screenW >= 860 || state.tvMode;
     if (isDesktopOrTv) {
-      if (_isSidebarCollapsed || !_isFocusInsideSidebar()) {
+      if ((!state.tvMode && _isSidebarCollapsed) || !_isFocusInsideSidebar()) {
         _focusSidebarTab(_selectedIndex);
         return;
       }
@@ -464,6 +459,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                               Row(
                                 children: [
                                   if (!isImmersive &&
+                                      !state.tvMode &&
                                       !useOverlaySidebar &&
                                       isSidebarOpen)
                                     FocusTraversalGroup(
@@ -486,6 +482,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                                 ],
                               ),
                               if (!isImmersive &&
+                                  !state.tvMode &&
                                   !useOverlaySidebar &&
                                   !isSidebarOpen)
                                 Positioned(
@@ -577,7 +574,6 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
 
   Widget _buildTopHeader(AppState state, bool isDesktop, double screenWidth) {
     final activeSource = state.selectedSource;
-    final isCompactMobile = screenWidth < 720;
     final isSidebarOpen =
         isDesktop ? !_isSidebarCollapsed : _isMobileSidebarOpen;
 
@@ -740,242 +736,24 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       );
     }
 
-    if (isCompactMobile) {
-      final showSearchRow = _selectedIndex == 0 ||
-          _showMobileSearchInput ||
-          state.searchKeyword.isNotEmpty;
+    if (state.tvMode) {
+      return _buildTvLeanbackHeader(state, activeSource: activeSource);
+    }
 
-      return Container(
-        decoration: BoxDecoration(
-          color: VideoPlatformTheme.bgElevated,
-          border: Border(
-            bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
-          ),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            // Row 1: Sidebar toggle + Logo + Source Selector + Scrollable Action Strip
-            SizedBox(
-              height: 48,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 8),
-                child: Row(
-                  children: [
-                    IconButton(
-                      visualDensity: VisualDensity.compact,
-                      tooltip: isSidebarOpen ? '收起侧边导航栏' : '展开侧边导航栏',
-                      onPressed: toggleSidebar,
-                      icon: Icon(
-                        isSidebarOpen
-                            ? Icons.menu_open_rounded
-                            : Icons.menu_rounded,
-                        size: 21,
-                        color: isSidebarOpen
-                            ? VideoPlatformTheme.accent
-                            : VideoPlatformTheme.textPrimary,
-                      ),
-                    ),
-                    InkWell(
-                      onTap: () {
-                        _selectTab(0);
-                        if (state.searchKeyword.isNotEmpty) {
-                          _searchController.clear();
-                          state.clearSearch();
-                        }
-                      },
-                      child: const Padding(
-                        padding: EdgeInsets.symmetric(horizontal: 4),
-                        child: AppBrandLogo(size: 26),
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    buildSourceSelectorButton(maxWidth: 105),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: Align(
-                        alignment: Alignment.centerRight,
-                        child: SingleChildScrollView(
-                          scrollDirection: Axis.horizontal,
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              if (_selectedIndex != 0)
-                                IconButton(
-                                  visualDensity: VisualDensity.compact,
-                                  tooltip: '展开/收起顶部搜索栏',
-                                  onPressed: () {
-                                    if (state.tvMode) {
-                                      _showTvSearchInputDialog(state);
-                                    } else {
-                                      setState(
-                                        () => _showMobileSearchInput =
-                                            !_showMobileSearchInput,
-                                      );
-                                    }
-                                  },
-                                  icon: Icon(
-                                    _showMobileSearchInput
-                                        ? Icons.search_off_rounded
-                                        : Icons.search_rounded,
-                                    size: 20,
-                                    color: _showMobileSearchInput
-                                        ? VideoPlatformTheme.accent
-                                        : VideoPlatformTheme.textSecondary,
-                                  ),
-                                ),
-                              _buildProxyQuickBadge(state),
-                              const SizedBox(width: 4),
-                              _buildTvModeButton(state),
-                              _buildThemePickerButton(state),
-                              IconButton(
-                                visualDensity: VisualDensity.compact,
-                                tooltip: '观看历史与收藏',
-                                onPressed: () => _selectTab(4),
-                                icon: Icon(
-                                  Icons.history_rounded,
-                                  size: 20,
-                                  color: _selectedIndex == 4
-                                      ? VideoPlatformTheme.accent
-                                      : VideoPlatformTheme.textSecondary,
-                                ),
-                              ),
-                              IconButton(
-                                visualDensity: VisualDensity.compact,
-                                tooltip: '偏好与服务端设置',
-                                onPressed: () => _selectTab(8),
-                                icon: Icon(
-                                  Icons.settings_outlined,
-                                  size: 19,
-                                  color: _selectedIndex == 8
-                                      ? VideoPlatformTheme.accent
-                                      : VideoPlatformTheme.textSecondary,
-                                ),
-                              ),
-                              PopupMenuButton<int>(
-                                tooltip: '更多功能',
-                                icon: const Icon(
-                                  Icons.more_vert_rounded,
-                                  size: 20,
-                                ),
-                                onSelected: (idx) {
-                                  if (idx == 99) {
-                                    state.logout();
-                                  } else if (idx == 98) {
-                                    _openCommandPalette();
-                                  } else {
-                                    _selectTab(idx);
-                                  }
-                                },
-                                itemBuilder: (_) => const [
-                                  PopupMenuItem(
-                                    value: 98,
-                                    child: Text('全局命令面板'),
-                                  ),
-                                  PopupMenuItem(
-                                    value: 4,
-                                    child: Text('观看历史与收藏'),
-                                  ),
-                                  PopupMenuItem(
-                                    value: 5,
-                                    child: Text('Telegram 会话'),
-                                  ),
-                                  PopupMenuItem(
-                                    value: 6,
-                                    child: Text('代理服务器'),
-                                  ),
-                                  PopupMenuItem(
-                                    value: 7,
-                                    child: Text('终端命令行'),
-                                  ),
-                                  PopupMenuItem(
-                                    value: 8,
-                                    child: Text('偏好与服务端设置'),
-                                  ),
-                                  PopupMenuDivider(),
-                                  PopupMenuItem(
-                                    value: 99,
-                                    child: Text('退出登录'),
-                                  ),
-                                ],
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            // Row 2: Horizontally Scrollable Top Navigation Strip (ensures all modules are 100% visible & reachable on mobile)
-            Container(
-              height: 36,
-              decoration: BoxDecoration(
-                border: Border(
-                  top: BorderSide(
-                    color:
-                        VideoPlatformTheme.borderSubtle.withValues(alpha: 0.6),
-                  ),
-                ),
-              ),
-              child: ListView(
-                scrollDirection: Axis.horizontal,
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                children: [
-                  _buildMobileTopNavChip(0, Icons.home_filled, '影视片库'),
-                  _buildMobileTopNavChip(1, Icons.live_tv_rounded, '电视直播'),
-                  _buildMobileTopNavChip(
-                    2,
-                    Icons.download_for_offline_outlined,
-                    state.activeTasksCount > 0
-                        ? '下载 (${state.activeTasksCount})'
-                        : '下载工作台',
-                  ),
-                  _buildMobileTopNavChip(
-                    3,
-                    Icons.folder_copy_outlined,
-                    '视频资料库',
-                  ),
-                  _buildMobileTopNavChip(
-                    4,
-                    Icons.bookmarks_outlined,
-                    '历史与收藏',
-                  ),
-                  _buildMobileTopNavChip(
-                    5,
-                    Icons.send_rounded,
-                    state.telegramNotifications.totalUnreadNotificationCount > 0
-                        ? 'Telegram (${state.telegramNotifications.totalUnreadNotificationCount})'
-                        : 'Telegram',
-                  ),
-                  _buildMobileTopNavChip(
-                    6,
-                    Icons.swap_horiz_rounded,
-                    '代理服务器',
-                  ),
-                  _buildMobileTopNavChip(
-                    7,
-                    Icons.terminal_rounded,
-                    '终端命令行',
-                  ),
-                  _buildMobileTopNavChip(
-                    8,
-                    Icons.settings_outlined,
-                    '偏好设置',
-                  ),
-                ],
-              ),
-            ),
-            // Row 3: Full-width Search Bar (shown on VOD home or when search toggled)
-            if (showSearchRow)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(10, 4, 10, 8),
-                child: buildInlineSearchBox(),
-              ),
-          ],
-        ),
-      );
+    if (!isDesktop) {
+      // Live TV (1) and Telegram (5) have their own dedicated mobile headers;
+      // hiding MainShell's header prevents double-stacked headers on phones.
+      if (_selectedIndex == 1 || _selectedIndex == 5) {
+        return const SizedBox.shrink();
+      }
+      if (_selectedIndex == 0) {
+        return _buildMobileVodTopHeader(
+          state,
+          activeSource: activeSource,
+          buildSourceSelectorButton: buildSourceSelectorButton,
+        );
+      }
+      return _buildMobileContextualTopHeader(state);
     }
 
     return Container(
@@ -1192,50 +970,607 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildMobileTopNavChip(int index, IconData icon, String label) {
-    final selected = _selectedIndex == index;
-    return Padding(
-      padding: const EdgeInsets.only(right: 6),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(14),
-        onTap: () => _selectTab(index),
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
-          decoration: BoxDecoration(
-            color: selected
-                ? VideoPlatformTheme.accent.withValues(alpha: 0.18)
-                : VideoPlatformTheme.bgCard,
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(
-              color: selected
-                  ? VideoPlatformTheme.accent
-                  : VideoPlatformTheme.borderSubtle,
+  Widget _buildTvLeanbackHeader(
+    AppState state, {
+    required VodSource? activeSource,
+  }) {
+    final proxySvc = state.proxyService;
+    final proxyEnabled = proxySvc.proxyEnabled;
+    final activeProxyNode = proxySvc.activeNode;
+    final tgUnread =
+        state.telegramNotifications.totalUnreadNotificationCount;
+
+    return Container(
+      key: _sidebarContainerKey,
+      height: 64,
+      padding: const EdgeInsets.symmetric(horizontal: 20),
+      decoration: BoxDecoration(
+        color: VideoPlatformTheme.bgElevated,
+        border: Border(
+          bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
+        ),
+      ),
+      child: Row(
+        children: [
+          // Brand Logo & TV Badge
+          const AppBrandLogo(size: 32),
+          const SizedBox(width: 10),
+          Text(
+            '流光 TV',
+            style: TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.w800,
+              color: VideoPlatformTheme.textPrimary,
+              letterSpacing: 0.5,
             ),
           ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(
-                icon,
-                size: 13.5,
-                color: selected
-                    ? VideoPlatformTheme.accent
-                    : VideoPlatformTheme.textSecondary,
+          const SizedBox(width: 20),
+          // Center: Large 10-foot D-Pad Navigation Tabs
+          Expanded(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  _buildTvNavTabButton(
+                    index: 0,
+                    icon: Icons.movie_filter_rounded,
+                    label: '影视大厅',
+                  ),
+                  const SizedBox(width: 8),
+                  _buildTvNavTabButton(
+                    index: 1,
+                    icon: Icons.live_tv_rounded,
+                    label: '电视直播',
+                  ),
+                  const SizedBox(width: 8),
+                  _buildTvNavTabButton(
+                    index: 4,
+                    icon: Icons.bookmarks_outlined,
+                    label: '历史收藏',
+                  ),
+                  const SizedBox(width: 8),
+                  _buildTvNavTabButton(
+                    index: 5,
+                    icon: Icons.send_rounded,
+                    label: 'Telegram',
+                    badgeCount: tgUnread,
+                  ),
+                  const SizedBox(width: 8),
+                  _buildTvNavTabButton(
+                    index: 3,
+                    icon: Icons.folder_copy_outlined,
+                    label: '资料库',
+                  ),
+                  const SizedBox(width: 8),
+                  _buildTvNavTabButton(
+                    index: 2,
+                    icon: Icons.downloading_rounded,
+                    label: '下载',
+                    badgeCount: state.activeTasksCount,
+                  ),
+                  const SizedBox(width: 8),
+                  _buildTvNavTabButton(
+                    index: 6,
+                    icon: Icons.swap_horiz_rounded,
+                    label: '代理加速',
+                  ),
+                  const SizedBox(width: 8),
+                  _buildTvNavTabButton(
+                    index: 8,
+                    icon: Icons.settings_outlined,
+                    label: '系统设置',
+                  ),
+                ],
               ),
-              const SizedBox(width: 4),
-              Text(
-                label,
-                style: TextStyle(
-                  fontSize: 11.5,
-                  fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
-                  color: selected
+            ),
+          ),
+          const SizedBox(width: 12),
+          // Right: High-Contrast TV Remote Action Pills (Source, Search, Proxy, Exit TV Mode)
+          _buildTvHeaderActionPill(
+            icon: Icons.layers_outlined,
+            label: activeSource?.name ??
+                (state.isConnecting ? '加载中...' : '切换片源'),
+            highlighted: true,
+            onTap: state.sources.isEmpty
+                ? null
+                : () {
+                    SourcePickerDialog.show(
+                      context,
+                      sources: state.visibleSources,
+                      selectedSource: state.selectedSource,
+                      onSelect: (src) {
+                        _selectTab(0);
+                        state.selectVodSource(src);
+                      },
+                    );
+                  },
+          ),
+          const SizedBox(width: 8),
+          _buildTvHeaderActionPill(
+            icon: Icons.search_rounded,
+            label: state.searchKeyword.isNotEmpty
+                ? '搜索: ${state.searchKeyword}'
+                : '搜索影视',
+            highlighted: state.searchKeyword.isNotEmpty,
+            onTap: () {
+              if (_selectedIndex != 0) {
+                _selectTab(0);
+              }
+              _showTvSearchInputDialog(state);
+            },
+          ),
+          const SizedBox(width: 8),
+          _buildTvHeaderActionPill(
+            icon: proxyEnabled
+                ? Icons.vpn_lock_rounded
+                : Icons.public_off_rounded,
+            label: proxyEnabled
+                ? (activeProxyNode?.displayTitle ?? '代理已开')
+                : '代理: 直连',
+            highlighted: proxyEnabled,
+            onTap: () => _selectTab(6),
+          ),
+          const SizedBox(width: 6),
+          _buildTvModeButton(state),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTvNavTabButton({
+    required int index,
+    required IconData icon,
+    required String label,
+    int badgeCount = 0,
+  }) {
+    final selected = _selectedIndex == index;
+    return InkWell(
+      focusNode: _sidebarTabFocusNodes[index],
+      borderRadius: BorderRadius.circular(10),
+      onFocusChange: (_) {
+        if (mounted) setState(() {});
+      },
+      onTap: () => _selectTab(index),
+      child: Builder(
+        builder: (ctx) {
+          final isFocused = Focus.of(ctx).hasPrimaryFocus;
+          if (isFocused) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (ctx.mounted) {
+                Scrollable.ensureVisible(
+                  ctx,
+                  alignment: 0.5,
+                  duration: const Duration(milliseconds: 140),
+                );
+              }
+            });
+          }
+          return AnimatedScale(
+            scale: isFocused ? 1.06 : 1.0,
+            duration: const Duration(milliseconds: 140),
+            child: Container(
+              height: 42,
+              padding: const EdgeInsets.symmetric(horizontal: 14),
+              decoration: BoxDecoration(
+                color: isFocused
+                    ? VideoPlatformTheme.accent
+                    : (selected
+                        ? VideoPlatformTheme.accent.withValues(alpha: 0.20)
+                        : VideoPlatformTheme.bgCard),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                  color: isFocused
+                      ? Colors.white
+                      : (selected
+                          ? VideoPlatformTheme.accent
+                          : VideoPlatformTheme.borderSubtle),
+                  width: isFocused ? 2.4 : (selected ? 1.6 : 1.0),
+                ),
+                boxShadow: isFocused
+                    ? [
+                        BoxShadow(
+                          color:
+                              VideoPlatformTheme.accent.withValues(alpha: 0.55),
+                          blurRadius: 12,
+                          spreadRadius: 1,
+                        ),
+                      ]
+                    : null,
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    icon,
+                    size: 18,
+                    color: isFocused
+                        ? Colors.white
+                        : (selected
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.textSecondary),
+                  ),
+                  const SizedBox(width: 7),
+                  Text(
+                    label,
+                    style: TextStyle(
+                      fontSize: 14.5,
+                      fontWeight: (selected || isFocused)
+                          ? FontWeight.w700
+                          : FontWeight.w500,
+                      color: isFocused
+                          ? Colors.white
+                          : (selected
+                              ? VideoPlatformTheme.accent
+                              : VideoPlatformTheme.textPrimary),
+                    ),
+                  ),
+                  if (badgeCount > 0) ...[
+                    const SizedBox(width: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 1,
+                      ),
+                      decoration: BoxDecoration(
+                        color: isFocused
+                            ? Colors.white
+                            : VideoPlatformTheme.accent,
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Text(
+                        badgeCount > 99 ? '99+' : '$badgeCount',
+                        style: TextStyle(
+                          fontSize: 10.5,
+                          fontWeight: FontWeight.w700,
+                          color: isFocused
+                              ? VideoPlatformTheme.accent
+                              : Colors.white,
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildTvHeaderActionPill({
+    required IconData icon,
+    required String label,
+    required VoidCallback? onTap,
+    bool highlighted = false,
+  }) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(20),
+      onFocusChange: (_) {
+        if (mounted) setState(() {});
+      },
+      onTap: onTap,
+      child: Builder(
+        builder: (ctx) {
+          final isFocused = Focus.of(ctx).hasPrimaryFocus;
+          return AnimatedScale(
+            scale: isFocused ? 1.06 : 1.0,
+            duration: const Duration(milliseconds: 140),
+            child: Container(
+              height: 40,
+              padding: const EdgeInsets.symmetric(horizontal: 13),
+              decoration: BoxDecoration(
+                color: isFocused
+                    ? VideoPlatformTheme.accent
+                    : (highlighted
+                        ? VideoPlatformTheme.accent.withValues(alpha: 0.16)
+                        : VideoPlatformTheme.bgCard),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(
+                  color: isFocused
+                      ? Colors.white
+                      : (highlighted
+                          ? VideoPlatformTheme.accent
+                          : VideoPlatformTheme.borderSubtle),
+                  width: isFocused ? 2.4 : 1.2,
+                ),
+                boxShadow: isFocused
+                    ? [
+                        BoxShadow(
+                          color:
+                              VideoPlatformTheme.accent.withValues(alpha: 0.5),
+                          blurRadius: 10,
+                          spreadRadius: 1,
+                        ),
+                      ]
+                    : null,
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    icon,
+                    size: 16,
+                    color: isFocused
+                        ? Colors.white
+                        : (highlighted
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.textSecondary),
+                  ),
+                  const SizedBox(width: 6),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 120),
+                    child: Text(
+                      label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: (isFocused || highlighted)
+                            ? FontWeight.w700
+                            : FontWeight.w500,
+                        color: isFocused
+                            ? Colors.white
+                            : VideoPlatformTheme.textPrimary,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildMobileVodTopHeader(
+    AppState state, {
+    required VodSource? activeSource,
+    required Widget Function({double maxWidth}) buildSourceSelectorButton,
+  }) {
+    final proxyEnabled = state.proxyService.proxyEnabled;
+    return Container(
+      height: 52,
+      padding: const EdgeInsets.symmetric(horizontal: 10),
+      decoration: BoxDecoration(
+        color: VideoPlatformTheme.bgElevated,
+        border: Border(
+          bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
+        ),
+      ),
+      child: Row(
+        children: [
+          // 1. Source selector pill
+          buildSourceSelectorButton(maxWidth: 88),
+          const SizedBox(width: 8),
+          // 2. Integrated rounded search pill with inline aggregated/single toggle
+          Expanded(
+            child: Container(
+              height: 36,
+              decoration: BoxDecoration(
+                color: VideoPlatformTheme.bgCard,
+                borderRadius: BorderRadius.circular(18),
+                border: Border.all(color: VideoPlatformTheme.borderSubtle),
+              ),
+              child: Row(
+                children: [
+                  const SizedBox(width: 10),
+                  Icon(
+                    Icons.search_rounded,
+                    size: 16,
+                    color: VideoPlatformTheme.textMuted,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: TextField(
+                      controller: _searchController,
+                      onSubmitted: _submitSearch,
+                      textInputAction: TextInputAction.search,
+                      style: const TextStyle(fontSize: 13),
+                      decoration: InputDecoration(
+                        isDense: true,
+                        border: InputBorder.none,
+                        enabledBorder: InputBorder.none,
+                        focusedBorder: InputBorder.none,
+                        filled: false,
+                        contentPadding: EdgeInsets.zero,
+                        hintText: state.aggregatedSearch
+                            ? '全网搜索影视/演员...'
+                            : '搜索当前站点...',
+                        hintStyle: TextStyle(
+                          fontSize: 12.5,
+                          color: VideoPlatformTheme.textMuted,
+                        ),
+                      ),
+                    ),
+                  ),
+                  if (_searchController.text.isNotEmpty ||
+                      state.searchKeyword.isNotEmpty)
+                    InkWell(
+                      borderRadius: BorderRadius.circular(12),
+                      onTap: () {
+                        _searchController.clear();
+                        state.clearSearch();
+                        setState(() {});
+                      },
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 4),
+                        child: Icon(
+                          Icons.cancel_rounded,
+                          size: 15,
+                          color: VideoPlatformTheme.textMuted,
+                        ),
+                      ),
+                    ),
+                  InkWell(
+                    borderRadius: BorderRadius.circular(14),
+                    onTap: () => state.setAggregatedSearch(
+                      !state.aggregatedSearch,
+                    ),
+                    child: Container(
+                      margin: const EdgeInsets.only(right: 4),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 7,
+                        vertical: 3,
+                      ),
+                      decoration: BoxDecoration(
+                        color: state.aggregatedSearch
+                            ? VideoPlatformTheme.accent.withValues(alpha: 0.18)
+                            : VideoPlatformTheme.bgElevated,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: state.aggregatedSearch
+                              ? VideoPlatformTheme.accent
+                              : VideoPlatformTheme.borderSubtle,
+                        ),
+                      ),
+                      child: Text(
+                        state.aggregatedSearch ? '全网' : '单站',
+                        style: TextStyle(
+                          fontSize: 10.5,
+                          fontWeight: FontWeight.w600,
+                          color: state.aggregatedSearch
+                              ? VideoPlatformTheme.accent
+                              : VideoPlatformTheme.textSecondary,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(width: 6),
+          // 3. Compact Proxy indicator button (tap -> Proxy settings, long-press -> toggle)
+          InkWell(
+            borderRadius: BorderRadius.circular(16),
+            onTap: () => _selectTab(6),
+            onLongPress: () =>
+                state.proxyService.setProxyEnabled(!proxyEnabled),
+            child: Container(
+              width: 34,
+              height: 34,
+              decoration: BoxDecoration(
+                color: proxyEnabled
+                    ? VideoPlatformTheme.accent.withValues(alpha: 0.16)
+                    : VideoPlatformTheme.bgCard,
+                shape: BoxShape.circle,
+                border: Border.all(
+                  color: proxyEnabled
                       ? VideoPlatformTheme.accent
-                      : VideoPlatformTheme.textPrimary,
+                      : VideoPlatformTheme.borderSubtle,
                 ),
               ),
-            ],
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  Icon(
+                    proxyEnabled
+                        ? Icons.vpn_lock_rounded
+                        : Icons.public_off_rounded,
+                    size: 16,
+                    color: proxyEnabled
+                        ? VideoPlatformTheme.accent
+                        : VideoPlatformTheme.textSecondary,
+                  ),
+                  if (proxyEnabled)
+                    Positioned(
+                      right: 6,
+                      top: 6,
+                      child: Container(
+                        width: 6,
+                        height: 6,
+                        decoration: const BoxDecoration(
+                          color: Color(0xFF22C55E),
+                          shape: BoxShape.circle,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
           ),
+          const SizedBox(width: 4),
+          // 4. Quick Watch History button
+          IconButton(
+            visualDensity: VisualDensity.compact,
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(minWidth: 34, minHeight: 34),
+            tooltip: '观看历史与收藏',
+            onPressed: () => _selectTab(4),
+            icon: Icon(
+              Icons.history_rounded,
+              size: 20,
+              color: VideoPlatformTheme.textSecondary,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMobileContextualTopHeader(AppState state) {
+    final (IconData icon, String title) = switch (_selectedIndex) {
+      2 => (Icons.downloading_rounded, '下载与嗅探中心'),
+      3 => (Icons.folder_copy_outlined, '本地视频资料库'),
+      4 => (Icons.bookmarks_outlined, '观看历史与收藏'),
+      6 => (Icons.swap_horiz_rounded, '代理加速与分流'),
+      7 => (Icons.terminal_rounded, '系统终端命令行'),
+      8 => (Icons.settings_outlined, '偏好与服务端设置'),
+      _ => (Icons.video_library_rounded, '流光视频'),
+    };
+    final isSubPage = _selectedIndex != 2;
+
+    return Container(
+      height: 48,
+      padding: const EdgeInsets.symmetric(horizontal: 10),
+      decoration: BoxDecoration(
+        color: VideoPlatformTheme.bgElevated,
+        border: Border(
+          bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
         ),
+      ),
+      child: Row(
+        children: [
+          if (isSubPage)
+            IconButton(
+              visualDensity: VisualDensity.compact,
+              tooltip: '返回影视首页',
+              onPressed: () => _selectTab(0),
+              icon: const Icon(Icons.arrow_back_ios_new_rounded, size: 17),
+            )
+          else
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 6),
+              child: Icon(icon, size: 19, color: VideoPlatformTheme.accent),
+            ),
+          const SizedBox(width: 4),
+          Expanded(
+            child: Text(
+              title,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 15,
+                fontWeight: FontWeight.w700,
+                color: VideoPlatformTheme.textPrimary,
+              ),
+            ),
+          ),
+          _buildProxyQuickBadge(state),
+          const SizedBox(width: 4),
+          IconButton(
+            visualDensity: VisualDensity.compact,
+            tooltip: '更多功能与设置',
+            onPressed: () => _showMobileMoreHubSheet(state),
+            icon: Icon(
+              Icons.apps_rounded,
+              size: 20,
+              color: VideoPlatformTheme.textSecondary,
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -1984,13 +2319,21 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       navIdx = 1;
     } else if (_selectedIndex == 2) {
       navIdx = 2;
-    } else if (_selectedIndex == 3) {
-      navIdx = 3;
     } else if (_selectedIndex == 5) {
-      navIdx = 4;
+      navIdx = 3;
     } else {
-      navIdx = 0;
+      // Tabs 3 (媒体库), 4 (历史收藏), 6 (代理), 7 (终端), 8 (设置) highlight "我的/更多"
+      navIdx = 4;
     }
+
+    final moreLabel = switch (_selectedIndex) {
+      3 => '媒体库',
+      4 => '历史收藏',
+      6 => '代理加速',
+      7 => '终端',
+      8 => '设置',
+      _ => '更多',
+    };
 
     return Container(
       decoration: BoxDecoration(
@@ -2012,10 +2355,10 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
               _selectTab(2);
               break;
             case 3:
-              _selectTab(3);
+              _selectTab(5);
               break;
             case 4:
-              _selectTab(5);
+              _showMobileMoreHubSheet(state);
               break;
           }
         },
@@ -2027,20 +2370,26 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
         unselectedFontSize: 11,
         items: [
           const BottomNavigationBarItem(
-            icon: Icon(Icons.home_filled, size: 21),
+            icon: Icon(Icons.movie_filter_rounded, size: 21),
             label: '影视',
           ),
           const BottomNavigationBarItem(
             icon: Icon(Icons.live_tv_rounded, size: 21),
             label: '直播',
           ),
-          const BottomNavigationBarItem(
-            icon: Icon(Icons.download_for_offline_outlined, size: 21),
+          BottomNavigationBarItem(
+            icon: Badge(
+              isLabelVisible: state.activeTasksCount > 0,
+              label: Text(
+                '${state.activeTasksCount}',
+                style: const TextStyle(fontSize: 9.5),
+              ),
+              child: const Icon(
+                Icons.download_for_offline_outlined,
+                size: 21,
+              ),
+            ),
             label: '下载',
-          ),
-          const BottomNavigationBarItem(
-            icon: Icon(Icons.folder_copy_outlined, size: 21),
-            label: '媒体库',
           ),
           BottomNavigationBarItem(
             icon: Badge(
@@ -2056,8 +2405,379 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
             ),
             label: 'Telegram',
           ),
+          BottomNavigationBarItem(
+            icon: Icon(
+              navIdx == 4 ? Icons.apps_rounded : Icons.grid_view_rounded,
+              size: 21,
+            ),
+            label: moreLabel,
+          ),
         ],
       ),
+    );
+  }
+
+  void _showMobileMoreHubSheet(AppState state) {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: VideoPlatformTheme.bgElevated,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+      ),
+      builder: (ctx) {
+        Widget buildGridTile({
+          required int tabIndex,
+          required IconData icon,
+          required String title,
+          required String subtitle,
+        }) {
+          final selected = _selectedIndex == tabIndex;
+          return InkWell(
+            borderRadius: BorderRadius.circular(12),
+            onTap: () {
+              Navigator.of(ctx).pop();
+              _selectTab(tabIndex);
+            },
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: selected
+                    ? VideoPlatformTheme.accent.withValues(alpha: 0.16)
+                    : VideoPlatformTheme.bgCard,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: selected
+                      ? VideoPlatformTheme.accent
+                      : VideoPlatformTheme.borderSubtle,
+                ),
+              ),
+              child: Row(
+                children: [
+                  Container(
+                    width: 36,
+                    height: 36,
+                    decoration: BoxDecoration(
+                      color: selected
+                          ? VideoPlatformTheme.accent.withValues(alpha: 0.22)
+                          : VideoPlatformTheme.bgPrimary.withValues(alpha: 0.6),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Icon(
+                      icon,
+                      size: 19,
+                      color: selected
+                          ? VideoPlatformTheme.accent
+                          : VideoPlatformTheme.textPrimary,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Text(
+                          title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                            color: selected
+                                ? VideoPlatformTheme.accent
+                                : VideoPlatformTheme.textPrimary,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          subtitle,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 10.5,
+                            color: VideoPlatformTheme.textMuted,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        }
+
+        final proxyEnabled = state.proxyService.proxyEnabled;
+        final activeProxy = state.proxyService.activeNode;
+
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(
+                  child: Container(
+                    width: 36,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: VideoPlatformTheme.borderStrong,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                Row(
+                  children: [
+                    const AppBrandLogo(size: 26),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '流光视频 · 功能与设置中心',
+                            style: TextStyle(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w700,
+                              color: VideoPlatformTheme.textPrimary,
+                            ),
+                          ),
+                          Text(
+                            '当前片源：${state.selectedSource?.name ?? "未选择"} · 代理：${proxyEnabled ? (activeProxy?.displayTitle ?? "已开启") : "直连"}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              color: VideoPlatformTheme.textMuted,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      onPressed: () => Navigator.of(ctx).pop(),
+                      icon: const Icon(Icons.close_rounded, size: 20),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                GridView.count(
+                  crossAxisCount: 2,
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  mainAxisSpacing: 10,
+                  crossAxisSpacing: 10,
+                  childAspectRatio: 2.55,
+                  children: [
+                    buildGridTile(
+                      tabIndex: 4,
+                      icon: Icons.bookmarks_outlined,
+                      title: '历史与收藏',
+                      subtitle: '${state.history.length} 条记录 · ${state.favorites.length} 收藏',
+                    ),
+                    buildGridTile(
+                      tabIndex: 3,
+                      icon: Icons.folder_copy_outlined,
+                      title: '视频资料库',
+                      subtitle: '已下载与云端归档视频',
+                    ),
+                    buildGridTile(
+                      tabIndex: 6,
+                      icon: Icons.swap_horiz_rounded,
+                      title: '代理加速节点',
+                      subtitle: proxyEnabled
+                          ? (activeProxy?.displayTitle ?? '代理已开启')
+                          : '点击管理节点与分流',
+                    ),
+                    buildGridTile(
+                      tabIndex: 8,
+                      icon: Icons.settings_outlined,
+                      title: '偏好与服务端',
+                      subtitle: '片源 · 播放器 · 去广告设置',
+                    ),
+                    buildGridTile(
+                      tabIndex: 7,
+                      icon: Icons.terminal_rounded,
+                      title: '系统终端',
+                      subtitle: '远程 SSH / Shell 控制台',
+                    ),
+                    InkWell(
+                      borderRadius: BorderRadius.circular(12),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _openCommandPalette();
+                      },
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 10,
+                        ),
+                        decoration: BoxDecoration(
+                          color: VideoPlatformTheme.bgCard,
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(
+                            color: VideoPlatformTheme.borderSubtle,
+                          ),
+                        ),
+                        child: Row(
+                          children: [
+                            Container(
+                              width: 36,
+                              height: 36,
+                              decoration: BoxDecoration(
+                                color: VideoPlatformTheme.bgPrimary
+                                    .withValues(alpha: 0.6),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: Icon(
+                                Icons.bolt_rounded,
+                                size: 19,
+                                color: VideoPlatformTheme.accent,
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  Text(
+                                    '全局快捷命令',
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      fontWeight: FontWeight.w600,
+                                      color: VideoPlatformTheme.textPrimary,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    '一键换源 / 搜频道 / 节点',
+                                    style: TextStyle(
+                                      fontSize: 10.5,
+                                      color: VideoPlatformTheme.textMuted,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                // Quick theme & TV mode & logout bar
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    color: VideoPlatformTheme.bgCard,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: VideoPlatformTheme.borderSubtle),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        Icons.palette_outlined,
+                        size: 16,
+                        color: VideoPlatformTheme.accent,
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          child: Row(
+                            children: VideoPlatformTheme.presets.map((p) {
+                              final isSel = p.id == state.themeId;
+                              return Padding(
+                                padding: const EdgeInsets.only(right: 6),
+                                child: InkWell(
+                                  borderRadius: BorderRadius.circular(14),
+                                  onTap: () {
+                                    state.setThemeId(p.id);
+                                    Navigator.of(ctx).pop();
+                                  },
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                      vertical: 4,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: isSel
+                                          ? p.accent.withValues(alpha: 0.18)
+                                          : Colors.transparent,
+                                      borderRadius: BorderRadius.circular(14),
+                                      border: Border.all(
+                                        color: isSel
+                                            ? p.accent
+                                            : VideoPlatformTheme.borderSubtle,
+                                      ),
+                                    ),
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Container(
+                                          width: 8,
+                                          height: 8,
+                                          decoration: BoxDecoration(
+                                            color: p.accent,
+                                            shape: BoxShape.circle,
+                                          ),
+                                        ),
+                                        const SizedBox(width: 4),
+                                        Text(
+                                          p.name,
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            fontWeight: isSel
+                                                ? FontWeight.w600
+                                                : FontWeight.normal,
+                                            color: isSel
+                                                ? p.accent
+                                                : VideoPlatformTheme
+                                                    .textSecondary,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              );
+                            }).toList(),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      TextButton.icon(
+                        style: TextButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          foregroundColor: const Color(0xFFEF4444),
+                        ),
+                        onPressed: () {
+                          Navigator.of(ctx).pop();
+                          state.logout();
+                        },
+                        icon: const Icon(Icons.logout_rounded, size: 15),
+                        label: const Text(
+                          '退出',
+                          style: TextStyle(fontSize: 12),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 
