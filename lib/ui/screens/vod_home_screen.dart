@@ -26,6 +26,7 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
   final ScrollController _scrollController = ScrollController();
   final ScrollController _categoryScrollController = ScrollController();
   final TextEditingController _categoryFilterCtrl = TextEditingController();
+  final PageController _heroPageController = PageController();
   bool _categoriesExpanded = false;
   String _categoryFilterQuery = '';
   String _selectedCategoryGroupTab = '全部';
@@ -33,6 +34,8 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
   String? _lastTypeId;
   String _lastSearchKeyword = '';
   int _lastItemCount = 0;
+  int _heroBannerIndex = 0;
+  VodItem? _tvFocusedHeroItem;
 
   String _viewCacheKey({
     String? sourceId,
@@ -90,6 +93,7 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
     _scrollController.dispose();
     _categoryScrollController.dispose();
     _categoryFilterCtrl.dispose();
+    _heroPageController.dispose();
     super.dispose();
   }
 
@@ -132,6 +136,8 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
       _categoriesExpanded = false;
       _categoryFilterQuery = '';
       _selectedCategoryGroupTab = '全部';
+      _heroBannerIndex = 0;
+      _tvFocusedHeroItem = null;
       _categoryFilterCtrl.clear();
       if (_categoryScrollController.hasClients) {
         _categoryScrollController.jumpTo(0);
@@ -289,20 +295,22 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
     final isCompactMobile = screenWidth < 580;
 
     return Container(
-      height: 48,
+      height: 46,
       padding: EdgeInsets.symmetric(horizontal: isCompactMobile ? 10 : 16),
       decoration: BoxDecoration(
-        color: VideoPlatformTheme.bgElevated,
+        color: VideoPlatformTheme.bgPrimary,
         border: Border(
-          bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
+          bottom: BorderSide(
+            color: VideoPlatformTheme.borderSubtle.withValues(alpha: 0.55),
+          ),
         ),
       ),
       child: Row(
         children: [
-          // Single-line horizontal scrollable category ribbon
+          // Single-line horizontal scrollable category ribbon (NetEase Filmly pill style)
           Expanded(
             child: SizedBox(
-              height: 34,
+              height: 32,
               child: Listener(
                 onPointerSignal: (event) {
                   if (event is PointerScrollEvent &&
@@ -322,7 +330,7 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                   physics: const BouncingScrollPhysics(),
                   children: [
                     _buildCategoryChip(
-                      label: '全部推荐',
+                      label: '首页推荐',
                       selected: state.selectedTypeId.isEmpty,
                       onTap: () => _selectCategoryAndSync(state, '', 0),
                     ),
@@ -348,7 +356,7 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
           if (!isCompactMobile && !state.tvMode && categories.length > 5) ...[
             const SizedBox(width: 6),
             InkWell(
-              borderRadius: BorderRadius.circular(6),
+              borderRadius: BorderRadius.circular(14),
               onTap: () => _scrollCategoriesBy(-260),
               child: Padding(
                 padding: const EdgeInsets.all(4),
@@ -360,7 +368,7 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
               ),
             ),
             InkWell(
-              borderRadius: BorderRadius.circular(6),
+              borderRadius: BorderRadius.circular(14),
               onTap: () => _scrollCategoriesBy(260),
               child: Padding(
                 padding: const EdgeInsets.all(4),
@@ -373,9 +381,9 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
             ),
           ],
           const SizedBox(width: 6),
-          // "全部分类" pill button that toggles the floating category dropdown window
+          // "筛选/分类" pill button that toggles the floating category dropdown window
           InkWell(
-            borderRadius: BorderRadius.circular(7),
+            borderRadius: BorderRadius.circular(16),
             onFocusChange: (_) {
               if (mounted) setState(() {});
             },
@@ -397,7 +405,7 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                 return AnimatedContainer(
                   duration: const Duration(milliseconds: 180),
                   padding: const EdgeInsets.symmetric(
-                    horizontal: 10,
+                    horizontal: 11,
                     vertical: 5,
                   ),
                   decoration: BoxDecoration(
@@ -406,7 +414,7 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                         : (isFocused
                             ? VideoPlatformTheme.accent.withValues(alpha: 0.26)
                             : VideoPlatformTheme.bgCard),
-                    borderRadius: BorderRadius.circular(7),
+                    borderRadius: BorderRadius.circular(16),
                     border: Border.all(
                       color: (_categoriesExpanded || isFocused)
                           ? VideoPlatformTheme.accent
@@ -420,8 +428,8 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                       Icon(
                         _categoriesExpanded
                             ? Icons.close_fullscreen_rounded
-                            : Icons.grid_view_rounded,
-                        size: 14,
+                            : Icons.tune_rounded,
+                        size: 13.5,
                         color: _categoriesExpanded
                             ? Colors.white
                             : VideoPlatformTheme.accent,
@@ -431,8 +439,8 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                         _categoriesExpanded
                             ? '收起'
                             : (isCompactMobile
-                                ? '分类 (${categories.length + 1})'
-                                : '全部分类 (${categories.length + 1})'),
+                                ? '筛选'
+                                : '筛选分类 (${categories.length + 1})'),
                         style: TextStyle(
                           fontSize: 12,
                           fontWeight: FontWeight.w600,
@@ -442,18 +450,6 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                                   ? VideoPlatformTheme.accent
                                   : VideoPlatformTheme.textPrimary),
                         ),
-                      ),
-                      const SizedBox(width: 2),
-                      Icon(
-                        _categoriesExpanded
-                            ? Icons.keyboard_arrow_up_rounded
-                            : Icons.keyboard_arrow_down_rounded,
-                        size: 16,
-                        color: _categoriesExpanded
-                            ? Colors.white
-                            : (isFocused
-                                ? VideoPlatformTheme.accent
-                                : VideoPlatformTheme.textSecondary),
                       ),
                     ],
                   ),
@@ -1114,7 +1110,7 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
       alignment: Alignment.center,
       widthFactor: 1.0,
       child: InkWell(
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.circular(16),
         onFocusChange: (_) {
           if (mounted) setState(() {});
         },
@@ -1133,14 +1129,15 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                 }
               });
             }
-            final isTv = widget.appState.tvMode;
+            final isTv = widget.appState.tvMode &&
+                MediaQuery.sizeOf(ctx).width >= 680;
             return AnimatedScale(
               scale: (isFocused && isTv) ? 1.07 : 1.0,
               duration: const Duration(milliseconds: 140),
               child: AnimatedContainer(
                 duration: const Duration(milliseconds: 160),
                 padding: EdgeInsets.symmetric(
-                  horizontal: isTv ? 15 : 12,
+                  horizontal: isTv ? 16 : 13,
                   vertical: isTv ? 6 : 5,
                 ),
                 decoration: BoxDecoration(
@@ -1152,8 +1149,8 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                               : VideoPlatformTheme.accent)
                           : (isFocused
                               ? VideoPlatformTheme.accent.withValues(alpha: 0.25)
-                              : Colors.transparent)),
-                  borderRadius: BorderRadius.circular(isTv ? 8 : 6),
+                              : Colors.white.withValues(alpha: 0.04))),
+                  borderRadius: BorderRadius.circular(16),
                   border: isFocused
                       ? Border.all(
                           color: isTv ? Colors.white : VideoPlatformTheme.accent,
@@ -1177,7 +1174,7 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                             : VideoPlatformTheme.textSecondary),
                     fontWeight: (selected || isFocused)
                         ? FontWeight.w700
-                        : FontWeight.w400,
+                        : FontWeight.w500,
                   ),
                 ),
               ),
@@ -1405,6 +1402,940 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
     );
   }
 
+  void _openHistoryItem(LibraryItem hist) {
+    final state = widget.appState;
+    VodSource? matchedSource;
+    for (final s in state.sources) {
+      if (s.id == hist.source || s.name == hist.source) {
+        matchedSource = s;
+        break;
+      }
+    }
+    matchedSource ??= state.selectedSource ??
+        (state.sources.isNotEmpty ? state.sources.first : null);
+    if (matchedSource == null) return;
+
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => VodDetailPlayerScreen(
+          appState: state,
+          source: matchedSource!,
+          vodId: hist.vodId,
+          initialTitle: hist.title,
+          initialPoster: hist.poster,
+          initialResumeSeconds: hist.position > 0 ? hist.position : 0,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildFilmlyHeroSpotlightSliver(
+    AppState state, {
+    required bool isTv,
+    required bool isMobile,
+  }) {
+    final items = state.filteredVodItems;
+    if (items.isEmpty ||
+        state.selectedTypeId.isNotEmpty ||
+        state.searchKeyword.isNotEmpty ||
+        state.directoryBreadcrumbs.isNotEmpty ||
+        items.first.isAlistDirectory) {
+      return const SliverToBoxAdapter(child: SizedBox.shrink());
+    }
+
+    if (isTv) {
+      final heroItem = _tvFocusedHeroItem ?? items.first;
+      final metaTags = <String>[
+        if (state.selectedSource != null) state.selectedSource!.name,
+        if (heroItem.typeName.isNotEmpty) heroItem.typeName,
+        if (heroItem.vodYear.isNotEmpty && heroItem.vodYear != '0')
+          heroItem.vodYear,
+        if (heroItem.vodClass.isNotEmpty &&
+            heroItem.vodClass != heroItem.typeName)
+          heroItem.vodClass,
+      ];
+      return SliverToBoxAdapter(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 14, 20, 6),
+          child: Container(
+            height: 214,
+            decoration: BoxDecoration(
+              color: VideoPlatformTheme.bgElevated,
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(
+                color: Colors.white.withValues(alpha: 0.08),
+              ),
+              boxShadow: const [
+                BoxShadow(
+                  color: Color(0x55000000),
+                  blurRadius: 18,
+                  offset: Offset(0, 6),
+                ),
+              ],
+            ),
+            clipBehavior: Clip.antiAlias,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                // Right-side cinematic poster backdrop
+                Positioned(
+                  right: 0,
+                  top: 0,
+                  bottom: 0,
+                  width: 460,
+                  child: Opacity(
+                    opacity: 0.55,
+                    child: VodCachedPosterImage(
+                      rawPicUrl: heroItem.vodPic,
+                      api: state.api,
+                      fit: BoxFit.cover,
+                      cacheWidth: 720,
+                      placeholderBuilder: (_) =>
+                          Container(color: VideoPlatformTheme.bgCard),
+                    ),
+                  ),
+                ),
+                // Smooth cinema gradient blending right image into left stage
+                Positioned.fill(
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.centerLeft,
+                        end: Alignment.centerRight,
+                        stops: const [0.0, 0.52, 0.82, 1.0],
+                        colors: [
+                          VideoPlatformTheme.bgElevated,
+                          VideoPlatformTheme.bgElevated.withValues(alpha: 0.96),
+                          VideoPlatformTheme.bgElevated.withValues(alpha: 0.55),
+                          VideoPlatformTheme.bgElevated.withValues(alpha: 0.18),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+                // Left content + right poster card preview
+                Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 26,
+                    vertical: 18,
+                  ),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Row(
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 8,
+                                    vertical: 3,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0x29FFB800),
+                                    borderRadius: BorderRadius.circular(6),
+                                    border: Border.all(
+                                      color: const Color(0x80FFB800),
+                                    ),
+                                  ),
+                                  child: const Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(
+                                        Icons.auto_awesome_rounded,
+                                        size: 13,
+                                        color: Color(0xFFFFC53D),
+                                      ),
+                                      SizedBox(width: 4),
+                                      Text(
+                                        '爆米花影院 · 焦点巨幕',
+                                        style: TextStyle(
+                                          color: Color(0xFFFFC53D),
+                                          fontSize: 11.5,
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                if (heroItem.vodRemarks.isNotEmpty) ...[
+                                  const SizedBox(width: 8),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                      vertical: 3,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: VideoPlatformTheme.bgCard,
+                                      borderRadius: BorderRadius.circular(6),
+                                    ),
+                                    child: Text(
+                                      heroItem.vodRemarks,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 11.5,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ],
+                            ),
+                            const SizedBox(height: 10),
+                            Text(
+                              heroItem.vodName,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 25,
+                                fontWeight: FontWeight.w800,
+                                letterSpacing: 0.3,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 6,
+                              children: metaTags
+                                  .map(
+                                    (t) => Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 8,
+                                        vertical: 2.5,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: Colors.white
+                                            .withValues(alpha: 0.08),
+                                        borderRadius: BorderRadius.circular(5),
+                                      ),
+                                      child: Text(
+                                        t,
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          color:
+                                              VideoPlatformTheme.textSecondary,
+                                        ),
+                                      ),
+                                    ),
+                                  )
+                                  .toList(),
+                            ),
+                            const Spacer(),
+                            Row(
+                              children: [
+                                InkWell(
+                                  borderRadius: BorderRadius.circular(22),
+                                  onFocusChange: (_) {
+                                    if (mounted) setState(() {});
+                                  },
+                                  onTap: () => _openVodItem(heroItem),
+                                  child: Builder(
+                                    builder: (ctx) {
+                                      final isFocused =
+                                          Focus.of(ctx).hasPrimaryFocus;
+                                      return AnimatedScale(
+                                        scale: isFocused ? 1.06 : 1.0,
+                                        duration:
+                                            const Duration(milliseconds: 140),
+                                        child: Container(
+                                          height: 40,
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 20,
+                                          ),
+                                          decoration: BoxDecoration(
+                                            color: VideoPlatformTheme.accent,
+                                            borderRadius:
+                                                BorderRadius.circular(22),
+                                            border: isFocused
+                                                ? Border.all(
+                                                    color: Colors.white,
+                                                    width: 2.4,
+                                                  )
+                                                : null,
+                                            boxShadow: isFocused
+                                                ? [
+                                                    BoxShadow(
+                                                      color: VideoPlatformTheme
+                                                          .accent
+                                                          .withValues(
+                                                        alpha: 0.55,
+                                                      ),
+                                                      blurRadius: 12,
+                                                    ),
+                                                  ]
+                                                : null,
+                                          ),
+                                          child: const Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              Icon(
+                                                Icons.play_arrow_rounded,
+                                                color: Colors.white,
+                                                size: 22,
+                                              ),
+                                              SizedBox(width: 6),
+                                              Text(
+                                                '立即播放',
+                                                style: TextStyle(
+                                                  color: Colors.white,
+                                                  fontSize: 14,
+                                                  fontWeight: FontWeight.w700,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      );
+                                    },
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                InkWell(
+                                  borderRadius: BorderRadius.circular(22),
+                                  onFocusChange: (_) {
+                                    if (mounted) setState(() {});
+                                  },
+                                  onTap: () {
+                                    SourcePickerDialog.show(
+                                      context,
+                                      sources: state.visibleSources,
+                                      selectedSource: state.selectedSource,
+                                      onSelect: state.selectVodSource,
+                                    );
+                                  },
+                                  child: Builder(
+                                    builder: (ctx) {
+                                      final isFocused =
+                                          Focus.of(ctx).hasPrimaryFocus;
+                                      return AnimatedScale(
+                                        scale: isFocused ? 1.06 : 1.0,
+                                        duration:
+                                            const Duration(milliseconds: 140),
+                                        child: Container(
+                                          height: 40,
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 16,
+                                          ),
+                                          decoration: BoxDecoration(
+                                            color: isFocused
+                                                ? Colors.white
+                                                    .withValues(alpha: 0.20)
+                                                : Colors.white
+                                                    .withValues(alpha: 0.10),
+                                            borderRadius:
+                                                BorderRadius.circular(22),
+                                            border: Border.all(
+                                              color: isFocused
+                                                  ? Colors.white
+                                                  : Colors.white
+                                                      .withValues(alpha: 0.18),
+                                              width: isFocused ? 2.2 : 1.0,
+                                            ),
+                                          ),
+                                          child: Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              const Icon(
+                                                Icons.video_library_outlined,
+                                                color: Colors.white,
+                                                size: 17,
+                                              ),
+                                              const SizedBox(width: 6),
+                                              Text(
+                                                '媒体库: ${state.selectedSource?.name ?? "切换"}',
+                                                style: const TextStyle(
+                                                  color: Colors.white,
+                                                  fontSize: 13,
+                                                  fontWeight: FontWeight.w600,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      );
+                                    },
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(width: 24),
+                      // Crisp vertical poster card on right of TV Hero
+                      Container(
+                        width: 122,
+                        height: 176,
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: Colors.white.withValues(alpha: 0.22),
+                            width: 1.2,
+                          ),
+                          boxShadow: const [
+                            BoxShadow(
+                              color: Color(0x80000000),
+                              blurRadius: 14,
+                              offset: Offset(0, 6),
+                            ),
+                          ],
+                        ),
+                        clipBehavior: Clip.antiAlias,
+                        child: VodCachedPosterImage(
+                          rawPicUrl: heroItem.vodPic,
+                          api: state.api,
+                          fit: BoxFit.cover,
+                          placeholderBuilder: (_) =>
+                              Container(color: VideoPlatformTheme.bgCard),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    // Mobile / Desktop NetEase Filmly Featured Hero Carousel
+    final heroItems = items.take(5).toList();
+    final safeIdx = _heroBannerIndex.clamp(0, heroItems.length - 1);
+
+    return SliverToBoxAdapter(
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(
+          isMobile ? 12 : 16,
+          isMobile ? 10 : 14,
+          isMobile ? 12 : 16,
+          4,
+        ),
+        child: SizedBox(
+          height: isMobile ? 176 : 210,
+          child: Stack(
+            children: [
+              PageView.builder(
+                controller: _heroPageController,
+                itemCount: heroItems.length,
+                onPageChanged: (idx) {
+                  if (mounted) setState(() => _heroBannerIndex = idx);
+                },
+                itemBuilder: (context, idx) {
+                  final item = heroItems[idx];
+                  final metaParts = <String>[
+                    if (item.typeName.isNotEmpty) item.typeName,
+                    if (item.vodYear.isNotEmpty && item.vodYear != '0')
+                      item.vodYear,
+                    if (item.vodClass.isNotEmpty &&
+                        item.vodClass != item.typeName)
+                      item.vodClass,
+                  ];
+                  return GestureDetector(
+                    onTap: () => _openVodItem(item),
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: VideoPlatformTheme.bgElevated,
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(
+                          color: Colors.white.withValues(alpha: 0.08),
+                        ),
+                      ),
+                      clipBehavior: Clip.antiAlias,
+                      child: Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          // Background blurred/dimmed cover
+                          Opacity(
+                            opacity: 0.42,
+                            child: VodCachedPosterImage(
+                              rawPicUrl: item.vodPic,
+                              api: state.api,
+                              fit: BoxFit.cover,
+                              cacheWidth: 640,
+                              placeholderBuilder: (_) =>
+                                  Container(color: VideoPlatformTheme.bgCard),
+                            ),
+                          ),
+                          // Cinema dark gradient overlay
+                          const DecoratedBox(
+                            decoration: BoxDecoration(
+                              gradient: LinearGradient(
+                                begin: Alignment.centerLeft,
+                                end: Alignment.centerRight,
+                                colors: [
+                                  Color(0xEB0B0C10),
+                                  Color(0xB80B0C10),
+                                  Color(0x660B0C10),
+                                ],
+                              ),
+                            ),
+                          ),
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(16, 14, 14, 14),
+                            child: Row(
+                              children: [
+                                // Left Info + Play Pill
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      Row(
+                                        children: [
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 7,
+                                              vertical: 2,
+                                            ),
+                                            decoration: BoxDecoration(
+                                              color: const Color(0x2EFFB800),
+                                              borderRadius:
+                                                  BorderRadius.circular(5),
+                                              border: Border.all(
+                                                color: const Color(0x80FFB800),
+                                                width: 0.8,
+                                              ),
+                                            ),
+                                            child: const Text(
+                                              '🍿 爆米花精选',
+                                              style: TextStyle(
+                                                color: Color(0xFFFFC53D),
+                                                fontSize: 10.5,
+                                                fontWeight: FontWeight.w700,
+                                              ),
+                                            ),
+                                          ),
+                                          if (item.vodRemarks.isNotEmpty) ...[
+                                            const SizedBox(width: 6),
+                                            Flexible(
+                                              child: Container(
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                  horizontal: 6,
+                                                  vertical: 2,
+                                                ),
+                                                decoration: BoxDecoration(
+                                                  color: Colors.white
+                                                      .withValues(alpha: 0.12),
+                                                  borderRadius:
+                                                      BorderRadius.circular(5),
+                                                ),
+                                                child: Text(
+                                                  item.vodRemarks,
+                                                  maxLines: 1,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: const TextStyle(
+                                                    color: Colors.white,
+                                                    fontSize: 10.5,
+                                                    fontWeight: FontWeight.w600,
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ],
+                                        ],
+                                      ),
+                                      const SizedBox(height: 8),
+                                      Text(
+                                        item.vodName,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          color: Colors.white,
+                                          fontSize: isMobile ? 17 : 20,
+                                          fontWeight: FontWeight.w800,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 4),
+                                      Text(
+                                        metaParts.isNotEmpty
+                                            ? metaParts.join(' · ')
+                                            : (state.selectedSource?.name ??
+                                                '院线热播'),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          color:
+                                              VideoPlatformTheme.textSecondary,
+                                          fontSize: 12,
+                                        ),
+                                      ),
+                                      const Spacer(),
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 13,
+                                          vertical: 6,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: VideoPlatformTheme.accent,
+                                          borderRadius:
+                                              BorderRadius.circular(18),
+                                        ),
+                                        child: const Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            Icon(
+                                              Icons.play_arrow_rounded,
+                                              size: 16,
+                                              color: Colors.white,
+                                            ),
+                                            SizedBox(width: 4),
+                                            Text(
+                                              '立即播放',
+                                              style: TextStyle(
+                                                color: Colors.white,
+                                                fontSize: 12,
+                                                fontWeight: FontWeight.w700,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                // Right crisp poster card
+                                Container(
+                                  width: isMobile ? 96 : 114,
+                                  height: isMobile ? 142 : 168,
+                                  decoration: BoxDecoration(
+                                    borderRadius: BorderRadius.circular(9),
+                                    border: Border.all(
+                                      color:
+                                          Colors.white.withValues(alpha: 0.18),
+                                    ),
+                                    boxShadow: const [
+                                      BoxShadow(
+                                        color: Color(0x66000000),
+                                        blurRadius: 10,
+                                        offset: Offset(0, 4),
+                                      ),
+                                    ],
+                                  ),
+                                  clipBehavior: Clip.antiAlias,
+                                  child: VodCachedPosterImage(
+                                    rawPicUrl: item.vodPic,
+                                    api: state.api,
+                                    fit: BoxFit.cover,
+                                    placeholderBuilder: (_) => Container(
+                                      color: VideoPlatformTheme.bgCard,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              ),
+              // Page Indicator Dots
+              if (heroItems.length > 1)
+                Positioned(
+                  left: 16,
+                  bottom: 10,
+                  child: IgnorePointer(
+                    child: Row(
+                      children: List.generate(heroItems.length, (i) {
+                        final active = i == safeIdx;
+                        return AnimatedContainer(
+                          duration: const Duration(milliseconds: 180),
+                          margin: const EdgeInsets.only(right: 5),
+                          width: active ? 16 : 6,
+                          height: 5,
+                          decoration: BoxDecoration(
+                            color: active
+                                ? const Color(0xFFFFC53D)
+                                : Colors.white.withValues(alpha: 0.32),
+                            borderRadius: BorderRadius.circular(3),
+                          ),
+                        );
+                      }),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildContinueWatchingSliver(
+    AppState state, {
+    required bool isTv,
+    required bool isMobile,
+  }) {
+    final historyItems = state.history;
+    if (historyItems.isEmpty ||
+        state.selectedTypeId.isNotEmpty ||
+        state.searchKeyword.isNotEmpty ||
+        state.directoryBreadcrumbs.isNotEmpty) {
+      return const SliverToBoxAdapter(child: SizedBox.shrink());
+    }
+
+    final displayHistory = historyItems.take(12).toList();
+    final horizontalPad = isTv ? 20.0 : (isMobile ? 12.0 : 16.0);
+
+    return SliverToBoxAdapter(
+      child: Padding(
+        padding: EdgeInsets.only(top: isTv ? 12 : 10, bottom: 4),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: EdgeInsets.symmetric(horizontal: horizontalPad),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.play_circle_fill_rounded,
+                    size: isTv ? 20 : 18,
+                    color: VideoPlatformTheme.accent,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    '最近观看 · 继续播放',
+                    style: TextStyle(
+                      fontSize: isTv ? 17 : 15,
+                      fontWeight: FontWeight.w800,
+                      color: VideoPlatformTheme.textPrimary,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 7,
+                      vertical: 1.5,
+                    ),
+                    decoration: BoxDecoration(
+                      color: VideoPlatformTheme.bgCard,
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Text(
+                      '${historyItems.length}',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                        color: VideoPlatformTheme.textSecondary,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 10),
+            SizedBox(
+              height: isTv ? 142 : 118,
+              child: ListView.separated(
+                padding: EdgeInsets.symmetric(horizontal: horizontalPad),
+                scrollDirection: Axis.horizontal,
+                itemCount: displayHistory.length,
+                separatorBuilder: (_, __) => SizedBox(width: isTv ? 14 : 10),
+                itemBuilder: (context, idx) {
+                  final hist = displayHistory[idx];
+                  final ratio = (hist.duration > 0 && hist.position > 0)
+                      ? (hist.position / hist.duration).clamp(0.04, 1.0)
+                      : 0.15;
+                  final mins = (hist.position / 60).floor();
+                  final secs = (hist.position % 60).round();
+                  final timeLabel = hist.position > 0
+                      ? '看到 ${mins.toString().padLeft(2, "0")}:${secs.toString().padLeft(2, "0")}'
+                      : '继续观看';
+
+                  return InkWell(
+                    borderRadius: BorderRadius.circular(10),
+                    onFocusChange: (_) {
+                      if (mounted) setState(() {});
+                    },
+                    onTap: () => _openHistoryItem(hist),
+                    child: Builder(
+                      builder: (ctx) {
+                        final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                        if (isFocused) {
+                          WidgetsBinding.instance.addPostFrameCallback((_) {
+                            if (ctx.mounted) {
+                              Scrollable.ensureVisible(
+                                ctx,
+                                alignment: 0.4,
+                                duration: const Duration(milliseconds: 150),
+                              );
+                            }
+                          });
+                        }
+                        return AnimatedScale(
+                          scale: isFocused ? 1.05 : 1.0,
+                          duration: const Duration(milliseconds: 150),
+                          child: Container(
+                            width: isTv ? 228 : 176,
+                            decoration: BoxDecoration(
+                              color: VideoPlatformTheme.bgCard,
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(
+                                color: isFocused
+                                    ? Colors.white
+                                    : Colors.white.withValues(alpha: 0.08),
+                                width: isFocused ? 2.4 : 1.0,
+                              ),
+                              boxShadow: isFocused
+                                  ? [
+                                      BoxShadow(
+                                        color: VideoPlatformTheme.accent
+                                            .withValues(alpha: 0.5),
+                                        blurRadius: 12,
+                                      ),
+                                    ]
+                                  : null,
+                            ),
+                            clipBehavior: Clip.antiAlias,
+                            child: Stack(
+                              fit: StackFit.expand,
+                              children: [
+                                Opacity(
+                                  opacity: 0.65,
+                                  child: VodCachedPosterImage(
+                                    rawPicUrl: hist.poster,
+                                    api: state.api,
+                                    fit: BoxFit.cover,
+                                    placeholderBuilder: (_) => Container(
+                                      color: VideoPlatformTheme.bgCard,
+                                    ),
+                                  ),
+                                ),
+                                const DecoratedBox(
+                                  decoration: BoxDecoration(
+                                    gradient: LinearGradient(
+                                      begin: Alignment.bottomCenter,
+                                      end: Alignment.topCenter,
+                                      colors: [
+                                        Color(0xEE08090C),
+                                        Color(0x8808090C),
+                                        Color(0x3308090C),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                                Padding(
+                                  padding:
+                                      const EdgeInsets.fromLTRB(10, 8, 10, 10),
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Row(
+                                        children: [
+                                          if (hist.episode.isNotEmpty)
+                                            Flexible(
+                                              child: Container(
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                  horizontal: 6,
+                                                  vertical: 2,
+                                                ),
+                                                decoration: BoxDecoration(
+                                                  color:
+                                                      const Color(0xD9101218),
+                                                  borderRadius:
+                                                      BorderRadius.circular(4),
+                                                  border: Border.all(
+                                                    color:
+                                                        const Color(0x66FFB800),
+                                                    width: 0.6,
+                                                  ),
+                                                ),
+                                                child: Text(
+                                                  hist.episode,
+                                                  maxLines: 1,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: const TextStyle(
+                                                    color: Color(0xFFFFC53D),
+                                                    fontSize: 10,
+                                                    fontWeight: FontWeight.w700,
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          const Spacer(),
+                                          Container(
+                                            width: 26,
+                                            height: 26,
+                                            decoration: BoxDecoration(
+                                              color: VideoPlatformTheme.accent
+                                                  .withValues(alpha: 0.9),
+                                              shape: BoxShape.circle,
+                                            ),
+                                            child: const Icon(
+                                              Icons.play_arrow_rounded,
+                                              size: 17,
+                                              color: Colors.white,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                      const Spacer(),
+                                      Text(
+                                        hist.title,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          color: Colors.white,
+                                          fontSize: isTv ? 13.5 : 12.5,
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        timeLabel,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          color:
+                                              VideoPlatformTheme.textSecondary,
+                                          fontSize: 10.5,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 5),
+                                      ClipRRect(
+                                        borderRadius: BorderRadius.circular(2),
+                                        child: LinearProgressIndicator(
+                                          value: ratio,
+                                          minHeight: 3,
+                                          backgroundColor: Colors.white
+                                              .withValues(alpha: 0.18),
+                                          valueColor:
+                                              AlwaysStoppedAnimation<Color>(
+                                            VideoPlatformTheme.accent,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildBodyContent(AppState state) {
     if (state.isConnecting) {
       return Center(
@@ -1583,80 +2514,170 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
               _checkViewportAndAutoLoadMore();
             }
           },
-          child: CustomScrollView(
-            controller: _scrollController,
-            cacheExtent: 1500,
-            physics: const AlwaysScrollableScrollPhysics(),
-            slivers: [
-              SliverPadding(
-                padding: const EdgeInsets.fromLTRB(16, 16, 16, 20),
-                sliver: SliverGrid(
-                  gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
-                    maxCrossAxisExtent: state.tvMode ? 220 : 185,
-                    mainAxisSpacing: state.tvMode ? 20 : 16,
-                    crossAxisSpacing: state.tvMode ? 18 : 14,
-                    childAspectRatio: 0.57,
+          child: Builder(
+            builder: (context) {
+              final screenWidth = MediaQuery.sizeOf(context).width;
+              final effectiveTvMode = state.tvMode && screenWidth >= 680;
+              final isMobilePhone = screenWidth < 600 && !effectiveTvMode;
+              final gridHorizontalPad =
+                  effectiveTvMode ? 20.0 : (isMobilePhone ? 12.0 : 16.0);
+              final activeCategoryName = state.selectedTypeId.isEmpty
+                  ? '海报墙 · 全部影片'
+                  : (state.categories
+                          .where((c) => c.typeId == state.selectedTypeId)
+                          .map((c) => c.typeName)
+                          .firstOrNull ??
+                      '分类影片');
+
+              return CustomScrollView(
+                controller: _scrollController,
+                cacheExtent: 1500,
+                physics: const AlwaysScrollableScrollPhysics(),
+                slivers: [
+                  // 1. NetEase Filmly (网易爆米花) Featured Hero Spotlight / TV Backdrop Stage
+                  _buildFilmlyHeroSpotlightSliver(
+                    state,
+                    isTv: effectiveTvMode,
+                    isMobile: isMobilePhone,
                   ),
-                  delegate: SliverChildBuilderDelegate(
-                    (context, index) {
-                      final items = state.filteredVodItems;
-                      final item = items[index];
-                      return VodPosterCard(
-                        key: ValueKey(
-                          '${item.source?.id ?? state.selectedSource?.id ?? ""}_${item.vodId}_${item.vodPic}',
+
+                  // 2. NetEase Filmly (网易爆米花) "Continue Watching" Horizontal Rail
+                  _buildContinueWatchingSliver(
+                    state,
+                    isTv: effectiveTvMode,
+                    isMobile: isMobilePhone,
+                  ),
+
+                  // 3. Poster Wall Section Title
+                  if (state.searchKeyword.isEmpty &&
+                      state.directoryBreadcrumbs.isEmpty)
+                    SliverToBoxAdapter(
+                      child: Padding(
+                        padding: EdgeInsets.fromLTRB(
+                          gridHorizontalPad,
+                          effectiveTvMode ? 14 : 12,
+                          gridHorizontalPad,
+                          2,
                         ),
-                        item: item,
-                        api: state.api,
-                        autofocus: state.tvMode && index == 0,
-                        showSourceBadge: state.searchKeyword.isNotEmpty &&
-                            state.aggregatedSearch,
-                        onFocused: () {
-                          if (index >= items.length - 8 &&
-                              state.hasMoreVod &&
-                              !state.isLoadingVod &&
-                              !state.isLoadingMoreVod) {
-                            state.loadMoreVod();
-                          }
+                        child: Row(
+                          children: [
+                            Icon(
+                              Icons.local_movies_rounded,
+                              size: effectiveTvMode ? 19 : 16,
+                              color: VideoPlatformTheme.accent,
+                            ),
+                            const SizedBox(width: 6),
+                            Text(
+                              activeCategoryName,
+                              style: TextStyle(
+                                fontSize: effectiveTvMode ? 17 : 14.5,
+                                fontWeight: FontWeight.w800,
+                                color: VideoPlatformTheme.textPrimary,
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            if (state.totalCount > 0)
+                              Text(
+                                '共 ${state.totalCount} 部',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: VideoPlatformTheme.textMuted,
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
+
+                  // 4. NetEase Filmly (网易爆米花) Cinema Poster Wall (3-col on mobile, 6/7-col on TV/Desktop)
+                  SliverPadding(
+                    padding: EdgeInsets.fromLTRB(
+                      gridHorizontalPad,
+                      effectiveTvMode ? 12 : 10,
+                      gridHorizontalPad,
+                      20,
+                    ),
+                    sliver: SliverGrid(
+                      gridDelegate: isMobilePhone
+                          ? const SliverGridDelegateWithFixedCrossAxisCount(
+                              crossAxisCount: 3,
+                              mainAxisSpacing: 14,
+                              crossAxisSpacing: 10,
+                              childAspectRatio: 0.54,
+                            )
+                          : SliverGridDelegateWithMaxCrossAxisExtent(
+                              maxCrossAxisExtent: effectiveTvMode ? 196 : 180,
+                              mainAxisSpacing: effectiveTvMode ? 22 : 16,
+                              crossAxisSpacing: effectiveTvMode ? 18 : 14,
+                              childAspectRatio: 0.56,
+                            ),
+                      delegate: SliverChildBuilderDelegate(
+                        (context, index) {
+                          final items = state.filteredVodItems;
+                          final item = items[index];
+                          return VodPosterCard(
+                            key: ValueKey(
+                              '${item.source?.id ?? state.selectedSource?.id ?? ""}_${item.vodId}_${item.vodPic}',
+                            ),
+                            item: item,
+                            api: state.api,
+                            autofocus: effectiveTvMode && index == 0,
+                            showSourceBadge: state.searchKeyword.isNotEmpty &&
+                                state.aggregatedSearch,
+                            onFocused: () {
+                              if (effectiveTvMode &&
+                                  _tvFocusedHeroItem?.vodId != item.vodId) {
+                                setState(() => _tvFocusedHeroItem = item);
+                              }
+                              if (index >= items.length - 8 &&
+                                  state.hasMoreVod &&
+                                  !state.isLoadingVod &&
+                                  !state.isLoadingMoreVod) {
+                                state.loadMoreVod();
+                              }
+                            },
+                            onTap: () => _openVodItem(item),
+                          );
                         },
-                        onTap: () => _openVodItem(item),
-                      );
-                    },
-                    childCount: state.filteredVodItems.length,
-                  ),
-                ),
-              ),
-              if (state.isLoadingMoreVod)
-                SliverToBoxAdapter(
-                  child: Padding(
-                    padding: const EdgeInsets.only(bottom: 24),
-                    child: Center(
-                      child: SizedBox(
-                        width: 22,
-                        height: 22,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: VideoPlatformTheme.accent,
-                        ),
+                        childCount: state.filteredVodItems.length,
                       ),
                     ),
                   ),
-                )
-              else if (state.hasMoreVod)
-                SliverToBoxAdapter(
-                  child: Padding(
-                    padding: const EdgeInsets.only(bottom: 24),
-                    child: Center(
-                      child: TextButton.icon(
-                        onPressed: state.loadMoreVod,
-                        icon: const Icon(Icons.expand_more_rounded, size: 18),
-                        label: Text(
-                          '加载更多影视 (${state.currentPage}/${state.totalPages} 页)',
+                  if (state.isLoadingMoreVod)
+                    SliverToBoxAdapter(
+                      child: Padding(
+                        padding: const EdgeInsets.only(bottom: 24),
+                        child: Center(
+                          child: SizedBox(
+                            width: 22,
+                            height: 22,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: VideoPlatformTheme.accent,
+                            ),
+                          ),
+                        ),
+                      ),
+                    )
+                  else if (state.hasMoreVod)
+                    SliverToBoxAdapter(
+                      child: Padding(
+                        padding: const EdgeInsets.only(bottom: 24),
+                        child: Center(
+                          child: TextButton.icon(
+                            onPressed: state.loadMoreVod,
+                            icon:
+                                const Icon(Icons.expand_more_rounded, size: 18),
+                            label: Text(
+                              '加载更多影视 (${state.currentPage}/${state.totalPages} 页)',
+                            ),
+                          ),
                         ),
                       ),
                     ),
-                  ),
-                ),
-            ],
+                ],
+              );
+            },
           ),
         ),
       ),

@@ -590,7 +590,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
 
     Widget buildSourceSelectorButton({double maxWidth = 140}) {
       return InkWell(
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.circular(18),
         onFocusChange: (_) {
           if (mounted) setState(() {});
         },
@@ -611,17 +611,17 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
           builder: (ctx) {
             final isFocused = Focus.of(ctx).hasPrimaryFocus;
             return Container(
-              height: 34,
-              padding: const EdgeInsets.symmetric(horizontal: 9),
+              height: 36,
+              padding: const EdgeInsets.symmetric(horizontal: 11),
               decoration: BoxDecoration(
                 color: isFocused
                     ? VideoPlatformTheme.accent.withValues(alpha: 0.24)
                     : VideoPlatformTheme.bgCard,
-                borderRadius: BorderRadius.circular(6),
+                borderRadius: BorderRadius.circular(18),
                 border: Border.all(
                   color: isFocused
                       ? VideoPlatformTheme.accent
-                      : VideoPlatformTheme.borderSubtle,
+                      : VideoPlatformTheme.accent.withValues(alpha: 0.35),
                   width: isFocused ? 2.0 : 1.0,
                 ),
               ),
@@ -629,30 +629,30 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Icon(
-                    Icons.layers_outlined,
+                    Icons.video_library_rounded,
                     size: 15,
                     color: VideoPlatformTheme.accent,
                   ),
-                  const SizedBox(width: 5),
+                  const SizedBox(width: 6),
                   ConstrainedBox(
                     constraints: BoxConstraints(maxWidth: maxWidth),
                     child: Text(
                       activeSource?.name ??
-                          (state.isConnecting ? '加载片源...' : '选择片源'),
+                          (state.isConnecting ? '加载媒体库...' : '选择媒体库'),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w500,
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w700,
                         color: VideoPlatformTheme.textPrimary,
                       ),
                     ),
                   ),
-                  const SizedBox(width: 3),
+                  const SizedBox(width: 2),
                   Icon(
-                    Icons.keyboard_arrow_down,
-                    size: 15,
-                    color: VideoPlatformTheme.textMuted,
+                    Icons.keyboard_arrow_down_rounded,
+                    size: 16,
+                    color: VideoPlatformTheme.accent,
                   ),
                 ],
               ),
@@ -983,94 +983,147 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
 
     return Container(
       key: _sidebarContainerKey,
-      height: 64,
-      padding: const EdgeInsets.symmetric(horizontal: 20),
+      height: 68,
+      padding: const EdgeInsets.symmetric(horizontal: 24),
       decoration: BoxDecoration(
-        color: VideoPlatformTheme.bgElevated,
+        color: VideoPlatformTheme.bgPrimary,
         border: Border(
-          bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
+          bottom: BorderSide(
+            color: VideoPlatformTheme.borderSubtle.withValues(alpha: 0.55),
+          ),
         ),
       ),
       child: Row(
         children: [
-          // Brand Logo & TV Badge
+          // Brand Logo & NetEase Filmly TV Identity
           const AppBrandLogo(size: 32),
           const SizedBox(width: 10),
-          Text(
-            '流光 TV',
-            style: TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.w800,
-              color: VideoPlatformTheme.textPrimary,
-              letterSpacing: 0.5,
-            ),
-          ),
-          const SizedBox(width: 20),
-          // Center: Large 10-foot D-Pad Navigation Tabs
-          Expanded(
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: Row(
+          Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  _buildTvNavTabButton(
-                    index: 0,
-                    icon: Icons.movie_filter_rounded,
-                    label: '影视大厅',
+                  Text(
+                    '流光影院',
+                    style: TextStyle(
+                      fontSize: 17,
+                      fontWeight: FontWeight.w800,
+                      color: VideoPlatformTheme.textPrimary,
+                      letterSpacing: 0.4,
+                    ),
                   ),
-                  const SizedBox(width: 8),
-                  _buildTvNavTabButton(
-                    index: 1,
-                    icon: Icons.live_tv_rounded,
-                    label: '电视直播',
-                  ),
-                  const SizedBox(width: 8),
-                  _buildTvNavTabButton(
-                    index: 4,
-                    icon: Icons.bookmarks_outlined,
-                    label: '历史收藏',
-                  ),
-                  const SizedBox(width: 8),
-                  _buildTvNavTabButton(
-                    index: 5,
-                    icon: Icons.send_rounded,
-                    label: 'Telegram',
-                    badgeCount: tgUnread,
-                  ),
-                  const SizedBox(width: 8),
-                  _buildTvNavTabButton(
-                    index: 3,
-                    icon: Icons.folder_copy_outlined,
-                    label: '资料库',
-                  ),
-                  const SizedBox(width: 8),
-                  _buildTvNavTabButton(
-                    index: 2,
-                    icon: Icons.downloading_rounded,
-                    label: '下载',
-                    badgeCount: state.activeTasksCount,
-                  ),
-                  const SizedBox(width: 8),
-                  _buildTvNavTabButton(
-                    index: 6,
-                    icon: Icons.swap_horiz_rounded,
-                    label: '代理加速',
-                  ),
-                  const SizedBox(width: 8),
-                  _buildTvNavTabButton(
-                    index: 8,
-                    icon: Icons.settings_outlined,
-                    label: '系统设置',
+                  const SizedBox(width: 6),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 5,
+                      vertical: 1,
+                    ),
+                    decoration: BoxDecoration(
+                      color: VideoPlatformTheme.accent,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: const Text(
+                      'TV',
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w900,
+                        color: Colors.black,
+                      ),
+                    ),
                   ),
                 ],
               ),
+              Text(
+                '爆米花海报墙系统',
+                style: TextStyle(
+                  fontSize: 10,
+                  color: VideoPlatformTheme.textMuted,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(width: 22),
+          // Center: NetEase Filmly Floating Capsule Navigation Bar
+          Expanded(
+            child: Center(
+              child: Container(
+                height: 48,
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                decoration: BoxDecoration(
+                  color: VideoPlatformTheme.bgElevated,
+                  borderRadius: BorderRadius.circular(24),
+                  border: Border.all(
+                    color: VideoPlatformTheme.borderSubtle,
+                  ),
+                ),
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _buildTvNavTabButton(
+                        index: 0,
+                        icon: Icons.video_library_rounded,
+                        label: '媒体库',
+                      ),
+                      const SizedBox(width: 4),
+                      _buildTvNavTabButton(
+                        index: 1,
+                        icon: Icons.live_tv_rounded,
+                        label: '电视直播',
+                      ),
+                      const SizedBox(width: 4),
+                      _buildTvNavTabButton(
+                        index: 4,
+                        icon: Icons.bookmarks_rounded,
+                        label: '我的片单',
+                      ),
+                      const SizedBox(width: 4),
+                      _buildTvNavTabButton(
+                        index: 5,
+                        icon: Icons.send_rounded,
+                        label: 'Telegram',
+                        badgeCount: tgUnread,
+                      ),
+                      const SizedBox(width: 4),
+                      _buildTvNavTabButton(
+                        index: 3,
+                        icon: Icons.folder_copy_outlined,
+                        label: '本地视频',
+                      ),
+                      const SizedBox(width: 4),
+                      _buildTvNavTabButton(
+                        index: 2,
+                        icon: Icons.downloading_rounded,
+                        label: '下载',
+                        badgeCount: state.activeTasksCount,
+                      ),
+                      const SizedBox(width: 4),
+                      _buildTvNavTabButton(
+                        index: 6,
+                        icon: Icons.bolt_rounded,
+                        label: '代理加速',
+                      ),
+                      const SizedBox(width: 4),
+                      _buildTvNavTabButton(
+                        index: 8,
+                        icon: Icons.settings_outlined,
+                        label: '设置',
+                      ),
+                    ],
+                  ),
+                ),
+              ),
             ),
           ),
-          const SizedBox(width: 12),
-          // Right: High-Contrast TV Remote Action Pills (Source, Search, Proxy, Exit TV Mode)
+          const SizedBox(width: 14),
+          // Right: High-Contrast TV Remote Action Pills (Media Library Switcher, Search, Proxy)
           _buildTvHeaderActionPill(
-            icon: Icons.layers_outlined,
+            icon: Icons.video_library_rounded,
             label: activeSource?.name ??
-                (state.isConnecting ? '加载中...' : '切换片源'),
+                (state.isConnecting ? '加载中...' : '切换媒体库'),
             highlighted: true,
             onTap: state.sources.isEmpty
                 ? null
@@ -1091,7 +1144,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
             icon: Icons.search_rounded,
             label: state.searchKeyword.isNotEmpty
                 ? '搜索: ${state.searchKeyword}'
-                : '搜索影视',
+                : '搜索',
             highlighted: state.searchKeyword.isNotEmpty,
             onTap: () {
               if (_selectedIndex != 0) {
@@ -1107,7 +1160,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                 : Icons.public_off_rounded,
             label: proxyEnabled
                 ? (activeProxyNode?.displayTitle ?? '代理已开')
-                : '代理: 直连',
+                : '直连',
             highlighted: proxyEnabled,
             onTap: () => _selectTab(6),
           ),
@@ -1127,7 +1180,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     final selected = _selectedIndex == index;
     return InkWell(
       focusNode: _sidebarTabFocusNodes[index],
-      borderRadius: BorderRadius.circular(10),
+      borderRadius: BorderRadius.circular(20),
       onFocusChange: (_) {
         if (mounted) setState(() {});
       },
@@ -1150,22 +1203,22 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
             scale: isFocused ? 1.06 : 1.0,
             duration: const Duration(milliseconds: 140),
             child: Container(
-              height: 42,
+              height: 38,
               padding: const EdgeInsets.symmetric(horizontal: 14),
               decoration: BoxDecoration(
                 color: isFocused
                     ? VideoPlatformTheme.accent
                     : (selected
                         ? VideoPlatformTheme.accent.withValues(alpha: 0.20)
-                        : VideoPlatformTheme.bgCard),
-                borderRadius: BorderRadius.circular(10),
+                        : Colors.transparent),
+                borderRadius: BorderRadius.circular(20),
                 border: Border.all(
                   color: isFocused
                       ? Colors.white
                       : (selected
                           ? VideoPlatformTheme.accent
-                          : VideoPlatformTheme.borderSubtle),
-                  width: isFocused ? 2.4 : (selected ? 1.6 : 1.0),
+                          : Colors.transparent),
+                  width: isFocused ? 2.2 : 1.4,
                 ),
                 boxShadow: isFocused
                     ? [
@@ -1183,23 +1236,23 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                 children: [
                   Icon(
                     icon,
-                    size: 18,
+                    size: 17,
                     color: isFocused
-                        ? Colors.white
+                        ? Colors.black
                         : (selected
                             ? VideoPlatformTheme.accent
                             : VideoPlatformTheme.textSecondary),
                   ),
-                  const SizedBox(width: 7),
+                  const SizedBox(width: 6),
                   Text(
                     label,
                     style: TextStyle(
-                      fontSize: 14.5,
+                      fontSize: 14,
                       fontWeight: (selected || isFocused)
-                          ? FontWeight.w700
+                          ? FontWeight.w800
                           : FontWeight.w500,
                       color: isFocused
-                          ? Colors.white
+                          ? Colors.black
                           : (selected
                               ? VideoPlatformTheme.accent
                               : VideoPlatformTheme.textPrimary),
@@ -1214,18 +1267,18 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                       ),
                       decoration: BoxDecoration(
                         color: isFocused
-                            ? Colors.white
+                            ? Colors.black
                             : VideoPlatformTheme.accent,
                         borderRadius: BorderRadius.circular(10),
                       ),
                       child: Text(
                         badgeCount > 99 ? '99+' : '$badgeCount',
                         style: TextStyle(
-                          fontSize: 10.5,
-                          fontWeight: FontWeight.w700,
+                          fontSize: 10,
+                          fontWeight: FontWeight.w800,
                           color: isFocused
                               ? VideoPlatformTheme.accent
-                              : Colors.white,
+                              : Colors.black,
                         ),
                       ),
                     ),
@@ -1333,26 +1386,30 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     final proxyEnabled = state.proxyService.proxyEnabled;
     return Container(
       height: 52,
-      padding: const EdgeInsets.symmetric(horizontal: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 12),
       decoration: BoxDecoration(
-        color: VideoPlatformTheme.bgElevated,
+        color: VideoPlatformTheme.bgPrimary,
         border: Border(
-          bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
+          bottom: BorderSide(
+            color: VideoPlatformTheme.borderSubtle.withValues(alpha: 0.45),
+          ),
         ),
       ),
       child: Row(
         children: [
-          // 1. Source selector pill
-          buildSourceSelectorButton(maxWidth: 88),
+          // 1. NetEase Filmly Media Library Switcher Capsule
+          buildSourceSelectorButton(maxWidth: 100),
           const SizedBox(width: 8),
-          // 2. Integrated rounded search pill with inline aggregated/single toggle
+          // 2. Clean Rounded Search Capsule with inline 全网/单站 pill
           Expanded(
             child: Container(
               height: 36,
               decoration: BoxDecoration(
                 color: VideoPlatformTheme.bgCard,
                 borderRadius: BorderRadius.circular(18),
-                border: Border.all(color: VideoPlatformTheme.borderSubtle),
+                border: Border.all(
+                  color: VideoPlatformTheme.borderSubtle.withValues(alpha: 0.7),
+                ),
               ),
               child: Row(
                 children: [
@@ -1377,8 +1434,8 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                         filled: false,
                         contentPadding: EdgeInsets.zero,
                         hintText: state.aggregatedSearch
-                            ? '全网搜索影视/演员...'
-                            : '搜索当前站点...',
+                            ? '全网搜电影、剧集、演员...'
+                            : '搜索当前媒体库...',
                         hintStyle: TextStyle(
                           fontSize: 12.5,
                           color: VideoPlatformTheme.textMuted,
@@ -1427,10 +1484,10 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                         ),
                       ),
                       child: Text(
-                        state.aggregatedSearch ? '全网' : '单站',
+                        state.aggregatedSearch ? '全网' : '本库',
                         style: TextStyle(
                           fontSize: 10.5,
-                          fontWeight: FontWeight.w600,
+                          fontWeight: FontWeight.w700,
                           color: state.aggregatedSearch
                               ? VideoPlatformTheme.accent
                               : VideoPlatformTheme.textSecondary,
@@ -1442,10 +1499,10 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
               ),
             ),
           ),
-          const SizedBox(width: 6),
+          const SizedBox(width: 8),
           // 3. Compact Proxy indicator button (tap -> Proxy settings, long-press -> toggle)
           InkWell(
-            borderRadius: BorderRadius.circular(16),
+            borderRadius: BorderRadius.circular(18),
             onTap: () => _selectTab(6),
             onLongPress: () =>
                 state.proxyService.setProxyEnabled(!proxyEnabled),
@@ -1468,9 +1525,9 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                 children: [
                   Icon(
                     proxyEnabled
-                        ? Icons.vpn_lock_rounded
+                        ? Icons.bolt_rounded
                         : Icons.public_off_rounded,
-                    size: 16,
+                    size: 17,
                     color: proxyEnabled
                         ? VideoPlatformTheme.accent
                         : VideoPlatformTheme.textSecondary,
@@ -1492,20 +1549,6 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
               ),
             ),
           ),
-          const SizedBox(width: 4),
-          // 4. Quick Watch History button
-          IconButton(
-            visualDensity: VisualDensity.compact,
-            padding: EdgeInsets.zero,
-            constraints: const BoxConstraints(minWidth: 34, minHeight: 34),
-            tooltip: '观看历史与收藏',
-            onPressed: () => _selectTab(4),
-            icon: Icon(
-              Icons.history_rounded,
-              size: 20,
-              color: VideoPlatformTheme.textSecondary,
-            ),
-          ),
         ],
       ),
     );
@@ -1513,15 +1556,15 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
 
   Widget _buildMobileContextualTopHeader(AppState state) {
     final (IconData icon, String title) = switch (_selectedIndex) {
-      2 => (Icons.downloading_rounded, '下载与嗅探中心'),
-      3 => (Icons.folder_copy_outlined, '本地视频资料库'),
-      4 => (Icons.bookmarks_outlined, '观看历史与收藏'),
-      6 => (Icons.swap_horiz_rounded, '代理加速与分流'),
+      2 => (Icons.downloading_rounded, '离线下载与嗅探中心'),
+      3 => (Icons.folder_copy_outlined, '本地视频媒体库'),
+      4 => (Icons.bookmarks_rounded, '我的片单 · 历史与收藏'),
+      6 => (Icons.bolt_rounded, '代理加速与分流'),
       7 => (Icons.terminal_rounded, '系统终端命令行'),
-      8 => (Icons.settings_outlined, '偏好与服务端设置'),
+      8 => (Icons.settings_outlined, '偏好与媒体源设置'),
       _ => (Icons.video_library_rounded, '流光视频'),
     };
-    final isSubPage = _selectedIndex != 2;
+    final isSubPage = _selectedIndex != 4;
 
     return Container(
       height: 48,
@@ -2315,31 +2358,34 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   Widget _buildMobileBottomBar(AppState state) {
     int navIdx;
     if (_selectedIndex == 0) {
-      navIdx = 0;
+      navIdx = 0; // 媒体库
     } else if (_selectedIndex == 1) {
-      navIdx = 1;
-    } else if (_selectedIndex == 2) {
-      navIdx = 2;
+      navIdx = 1; // 直播
     } else if (_selectedIndex == 5) {
-      navIdx = 3;
+      navIdx = 2; // Telegram
+    } else if (_selectedIndex == 4) {
+      navIdx = 3; // 我的片单 (历史与收藏)
     } else {
-      // Tabs 3 (媒体库), 4 (历史收藏), 6 (代理), 7 (终端), 8 (设置) highlight "我的/更多"
+      // Tabs 2 (下载), 3 (本地视频), 6 (代理), 7 (终端), 8 (设置) highlight "我的"
       navIdx = 4;
     }
 
     final moreLabel = switch (_selectedIndex) {
-      3 => '媒体库',
-      4 => '历史收藏',
-      6 => '代理加速',
+      2 => '下载',
+      3 => '本地库',
+      6 => '代理',
       7 => '终端',
       8 => '设置',
-      _ => '更多',
+      _ => '我的',
     };
 
     return Container(
       decoration: BoxDecoration(
+        color: VideoPlatformTheme.bgElevated,
         border: Border(
-          top: BorderSide(color: VideoPlatformTheme.borderSubtle),
+          top: BorderSide(
+            color: VideoPlatformTheme.borderSubtle.withValues(alpha: 0.6),
+          ),
         ),
       ),
       child: BottomNavigationBar(
@@ -2353,10 +2399,10 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
               _selectTab(1);
               break;
             case 2:
-              _selectTab(2);
+              _selectTab(5);
               break;
             case 3:
-              _selectTab(5);
+              _selectTab(4);
               break;
             case 4:
               _showMobileMoreHubSheet(state);
@@ -2371,26 +2417,14 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
         unselectedFontSize: 11,
         items: [
           const BottomNavigationBarItem(
-            icon: Icon(Icons.movie_filter_rounded, size: 21),
-            label: '影视',
+            icon: Icon(Icons.video_library_outlined, size: 21),
+            activeIcon: Icon(Icons.video_library_rounded, size: 22),
+            label: '媒体库',
           ),
           const BottomNavigationBarItem(
-            icon: Icon(Icons.live_tv_rounded, size: 21),
-            label: '直播',
-          ),
-          BottomNavigationBarItem(
-            icon: Badge(
-              isLabelVisible: state.activeTasksCount > 0,
-              label: Text(
-                '${state.activeTasksCount}',
-                style: const TextStyle(fontSize: 9.5),
-              ),
-              child: const Icon(
-                Icons.download_for_offline_outlined,
-                size: 21,
-              ),
-            ),
-            label: '下载',
+            icon: Icon(Icons.live_tv_outlined, size: 21),
+            activeIcon: Icon(Icons.live_tv_rounded, size: 22),
+            label: '电视直播',
           ),
           BottomNavigationBarItem(
             icon: Badge(
@@ -2406,10 +2440,24 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
             ),
             label: 'Telegram',
           ),
+          const BottomNavigationBarItem(
+            icon: Icon(Icons.bookmarks_outlined, size: 21),
+            activeIcon: Icon(Icons.bookmarks_rounded, size: 22),
+            label: '我的片单',
+          ),
           BottomNavigationBarItem(
-            icon: Icon(
-              navIdx == 4 ? Icons.apps_rounded : Icons.grid_view_rounded,
-              size: 21,
+            icon: Badge(
+              isLabelVisible: state.activeTasksCount > 0,
+              label: Text(
+                '${state.activeTasksCount}',
+                style: const TextStyle(fontSize: 9.5),
+              ),
+              child: Icon(
+                navIdx == 4
+                    ? Icons.person_rounded
+                    : Icons.person_outline_rounded,
+                size: 22,
+              ),
             ),
             label: moreLabel,
           ),
@@ -2424,7 +2472,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       backgroundColor: VideoPlatformTheme.bgElevated,
       isScrollControlled: true,
       shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
       builder: (ctx) {
         Widget buildGridTile({
@@ -2484,7 +2532,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(
                             fontSize: 13,
-                            fontWeight: FontWeight.w600,
+                            fontWeight: FontWeight.w700,
                             color: selected
                                 ? VideoPlatformTheme.accent
                                 : VideoPlatformTheme.textPrimary,
@@ -2511,6 +2559,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
 
         final proxyEnabled = state.proxyService.proxyEnabled;
         final activeProxy = state.proxyService.activeNode;
+        final visibleSources = state.visibleSources;
 
         return SafeArea(
           child: Padding(
@@ -2532,22 +2581,22 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                 const SizedBox(height: 14),
                 Row(
                   children: [
-                    const AppBrandLogo(size: 26),
+                    const AppBrandLogo(size: 28),
                     const SizedBox(width: 10),
                     Expanded(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            '流光视频 · 功能与设置中心',
+                            '媒体库与个人中心',
                             style: TextStyle(
-                              fontSize: 15,
-                              fontWeight: FontWeight.w700,
+                              fontSize: 15.5,
+                              fontWeight: FontWeight.w800,
                               color: VideoPlatformTheme.textPrimary,
                             ),
                           ),
                           Text(
-                            '当前片源：${state.selectedSource?.name ?? "未选择"} · 代理：${proxyEnabled ? (activeProxy?.displayTitle ?? "已开启") : "直连"}',
+                            '当前挂载：${state.selectedSource?.name ?? "未选择"} (${visibleSources.length}个源) · 代理：${proxyEnabled ? (activeProxy?.displayTitle ?? "已开启") : "直连"}',
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: TextStyle(
@@ -2565,6 +2614,100 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                     ),
                   ],
                 ),
+                // NetEase Filmly Quick Media Library Switcher Strip
+                if (visibleSources.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Icon(
+                        Icons.storage_rounded,
+                        size: 14,
+                        color: VideoPlatformTheme.accent,
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        '快速切换媒体库片源',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                          color: VideoPlatformTheme.textSecondary,
+                        ),
+                      ),
+                      const Spacer(),
+                      InkWell(
+                        borderRadius: BorderRadius.circular(10),
+                        onTap: () {
+                          Navigator.of(ctx).pop();
+                          SourcePickerDialog.show(
+                            context,
+                            sources: visibleSources,
+                            selectedSource: state.selectedSource,
+                            onSelect: (src) {
+                              _selectTab(0);
+                              state.selectVodSource(src);
+                            },
+                          );
+                        },
+                        child: Text(
+                          '全部 ${visibleSources.length} 个源 ›',
+                          style: TextStyle(
+                            fontSize: 11.5,
+                            fontWeight: FontWeight.w600,
+                            color: VideoPlatformTheme.accent,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    height: 34,
+                    child: ListView.separated(
+                      scrollDirection: Axis.horizontal,
+                      itemCount: visibleSources.length.clamp(0, 15),
+                      separatorBuilder: (_, __) => const SizedBox(width: 8),
+                      itemBuilder: (_, idx) {
+                        final src = visibleSources[idx];
+                        final isCurrent = state.selectedSource?.id == src.id;
+                        return InkWell(
+                          borderRadius: BorderRadius.circular(16),
+                          onTap: () {
+                            Navigator.of(ctx).pop();
+                            _selectTab(0);
+                            state.selectVodSource(src);
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 12),
+                            alignment: Alignment.center,
+                            decoration: BoxDecoration(
+                              color: isCurrent
+                                  ? VideoPlatformTheme.accent
+                                  : VideoPlatformTheme.bgCard,
+                              borderRadius: BorderRadius.circular(16),
+                              border: Border.all(
+                                color: isCurrent
+                                    ? VideoPlatformTheme.accent
+                                    : VideoPlatformTheme.borderSubtle,
+                              ),
+                            ),
+                            child: Text(
+                              src.name,
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: isCurrent
+                                    ? FontWeight.w800
+                                    : FontWeight.w500,
+                                color: isCurrent
+                                    ? Colors.black
+                                    : VideoPlatformTheme.textPrimary,
+                              ),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 14),
                 GridView.count(
                   crossAxisCount: 2,
@@ -2575,20 +2718,22 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                   childAspectRatio: 2.55,
                   children: [
                     buildGridTile(
-                      tabIndex: 4,
-                      icon: Icons.bookmarks_outlined,
-                      title: '历史与收藏',
-                      subtitle: '${state.history.length} 条记录 · ${state.favorites.length} 收藏',
+                      tabIndex: 2,
+                      icon: Icons.downloading_rounded,
+                      title: '离线下载中心',
+                      subtitle: state.activeTasksCount > 0
+                          ? '${state.activeTasksCount} 个任务下载中'
+                          : '管理 M3U8 缓存与嗅探',
                     ),
                     buildGridTile(
                       tabIndex: 3,
                       icon: Icons.folder_copy_outlined,
-                      title: '视频资料库',
+                      title: '本地视频资料库',
                       subtitle: '已下载与云端归档视频',
                     ),
                     buildGridTile(
                       tabIndex: 6,
-                      icon: Icons.swap_horiz_rounded,
+                      icon: Icons.bolt_rounded,
                       title: '代理加速节点',
                       subtitle: proxyEnabled
                           ? (activeProxy?.displayTitle ?? '代理已开启')
@@ -2601,73 +2746,17 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                       subtitle: '片源 · 播放器 · 去广告设置',
                     ),
                     buildGridTile(
+                      tabIndex: 4,
+                      icon: Icons.bookmarks_rounded,
+                      title: '我的片单与历史',
+                      subtitle:
+                          '${state.history.length} 条记录 · ${state.favorites.length} 收藏',
+                    ),
+                    buildGridTile(
                       tabIndex: 7,
                       icon: Icons.terminal_rounded,
                       title: '系统终端',
                       subtitle: '远程 SSH / Shell 控制台',
-                    ),
-                    InkWell(
-                      borderRadius: BorderRadius.circular(12),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _openCommandPalette();
-                      },
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 12,
-                          vertical: 10,
-                        ),
-                        decoration: BoxDecoration(
-                          color: VideoPlatformTheme.bgCard,
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(
-                            color: VideoPlatformTheme.borderSubtle,
-                          ),
-                        ),
-                        child: Row(
-                          children: [
-                            Container(
-                              width: 36,
-                              height: 36,
-                              decoration: BoxDecoration(
-                                color: VideoPlatformTheme.bgPrimary
-                                    .withValues(alpha: 0.6),
-                                borderRadius: BorderRadius.circular(10),
-                              ),
-                              child: Icon(
-                                Icons.bolt_rounded,
-                                size: 19,
-                                color: VideoPlatformTheme.accent,
-                              ),
-                            ),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  Text(
-                                    '全局快捷命令',
-                                    style: TextStyle(
-                                      fontSize: 13,
-                                      fontWeight: FontWeight.w600,
-                                      color: VideoPlatformTheme.textPrimary,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 2),
-                                  Text(
-                                    '一键换源 / 搜频道 / 节点',
-                                    style: TextStyle(
-                                      fontSize: 10.5,
-                                      color: VideoPlatformTheme.textMuted,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
                     ),
                   ],
                 ),

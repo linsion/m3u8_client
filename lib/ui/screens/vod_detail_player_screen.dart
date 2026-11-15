@@ -2623,21 +2623,21 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                       );
                     }
 
-                    // Mobile / Tablet stacked layout
+                    // Mobile / Tablet stacked layout (NetEase Filmly Cinema Style)
                     return Column(
                       children: [
                         _buildVideoPlayerStage(fullBleed: true),
                         _buildMobileCompactTransportBar(),
                         Expanded(
                           child: SingleChildScrollView(
-                            padding: const EdgeInsets.fromLTRB(12, 10, 12, 18),
+                            padding: const EdgeInsets.fromLTRB(12, 10, 12, 20),
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
                                 _buildMobileQuickActionBar(),
                                 const SizedBox(height: 12),
                                 _buildInlineEpisodeSection(),
-                                const SizedBox(height: 14),
+                                const SizedBox(height: 12),
                                 _buildMetadataPanel(),
                               ],
                             ),
@@ -6136,7 +6136,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         color: VideoPlatformTheme.bgElevated,
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.circular(12),
         border: Border.all(color: VideoPlatformTheme.borderSubtle),
       ),
       child: Column(
@@ -6144,11 +6144,17 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         children: [
           Row(
             children: [
+              Icon(
+                Icons.playlist_play_rounded,
+                size: 18,
+                color: VideoPlatformTheme.accent,
+              ),
+              const SizedBox(width: 6),
               Text(
-                '播放线路与选集 (${currentGroup.episodes.length}集)',
+                '选集与片源线路 (${currentGroup.episodes.length}集)',
                 style: TextStyle(
-                  fontSize: 14,
-                  fontWeight: FontWeight.w600,
+                  fontSize: 14.5,
+                  fontWeight: FontWeight.w800,
                   color: VideoPlatformTheme.textPrimary,
                 ),
               ),
@@ -6189,7 +6195,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
           ),
           const SizedBox(height: 8),
           SizedBox(
-            height: 34,
+            height: 32,
             child: ListView.separated(
               scrollDirection: Axis.horizontal,
               itemCount: detail.playGroups.length,
@@ -6198,26 +6204,33 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                 final grp = detail.playGroups[idx];
                 final selected = idx == _selectedGroupIndex;
                 return InkWell(
-                  borderRadius: BorderRadius.circular(5),
+                  borderRadius: BorderRadius.circular(16),
                   onTap: () => setState(() {
                     _selectedGroupIndex = idx;
                     _episodeChunkIndex = -1;
                   }),
                   child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    padding: const EdgeInsets.symmetric(horizontal: 13),
                     alignment: Alignment.center,
                     decoration: BoxDecoration(
                       color: selected
                           ? VideoPlatformTheme.accent
                           : VideoPlatformTheme.bgCard,
-                      borderRadius: BorderRadius.circular(5),
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(
+                        color: selected
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.borderSubtle,
+                      ),
                     ),
                     child: Text(
                       grp.name,
                       style: TextStyle(
                         fontSize: 12,
+                        fontWeight:
+                            selected ? FontWeight.w800 : FontWeight.w500,
                         color: selected
-                            ? Colors.white
+                            ? Colors.black
                             : VideoPlatformTheme.textSecondary,
                       ),
                     ),
@@ -6229,14 +6242,14 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
           _buildEpisodeChunkAndSearchControls(currentGroup.episodes.length),
           const SizedBox(height: 12),
           ConstrainedBox(
-            constraints: const BoxConstraints(maxHeight: 220),
+            constraints: const BoxConstraints(maxHeight: 224),
             child: GridView.builder(
               shrinkWrap: true,
               gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-                maxCrossAxisExtent: 110,
+                maxCrossAxisExtent: 108,
                 mainAxisSpacing: 8,
                 crossAxisSpacing: 8,
-                childAspectRatio: 2.6,
+                childAspectRatio: 2.55,
               ),
               itemCount: displayEpisodes.length,
               itemBuilder: (_, idx) {
@@ -6262,7 +6275,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         savedProg.positionSeconds > 5;
 
     return InkWell(
-      borderRadius: BorderRadius.circular(5),
+      borderRadius: BorderRadius.circular(10),
       focusColor: VideoPlatformTheme.accent.withValues(alpha: 0.35),
       onFocusChange: (focused) {
         if (focused && mounted) {
@@ -6293,20 +6306,20 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
             alignment: Alignment.center,
             decoration: BoxDecoration(
               color: isFocused
-                  ? VideoPlatformTheme.accent.withValues(alpha: 0.28)
+                  ? VideoPlatformTheme.accent
                   : (isPlaying
-                      ? VideoPlatformTheme.accent.withValues(alpha: 0.16)
+                      ? VideoPlatformTheme.accent.withValues(alpha: 0.18)
                       : VideoPlatformTheme.bgCard),
-              borderRadius: BorderRadius.circular(5),
+              borderRadius: BorderRadius.circular(10),
               border: Border.all(
                 color: isFocused
-                    ? VideoPlatformTheme.accent
+                    ? Colors.white
                     : (isPlaying
                         ? VideoPlatformTheme.accent
                         : (isSavedEpisode
                             ? VideoPlatformTheme.accent.withValues(alpha: 0.5)
                             : VideoPlatformTheme.borderSubtle)),
-                width: isFocused ? 2.0 : 1.0,
+                width: isFocused ? 2.2 : 1.0,
               ),
             ),
             child: Column(
@@ -6318,12 +6331,14 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
                     fontSize: 12,
-                    color: (isPlaying || isFocused)
-                        ? VideoPlatformTheme.accent
-                        : VideoPlatformTheme.textPrimary,
+                    color: isFocused
+                        ? Colors.black
+                        : (isPlaying
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.textPrimary),
                     fontWeight: (isPlaying || isFocused)
-                        ? FontWeight.w600
-                        : FontWeight.w400,
+                        ? FontWeight.w800
+                        : FontWeight.w500,
                   ),
                 ),
                 if (isSavedEpisode)
@@ -6331,7 +6346,9 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                     _formatDurationLabel(savedProg.positionSeconds),
                     style: TextStyle(
                       fontSize: 9.5,
-                      color: VideoPlatformTheme.accent,
+                      color: isFocused
+                          ? Colors.black87
+                          : VideoPlatformTheme.accent,
                     ),
                   ),
               ],
@@ -6346,11 +6363,11 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     final detail = _detail;
     if (detail == null) return const SizedBox.shrink();
 
-    final tags = <String>[
-      if (detail.typeName.isNotEmpty) detail.typeName,
+    final metaParts = <String>[
       if (detail.vodYear.isNotEmpty && detail.vodYear != '0') detail.vodYear,
       if (detail.vodArea.isNotEmpty) detail.vodArea,
-      if (detail.vodRemarks.isNotEmpty) detail.vodRemarks,
+      if (detail.typeName.isNotEmpty) detail.typeName,
+      '媒体源: ${_activeSource.name}',
     ];
 
     return Container(
@@ -6358,49 +6375,57 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: VideoPlatformTheme.bgElevated,
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.circular(12),
         border: Border.all(color: VideoPlatformTheme.borderSubtle),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            detail.vodName,
-            style: TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.w600,
-              color: VideoPlatformTheme.textPrimary,
-            ),
-          ),
-          if (tags.isNotEmpty) ...[
-            const SizedBox(height: 8),
-            Wrap(
-              spacing: 8,
-              runSpacing: 6,
-              children: tags
-                  .map(
-                    (t) => Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 3,
-                      ),
-                      decoration: BoxDecoration(
-                        color: VideoPlatformTheme.bgCard,
-                        borderRadius: BorderRadius.circular(4),
-                        border: Border.all(
-                          color: VideoPlatformTheme.borderSubtle,
-                        ),
-                      ),
-                      child: Text(
-                        t,
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: VideoPlatformTheme.textSecondary,
-                        ),
-                      ),
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  detail.vodName,
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w800,
+                    color: VideoPlatformTheme.textPrimary,
+                  ),
+                ),
+              ),
+              if (detail.vodRemarks.isNotEmpty)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 3,
+                  ),
+                  decoration: BoxDecoration(
+                    color: VideoPlatformTheme.accent.withValues(alpha: 0.16),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(
+                      color: VideoPlatformTheme.accent.withValues(alpha: 0.55),
                     ),
-                  )
-                  .toList(),
+                  ),
+                  child: Text(
+                    detail.vodRemarks,
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w800,
+                      color: VideoPlatformTheme.accent,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          if (metaParts.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(
+              metaParts.join(' · '),
+              style: TextStyle(
+                fontSize: 12.5,
+                fontWeight: FontWeight.w600,
+                color: VideoPlatformTheme.textSecondary,
+              ),
             ),
           ],
           if (detail.vodDirector.isNotEmpty) ...[
@@ -6408,17 +6433,17 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
             Text(
               '导演：${detail.vodDirector}',
               style: TextStyle(
-                fontSize: 13,
+                fontSize: 12.5,
                 color: VideoPlatformTheme.textSecondary,
               ),
             ),
           ],
           if (detail.vodActor.isNotEmpty) ...[
-            const SizedBox(height: 6),
+            const SizedBox(height: 5),
             Text(
-              '主演：${detail.vodActor}',
+              '演职员：${detail.vodActor}',
               style: TextStyle(
-                fontSize: 13,
+                fontSize: 12.5,
                 color: VideoPlatformTheme.textSecondary,
               ),
             ),
@@ -6431,13 +6456,13 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
               '剧情简介',
               style: TextStyle(
                 fontSize: 14,
-                fontWeight: FontWeight.w600,
+                fontWeight: FontWeight.w700,
                 color: VideoPlatformTheme.textPrimary,
               ),
             ),
             const SizedBox(height: 6),
             Text(
-              detail.vodContent,
+              detail.vodContent.replaceAll(RegExp(r'<[^>]*>'), '').trim(),
               style: TextStyle(
                 fontSize: 13,
                 height: 1.55,

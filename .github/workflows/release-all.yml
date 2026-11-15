@@ -7,15 +7,15 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Release tag version (e.g. v1.0.8)'
+        description: 'Release tag version (e.g. v1.1.0)'
         required: false
-        default: 'v1.0.8'
+        default: 'v1.1.0'
 
 permissions:
   contents: write
 
 env:
-  VERSION_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v1.0.8' }}
+  VERSION_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v1.1.0' }}
 
 jobs:
   build-android:
@@ -81,7 +81,12 @@ jobs:
           IPA_STAGE="$(mktemp -d)"
           mkdir -p "$IPA_STAGE/Payload"
           cp -R build/ios/iphoneos/Runner.app "$IPA_STAGE/Payload/Runner.app"
+          for fw in "$IPA_STAGE/Payload/Runner.app/Frameworks/"*.framework; do
+            [ -d "$fw" ] && codesign --force --sign - --timestamp=none "$fw"
+          done
+          codesign --force --sign - --timestamp=none "$IPA_STAGE/Payload/Runner.app"
           (cd "$IPA_STAGE" && zip -qry "$GITHUB_WORKSPACE/dist/LiuguangVideo-iOS-${VERSION_TAG}-unsigned.ipa" Payload)
+          unzip -t "$GITHUB_WORKSPACE/dist/LiuguangVideo-iOS-${VERSION_TAG}-unsigned.ipa" >/dev/null
       - uses: actions/upload-artifact@v4
         with:
           name: apple-release

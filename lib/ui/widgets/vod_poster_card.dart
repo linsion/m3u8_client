@@ -433,71 +433,106 @@ class _VodPosterCardState extends State<VodPosterCard> {
       child: GestureDetector(
         onTap: widget.onTap,
         child: AnimatedScale(
-          scale: _focused ? 1.04 : 1.0,
-          duration: const Duration(milliseconds: 140),
+          scale: _focused ? 1.06 : (_hovered ? 1.02 : 1.0),
+          duration: const Duration(milliseconds: 160),
           curve: Curves.easeOutCubic,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Expanded(
                 child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 140),
+                  duration: const Duration(milliseconds: 160),
                   decoration: BoxDecoration(
                     color: VideoPlatformTheme.bgCard,
-                    borderRadius: BorderRadius.circular(6),
+                    borderRadius: BorderRadius.circular(10),
                     border: Border.all(
-                      color: activeHighlight
-                          ? VideoPlatformTheme.accent
-                          : VideoPlatformTheme.borderSubtle,
-                      width: _focused ? 2.5 : 1.0,
+                      color: _focused
+                          ? Colors.white
+                          : (activeHighlight
+                              ? VideoPlatformTheme.accent
+                              : Colors.white.withValues(alpha: 0.07)),
+                      width: _focused ? 2.4 : 1.0,
                     ),
                     boxShadow: _focused
                         ? [
                             BoxShadow(
                               color: VideoPlatformTheme.accent
-                                  .withValues(alpha: 0.45),
-                              blurRadius: 14,
-                              spreadRadius: 1,
+                                  .withValues(alpha: 0.55),
+                              blurRadius: 16,
+                              spreadRadius: 1.5,
+                            ),
+                            const BoxShadow(
+                              color: Color(0x66000000),
+                              blurRadius: 10,
+                              offset: Offset(0, 4),
                             ),
                           ]
-                        : null,
+                        : const [
+                            BoxShadow(
+                              color: Color(0x33000000),
+                              blurRadius: 6,
+                              offset: Offset(0, 2),
+                            ),
+                          ],
                   ),
                   clipBehavior: Clip.antiAlias,
                   child: Stack(
                     fit: StackFit.expand,
                     children: [
                       _buildPosterImage(item),
-                      // Bottom subtle dark gradient for remark readability
+                      // Top-right NetEase Filmly (网易爆米花) Amber-Gold Remarks / Quality Badge
                       if (item.vodRemarks.isNotEmpty)
                         Positioned(
-                          left: 0,
-                          right: 0,
-                          bottom: 0,
+                          top: 6,
+                          right: 6,
                           child: Container(
-                            padding: const EdgeInsets.fromLTRB(8, 18, 8, 6),
-                            decoration: const BoxDecoration(
-                              gradient: LinearGradient(
-                                begin: Alignment.bottomCenter,
-                                end: Alignment.topCenter,
-                                colors: [
-                                  Color(0xD9000000),
-                                  Color(0x00000000),
-                                ],
+                            constraints: const BoxConstraints(maxWidth: 96),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 2.5,
+                            ),
+                            decoration: BoxDecoration(
+                              color: const Color(0xD9101218),
+                              borderRadius: BorderRadius.circular(5),
+                              border: Border.all(
+                                color: const Color(0x66FFB800),
+                                width: 0.7,
                               ),
                             ),
                             child: Text(
                               item.vodRemarks,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              textAlign: TextAlign.right,
                               style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 11,
-                                fontWeight: FontWeight.w500,
+                                color: Color(0xFFFFC53D),
+                                fontSize: 10,
+                                fontWeight: FontWeight.w700,
+                                letterSpacing: 0.1,
                               ),
                             ),
                           ),
                         ),
+                      // Bottom subtle cinema gradient for depth & year/type pill on focus
+                      Positioned(
+                        left: 0,
+                        right: 0,
+                        bottom: 0,
+                        child: IgnorePointer(
+                          child: Container(
+                            height: 40,
+                            decoration: const BoxDecoration(
+                              gradient: LinearGradient(
+                                begin: Alignment.bottomCenter,
+                                end: Alignment.topCenter,
+                                colors: [
+                                  Color(0xCC08090C),
+                                  Color(0x0008090C),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
                       // Top-left source badge when displaying aggregated search results
                       if (widget.showSourceBadge && item.source != null)
                         Positioned(
@@ -506,14 +541,14 @@ class _VodPosterCardState extends State<VodPosterCard> {
                           child: Container(
                             padding: const EdgeInsets.symmetric(
                               horizontal: 6,
-                              vertical: 2,
+                              vertical: 2.5,
                             ),
                             decoration: BoxDecoration(
-                              color: const Color(0xCC17181E),
-                              borderRadius: BorderRadius.circular(4),
+                              color: const Color(0xD914161E),
+                              borderRadius: BorderRadius.circular(5),
                               border: Border.all(
                                 color: VideoPlatformTheme.borderStrong,
-                                width: 0.5,
+                                width: 0.6,
                               ),
                             ),
                             child: Text(
@@ -521,7 +556,7 @@ class _VodPosterCardState extends State<VodPosterCard> {
                               style: TextStyle(
                                 color: VideoPlatformTheme.textPrimary,
                                 fontSize: 10,
-                                fontWeight: FontWeight.w500,
+                                fontWeight: FontWeight.w600,
                               ),
                             ),
                           ),
@@ -529,15 +564,21 @@ class _VodPosterCardState extends State<VodPosterCard> {
                       // Hover / TV Remote Focus play overlay
                       if (activeHighlight)
                         Container(
-                          color: const Color(0x38000000),
+                          color: const Color(0x2E000000),
                           alignment: Alignment.center,
                           child: Container(
                             width: 42,
                             height: 42,
                             decoration: BoxDecoration(
                               color: VideoPlatformTheme.accent
-                                  .withValues(alpha: 0.88),
+                                  .withValues(alpha: 0.92),
                               shape: BoxShape.circle,
+                              boxShadow: const [
+                                BoxShadow(
+                                  color: Color(0x55000000),
+                                  blurRadius: 8,
+                                ),
+                              ],
                             ),
                             child: Icon(
                               item.isAlistDirectory
@@ -552,7 +593,7 @@ class _VodPosterCardState extends State<VodPosterCard> {
                   ),
                 ),
               ),
-              const SizedBox(height: 6),
+              const SizedBox(height: 7),
               Text(
                 item.vodName,
                 maxLines: 1,
@@ -563,15 +604,15 @@ class _VodPosterCardState extends State<VodPosterCard> {
                       : VideoPlatformTheme.textPrimary,
                   fontSize: 13,
                   fontWeight:
-                      _focused ? FontWeight.w700 : FontWeight.w500,
-                  height: 1.25,
+                      activeHighlight ? FontWeight.w700 : FontWeight.w600,
+                  height: 1.22,
                 ),
               ),
               const SizedBox(height: 2),
               Text(
                 subtitle.isNotEmpty
                     ? subtitle
-                    : (item.isAlistDirectory ? '目录文件夹' : '影视资源'),
+                    : (item.isAlistDirectory ? '目录文件夹' : '影视媒体'),
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(
