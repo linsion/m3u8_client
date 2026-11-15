@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -1182,7 +1183,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                   ],
                 ),
                 Text(
-                  '爆米花海报墙 · ${AppState.appShortVersion}',
+                  AppState.appShortVersion,
                   style: TextStyle(
                     fontSize: 10,
                     color: VideoPlatformTheme.textMuted,
@@ -2518,11 +2519,11 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     } else if (_selectedIndex == 1) {
       navIdx = 1; // 直播
     } else if (_selectedIndex == 5) {
-      navIdx = 2; // Telegram
+      navIdx = 2; // Telegram 对话
     } else if (_selectedIndex == 4) {
-      navIdx = 3; // 我的片单 (历史与收藏)
+      navIdx = 3; // 片单
     } else {
-      // Tabs 2 (下载), 3 (本地视频), 6 (代理), 7 (终端), 8 (设置) highlight "我的"
+      // Tabs 2 (下载), 3 (本地视频), 6 (代理), 7 (终端), 8 (设置) highlight "设置/我的"
       navIdx = 4;
     }
 
@@ -2532,92 +2533,198 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       6 => '代理',
       7 => '终端',
       8 => '设置',
-      _ => '我的',
+      _ => '设置',
     };
 
-    return Container(
-      decoration: BoxDecoration(
-        color: VideoPlatformTheme.bgElevated,
-        border: Border(
-          top: BorderSide(
-            color: VideoPlatformTheme.borderSubtle.withValues(alpha: 0.6),
-          ),
-        ),
+    final isDark = VideoPlatformTheme.isDark;
+    final barBg = isDark
+        ? const Color(0xFF17212B).withValues(alpha: 0.92)
+        : const Color(0xFFF7F8FA).withValues(alpha: 0.94);
+    final topBorderColor = isDark
+        ? const Color(0xFF0E1621).withValues(alpha: 0.85)
+        : const Color(0xFFD8DCE0);
+    final tgBlue = isDark ? const Color(0xFF3E99F7) : const Color(0xFF2481CC);
+    final inactiveColor =
+        isDark ? const Color(0xFF7D8B99) : const Color(0xFF8E8E93);
+    final unreadCount =
+        state.telegramNotifications.totalUnreadNotificationCount;
+    final activeTasks = state.activeTasksCount;
+
+    final tabs = <({
+      IconData icon,
+      IconData activeIcon,
+      String label,
+      int badgeCount,
+      Color badgeColor,
+      VoidCallback onTap,
+    })>[
+      (
+        icon: Icons.video_library_outlined,
+        activeIcon: Icons.video_library_rounded,
+        label: '媒体库',
+        badgeCount: 0,
+        badgeColor: tgBlue,
+        onTap: () => _selectTab(0),
       ),
-      child: BottomNavigationBar(
-        currentIndex: navIdx,
-        onTap: (idx) {
-          switch (idx) {
-            case 0:
-              _selectTab(0);
-              break;
-            case 1:
-              _selectTab(1);
-              break;
-            case 2:
-              _selectTab(5);
-              break;
-            case 3:
-              _selectTab(4);
-              break;
-            case 4:
-              _showMobileMoreHubSheet(state);
-              break;
+      (
+        icon: Icons.live_tv_outlined,
+        activeIcon: Icons.live_tv_rounded,
+        label: '直播',
+        badgeCount: 0,
+        badgeColor: tgBlue,
+        onTap: () => _selectTab(1),
+      ),
+      (
+        icon: Icons.forum_outlined,
+        activeIcon: Icons.forum_rounded,
+        label: '对话',
+        badgeCount: unreadCount,
+        badgeColor: tgBlue,
+        onTap: () {
+          if (_selectedIndex == 5 && state.activeChildBackHandler != null) {
+            state.activeChildBackHandler!();
+          } else {
+            _selectTab(5);
           }
         },
-        type: BottomNavigationBarType.fixed,
-        backgroundColor: VideoPlatformTheme.bgElevated,
-        selectedItemColor: VideoPlatformTheme.accent,
-        unselectedItemColor: VideoPlatformTheme.textMuted,
-        selectedFontSize: 11,
-        unselectedFontSize: 11,
-        items: [
-          const BottomNavigationBarItem(
-            icon: Icon(Icons.video_library_outlined, size: 21),
-            activeIcon: Icon(Icons.video_library_rounded, size: 22),
-            label: '媒体库',
-          ),
-          const BottomNavigationBarItem(
-            icon: Icon(Icons.live_tv_outlined, size: 21),
-            activeIcon: Icon(Icons.live_tv_rounded, size: 22),
-            label: '电视直播',
-          ),
-          BottomNavigationBarItem(
-            icon: Badge(
-              isLabelVisible:
-                  state.telegramNotifications.totalUnreadNotificationCount > 0,
-              label: Text(
-                state.telegramNotifications.totalUnreadNotificationCount > 99
-                    ? '99+'
-                    : '${state.telegramNotifications.totalUnreadNotificationCount}',
-                style: const TextStyle(fontSize: 9.5),
-              ),
-              child: const Icon(Icons.send_rounded, size: 20),
+      ),
+      (
+        icon: Icons.bookmarks_outlined,
+        activeIcon: Icons.bookmarks_rounded,
+        label: '片单',
+        badgeCount: 0,
+        badgeColor: tgBlue,
+        onTap: () => _selectTab(4),
+      ),
+      (
+        icon: Icons.settings_outlined,
+        activeIcon: Icons.settings_rounded,
+        label: moreLabel,
+        badgeCount: activeTasks,
+        badgeColor: const Color(0xFF34C759),
+        onTap: () => _showMobileMoreHubSheet(state),
+      ),
+    ];
+
+    return ClipRect(
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 22, sigmaY: 22),
+        child: Container(
+          decoration: BoxDecoration(
+            color: barBg,
+            border: Border(
+              top: BorderSide(color: topBorderColor, width: 0.6),
             ),
-            label: 'Telegram',
           ),
-          const BottomNavigationBarItem(
-            icon: Icon(Icons.bookmarks_outlined, size: 21),
-            activeIcon: Icon(Icons.bookmarks_rounded, size: 22),
-            label: '我的片单',
-          ),
-          BottomNavigationBarItem(
-            icon: Badge(
-              isLabelVisible: state.activeTasksCount > 0,
-              label: Text(
-                '${state.activeTasksCount}',
-                style: const TextStyle(fontSize: 9.5),
-              ),
-              child: Icon(
-                navIdx == 4
-                    ? Icons.person_rounded
-                    : Icons.person_outline_rounded,
-                size: 22,
+          child: SafeArea(
+            top: false,
+            child: SizedBox(
+              height: 56,
+              child: Row(
+                children: List.generate(tabs.length, (idx) {
+                  final item = tabs[idx];
+                  final selected = navIdx == idx;
+                  final badgeText = item.badgeCount > 99
+                      ? '99+'
+                      : '${item.badgeCount}';
+
+                  return Expanded(
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () {
+                        HapticFeedback.selectionClick();
+                        item.onTap();
+                      },
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Stack(
+                            clipBehavior: Clip.none,
+                            alignment: Alignment.center,
+                            children: [
+                              AnimatedContainer(
+                                duration: const Duration(milliseconds: 200),
+                                curve: Curves.easeOutCubic,
+                                width: selected ? 54 : 36,
+                                height: 28,
+                                decoration: BoxDecoration(
+                                  color: selected
+                                      ? tgBlue.withValues(alpha: 0.16)
+                                      : Colors.transparent,
+                                  borderRadius: BorderRadius.circular(14),
+                                ),
+                                alignment: Alignment.center,
+                                child: AnimatedScale(
+                                  scale: selected ? 1.06 : 1.0,
+                                  duration: const Duration(milliseconds: 180),
+                                  curve: Curves.easeOutBack,
+                                  child: Icon(
+                                    selected ? item.activeIcon : item.icon,
+                                    size: 22,
+                                    color: selected ? tgBlue : inactiveColor,
+                                  ),
+                                ),
+                              ),
+                              if (item.badgeCount > 0)
+                                Positioned(
+                                  right: selected ? 2 : -4,
+                                  top: -3,
+                                  child: Container(
+                                    constraints: const BoxConstraints(
+                                      minWidth: 17,
+                                      minHeight: 16,
+                                    ),
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 4.5,
+                                      vertical: 1,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: item.badgeColor,
+                                      borderRadius: BorderRadius.circular(10),
+                                      border: Border.all(
+                                        color: isDark
+                                            ? const Color(0xFF17212B)
+                                            : const Color(0xFFF7F8FA),
+                                        width: 1.5,
+                                      ),
+                                    ),
+                                    alignment: Alignment.center,
+                                    child: Text(
+                                      badgeText,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 9.5,
+                                        fontWeight: FontWeight.w700,
+                                        height: 1.05,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                            ],
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            item.label,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 10.5,
+                              fontWeight: selected
+                                  ? FontWeight.w600
+                                  : FontWeight.w500,
+                              color: selected ? tgBlue : inactiveColor,
+                              letterSpacing: 0.1,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                }),
               ),
             ),
-            label: moreLabel,
           ),
-        ],
+        ),
       ),
     );
   }

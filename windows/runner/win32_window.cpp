@@ -2,10 +2,17 @@
 
 #include <dwmapi.h>
 #include <flutter_windows.h>
+#include <shellapi.h>
 
 #include "resource.h"
 
 namespace {
+
+constexpr UINT kTrayCallbackMessage = WM_APP + 1;
+constexpr UINT kWakeSingleInstanceMessage = WM_APP + 2;
+constexpr UINT kTrayIconId = 1;
+constexpr UINT_PTR kTrayMenuShowId = 1001;
+constexpr UINT_PTR kTrayMenuExitId = 1002;
 
 /// Window attribute that enables dark mode window decorations.
 ///
@@ -145,6 +152,7 @@ bool Win32Window::Create(const std::wstring& title,
   }
 
   UpdateTheme(window);
+  AddTrayIcon();
 
   return OnCreate();
 }
@@ -179,7 +187,50 @@ Win32Window::MessageHandler(HWND hwnd,
                             WPARAM const wparam,
                             LPARAM const lparam) noexcept {
   switch (message) {
+    case WM_CLOSE:
+      if (!force_quit_) {
+        if (tray_icon_added_) {
+          ShowWindow(hwnd, SW_HIDE);
+        } else {
+          ShowWindow(hwnd, SW_MINIMIZE);
+        }
+        return 0;
+      }
+      break;
+
+    case WM_QUERYENDSESSION:
+    case WM_ENDSESSION:
+      force_quit_ = true;
+      break;
+
+    case kWakeSingleInstanceMessage:
+      RestoreFromTray();
+      return 0;
+
+    case kTrayCallbackMessage:
+      if (lparam == WM_LBUTTONUP || lparam == WM_LBUTTONDBLCLK) {
+        RestoreFromTray();
+        return 0;
+      } else if (lparam == WM_RBUTTONUP || lparam == WM_CONTEXTMENU) {
+        ShowTrayContextMenu();
+        return 0;
+      }
+      return 0;
+
+    case WM_COMMAND:
+      if (LOWORD(wparam) == kTrayMenuShowId) {
+        RestoreFromTray();
+        return 0;
+      } else if (LOWORD(wparam) == kTrayMenuExitId) {
+        force_quit_ = true;
+        RemoveTrayIcon();
+        DestroyWindow(hwnd);
+        return 0;
+      }
+      break;
+
     case WM_DESTROY:
+      RemoveTrayIcon();
       window_handle_ = nullptr;
       Destroy();
       if (quit_on_close_) {
@@ -223,6 +274,7 @@ Win32Window::MessageHandler(HWND hwnd,
 
 void Win32Window::Destroy() {
   OnDestroy();
+  RemoveTrayIcon();
 
   if (window_handle_) {
     DestroyWindow(window_handle_);
@@ -231,6 +283,70 @@ void Win32Window::Destroy() {
   if (g_active_window_count == 0) {
     WindowClassRegistrar::GetInstance()->UnregisterWindowClass();
   }
+}
+
+void Win32Window::AddTrayIcon() {
+  if (tray_icon_added_ || !window_handle_) {
+    return;
+  }
+  NOTIFYICONDATAW nid = {};
+  nid.cbSize = sizeof(NOTIFYICONDATAW);
+  nid.hWnd = window_handle_;
+  nid.uID = kTrayIconId;
+  nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+  nid.uCallbackMessage = kTrayCallbackMessage;
+  nid.hIcon = LoadIcon(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_APP_ICON));
+  wcscpy_s(nid.szTip, L"\u6D41\u5149\u89C6\u9891");
+  if (Shell_NotifyIconW(NIM_ADD, &nid)) {
+    tray_icon_added_ = true;
+  }
+}
+
+void Win32Window::RemoveTrayIcon() {
+  if (!tray_icon_added_ || !window_handle_) {
+    return;
+  }
+  NOTIFYICONDATAW nid = {};
+  nid.cbSize = sizeof(NOTIFYICONDATAW);
+  nid.hWnd = window_handle_;
+  nid.uID = kTrayIconId;
+  Shell_NotifyIconW(NIM_DELETE, &nid);
+  tray_icon_added_ = false;
+}
+
+void Win32Window::RestoreFromTray() {
+  if (!window_handle_) {
+    return;
+  }
+  ShowWindow(window_handle_, SW_SHOW);
+  if (IsIconic(window_handle_)) {
+    ShowWindow(window_handle_, SW_RESTORE);
+  }
+  SetForegroundWindow(window_handle_);
+  if (child_content_ != nullptr) {
+    SetFocus(child_content_);
+  }
+}
+
+void Win32Window::ShowTrayContextMenu() {
+  if (!window_handle_) {
+    return;
+  }
+  HMENU menu = CreatePopupMenu();
+  if (!menu) {
+    return;
+  }
+  AppendMenuW(menu, MF_STRING, kTrayMenuShowId, L"\u663E\u793A\u4E3B\u7A97\u53E3");
+  AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(menu, MF_STRING, kTrayMenuExitId, L"\u9000\u51FA\u6D41\u5149\u89C6\u9891");
+
+  POINT pt;
+  GetCursorPos(&pt);
+  SetForegroundWindow(window_handle_);
+  TrackPopupMenu(menu, TPM_BOTTOMALIGN | TPM_LEFTALIGN | TPM_RIGHTBUTTON, pt.x,
+                 pt.y, 0, window_handle_, nullptr);
+  PostMessage(window_handle_, WM_NULL, 0, 0);
+  DestroyMenu(menu);
 }
 
 Win32Window* Win32Window::GetThisFromHandle(HWND const window) noexcept {

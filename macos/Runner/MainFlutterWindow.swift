@@ -4,7 +4,7 @@ import FlutterMacOS
 import GameController
 import UserNotifications
 
-class MainFlutterWindow: NSWindow, UNUserNotificationCenterDelegate {
+class MainFlutterWindow: NSWindow, NSWindowDelegate, UNUserNotificationCenterDelegate {
   private let channelName = "com.linsion.m3u8_client/tv_platform"
   private var notificationsChannel: FlutterMethodChannel?
 
@@ -12,6 +12,8 @@ class MainFlutterWindow: NSWindow, UNUserNotificationCenterDelegate {
     let flutterViewController = FlutterViewController()
     self.contentViewController = flutterViewController
     self.title = "流光视频"
+    self.isReleasedWhenClosed = false
+    self.delegate = self
     self.minSize = NSSize(width: 960, height: 640)
     if let screen = NSScreen.main {
       let screenRect = screen.visibleFrame
@@ -76,6 +78,18 @@ class MainFlutterWindow: NSWindow, UNUserNotificationCenterDelegate {
     RegisterGeneratedPlugins(registry: flutterViewController)
 
     super.awakeFromNib()
+  }
+
+  func windowShouldClose(_ sender: NSWindow) -> Bool {
+    if self.styleMask.contains(.fullScreen) {
+      self.toggleFullScreen(nil)
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) { [weak self] in
+        self?.orderOut(nil)
+      }
+    } else {
+      self.orderOut(nil)
+    }
+    return false
   }
 
   private func presentMacAirPlayRoutePicker(in hostView: NSView) {

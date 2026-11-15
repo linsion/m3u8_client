@@ -579,7 +579,12 @@ class _TelegramScreenState extends State<TelegramScreen> {
       }
       if (msg != null && msg.id > 0) {
         final existingIdx = _messages.indexWhere((m) => m.id == msg.id);
-        if (existingIdx >= 0) {
+        if (!msg.hasRenderableContent) {
+          if (existingIdx >= 0) {
+            _messages.removeAt(existingIdx);
+            changed = true;
+          }
+        } else if (existingIdx >= 0) {
           _messages[existingIdx] = msg;
           changed = true;
         } else {
@@ -671,11 +676,20 @@ class _TelegramScreenState extends State<TelegramScreen> {
           ? _messageScrollController.position.pixels
           : existing?.scrollOffset;
       if (_messages.isNotEmpty) {
+        final tailMessages = _messages.length > 80
+            ? _messages.sublist(_messages.length - 80)
+            : _messages;
+        _cachedMessagesByPeer.remove(peerKey);
         _cachedMessagesByPeer[peerKey] = (
-          messages: List<TelegramMessage>.from(_messages),
-          nextOffset: _nextMessageOffset,
+          messages: List<TelegramMessage>.from(tailMessages),
+          nextOffset: _messages.length > 80
+              ? tailMessages.first.id
+              : _nextMessageOffset,
           scrollOffset: currentScroll,
         );
+        while (_cachedMessagesByPeer.length > 20) {
+          _cachedMessagesByPeer.remove(_cachedMessagesByPeer.keys.first);
+        }
       }
     } else {
       _cachedSelectedChatByAccount.remove(_activeAccountId);
@@ -1055,14 +1069,13 @@ class _TelegramScreenState extends State<TelegramScreen> {
   void _onMessageScroll() {
     if (!_messageScrollController.hasClients) return;
     final pos = _messageScrollController.position;
-    final distFromBottom = pos.maxScrollExtent - pos.pixels;
-    final shouldShow = distFromBottom > 260;
+    final shouldShow = pos.pixels > 260;
     if (shouldShow != _showScrollToBottomBtn && mounted) {
       setState(() => _showScrollToBottomBtn = shouldShow);
       _syncReadingContext();
     }
-    if (pos.pixels <= 72 &&
-        pos.userScrollDirection == ScrollDirection.forward) {
+    if (pos.pixels >= pos.maxScrollExtent - 120 &&
+        pos.userScrollDirection == ScrollDirection.reverse) {
       _tryLoadOlderMessagesOnScroll();
     }
   }
@@ -1070,15 +1083,14 @@ class _TelegramScreenState extends State<TelegramScreen> {
   void _scrollToBottom({bool animated = true}) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_messageScrollController.hasClients) return;
-      final target = _messageScrollController.position.maxScrollExtent;
       if (animated) {
         _messageScrollController.animateTo(
-          target,
+          0.0,
           duration: const Duration(milliseconds: 220),
           curve: Curves.easeOutCubic,
         );
       } else {
-        _messageScrollController.jumpTo(target);
+        _messageScrollController.jumpTo(0.0);
       }
     });
   }
@@ -1153,12 +1165,12 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
   FocusNode? _findVerticalFocusTargetInContainer({
     required GlobalKey containerKey,
+    FocusNode? containerNode,
     required FocusNode currentNode,
     required bool moveUp,
   }) {
     final containerCtx = containerKey.currentContext;
-    if (containerCtx == null) return null;
-    final scope = FocusScope.of(containerCtx);
+    if (containerCtx == null || !currentNode.canRequestFocus) return null;
     final currentRect = currentNode.rect;
     if (currentRect.isEmpty) return null;
 
@@ -1166,16 +1178,24 @@ class _TelegramScreenState extends State<TelegramScreen> {
     Rect? containerBounds;
     if (containerBox != null && containerBox.hasSize) {
       final topLeft = containerBox.localToGlobal(Offset.zero);
-      containerBounds =
-          topLeft & containerBox.size;
+      containerBounds = topLeft & containerBox.size;
     }
 
-    final candidates = <FocusNode>[];
-    for (final node in scope.traversalDescendants) {
-      if (node == currentNode || !node.canRequestFocus || node.context == null) {
+    final Iterable<FocusNode> descendants = containerNode != null
+        ? containerNode.traversalDescendants
+        : FocusScope.of(containerCtx).traversalDescendants;
+
+    FocusNode? bestNode;
+    double bestScore = double.infinity;
+
+    for (final node in descendants) {
+      if (node == currentNode ||
+          !node.canRequestFocus ||
+          node.context == null) {
         continue;
       }
-      if (!_isFocusNodeInsideContainer(node, containerKey)) {
+      if (containerNode == null &&
+          !_isFocusNodeInsideContainer(node, containerKey)) {
         continue;
       }
       if (_areFocusNodesNested(currentNode, node)) {
@@ -1190,39 +1210,29 @@ class _TelegramScreenState extends State<TelegramScreen> {
         }
       }
       if (moveUp) {
-        if (r.center.dy < currentRect.top - 2 && r.top < currentRect.top - 4) {
-          candidates.add(node);
+        if (r.center.dy >= currentRect.top - 2 ||
+            r.top >= currentRect.top - 4) {
+          continue;
         }
       } else {
-        if (r.center.dy > currentRect.bottom + 2 &&
-            r.bottom > currentRect.bottom + 4) {
-          candidates.add(node);
+        if (r.center.dy <= currentRect.bottom + 2 ||
+            r.bottom <= currentRect.bottom + 4) {
+          continue;
         }
+      }
+
+      final verticalDist = moveUp
+          ? (currentRect.top - r.bottom).abs()
+          : (r.top - currentRect.bottom).abs();
+      final horizontalDist = (r.center.dx - currentRect.center.dx).abs();
+      final score = verticalDist * 10.0 + horizontalDist * 0.25;
+      if (score < bestScore) {
+        bestScore = score;
+        bestNode = node;
       }
     }
 
-    if (candidates.isEmpty) return null;
-
-    candidates.sort((a, b) {
-      final ra = a.rect;
-      final rb = b.rect;
-      if ((ra.center.dy - rb.center.dy).abs() <= 18) {
-        final dxA = (ra.center.dx - currentRect.center.dx).abs();
-        final dxB = (rb.center.dx - currentRect.center.dx).abs();
-        return dxA.compareTo(dxB);
-      }
-      if (moveUp) {
-        final distA = (currentRect.top - ra.bottom).abs();
-        final distB = (currentRect.top - rb.bottom).abs();
-        return distA.compareTo(distB);
-      } else {
-        final distA = (ra.top - currentRect.bottom).abs();
-        final distB = (rb.top - currentRect.bottom).abs();
-        return distA.compareTo(distB);
-      }
-    });
-
-    return candidates.first;
+    return bestNode;
   }
 
   KeyEventResult _handleMessageListKeyEvent(FocusNode node, KeyEvent event) {
@@ -1261,26 +1271,27 @@ class _TelegramScreenState extends State<TelegramScreen> {
           listTop != null &&
           listHeight != null &&
           currentRect.top < listTop + listHeight * 0.42 &&
-          pos.pixels > 2) {
+          pos.pixels < pos.maxScrollExtent - 2) {
         final nextPixels =
-            (pos.pixels - 220.0).clamp(0.0, pos.maxScrollExtent);
+            (pos.pixels + 220.0).clamp(0.0, pos.maxScrollExtent);
         _messageScrollController.jumpTo(nextPixels);
-        if (nextPixels <= 180) {
+        if (nextPixels >= pos.maxScrollExtent - 180) {
           _tryLoadOlderMessagesOnScroll();
         }
       } else if (isDown &&
           listBottom != null &&
           listHeight != null &&
           currentRect.bottom > listBottom - listHeight * 0.38 &&
-          pos.pixels < pos.maxScrollExtent - 2) {
+          pos.pixels > 2) {
         final nextPixels =
-            (pos.pixels + 220.0).clamp(0.0, pos.maxScrollExtent);
+            (pos.pixels - 220.0).clamp(0.0, pos.maxScrollExtent);
         _messageScrollController.jumpTo(nextPixels);
       }
     }
 
     final target = _findVerticalFocusTargetInContainer(
       containerKey: _messageListContainerKey,
+      containerNode: node,
       currentNode: currentFocus,
       moveUp: isUp,
     );
@@ -1292,20 +1303,21 @@ class _TelegramScreenState extends State<TelegramScreen> {
           listBottom != null) {
         final pos = _messageScrollController.position;
         final tr = target.rect;
-        if (isUp && tr.top < listTop + 28 && pos.pixels > 2) {
+        if (isUp && tr.top < listTop + 28 && pos.pixels < pos.maxScrollExtent - 2) {
           final delta = (listTop + 56) - tr.top;
           _messageScrollController.jumpTo(
-            (pos.pixels - delta).clamp(0.0, pos.maxScrollExtent),
+            (pos.pixels + delta).clamp(0.0, pos.maxScrollExtent),
           );
-          if (_messageScrollController.position.pixels <= 180) {
+          if (_messageScrollController.position.pixels >=
+              _messageScrollController.position.maxScrollExtent - 180) {
             _tryLoadOlderMessagesOnScroll();
           }
         } else if (isDown &&
             tr.bottom > listBottom - 28 &&
-            pos.pixels < pos.maxScrollExtent - 2) {
+            pos.pixels > 2) {
           final delta = tr.bottom - (listBottom - 56);
           _messageScrollController.jumpTo(
-            (pos.pixels + delta).clamp(0.0, pos.maxScrollExtent),
+            (pos.pixels - delta).clamp(0.0, pos.maxScrollExtent),
           );
         }
       }
@@ -1314,25 +1326,29 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
     if (isUp) {
       final hasMoreAbove = _messageScrollController.hasClients &&
-          (_messageScrollController.position.pixels > 2 ||
+          (_messageScrollController.position.pixels <
+                  _messageScrollController.position.maxScrollExtent - 2 ||
               _isLoadingMessages ||
               _nextMessageOffset > 0);
       if (hasMoreAbove) {
         if (_messageScrollController.hasClients &&
-            _messageScrollController.position.pixels > 0) {
+            _messageScrollController.position.pixels <
+                _messageScrollController.position.maxScrollExtent) {
           final pos = _messageScrollController.position;
           final nextPixels =
-              (pos.pixels - 280.0).clamp(0.0, pos.maxScrollExtent);
+              (pos.pixels + 280.0).clamp(0.0, pos.maxScrollExtent);
           _messageScrollController.jumpTo(nextPixels);
         }
         if (!_messageScrollController.hasClients ||
-            _messageScrollController.position.pixels <= 220) {
+            _messageScrollController.position.pixels >=
+                _messageScrollController.position.maxScrollExtent - 220) {
           _tryLoadOlderMessagesOnScroll();
         }
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (!mounted) return;
           final nextTarget = _findVerticalFocusTargetInContainer(
             containerKey: _messageListContainerKey,
+            containerNode: node,
             currentNode: currentFocus,
             moveUp: true,
           );
@@ -1346,17 +1362,17 @@ class _TelegramScreenState extends State<TelegramScreen> {
       }
     } else if (isDown) {
       final hasMoreBelow = _messageScrollController.hasClients &&
-          _messageScrollController.position.pixels <
-              _messageScrollController.position.maxScrollExtent - 2;
+          _messageScrollController.position.pixels > 2;
       if (hasMoreBelow) {
         final pos = _messageScrollController.position;
         final nextPixels =
-            (pos.pixels + 280.0).clamp(0.0, pos.maxScrollExtent);
+            (pos.pixels - 280.0).clamp(0.0, pos.maxScrollExtent);
         _messageScrollController.jumpTo(nextPixels);
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (!mounted) return;
           final nextTarget = _findVerticalFocusTargetInContainer(
             containerKey: _messageListContainerKey,
+            containerNode: node,
             currentNode: currentFocus,
             moveUp: false,
           );
@@ -1425,6 +1441,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
     final target = _findVerticalFocusTargetInContainer(
       containerKey: _chatListContainerKey,
+      containerNode: node,
       currentNode: currentFocus,
       moveUp: isUp,
     );
@@ -1444,6 +1461,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
         if (!mounted) return;
         final nextTarget = _findVerticalFocusTargetInContainer(
           containerKey: _chatListContainerKey,
+          containerNode: node,
           currentNode: currentFocus,
           moveUp: true,
         );
@@ -2125,14 +2143,6 @@ class _TelegramScreenState extends State<TelegramScreen> {
     final reqAccountId = _activeAccountId;
     final reqEpoch = _accountSwitchEpoch;
 
-    final hadClientsBefore = loadOlder && _messageScrollController.hasClients;
-    final prevMaxExtent = hadClientsBefore
-        ? _messageScrollController.position.maxScrollExtent
-        : 0.0;
-    final prevPixels = hadClientsBefore
-        ? _messageScrollController.position.pixels
-        : 0.0;
-
     if (!silent) {
       setState(() {
         _isLoadingMessages = true;
@@ -2153,20 +2163,33 @@ class _TelegramScreenState extends State<TelegramScreen> {
       }
 
       int addedOlderCount = 0;
+      bool shouldChainLoadOlder = false;
       final prevLastId = _messages.isNotEmpty ? _messages.last.id : 0;
       setState(() {
         if (loadOlder) {
+          final prevOffset = _nextMessageOffset;
           final existingIds = _messages.map((m) => m.id).toSet();
           final olderIncoming = res.messages
               .where((m) => !existingIds.contains(m.id))
               .toList();
           addedOlderCount = olderIncoming.length;
-          final merged = [
-            ...olderIncoming,
-            ..._messages,
-          ]..sort((a, b) => a.id.compareTo(b.id));
-          _messages = merged;
-          _nextMessageOffset = res.nextOffset;
+          if (olderIncoming.isNotEmpty) {
+            final merged = [
+              ...olderIncoming,
+              ..._messages,
+            ]..sort((a, b) => a.id.compareTo(b.id));
+            _messages = merged;
+          }
+          if (res.nextOffset <= 1 ||
+              res.nextOffset >= prevOffset ||
+              (olderIncoming.isEmpty && res.messages.isNotEmpty)) {
+            _nextMessageOffset = 0;
+          } else {
+            _nextMessageOffset = res.nextOffset;
+            if (addedOlderCount == 0 && _nextMessageOffset > 0) {
+              shouldChainLoadOlder = true;
+            }
+          }
         } else if (silent && _messages.isNotEmpty) {
           final byId = <int, TelegramMessage>{
             for (final m in _messages) m.id: m,
@@ -2177,12 +2200,12 @@ class _TelegramScreenState extends State<TelegramScreen> {
           final merged = byId.values.toList()
             ..sort((a, b) => a.id.compareTo(b.id));
           _messages = merged;
-          if (_nextMessageOffset == 0) {
+          if (_nextMessageOffset == 0 && res.nextOffset > 1) {
             _nextMessageOffset = res.nextOffset;
           }
         } else {
           _messages = res.messages;
-          _nextMessageOffset = res.nextOffset;
+          _nextMessageOffset = res.nextOffset > 1 ? res.nextOffset : 0;
         }
         _isLoadingMessages = false;
       });
@@ -2204,16 +2227,8 @@ class _TelegramScreenState extends State<TelegramScreen> {
         _scrollToBottom(animated: false);
       } else if (!loadOlder && silent && hasNewerTail && !_showScrollToBottomBtn) {
         _scrollToBottom(animated: true);
-      } else if (addedOlderCount > 0 && hadClientsBefore) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (!mounted || !_messageScrollController.hasClients) return;
-          final pos = _messageScrollController.position;
-          final delta = pos.maxScrollExtent - prevMaxExtent;
-          if (delta > 0) {
-            final target = (prevPixels + delta).clamp(0.0, pos.maxScrollExtent);
-            _messageScrollController.jumpTo(target);
-          }
-        });
+      } else if (shouldChainLoadOlder && mounted) {
+        unawaited(_loadMessages(loadOlder: true));
       }
     } catch (e) {
       if (!mounted) return;
@@ -3753,7 +3768,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
       final idx = _messages.indexWhere((m) => m.id == msg.id);
       if (idx < 0 || _messages.isEmpty) return;
       final maxExt = _messageScrollController.position.maxScrollExtent;
-      final ratio = (idx / _messages.length).clamp(0.0, 1.0);
+      final ratio = ((_messages.length - 1 - idx) / _messages.length).clamp(0.0, 1.0);
       _messageScrollController.animateTo(
         (maxExt * ratio).clamp(0.0, maxExt),
         duration: const Duration(milliseconds: 260),
@@ -5490,7 +5505,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
                             onKeyEvent: _handleChatListKeyEvent,
                             child: ListView.builder(
                               controller: _chatListScrollController,
-                              cacheExtent: 1000,
+                              cacheExtent: 350,
                               physics: const AlwaysScrollableScrollPhysics(),
                               itemCount: filteredChats.length +
                                   (_nextChatCursor.isNotEmpty ? 1 : 0),
@@ -5842,6 +5857,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
     final kw = _messageFilter.trim().toLowerCase();
     final visibleMessages = _messages.where((m) {
+      if (!m.hasRenderableContent) return false;
       if (_mediaTypeFilter == 'video' && !(m.attachment?.isVideo ?? false)) {
         return false;
       }
@@ -6586,141 +6602,156 @@ class _TelegramScreenState extends State<TelegramScreen> {
                           if (event is PointerScrollEvent &&
                               event.scrollDelta.dy < 0) {
                             if (!_messageScrollController.hasClients ||
-                                _messageScrollController.position.pixels <= 96) {
+                                _messageScrollController.position.pixels >=
+                                    _messageScrollController
+                                            .position.maxScrollExtent -
+                                        120) {
                               _tryLoadOlderMessagesOnScroll();
                             }
                           }
                         },
-                        child: ListView.builder(
-                          controller: _messageScrollController,
-                          cacheExtent: 1500,
-                          padding: EdgeInsets.symmetric(
-                            horizontal: isMobile ? 8 : 18,
-                            vertical: isMobile ? 10 : 14,
-                          ),
-                        itemCount: groupedEntries.length +
-                            (_nextMessageOffset > 0 ? 1 : 0),
-                        itemBuilder: (context, idx) {
-                          if (_nextMessageOffset > 0 && idx == 0) {
-                            return Padding(
-                              padding: const EdgeInsets.only(bottom: 14),
-                              child: Center(
-                                child: InkWell(
-                                  borderRadius: BorderRadius.circular(16),
-                                  onTap: _isLoadingMessages
-                                      ? null
-                                      : () => _loadMessages(loadOlder: true),
-                                  child: Container(
-                                    padding: const EdgeInsets.symmetric(
-                                      horizontal: 14,
-                                      vertical: 6,
-                                    ),
-                                    decoration: BoxDecoration(
-                                      color: tg.datePillBg,
-                                      borderRadius: BorderRadius.circular(16),
-                                    ),
-                                    child: Row(
-                                      mainAxisSize: MainAxisSize.min,
-                                      children: [
-                                        if (_isLoadingMessages)
-                                          const SizedBox(
-                                            width: 12,
-                                            height: 12,
-                                            child: CircularProgressIndicator(
-                                              strokeWidth: 1.8,
-                                              color: Colors.white,
-                                            ),
-                                          )
-                                        else
-                                          const Icon(
-                                            Icons.history_rounded,
-                                            size: 15,
-                                            color: Colors.white,
-                                          ),
-                                        const SizedBox(width: 6),
-                                        Text(
-                                          _isLoadingMessages
-                                              ? '正在加载更早的消息...'
-                                              : '向上滚动滚轮或点击加载更早消息',
-                                          style: const TextStyle(
-                                            color: Colors.white,
-                                            fontSize: 12,
-                                            fontWeight: FontWeight.w500,
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            );
-                          }
-
-                          final entryIdx =
-                              _nextMessageOffset > 0 ? idx - 1 : idx;
-                          final entry = groupedEntries[entryIdx];
-                          final msg = entry.first;
-                          final prevMsg = entryIdx > 0
-                              ? groupedEntries[entryIdx - 1].first
-                              : null;
-                          final curDateLabel = _formatDatePill(msg.date);
-                          final prevDateLabel = prevMsg != null
-                              ? _formatDatePill(prevMsg.date)
-                              : '';
-                          final showDateHeader = curDateLabel.isNotEmpty &&
-                              curDateLabel != prevDateLabel;
-
-                          return Column(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: [
-                              if (showDateHeader)
-                                Padding(
-                                  padding:
-                                      const EdgeInsets.symmetric(vertical: 10),
+                        child: Align(
+                          alignment: Alignment.topCenter,
+                          child: ListView.builder(
+                            controller: _messageScrollController,
+                            reverse: true,
+                            shrinkWrap: groupedEntries.length <= 8 &&
+                                _nextMessageOffset <= 0,
+                            cacheExtent: 400,
+                            padding: EdgeInsets.symmetric(
+                              horizontal: isMobile ? 8 : 18,
+                              vertical: isMobile ? 10 : 14,
+                            ),
+                            itemCount: groupedEntries.length +
+                                (_nextMessageOffset > 0 ? 1 : 0),
+                            itemBuilder: (context, idx) {
+                              if (_nextMessageOffset > 0 &&
+                                  idx == groupedEntries.length) {
+                                return Padding(
+                                  padding: const EdgeInsets.only(bottom: 14),
                                   child: Center(
-                                    child: Container(
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 12,
-                                        vertical: 4,
-                                      ),
-                                      decoration: BoxDecoration(
-                                        color: tg.datePillBg,
-                                        borderRadius: BorderRadius.circular(12),
-                                      ),
-                                      child: Text(
-                                        curDateLabel,
-                                        style: const TextStyle(
-                                          color: Colors.white,
-                                          fontSize: 12,
-                                          fontWeight: FontWeight.w500,
+                                    child: InkWell(
+                                      borderRadius: BorderRadius.circular(16),
+                                      onTap: _isLoadingMessages
+                                          ? null
+                                          : () => _loadMessages(loadOlder: true),
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 14,
+                                          vertical: 6,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: tg.datePillBg,
+                                          borderRadius:
+                                              BorderRadius.circular(16),
+                                        ),
+                                        child: Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            if (_isLoadingMessages)
+                                              const SizedBox(
+                                                width: 12,
+                                                height: 12,
+                                                child:
+                                                    CircularProgressIndicator(
+                                                  strokeWidth: 1.8,
+                                                  color: Colors.white,
+                                                ),
+                                              )
+                                            else
+                                              const Icon(
+                                                Icons.history_rounded,
+                                                size: 15,
+                                                color: Colors.white,
+                                              ),
+                                            const SizedBox(width: 6),
+                                            Text(
+                                              _isLoadingMessages
+                                                  ? '正在加载更早的消息...'
+                                                  : '向上滚动滚轮或点击加载更早消息',
+                                              style: const TextStyle(
+                                                color: Colors.white,
+                                                fontSize: 12,
+                                                fontWeight: FontWeight.w500,
+                                              ),
+                                            ),
+                                          ],
                                         ),
                                       ),
                                     ),
                                   ),
-                                ),
-                              Padding(
-                                padding: const EdgeInsets.only(bottom: 8),
-                                child: entry.length > 1
-                                    ? ((msg.attachment?.isVisualMedia ?? false)
-                                        ? _buildTelegramAlbumBubble(
-                                            tg,
-                                            chat,
-                                            entry,
-                                          )
-                                        : _buildTelegramMusicOrFileGroupBubble(
-                                            tg,
-                                            chat,
-                                            entry,
-                                          ))
-                                    : _buildTelegramMessageBubble(
-                                        tg,
-                                        chat,
-                                        msg,
+                                );
+                              }
+
+                              final entryIdx =
+                                  groupedEntries.length - 1 - idx;
+                              final entry = groupedEntries[entryIdx];
+                              final msg = entry.first;
+                              final prevMsg = entryIdx > 0
+                                  ? groupedEntries[entryIdx - 1].first
+                                  : null;
+                              final curDateLabel = _formatDatePill(msg.date);
+                              final prevDateLabel = prevMsg != null
+                                  ? _formatDatePill(prevMsg.date)
+                                  : '';
+                              final showDateHeader = curDateLabel.isNotEmpty &&
+                                  curDateLabel != prevDateLabel;
+
+                              return Column(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  if (showDateHeader)
+                                    Padding(
+                                      padding: const EdgeInsets.symmetric(
+                                        vertical: 10,
                                       ),
-                              ),
-                            ],
-                          );
-                        },
+                                      child: Center(
+                                        child: Container(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 12,
+                                            vertical: 4,
+                                          ),
+                                          decoration: BoxDecoration(
+                                            color: tg.datePillBg,
+                                            borderRadius:
+                                                BorderRadius.circular(12),
+                                          ),
+                                          child: Text(
+                                            curDateLabel,
+                                            style: const TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 12,
+                                              fontWeight: FontWeight.w500,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  Padding(
+                                    padding: const EdgeInsets.only(bottom: 8),
+                                    child: entry.length > 1
+                                        ? ((msg.attachment?.isVisualMedia ??
+                                                false)
+                                            ? _buildTelegramAlbumBubble(
+                                                tg,
+                                                chat,
+                                                entry,
+                                              )
+                                            : _buildTelegramMusicOrFileGroupBubble(
+                                                tg,
+                                                chat,
+                                                entry,
+                                              ))
+                                        : _buildTelegramMessageBubble(
+                                            tg,
+                                            chat,
+                                            msg,
+                                          ),
+                                  ),
+                                ],
+                              );
+                            },
+                          ),
                         ),
                       ),
                     );
@@ -6957,6 +6988,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
           Padding(
             padding: const EdgeInsets.all(4),
             child: GridView.builder(
+              padding: EdgeInsets.zero,
               shrinkWrap: true,
               physics: const NeverScrollableScrollPhysics(),
               gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
@@ -7959,100 +7991,165 @@ class _TelegramScreenState extends State<TelegramScreen> {
       bottomRight: Radius.circular(isOutgoing ? 4 : 14),
     );
 
-    Widget bubbleContent = Container(
-      constraints: const BoxConstraints(minWidth: 140, maxWidth: 500),
-      decoration: BoxDecoration(
-        color: bubbleColor,
-        borderRadius: borderRadius,
-        boxShadow: const [
-          BoxShadow(
-            color: Color(0x14000000),
-            blurRadius: 3,
-            offset: Offset(0, 1),
-          ),
-        ],
-      ),
-      clipBehavior: Clip.antiAlias,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          // Sender header (for incoming group/channel messages)
-          if (!isOutgoing)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 8, 12, 2),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Flexible(
-                    child: Text(
-                      senderName,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 12.5,
-                        fontWeight: FontWeight.w600,
-                        color: senderColor,
-                      ),
+    Widget innerColumn = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // Sender header (for incoming group/channel messages)
+        if (!isOutgoing)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 2),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Flexible(
+                  child: Text(
+                    senderName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w600,
+                      color: senderColor,
                     ),
                   ),
-                  if (chat.broadcast) ...[
-                    const SizedBox(width: 6),
-                    Text(
-                      '频道',
-                      style: TextStyle(
-                        fontSize: 10.5,
-                        color: tg.textMuted,
-                      ),
+                ),
+                if (chat.broadcast) ...[
+                  const SizedBox(width: 6),
+                  Text(
+                    '频道',
+                    style: TextStyle(
+                      fontSize: 10.5,
+                      color: tg.textMuted,
                     ),
-                  ],
+                  ),
                 ],
-              ),
+              ],
             ),
+          ),
 
-          // Optional reply quote header when this message replies to another message
-          if (msg.replyToId > 0)
-            _buildReplyQuoteBanner(tg, chat, msg.replyToId),
+        // Optional reply quote header when this message replies to another message
+        if (msg.replyToId > 0)
+          _buildReplyQuoteBanner(tg, chat, msg.replyToId),
 
-          // Media attachment (Video / Photo / Document)
-          if (att != null) _buildTelegramBubbleAttachment(tg, chat, msg, att),
+        // Media attachment (Video / Photo / Document)
+        if (att != null) _buildTelegramBubbleAttachment(tg, chat, msg, att),
 
-          // Message text + bottom-right floated timestamp & read status
-          Padding(
-            padding: EdgeInsets.fromLTRB(
-              12,
-              msg.text.isNotEmpty ? 6 : 2,
-              12,
-              7,
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                if (msg.text.isNotEmpty) ...[
-                  Builder(
-                    builder: (_) {
-                      final trimmed = msg.text.trim();
-                      final isGiantEmoji =
-                          att == null &&
-                          trimmed.characters.length <= 2 &&
-                          trimmed.runes.any((r) => r > 0x1F000);
-                      return Text(
-                        msg.text,
-                        style: TextStyle(
-                          fontSize: isGiantEmoji ? 36 : 13.5,
-                          height: isGiantEmoji ? 1.15 : 1.42,
-                          color: tg.textPrimary,
+        // Message text + bottom-right floated timestamp & read status
+        Padding(
+          padding: EdgeInsets.fromLTRB(
+            12,
+            msg.text.isNotEmpty ? 6 : 2,
+            12,
+            7,
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (msg.text.isNotEmpty) ...[
+                if (att == null)
+                  StatefulBuilder(
+                    builder: (textFocusCtx, setTextFocusState) {
+                      return Focus(
+                        onFocusChange: (_) {
+                          if (textFocusCtx.mounted) {
+                            setTextFocusState(() {});
+                          }
+                        },
+                        onKeyEvent: (node, event) {
+                          if (event is KeyDownEvent &&
+                              (event.logicalKey ==
+                                      LogicalKeyboardKey.select ||
+                                  event.logicalKey ==
+                                      LogicalKeyboardKey.enter ||
+                                  event.logicalKey ==
+                                      LogicalKeyboardKey.gameButtonA)) {
+                            _markChatAsRead(
+                              chat,
+                              latestMessageDate: msg.date,
+                              maxMessageId: msg.id,
+                            );
+                            if (_selectionMode) {
+                              setState(() {
+                                if (isSelected) {
+                                  _selectedMessageIds.remove(msg.id);
+                                } else {
+                                  _selectedMessageIds.add(msg.id);
+                                }
+                              });
+                            } else {
+                              final box = textFocusCtx.findRenderObject()
+                                  as RenderBox?;
+                              final pos = box != null && box.hasSize
+                                  ? box.localToGlobal(
+                                      box.size.center(Offset.zero),
+                                    )
+                                  : const Offset(400, 300);
+                              _showMessageContextMenu(tg, chat, msg, pos);
+                            }
+                            return KeyEventResult.handled;
+                          }
+                          return KeyEventResult.ignored;
+                        },
+                        child: Builder(
+                          builder: (innerCtx) {
+                            final hasFocus =
+                                Focus.of(innerCtx).hasPrimaryFocus;
+                            final trimmed = msg.text.trim();
+                            final isGiantEmoji =
+                                trimmed.characters.length <= 2 &&
+                                trimmed.runes.any((r) => r > 0x1F000);
+                            return Container(
+                              padding: hasFocus
+                                  ? const EdgeInsets.symmetric(
+                                      horizontal: 6,
+                                      vertical: 3,
+                                    )
+                                  : EdgeInsets.zero,
+                              decoration: hasFocus
+                                  ? BoxDecoration(
+                                      color: tg.tgBlueBright
+                                          .withValues(alpha: 0.18),
+                                      borderRadius: BorderRadius.circular(8),
+                                      border: Border.all(
+                                        color: const Color(0xFFFFE066),
+                                        width: 1.8,
+                                      ),
+                                    )
+                                  : null,
+                              child: Text(
+                                msg.text,
+                                style: TextStyle(
+                                  fontSize: isGiantEmoji ? 36 : 13.5,
+                                  height: isGiantEmoji ? 1.15 : 1.42,
+                                  color: tg.textPrimary,
+                                ),
+                              ),
+                            );
+                          },
                         ),
                       );
                     },
+                  )
+                else
+                  Text(
+                    msg.text,
+                    style: TextStyle(
+                      fontSize: 13.5,
+                      height: 1.42,
+                      color: tg.textPrimary,
+                    ),
                   ),
-                  const SizedBox(height: 3),
-                ],
-                Row(
+                const SizedBox(height: 3),
+              ],
+              Align(
+                alignment: Alignment.centerRight,
+                widthFactor: 1.0,
+                child: Row(
                   mainAxisSize: MainAxisSize.min,
                   mainAxisAlignment: MainAxisAlignment.end,
                   children: [
-                    const Spacer(),
                     if (!chat.readOnly)
                       InkWell(
                         onTap: () {
@@ -8106,128 +8203,90 @@ class _TelegramScreenState extends State<TelegramScreen> {
                     ],
                   ],
                 ),
-              ],
+              ),
+            ],
+          ),
+        ),
+
+        // Extracted links inside message
+        if (msg.links.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(10, 0, 10, 8),
+            child: Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: msg.links.map((url) {
+                final isTg = _isTelegramLink(url);
+                return InkWell(
+                  borderRadius: BorderRadius.circular(6),
+                  onTap: () => isTg
+                      ? _openOrResolveLink(url)
+                      : _queueTelegramDownload(
+                          url: url,
+                          name: 'TG_${msg.id}',
+                        ),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 4,
+                    ),
+                    decoration: BoxDecoration(
+                      color: tg.tgBlueBright.withValues(alpha: 0.14),
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          isTg
+                              ? Icons.open_in_new_rounded
+                              : Icons.add_to_queue_rounded,
+                          size: 13,
+                          color: tg.tgBlueBright,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          url.length > 34
+                              ? '${url.substring(0, 34)}...'
+                              : url,
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: tg.tgBlueBright,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              }).toList(),
             ),
           ),
 
-          // Extracted links inside message
-          if (msg.links.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(10, 0, 10, 8),
-              child: Wrap(
-                spacing: 6,
-                runSpacing: 6,
-                children: msg.links.map((url) {
-                  final isTg = _isTelegramLink(url);
-                  return InkWell(
-                    borderRadius: BorderRadius.circular(6),
-                    onTap: () => isTg
-                        ? _openOrResolveLink(url)
-                        : _queueTelegramDownload(
-                            url: url,
-                            name: 'TG_${msg.id}',
-                          ),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 4,
-                      ),
-                      decoration: BoxDecoration(
-                        color: tg.tgBlueBright.withValues(alpha: 0.14),
-                        borderRadius: BorderRadius.circular(6),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            isTg
-                                ? Icons.open_in_new_rounded
-                                : Icons.add_to_queue_rounded,
-                            size: 13,
-                            color: tg.tgBlueBright,
-                          ),
-                          const SizedBox(width: 4),
-                          Text(
-                            url.length > 34
-                                ? '${url.substring(0, 34)}...'
-                                : url,
-                            style: TextStyle(
-                              fontSize: 11,
-                              color: tg.tgBlueBright,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  );
-                }).toList(),
-              ),
-            ),
-
-          // Interactive selection / inline keyboard buttons
-          if (msg.hasButtons) _buildTelegramInlineKeyboard(tg, chat, msg),
-        ],
-      ),
+        // Interactive selection / inline keyboard buttons
+        if (msg.hasButtons) _buildTelegramInlineKeyboard(tg, chat, msg),
+      ],
     );
 
-    if (att == null) {
-      bubbleContent = StatefulBuilder(
-        builder: (bubbleCtx, setBubbleState) {
-          return Focus(
-            onFocusChange: (_) {
-              if (bubbleCtx.mounted) setBubbleState(() {});
-            },
-            onKeyEvent: (node, event) {
-              if (event is KeyDownEvent &&
-                  (event.logicalKey == LogicalKeyboardKey.select ||
-                      event.logicalKey == LogicalKeyboardKey.enter ||
-                      event.logicalKey == LogicalKeyboardKey.gameButtonA)) {
-                _markChatAsRead(
-                  chat,
-                  latestMessageDate: msg.date,
-                  maxMessageId: msg.id,
-                );
-                if (_selectionMode) {
-                  setState(() {
-                    if (isSelected) {
-                      _selectedMessageIds.remove(msg.id);
-                    } else {
-                      _selectedMessageIds.add(msg.id);
-                    }
-                  });
-                } else {
-                  final box = bubbleCtx.findRenderObject() as RenderBox?;
-                  final pos = box != null && box.hasSize
-                      ? box.localToGlobal(box.size.center(Offset.zero))
-                      : const Offset(400, 300);
-                  _showMessageContextMenu(tg, chat, msg, pos);
-                }
-                return KeyEventResult.handled;
-              }
-              return KeyEventResult.ignored;
-            },
-            child: Builder(
-              builder: (innerCtx) {
-                final hasFocus = Focus.of(innerCtx).hasPrimaryFocus;
-                return DecoratedBox(
-                  position: DecorationPosition.foreground,
-                  decoration: BoxDecoration(
-                    borderRadius: borderRadius,
-                    border: hasFocus
-                        ? Border.all(
-                            color: const Color(0xFFFFE066),
-                            width: 2.2,
-                          )
-                        : null,
-                  ),
-                  child: bubbleContent,
-                );
-              },
-            ),
-          );
-        },
-      );
+    if (att == null && !msg.hasButtons) {
+      innerColumn = IntrinsicWidth(child: innerColumn);
     }
+
+    Widget bubbleContent = Container(
+      constraints: const BoxConstraints(minWidth: 110, maxWidth: 500),
+      decoration: BoxDecoration(
+        color: bubbleColor,
+        borderRadius: borderRadius,
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x14000000),
+            blurRadius: 3,
+            offset: Offset(0, 1),
+          ),
+        ],
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: innerColumn,
+    );
 
     return GestureDetector(
       onTap: () {
@@ -8848,448 +8907,428 @@ class _TelegramScreenState extends State<TelegramScreen> {
     final isFailedLocal = _failedLocalSaves.contains(msg.id);
 
     if (isVideo || isPhoto) {
-      return Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Focus(
-            onFocusChange: (_) {
-              if (mounted) setState(() {});
-            },
-            onKeyEvent: (node, event) {
-              if (!node.hasPrimaryFocus) {
-                return KeyEventResult.ignored;
-              }
-              if (event is KeyDownEvent &&
-                  (event.logicalKey == LogicalKeyboardKey.select ||
-                      event.logicalKey == LogicalKeyboardKey.enter ||
-                      event.logicalKey == LogicalKeyboardKey.numpadEnter ||
-                      event.logicalKey == LogicalKeyboardKey.space ||
-                      event.logicalKey == LogicalKeyboardKey.gameButtonA)) {
-                _openMediaGalleryViewer(chat, msg);
-                return KeyEventResult.handled;
-              }
-              return KeyEventResult.ignored;
-            },
-            child: Builder(
-              builder: (mediaCtx) {
-                final isMediaFocused = Focus.of(mediaCtx).hasPrimaryFocus;
-                return GestureDetector(
-                  onTap: () => _openMediaGalleryViewer(chat, msg),
-                  child: Container(
-                    height: isVideo ? 280 : 230,
-                    margin: const EdgeInsets.fromLTRB(4, 4, 4, 0),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF0A1017),
-                      borderRadius: BorderRadius.circular(10),
-                      border: isMediaFocused
-                          ? Border.all(
-                              color: const Color(0xFFFFE066),
-                              width: 2.6,
-                            )
-                          : null,
-                      boxShadow: isMediaFocused
-                          ? [
-                              BoxShadow(
-                                color: tg.tgBlueBright.withValues(alpha: 0.65),
-                                blurRadius: 12,
-                                spreadRadius: 1,
-                              ),
-                            ]
-                          : null,
-                    ),
-                    clipBehavior: Clip.antiAlias,
-                    child: Stack(
-                      fit: StackFit.expand,
-                      children: [
-                        if (isPhoto ||
-                            att.hasThumbnail ||
-                            att.thumbnail.isNotEmpty)
-                          Image.network(
-                            thumbUrl,
-                            headers: widget.appState.api.authHeaders,
-                            fit: BoxFit.cover,
-                            errorBuilder: (_, __, ___) => isVideo
-                                ? _TelegramVideoFrameFallback(
-                                    streamUrl: widget.appState.api
-                                        .buildTelegramVideoStreamUrl(
-                                      accountId: _activeAccountId,
-                                      peer: chat.peer,
-                                      messageId: msg.id,
-                                    ),
-                                    headers: widget.appState.api.authHeaders,
-                                    fallbackIconColor: tg.textMuted,
-                                  )
-                                : Container(
-                                    color: const Color(0xFF101923),
-                                    alignment: Alignment.center,
-                                    child: Icon(
-                                      Icons.image_outlined,
-                                      size: 46,
-                                      color: tg.textMuted,
-                                    ),
-                                  ),
-                          )
-                        else
-                          _TelegramVideoFrameFallback(
-                            streamUrl:
-                                widget.appState.api.buildTelegramVideoStreamUrl(
+      return StatefulBuilder(
+        builder: (attStateCtx, setAttState) {
+          void refreshAttFocus(bool _) {
+            if (attStateCtx.mounted) setAttState(() {});
+          }
+
+          return Container(
+            height: isVideo ? 280 : 230,
+            margin: const EdgeInsets.fromLTRB(4, 4, 4, 0),
+            decoration: BoxDecoration(
+              color: const Color(0xFF0A1017),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            clipBehavior: Clip.antiAlias,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                if (isPhoto || att.hasThumbnail || att.thumbnail.isNotEmpty)
+                  Image.network(
+                    thumbUrl,
+                    headers: widget.appState.api.authHeaders,
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, __, ___) => isVideo
+                        ? _TelegramVideoFrameFallback(
+                            streamUrl: widget.appState.api
+                                .buildTelegramVideoStreamUrl(
                               accountId: _activeAccountId,
                               peer: chat.peer,
                               messageId: msg.id,
                             ),
                             headers: widget.appState.api.authHeaders,
                             fallbackIconColor: tg.textMuted,
-                          ),
-                        // Top-left official Telegram duration + size pill
-                        if (isVideo)
-                          Positioned(
-                            top: 8,
-                            left: 8,
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 8,
-                                vertical: 3,
-                              ),
-                              decoration: BoxDecoration(
-                                color: const Color(0xA6000000),
-                                borderRadius: BorderRadius.circular(10),
-                              ),
-                              child: Text(
-                                [
-                                  _formatDurationClock(att.duration),
-                                  if (att.formattedSize.isNotEmpty)
-                                    att.formattedSize,
-                                ].join(' · '),
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w500,
-                                ),
-                              ),
+                          )
+                        : Container(
+                            color: const Color(0xFF101923),
+                            alignment: Alignment.center,
+                            child: Icon(
+                              Icons.image_outlined,
+                              size: 46,
+                              color: tg.textMuted,
                             ),
                           ),
-                        // Center official Telegram translucent play button
-                        if (isVideo)
-                          Center(
-                            child: Container(
-                              width: isMediaFocused ? 60 : 54,
-                              height: isMediaFocused ? 60 : 54,
-                              decoration: BoxDecoration(
-                                color: isMediaFocused
-                                    ? tg.tgBlueBright
-                                    : const Color(0x99000000),
-                                shape: BoxShape.circle,
-                                border: isMediaFocused
-                                    ? Border.all(
-                                        color: const Color(0xFFFFE066),
-                                        width: 2.2,
-                                      )
-                                    : null,
-                              ),
-                              alignment: Alignment.center,
-                              child: const Icon(
-                                Icons.play_arrow_rounded,
-                                color: Colors.white,
-                                size: 34,
-                              ),
-                            ),
-                          ),
-                        // Bottom filename + quick action bar overlay
-                        Positioned(
-                          left: 0,
-                          right: 0,
-                          bottom: 0,
+                  )
+                else
+                  _TelegramVideoFrameFallback(
+                    streamUrl:
+                        widget.appState.api.buildTelegramVideoStreamUrl(
+                      accountId: _activeAccountId,
+                      peer: chat.peer,
+                      messageId: msg.id,
+                    ),
+                    headers: widget.appState.api.authHeaders,
+                    fallbackIconColor: tg.textMuted,
+                  ),
+                // Top-left official Telegram duration + size pill
+                if (isVideo)
+                  Positioned(
+                    top: 8,
+                    left: 8,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 3,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xA6000000),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Text(
+                        [
+                          _formatDurationClock(att.duration),
+                          if (att.formattedSize.isNotEmpty) att.formattedSize,
+                        ].join(' · '),
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ),
+                  ),
+                // Disjoint sibling leaf Focus for main media preview area
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  top: 0,
+                  bottom: 34,
+                  child: Focus(
+                    onFocusChange: refreshAttFocus,
+                    onKeyEvent: (node, event) {
+                      if (!node.hasPrimaryFocus) {
+                        return KeyEventResult.ignored;
+                      }
+                      if (event is KeyDownEvent &&
+                          (event.logicalKey == LogicalKeyboardKey.select ||
+                              event.logicalKey == LogicalKeyboardKey.enter ||
+                              event.logicalKey ==
+                                  LogicalKeyboardKey.numpadEnter ||
+                              event.logicalKey == LogicalKeyboardKey.space ||
+                              event.logicalKey ==
+                                  LogicalKeyboardKey.gameButtonA)) {
+                        _openMediaGalleryViewer(chat, msg);
+                        return KeyEventResult.handled;
+                      }
+                      return KeyEventResult.ignored;
+                    },
+                    child: Builder(
+                      builder: (mediaCtx) {
+                        final isMediaFocused =
+                            Focus.of(mediaCtx).hasPrimaryFocus;
+                        return GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onTap: () => _openMediaGalleryViewer(chat, msg),
                           child: Container(
-                            padding: const EdgeInsets.fromLTRB(10, 18, 8, 6),
-                            decoration: const BoxDecoration(
-                              gradient: LinearGradient(
-                                begin: Alignment.bottomCenter,
-                                end: Alignment.topCenter,
-                                colors: [
-                                  Color(0xCC000000),
-                                  Color(0x00000000),
-                                ],
-                              ),
-                            ),
-                            child: Row(
-                              children: [
-                                Expanded(
-                                  child: Text(
-                                    att.displayName,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(
+                            decoration: isMediaFocused
+                                ? BoxDecoration(
+                                    borderRadius: const BorderRadius.vertical(
+                                      top: Radius.circular(10),
+                                    ),
+                                    border: Border.all(
+                                      color: const Color(0xFFFFE066),
+                                      width: 2.6,
+                                    ),
+                                  )
+                                : null,
+                            alignment: Alignment.center,
+                            child: isVideo
+                                ? Container(
+                                    width: isMediaFocused ? 60 : 54,
+                                    height: isMediaFocused ? 60 : 54,
+                                    decoration: BoxDecoration(
+                                      color: isMediaFocused
+                                          ? tg.tgBlueBright
+                                          : const Color(0x99000000),
+                                      shape: BoxShape.circle,
+                                      border: isMediaFocused
+                                          ? Border.all(
+                                              color: const Color(0xFFFFE066),
+                                              width: 2.2,
+                                            )
+                                          : null,
+                                    ),
+                                    alignment: Alignment.center,
+                                    child: const Icon(
+                                      Icons.play_arrow_rounded,
                                       color: Colors.white,
-                                      fontSize: 11.5,
-                                      fontWeight: FontWeight.w500,
+                                      size: 34,
                                     ),
-                                  ),
-                                ),
-                                if (isVideo)
-                                  InkWell(
-                                    onFocusChange: (_) {
-                                      if (mounted) setState(() {});
-                                    },
-                                    onTap: () =>
-                                        _openVideoInMiniPlayer(chat, msg),
-                                    child: Builder(
-                                      builder: (pipCtx) {
-                                        final isPipFocused =
-                                            Focus.of(pipCtx).hasPrimaryFocus;
-                                        return Container(
-                                          margin:
-                                              const EdgeInsets.only(right: 6),
-                                          padding: const EdgeInsets.symmetric(
-                                            horizontal: 7,
-                                            vertical: 3,
-                                          ),
-                                          decoration: BoxDecoration(
-                                            color: isPipFocused
-                                                ? tg.tgBlueBright
-                                                : const Color(0x99000000),
-                                            borderRadius:
-                                                BorderRadius.circular(10),
-                                            border: isPipFocused
-                                                ? Border.all(
-                                                    color: const Color(
-                                                      0xFFFFE066,
-                                                    ),
-                                                    width: 1.8,
-                                                  )
-                                                : null,
-                                          ),
-                                          child: const Row(
-                                            mainAxisSize: MainAxisSize.min,
-                                            children: [
-                                              Icon(
-                                                Icons
-                                                    .picture_in_picture_alt_rounded,
-                                                size: 12,
-                                                color: Colors.white,
-                                              ),
-                                              SizedBox(width: 3),
-                                              Text(
-                                                '小窗',
-                                                style: TextStyle(
-                                                  color: Colors.white,
-                                                  fontSize: 10.5,
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                        );
-                                      },
-                                    ),
-                                  ),
-                                InkWell(
-                                  onFocusChange: (_) {
-                                    if (mounted) setState(() {});
-                                  },
-                                  onTap: isSavingLocal
-                                      ? null
-                                      : () => _saveAttachmentToLocalDownloads(
-                                            chat,
-                                            msg,
-                                          ),
-                                  child: Builder(
-                                    builder: (saveCtx) {
-                                      final isSaveFocused =
-                                          Focus.of(saveCtx).hasPrimaryFocus;
-                                      return Container(
-                                        margin: const EdgeInsets.only(right: 6),
-                                        padding: const EdgeInsets.symmetric(
-                                          horizontal: 7,
-                                          vertical: 3,
-                                        ),
-                                        decoration: BoxDecoration(
-                                          color: isSavedLocal
-                                              ? const Color(0xCC2EBE70)
-                                              : (isFailedLocal
-                                                  ? const Color(0xCCE54D42)
-                                                  : (isSaveFocused
-                                                      ? tg.tgBlueBright
-                                                      : const Color(
-                                                          0x99000000,
-                                                        ))),
-                                          borderRadius:
-                                              BorderRadius.circular(10),
-                                          border: isSaveFocused
-                                              ? Border.all(
-                                                  color:
-                                                      const Color(0xFFFFE066),
-                                                  width: 1.8,
-                                                )
-                                              : null,
-                                        ),
-                                        child: AnimatedSwitcher(
-                                          duration: const Duration(
-                                            milliseconds: 200,
-                                          ),
-                                          transitionBuilder: (child, anim) =>
-                                              ScaleTransition(
-                                            scale: anim,
-                                            child: child,
-                                          ),
-                                          child: Row(
-                                            key: ValueKey(
-                                              'local_${msg.id}_${isSavingLocal}_${isSavedLocal}_$isFailedLocal',
-                                            ),
-                                            mainAxisSize: MainAxisSize.min,
-                                            children: [
-                                              if (isSavingLocal)
-                                                const SizedBox(
-                                                  width: 11,
-                                                  height: 11,
-                                                  child:
-                                                      CircularProgressIndicator(
-                                                    strokeWidth: 1.8,
-                                                    color: Colors.white,
-                                                  ),
-                                                )
-                                              else
-                                                Icon(
-                                                  isSavedLocal
-                                                      ? Icons
-                                                          .check_circle_rounded
-                                                      : (isFailedLocal
-                                                          ? Icons
-                                                              .error_outline_rounded
-                                                          : Icons
-                                                              .download_rounded),
-                                                  size: 12,
-                                                  color: Colors.white,
-                                                ),
-                                              const SizedBox(width: 3),
-                                              Text(
-                                                isSavingLocal
-                                                    ? '保存中...'
-                                                    : (isSavedLocal
-                                                        ? '已存本机'
-                                                        : (isFailedLocal
-                                                            ? '重试保存'
-                                                            : '保存本机')),
-                                                style: const TextStyle(
-                                                  color: Colors.white,
-                                                  fontSize: 10.5,
-                                                  fontWeight: FontWeight.w600,
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                        ),
-                                      );
-                                    },
-                                  ),
-                                ),
-                                if (att.url.isNotEmpty)
-                                  InkWell(
-                                    onFocusChange: (_) {
-                                      if (mounted) setState(() {});
-                                    },
-                                    onTap: isQueueing
-                                        ? null
-                                        : () => _queueTelegramDownload(
-                                              url: att.url,
-                                              name: att.displayName,
-                                            ),
-                                    child: Builder(
-                                      builder: (qCtx) {
-                                        final isQueueFocused =
-                                            Focus.of(qCtx).hasPrimaryFocus;
-                                        return Container(
-                                          padding: const EdgeInsets.symmetric(
-                                            horizontal: 8,
-                                            vertical: 3,
-                                          ),
-                                          decoration: BoxDecoration(
-                                            color: isQueued
-                                                ? const Color(0xE62EBE70)
-                                                : (isFailed
-                                                    ? const Color(0xE6E54D42)
-                                                    : tg.tgBlueBright),
-                                            borderRadius:
-                                                BorderRadius.circular(10),
-                                            border: isQueueFocused
-                                                ? Border.all(
-                                                    color: const Color(
-                                                      0xFFFFE066,
-                                                    ),
-                                                    width: 1.8,
-                                                  )
-                                                : null,
-                                          ),
-                                          child: AnimatedSwitcher(
-                                            duration: const Duration(
-                                              milliseconds: 200,
-                                            ),
-                                            transitionBuilder: (child, anim) =>
-                                                ScaleTransition(
-                                              scale: anim,
-                                              child: child,
-                                            ),
-                                            child: Row(
-                                              key: ValueKey(
-                                                'queue_${msg.id}_${isQueueing}_${isQueued}_$isFailed',
-                                              ),
-                                              mainAxisSize: MainAxisSize.min,
-                                              children: [
-                                                if (isQueueing)
-                                                  const SizedBox(
-                                                    width: 11,
-                                                    height: 11,
-                                                    child:
-                                                        CircularProgressIndicator(
-                                                      strokeWidth: 1.8,
-                                                      color: Colors.white,
-                                                    ),
-                                                  )
-                                                else
-                                                  Icon(
-                                                    isQueued
-                                                        ? Icons
-                                                            .check_circle_rounded
-                                                        : (isFailed
-                                                            ? Icons
-                                                                .error_outline_rounded
-                                                            : Icons
-                                                                .cloud_download_outlined),
-                                                    size: 13,
-                                                    color: Colors.white,
-                                                  ),
-                                                const SizedBox(width: 4),
-                                                Text(
-                                                  isQueueing
-                                                      ? '添加中...'
-                                                      : (isQueued
-                                                          ? '已入队 ✓'
-                                                          : (isFailed
-                                                              ? '失败·重试'
-                                                              : '转存下载')),
-                                                  style: const TextStyle(
-                                                    color: Colors.white,
-                                                    fontSize: 11,
-                                                    fontWeight: FontWeight.w600,
-                                                  ),
-                                                ),
-                                              ],
-                                            ),
-                                          ),
-                                        );
-                                      },
-                                    ),
-                                  ),
-                              ],
+                                  )
+                                : const SizedBox.expand(),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ),
+                // Bottom filename + quick action bar overlay (sibling of media Focus)
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  child: Container(
+                    padding: const EdgeInsets.fromLTRB(10, 12, 8, 6),
+                    decoration: const BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.bottomCenter,
+                        end: Alignment.topCenter,
+                        colors: [
+                          Color(0xCC000000),
+                          Color(0x00000000),
+                        ],
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: GestureDetector(
+                            onTap: () => _openMediaGalleryViewer(chat, msg),
+                            child: Text(
+                              att.displayName,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w500,
+                              ),
                             ),
                           ),
                         ),
+                        if (isVideo)
+                          InkWell(
+                            onFocusChange: refreshAttFocus,
+                            onTap: () => _openVideoInMiniPlayer(chat, msg),
+                            child: Builder(
+                              builder: (pipCtx) {
+                                final isPipFocused =
+                                    Focus.of(pipCtx).hasPrimaryFocus;
+                                return Container(
+                                  margin: const EdgeInsets.only(right: 6),
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 7,
+                                    vertical: 3,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: isPipFocused
+                                        ? tg.tgBlueBright
+                                        : const Color(0x99000000),
+                                    borderRadius: BorderRadius.circular(10),
+                                    border: isPipFocused
+                                        ? Border.all(
+                                            color: const Color(0xFFFFE066),
+                                            width: 1.8,
+                                          )
+                                        : null,
+                                  ),
+                                  child: const Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(
+                                        Icons.picture_in_picture_alt_rounded,
+                                        size: 12,
+                                        color: Colors.white,
+                                      ),
+                                      SizedBox(width: 3),
+                                      Text(
+                                        '小窗',
+                                        style: TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 10.5,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                );
+                              },
+                            ),
+                          ),
+                        InkWell(
+                          onFocusChange: refreshAttFocus,
+                          onTap: isSavingLocal
+                              ? null
+                              : () => _saveAttachmentToLocalDownloads(
+                                    chat,
+                                    msg,
+                                  ),
+                          child: Builder(
+                            builder: (saveCtx) {
+                              final isSaveFocused =
+                                  Focus.of(saveCtx).hasPrimaryFocus;
+                              return Container(
+                                margin: const EdgeInsets.only(right: 6),
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 7,
+                                  vertical: 3,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: isSavedLocal
+                                      ? const Color(0xCC2EBE70)
+                                      : (isFailedLocal
+                                          ? const Color(0xCCE54D42)
+                                          : (isSaveFocused
+                                              ? tg.tgBlueBright
+                                              : const Color(0x99000000))),
+                                  borderRadius: BorderRadius.circular(10),
+                                  border: isSaveFocused
+                                      ? Border.all(
+                                          color: const Color(0xFFFFE066),
+                                          width: 1.8,
+                                        )
+                                      : null,
+                                ),
+                                child: AnimatedSwitcher(
+                                  duration: const Duration(milliseconds: 200),
+                                  transitionBuilder: (child, anim) =>
+                                      ScaleTransition(
+                                    scale: anim,
+                                    child: child,
+                                  ),
+                                  child: Row(
+                                    key: ValueKey(
+                                      'local_${msg.id}_${isSavingLocal}_${isSavedLocal}_$isFailedLocal',
+                                    ),
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      if (isSavingLocal)
+                                        const SizedBox(
+                                          width: 11,
+                                          height: 11,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 1.8,
+                                            color: Colors.white,
+                                          ),
+                                        )
+                                      else
+                                        Icon(
+                                          isSavedLocal
+                                              ? Icons.check_circle_rounded
+                                              : (isFailedLocal
+                                                  ? Icons.error_outline_rounded
+                                                  : Icons.download_rounded),
+                                          size: 12,
+                                          color: Colors.white,
+                                        ),
+                                      const SizedBox(width: 3),
+                                      Text(
+                                        isSavingLocal
+                                            ? '保存中...'
+                                            : (isSavedLocal
+                                                ? '已存本机'
+                                                : (isFailedLocal
+                                                    ? '重试保存'
+                                                    : '保存本机')),
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 10.5,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                        if (att.url.isNotEmpty)
+                          InkWell(
+                            onFocusChange: refreshAttFocus,
+                            onTap: isQueueing
+                                ? null
+                                : () => _queueTelegramDownload(
+                                      url: att.url,
+                                      name: att.displayName,
+                                    ),
+                            child: Builder(
+                              builder: (qCtx) {
+                                final isQueueFocused =
+                                    Focus.of(qCtx).hasPrimaryFocus;
+                                return Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 8,
+                                    vertical: 3,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: isQueued
+                                        ? const Color(0xE62EBE70)
+                                        : (isFailed
+                                            ? const Color(0xE6E54D42)
+                                            : tg.tgBlueBright),
+                                    borderRadius: BorderRadius.circular(10),
+                                    border: isQueueFocused
+                                        ? Border.all(
+                                            color: const Color(0xFFFFE066),
+                                            width: 1.8,
+                                          )
+                                        : null,
+                                  ),
+                                  child: AnimatedSwitcher(
+                                    duration: const Duration(milliseconds: 200),
+                                    transitionBuilder: (child, anim) =>
+                                        ScaleTransition(
+                                      scale: anim,
+                                      child: child,
+                                    ),
+                                    child: Row(
+                                      key: ValueKey(
+                                        'queue_${msg.id}_${isQueueing}_${isQueued}_$isFailed',
+                                      ),
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        if (isQueueing)
+                                          const SizedBox(
+                                            width: 11,
+                                            height: 11,
+                                            child: CircularProgressIndicator(
+                                              strokeWidth: 1.8,
+                                              color: Colors.white,
+                                            ),
+                                          )
+                                        else
+                                          Icon(
+                                            isQueued
+                                                ? Icons.check_circle_rounded
+                                                : (isFailed
+                                                    ? Icons
+                                                        .error_outline_rounded
+                                                    : Icons
+                                                        .cloud_download_outlined),
+                                            size: 13,
+                                            color: Colors.white,
+                                          ),
+                                        const SizedBox(width: 4),
+                                        Text(
+                                          isQueueing
+                                              ? '添加中...'
+                                              : (isQueued
+                                                  ? '已入队 ✓'
+                                                  : (isFailed
+                                                      ? '失败·重试'
+                                                      : '转存下载')),
+                                          style: const TextStyle(
+                                            color: Colors.white,
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                );
+                              },
+                            ),
+                          ),
                       ],
                     ),
                   ),
-                );
-              },
+                ),
+              ],
             ),
-          ),
-        ],
+          );
+        },
       );
     }
 
@@ -9340,45 +9379,49 @@ class _TelegramScreenState extends State<TelegramScreen> {
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
       child: Row(
         children: [
-          InkWell(
-            customBorder: const CircleBorder(),
-            onFocusChange: (_) {
-              if (mounted) setState(() {});
+          StatefulBuilder(
+            builder: (fileStateCtx, setFileState) {
+              return InkWell(
+                customBorder: const CircleBorder(),
+                onFocusChange: (_) {
+                  if (fileStateCtx.mounted) setFileState(() {});
+                },
+                onTap: () {
+                  if (canPreview) {
+                    _openFilePreviewDialog(chat, msg);
+                  } else {
+                    _saveAttachmentToLocalDownloads(chat, msg);
+                  }
+                },
+                child: Builder(
+                  builder: (fileCtx) {
+                    final isFileFocused = Focus.of(fileCtx).hasPrimaryFocus;
+                    return Container(
+                      width: 44,
+                      height: 44,
+                      decoration: BoxDecoration(
+                        color: tg.tgBlueBright,
+                        shape: BoxShape.circle,
+                        border: isFileFocused
+                            ? Border.all(
+                                color: const Color(0xFFFFE066),
+                                width: 2.2,
+                              )
+                            : null,
+                      ),
+                      alignment: Alignment.center,
+                      child: Icon(
+                        isQueued
+                            ? Icons.check_rounded
+                            : Icons.insert_drive_file_rounded,
+                        color: Colors.white,
+                        size: 22,
+                      ),
+                    );
+                  },
+                ),
+              );
             },
-            onTap: () {
-              if (canPreview) {
-                _openFilePreviewDialog(chat, msg);
-              } else {
-                _saveAttachmentToLocalDownloads(chat, msg);
-              }
-            },
-            child: Builder(
-              builder: (fileCtx) {
-                final isFileFocused = Focus.of(fileCtx).hasPrimaryFocus;
-                return Container(
-                  width: 44,
-                  height: 44,
-                  decoration: BoxDecoration(
-                    color: tg.tgBlueBright,
-                    shape: BoxShape.circle,
-                    border: isFileFocused
-                        ? Border.all(
-                            color: const Color(0xFFFFE066),
-                            width: 2.2,
-                          )
-                        : null,
-                  ),
-                  alignment: Alignment.center,
-                  child: Icon(
-                    isQueued
-                        ? Icons.check_rounded
-                        : Icons.insert_drive_file_rounded,
-                    color: Colors.white,
-                    size: 22,
-                  ),
-                );
-              },
-            ),
           ),
           const SizedBox(width: 10),
           Expanded(
@@ -10461,6 +10504,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
                 // 3. Multi-line Official Telegram Input Field (Enter to send, Shift+Enter for newline, Cmd+V image paste)
                 Expanded(
                   child: Focus(
+                    canRequestFocus: false,
                     onKeyEvent: (node, event) {
                       if (event is! KeyDownEvent) return KeyEventResult.ignored;
                       final isShift = HardwareKeyboard.instance.isShiftPressed;

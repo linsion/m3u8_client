@@ -7,6 +7,20 @@
 
 int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
                       _In_ wchar_t *command_line, _In_ int show_command) {
+  // If an instance of Liuguang Video is already running (e.g. minimized or in
+  // the Windows system tray), wake and focus the existing window instead of
+  // spawning a duplicate instance.
+  HWND existing_window = ::FindWindowW(L"FLUTTER_RUNNER_WIN32_WINDOW", nullptr);
+  if (existing_window != nullptr) {
+    ::PostMessageW(existing_window, WM_APP + 2, 0, 0);
+    ::ShowWindow(existing_window, SW_SHOW);
+    if (::IsIconic(existing_window)) {
+      ::ShowWindow(existing_window, SW_RESTORE);
+    }
+    ::SetForegroundWindow(existing_window);
+    return EXIT_SUCCESS;
+  }
+
   // Attach to console when present (e.g., 'flutter run') or create a
   // new console when running with a debugger.
   if (!::AttachConsole(ATTACH_PARENT_PROCESS) && ::IsDebuggerPresent()) {

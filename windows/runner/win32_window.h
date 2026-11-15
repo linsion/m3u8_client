@@ -90,7 +90,14 @@ class Win32Window {
   // Update the window frame's theme to match the system theme.
   static void UpdateTheme(HWND const window);
 
+  void AddTrayIcon();
+  void RemoveTrayIcon();
+  void RestoreFromTray();
+  void ShowTrayContextMenu();
+
   bool quit_on_close_ = false;
+  bool force_quit_ = false;
+  bool tray_icon_added_ = false;
 
   // window handle for top level window.
   HWND window_handle_ = nullptr;

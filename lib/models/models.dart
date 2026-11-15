@@ -1405,6 +1405,16 @@ class TelegramAttachment {
 
   bool get isVisualMedia => isVideo || isPhoto;
 
+  bool get isValid =>
+      url.trim().isNotEmpty ||
+      thumbnail.trim().isNotEmpty ||
+      hasThumbnail ||
+      size > 0 ||
+      name.trim().isNotEmpty ||
+      fileName.trim().isNotEmpty ||
+      title.trim().isNotEmpty ||
+      duration > 0;
+
   String get formattedSize {
     if (size <= 0) return '';
     if (size < 1024) return '$size B';
@@ -1527,6 +1537,12 @@ class TelegramMessage {
 
   bool get hasButtons => buttons.any((row) => row.isNotEmpty);
 
+  bool get hasRenderableContent =>
+      text.trim().isNotEmpty ||
+      (attachment != null && attachment!.isValid) ||
+      hasButtons ||
+      links.isNotEmpty;
+
   TelegramMessage copyWith({
     int? id,
     int? date,
@@ -1628,6 +1644,11 @@ class TelegramMessage {
       }
     }
     final rawAtt = json['attachment'];
+    final parsedAtt = rawAtt is Map<String, dynamic>
+        ? TelegramAttachment.fromJson(rawAtt)
+        : (rawAtt is Map
+            ? TelegramAttachment.fromJson(Map<String, dynamic>.from(rawAtt))
+            : null);
     final buttons = _parseButtonRows(
       json['buttons'] ?? json['reply_markup'] ?? json['inline_keyboard'],
     );
@@ -1645,9 +1666,7 @@ class TelegramMessage {
       replyToId: int.tryParse((json['reply_to_id'] ?? 0).toString()) ?? 0,
       links: links,
       buttons: buttons,
-      attachment: rawAtt is Map<String, dynamic>
-          ? TelegramAttachment.fromJson(rawAtt)
-          : null,
+      attachment: (parsedAtt != null && parsedAtt.isValid) ? parsedAtt : null,
     );
   }
 }

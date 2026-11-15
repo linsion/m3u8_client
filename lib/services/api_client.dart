@@ -2560,9 +2560,15 @@ class ApiClient {
       nextOffset = int.tryParse((data['next_offset'] ?? 0).toString()) ?? 0;
       final raw = data['messages'];
       if (raw is List) {
+        if (raw.isEmpty) {
+          nextOffset = 0;
+        }
         for (final item in raw) {
           if (item is Map<String, dynamic>) {
-            messages.add(TelegramMessage.fromJson(item));
+            final msg = TelegramMessage.fromJson(item);
+            if (msg.hasRenderableContent) {
+              messages.add(msg);
+            }
           }
         }
       }
@@ -2904,9 +2910,15 @@ class ApiClient {
       nextOffset = int.tryParse((page['next_offset'] ?? 0).toString()) ?? 0;
       final rawMsgs = page['messages'];
       if (rawMsgs is List) {
+        if (rawMsgs.isEmpty) {
+          nextOffset = 0;
+        }
         for (final item in rawMsgs) {
           if (item is Map<String, dynamic>) {
-            messages.add(TelegramMessage.fromJson(item));
+            final msg = TelegramMessage.fromJson(item);
+            if (msg.hasRenderableContent) {
+              messages.add(msg);
+            }
           }
         }
       }

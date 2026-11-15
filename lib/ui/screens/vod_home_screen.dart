@@ -1550,7 +1550,7 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                                       ),
                                       SizedBox(width: 4),
                                       Text(
-                                        '爆米花影院 · 焦点巨幕',
+                                        '流光影院 · 焦点巨幕',
                                         style: TextStyle(
                                           color: Color(0xFFFFC53D),
                                           fontSize: 11.5,
@@ -1902,7 +1902,7 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                                               ),
                                             ),
                                             child: const Text(
-                                              '🍿 爆米花精选',
+                                              '🎬 流光精选',
                                               style: TextStyle(
                                                 color: Color(0xFFFFC53D),
                                                 fontSize: 10.5,
