@@ -183,7 +183,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     _useServerProxy = !widget.appState.serverConfig.preferDirectPlayback;
     _player = Player(
       configuration: const PlayerConfiguration(
-        bufferSize: 64 * 1024 * 1024,
+        bufferSize: 128 * 1024 * 1024,
       ),
     );
     _videoController = VideoController(_player);
@@ -286,24 +286,25 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       final props = <String, String>{
         'cache': 'yes',
         'cache-on-disk': 'no',
-        'cache-secs': '30',
-        'cache-pause-initial': 'no',
-        'cache-pause-wait': '0.1',
+        'cache-secs': '90',
+        'cache-pause': 'yes',
+        'cache-pause-initial': 'yes',
+        'cache-pause-wait': '3.5',
         'demuxer-thread': 'yes',
-        'demuxer-max-bytes': '67108864',
-        'demuxer-max-back-bytes': '16777216',
-        'demuxer-readahead-secs': '20',
+        'demuxer-max-bytes': '134217728',
+        'demuxer-max-back-bytes': '33554432',
+        'demuxer-readahead-secs': '45',
+        'stream-buffer-size': '4194304',
         'vd-lavc-threads': '0',
         'ad-lavc-threads': '0',
-        // Ultra-small initial probe size so first video frame renders in sub-second time
-        'demuxer-lavf-probesize': '262144',
+        'demuxer-lavf-probesize': '524288',
         'demuxer-lavf-analyzeduration': '0',
-        'network-timeout': '8',
+        'network-timeout': '15',
         'tls-verify': 'no',
         'stream-lavf-o':
             'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=4xx,5xx,reconnect_delay_max=5',
         'demuxer-lavf-o':
-            'seg_max_retry=8,http_persistent=1,http_multiple=1,allowed_extensions=ALL,protocol_whitelist=file,http,https,httpproxy,tcp,tls,crypto,data,rtp,udp,subfile',
+            'seg_max_retry=10,http_persistent=1,http_multiple=1,allowed_extensions=ALL,protocol_whitelist=file,http,https,httpproxy,tcp,tls,crypto,data,rtp,udp,subfile',
       };
       for (final entry in props.entries) {
         await platform.setProperty(entry.key, entry.value);

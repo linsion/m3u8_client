@@ -160,7 +160,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     super.initState();
     _player = Player(
       configuration: const PlayerConfiguration(
-        bufferSize: 64 * 1024 * 1024,
+        bufferSize: 96 * 1024 * 1024,
       ),
     );
     _videoController = VideoController(_player);
@@ -476,19 +476,20 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
       final props = <String, String>{
         'cache': 'yes',
         'cache-on-disk': 'no',
-        'cache-secs': '20',
-        'cache-pause-initial': 'no',
-        'cache-pause-wait': '0.1',
+        'cache-secs': '45',
+        'cache-pause': 'yes',
+        'cache-pause-initial': 'yes',
+        'cache-pause-wait': '2.5',
         'demuxer-thread': 'yes',
-        'demuxer-max-bytes': '67108864',
+        'demuxer-max-bytes': '100663296',
         'demuxer-max-back-bytes': '16777216',
-        'demuxer-readahead-secs': '12',
+        'demuxer-readahead-secs': '25',
+        'stream-buffer-size': '2097152',
         'vd-lavc-threads': '0',
         'ad-lavc-threads': '0',
-        // Fast stream probe for sub-second first frame display
-        'demuxer-lavf-probesize': '262144',
+        'demuxer-lavf-probesize': '524288',
         'demuxer-lavf-analyzeduration': '0',
-        'network-timeout': '8',
+        'network-timeout': '12',
         'tls-verify': 'no',
         // Prevent libmpv from pausing permanently at temporary live stream EOF
         'keep-open': 'no',

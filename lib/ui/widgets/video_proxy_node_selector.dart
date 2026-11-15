@@ -15,6 +15,12 @@ class VideoProxyNodeSelector extends StatefulWidget {
   final ValueChanged<String>? onProxyChanged;
   final bool compact;
   final bool overlayStyle;
+  final FocusNode? focusNode;
+  final FocusNode? upFocusNode;
+  final FocusNode? downFocusNode;
+  final FocusNode? leftFocusNode;
+  final FocusNode? rightFocusNode;
+  final VoidCallback? onInteraction;
 
   const VideoProxyNodeSelector({
     super.key,
@@ -23,6 +29,12 @@ class VideoProxyNodeSelector extends StatefulWidget {
     this.onProxyChanged,
     this.compact = false,
     this.overlayStyle = true,
+    this.focusNode,
+    this.upFocusNode,
+    this.downFocusNode,
+    this.leftFocusNode,
+    this.rightFocusNode,
+    this.onInteraction,
   });
 
   @override
@@ -173,13 +185,40 @@ class _VideoProxyNodeSelectorState extends State<VideoProxyNodeSelector> {
             : const Color(0xFF34D399);
 
         return Focus(
-          canRequestFocus: false,
+          focusNode: widget.focusNode,
+          canRequestFocus: widget.focusNode != null,
           onFocusChange: (focused) {
+            if (focused) {
+              widget.onInteraction?.call();
+            }
             if (mounted && _isFocused != focused) {
               setState(() => _isFocused = focused);
             }
           },
           onKeyEvent: (node, event) {
+            if (event is KeyDownEvent || event is KeyRepeatEvent) {
+              widget.onInteraction?.call();
+              if (event.logicalKey == LogicalKeyboardKey.arrowUp &&
+                  widget.upFocusNode != null) {
+                widget.upFocusNode!.requestFocus();
+                return KeyEventResult.handled;
+              }
+              if (event.logicalKey == LogicalKeyboardKey.arrowDown &&
+                  widget.downFocusNode != null) {
+                widget.downFocusNode!.requestFocus();
+                return KeyEventResult.handled;
+              }
+              if (event.logicalKey == LogicalKeyboardKey.arrowLeft &&
+                  widget.leftFocusNode != null) {
+                widget.leftFocusNode!.requestFocus();
+                return KeyEventResult.handled;
+              }
+              if (event.logicalKey == LogicalKeyboardKey.arrowRight &&
+                  widget.rightFocusNode != null) {
+                widget.rightFocusNode!.requestFocus();
+                return KeyEventResult.handled;
+              }
+            }
             if (event is KeyDownEvent &&
                 (event.logicalKey == LogicalKeyboardKey.select ||
                     event.logicalKey == LogicalKeyboardKey.enter ||
@@ -191,7 +230,9 @@ class _VideoProxyNodeSelectorState extends State<VideoProxyNodeSelector> {
             }
             return KeyEventResult.ignored;
           },
-          child: PopupMenuButton<String>(
+          child: ExcludeFocus(
+            excluding: widget.focusNode != null,
+            child: PopupMenuButton<String>(
             key: _menuKey,
             tooltip: '切换视频播放代理节点',
             offset: Offset(0, compact ? 26 : 34),
@@ -472,6 +513,7 @@ class _VideoProxyNodeSelectorState extends State<VideoProxyNodeSelector> {
               },
             ),
           ),
+        ),
         );
       },
     );

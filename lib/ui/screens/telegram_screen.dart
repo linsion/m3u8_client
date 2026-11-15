@@ -13131,6 +13131,7 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
   Duration _position = Duration.zero;
   Duration _duration = Duration.zero;
   int _pendingResumeSeconds = 0;
+  DateTime? _lastInlinePosUiUpdateAt;
 
   @override
   bool get wantKeepAlive => _isInlineMode;
@@ -13161,19 +13162,25 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
       final props = <String, String>{
         'cache': 'yes',
         'cache-on-disk': 'no',
-        'cache-secs': '25',
-        'cache-pause-initial': 'no',
-        'cache-pause-wait': '0.2',
+        'cache-secs': '90',
+        'cache-pause': 'yes',
+        'cache-pause-initial': 'yes',
+        'cache-pause-wait': '3.5',
         'demuxer-thread': 'yes',
-        'demuxer-max-bytes': '67108864',
-        'demuxer-max-back-bytes': '16777216',
+        'demuxer-max-bytes': '134217728',
+        'demuxer-max-back-bytes': '33554432',
+        'demuxer-readahead-secs': '45',
+        'stream-buffer-size': '4194304',
+        'demuxer-lavf-probesize': '524288',
         'vd-lavc-threads': '0',
         'ad-lavc-threads': '0',
-        'network-timeout': '15',
+        'network-timeout': '20',
         'tls-verify': 'no',
         'keep-open': 'no',
         'stream-lavf-o':
             'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=4xx,5xx,reconnect_delay_max=5',
+        'demuxer-lavf-o':
+            'http_persistent=1,http_multiple=1,allowed_extensions=ALL',
       };
       for (final entry in props.entries) {
         await platform.setProperty(entry.key, entry.value);
@@ -13188,7 +13195,7 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
     if (!_isInlineMode || _inlinePlayer == null) {
       final p = Player(
         configuration: const PlayerConfiguration(
-          bufferSize: 32 * 1024 * 1024,
+          bufferSize: 64 * 1024 * 1024,
         ),
       );
       final c = VideoController(p);
@@ -13216,7 +13223,15 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
       _posSub = p.stream.position.listen((pos) {
         if (!mounted) return;
         if (pos > Duration.zero) {
-          setState(() => _position = pos);
+          final now = DateTime.now();
+          if (_lastInlinePosUiUpdateAt == null ||
+              now.difference(_lastInlinePosUiUpdateAt!) >=
+                  const Duration(milliseconds: 250)) {
+            _lastInlinePosUiUpdateAt = now;
+            setState(() => _position = pos);
+          } else {
+            _position = pos;
+          }
         }
         if (_pendingResumeSeconds > 2 && _duration.inSeconds > 0) {
           final target = _pendingResumeSeconds;
@@ -13955,11 +13970,45 @@ class _TelegramPhotoGalleryDialog extends StatefulWidget {
 
 class _TelegramPhotoGalleryDialogState
     extends State<_TelegramPhotoGalleryDialog> {
-  final FocusNode _focusNode = FocusNode();
-  final FocusNode _scrubberFocusNode = FocusNode();
-  final FocusNode _playPauseFocusNode = FocusNode();
-  final FocusNode _topSaveFocusNode = FocusNode();
-  final FocusNode _topCloseFocusNode = FocusNode();
+  final FocusNode _focusNode = FocusNode(debugLabel: 'Gallery_Stage');
+  final FocusNode _scrubberFocusNode = FocusNode(debugLabel: 'Gallery_Scrubber');
+
+  // Middle Left / Right previous/next media switch buttons (`<` / `>`)
+  final FocusNode _prevItemFocusNode = FocusNode(debugLabel: 'Gallery_MidPrev');
+  final FocusNode _nextItemFocusNode = FocusNode(debugLabel: 'Gallery_MidNext');
+
+  // Top bar focus nodes
+  final FocusNode _topProxyFocusNode = FocusNode(debugLabel: 'Gallery_TopProxy');
+  final FocusNode _topScopeFocusNode = FocusNode(debugLabel: 'Gallery_TopScope');
+  final FocusNode _topMiniFocusNode = FocusNode(debugLabel: 'Gallery_TopMini');
+  final FocusNode _topAlbumQueueFocusNode =
+      FocusNode(debugLabel: 'Gallery_TopAlbumQueue');
+  final FocusNode _topSaveFocusNode = FocusNode(debugLabel: 'Gallery_TopSave');
+  final FocusNode _topQueueFocusNode = FocusNode(debugLabel: 'Gallery_TopQueue');
+  final FocusNode _topCloseFocusNode = FocusNode(debugLabel: 'Gallery_TopClose');
+
+  // Bottom Row 2 control buttons focus nodes
+  final FocusNode _playPauseFocusNode =
+      FocusNode(debugLabel: 'Gallery_PlayPause');
+  final FocusNode _rewindFocusNode = FocusNode(debugLabel: 'Gallery_Rewind5s');
+  final FocusNode _forwardFocusNode = FocusNode(debugLabel: 'Gallery_Forward5s');
+  final FocusNode _bottomPrevFocusNode =
+      FocusNode(debugLabel: 'Gallery_BottomPrev');
+  final FocusNode _bottomNextFocusNode =
+      FocusNode(debugLabel: 'Gallery_BottomNext');
+  final FocusNode _speedFocusNode = FocusNode(debugLabel: 'Gallery_Speed');
+  final FocusNode _bottomProxyFocusNode =
+      FocusNode(debugLabel: 'Gallery_BottomProxy');
+  final FocusNode _muteFocusNode = FocusNode(debugLabel: 'Gallery_Mute');
+  final FocusNode _bottomSaveFocusNode =
+      FocusNode(debugLabel: 'Gallery_BottomSave');
+  final FocusNode _bottomQueueFocusNode =
+      FocusNode(debugLabel: 'Gallery_BottomQueue');
+  final FocusNode _bottomExitFocusNode =
+      FocusNode(debugLabel: 'Gallery_BottomExit');
+
+  final DateTime _dialogOpenedAt = DateTime.now();
+  bool _hasAssignedInitialFocus = false;
   late bool _albumScopeOnly;
   late int _currentIndex;
 
@@ -13968,14 +14017,17 @@ class _TelegramPhotoGalleryDialogState
   StreamSubscription<bool>? _playingSub;
   StreamSubscription<Duration>? _posSub;
   StreamSubscription<Duration>? _durSub;
+  StreamSubscription<Duration>? _bufferSub;
   StreamSubscription<bool>? _bufferingSub;
   StreamSubscription<bool>? _completedSub;
   int _pendingGalleryResumeSeconds = 0;
+  DateTime? _lastGalleryPosUiUpdateAt;
 
   bool _isVideoPlaying = false;
   bool _isVideoBuffering = false;
   Duration _videoPosition = Duration.zero;
   Duration _videoDuration = Duration.zero;
+  Duration _videoBuffer = Duration.zero;
   double _playbackSpeed = 1.0;
   bool _isMuted = false;
   double _volume = 100.0;
@@ -14092,8 +14144,8 @@ class _TelegramPhotoGalleryDialogState
   @override
   void initState() {
     super.initState();
-    _albumScopeOnly =
-        widget.albumMessages != null && widget.albumMessages!.length > 1;
+    // Default to all chat media so Left/Right (`<` / `>`) can switch across all videos/photos in the chat
+    _albumScopeOnly = false;
     final list = _activeMessages;
     final idx = list.indexWhere((m) => m.id == widget.initialMessageId);
     _currentIndex = idx >= 0 ? idx : 0;
@@ -14106,9 +14158,26 @@ class _TelegramPhotoGalleryDialogState
     _disposeVideoPlayer();
     _focusNode.dispose();
     _scrubberFocusNode.dispose();
-    _playPauseFocusNode.dispose();
+    _prevItemFocusNode.dispose();
+    _nextItemFocusNode.dispose();
+    _topProxyFocusNode.dispose();
+    _topScopeFocusNode.dispose();
+    _topMiniFocusNode.dispose();
+    _topAlbumQueueFocusNode.dispose();
     _topSaveFocusNode.dispose();
+    _topQueueFocusNode.dispose();
     _topCloseFocusNode.dispose();
+    _playPauseFocusNode.dispose();
+    _rewindFocusNode.dispose();
+    _forwardFocusNode.dispose();
+    _bottomPrevFocusNode.dispose();
+    _bottomNextFocusNode.dispose();
+    _speedFocusNode.dispose();
+    _bottomProxyFocusNode.dispose();
+    _muteFocusNode.dispose();
+    _bottomSaveFocusNode.dispose();
+    _bottomQueueFocusNode.dispose();
+    _bottomExitFocusNode.dispose();
     super.dispose();
   }
 
@@ -14116,11 +14185,13 @@ class _TelegramPhotoGalleryDialogState
     _playingSub?.cancel();
     _posSub?.cancel();
     _durSub?.cancel();
+    _bufferSub?.cancel();
     _bufferingSub?.cancel();
     _completedSub?.cancel();
     _playingSub = null;
     _posSub = null;
     _durSub = null;
+    _bufferSub = null;
     _bufferingSub = null;
     _completedSub = null;
     _videoPlayer?.dispose();
@@ -14134,19 +14205,25 @@ class _TelegramPhotoGalleryDialogState
       final props = <String, String>{
         'cache': 'yes',
         'cache-on-disk': 'no',
-        'cache-secs': '30',
-        'cache-pause-initial': 'no',
-        'cache-pause-wait': '0.2',
+        'cache-secs': '120',
+        'cache-pause': 'yes',
+        'cache-pause-initial': 'yes',
+        'cache-pause-wait': '3.5',
         'demuxer-thread': 'yes',
-        'demuxer-max-bytes': '67108864',
-        'demuxer-max-back-bytes': '16777216',
+        'demuxer-max-bytes': '134217728',
+        'demuxer-max-back-bytes': '33554432',
+        'demuxer-readahead-secs': '60',
+        'stream-buffer-size': '4194304',
+        'demuxer-lavf-probesize': '524288',
         'vd-lavc-threads': '0',
         'ad-lavc-threads': '0',
-        'network-timeout': '15',
+        'network-timeout': '20',
         'tls-verify': 'no',
         'keep-open': 'no',
         'stream-lavf-o':
             'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=4xx,5xx,reconnect_delay_max=5',
+        'demuxer-lavf-o':
+            'http_persistent=1,http_multiple=1,allowed_extensions=ALL',
       };
       for (final entry in props.entries) {
         await platform.setProperty(entry.key, entry.value);
@@ -14168,6 +14245,7 @@ class _TelegramPhotoGalleryDialogState
           _isVideoBuffering = false;
           _videoPosition = Duration.zero;
           _videoDuration = Duration.zero;
+          _videoBuffer = Duration.zero;
         });
       }
       return;
@@ -14175,13 +14253,14 @@ class _TelegramPhotoGalleryDialogState
 
     final p = Player(
       configuration: const PlayerConfiguration(
-        bufferSize: 64 * 1024 * 1024,
+        bufferSize: 128 * 1024 * 1024,
       ),
     );
     final c = VideoController(p);
     _videoPlayer = p;
     _videoController = c;
     _videoPosition = Duration.zero;
+    _videoBuffer = Duration.zero;
     _pendingGalleryResumeSeconds = 0;
     _videoDuration =
         att.duration > 0 ? Duration(seconds: att.duration) : Duration.zero;
@@ -14196,15 +14275,29 @@ class _TelegramPhotoGalleryDialogState
     var usingLocalRelay = false;
 
     _playingSub = p.stream.playing.listen((playing) {
-      if (mounted) setState(() => _isVideoPlaying = playing);
+      if (mounted && _isVideoPlaying != playing) {
+        setState(() => _isVideoPlaying = playing);
+      }
     });
     _posSub = p.stream.position.listen((pos) {
       if (!mounted) return;
       if (pos > Duration.zero) {
-        setState(() {
+        final now = DateTime.now();
+        final shouldClearBuf = _isVideoBuffering && !p.state.buffering;
+        if (shouldClearBuf ||
+            _lastGalleryPosUiUpdateAt == null ||
+            now.difference(_lastGalleryPosUiUpdateAt!) >=
+                const Duration(milliseconds: 250)) {
+          _lastGalleryPosUiUpdateAt = now;
+          setState(() {
+            _videoPosition = pos;
+            if (!p.state.buffering) {
+              _isVideoBuffering = false;
+            }
+          });
+        } else {
           _videoPosition = pos;
-          _isVideoBuffering = false;
-        });
+        }
       }
       if (_pendingGalleryResumeSeconds > 2 && _videoDuration.inSeconds > 0) {
         final target = _pendingGalleryResumeSeconds;
@@ -14215,12 +14308,22 @@ class _TelegramPhotoGalleryDialogState
       }
     });
     _durSub = p.stream.duration.listen((dur) {
-      if (dur > Duration.zero && mounted) {
+      if (dur > Duration.zero && mounted && _videoDuration != dur) {
         setState(() => _videoDuration = dur);
       }
     });
+    _bufferSub = p.stream.buffer.listen((buf) {
+      if (!mounted) return;
+      if ((buf.inMilliseconds - _videoBuffer.inMilliseconds).abs() >= 1000) {
+        setState(() => _videoBuffer = buf);
+      } else {
+        _videoBuffer = buf;
+      }
+    });
     _bufferingSub = p.stream.buffering.listen((buf) {
-      if (mounted) setState(() => _isVideoBuffering = buf);
+      if (mounted && _isVideoBuffering != buf) {
+        setState(() => _isVideoBuffering = buf);
+      }
     });
     _completedSub = p.stream.completed.listen((completed) {
       if (!completed || !mounted) return;
@@ -14245,12 +14348,13 @@ class _TelegramPhotoGalleryDialogState
 
     if (mounted) {
       setState(() {});
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) return;
-        if (!_playPauseFocusNode.hasFocus && !_scrubberFocusNode.hasFocus) {
+      if (!_hasAssignedInitialFocus) {
+        _hasAssignedInitialFocus = true;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
           _playPauseFocusNode.requestFocus();
-        }
-      });
+        });
+      }
     }
 
     try {
@@ -14375,6 +14479,21 @@ class _TelegramPhotoGalleryDialogState
     return h > 0 ? '$h:$m:$s' : '$m:$s';
   }
 
+  FocusNode? _neighborInChain(
+    List<FocusNode> chain,
+    FocusNode node,
+    int delta, {
+    FocusNode? edgeTarget,
+  }) {
+    final idx = chain.indexOf(node);
+    if (idx < 0) return edgeTarget;
+    final nextIdx = idx + delta;
+    if (nextIdx >= 0 && nextIdx < chain.length) {
+      return chain[nextIdx];
+    }
+    return edgeTarget;
+  }
+
   Widget _buildGalleryTvButton({
     FocusNode? focusNode,
     bool autofocus = false,
@@ -14385,21 +14504,49 @@ class _TelegramPhotoGalleryDialogState
     Color iconColor = Colors.white,
     FocusNode? upFocusNode,
     FocusNode? downFocusNode,
+    FocusNode? leftFocusNode,
+    FocusNode? rightFocusNode,
   }) {
     return StatefulBuilder(
       builder: (btnCtx, setBtnState) {
         return Focus(
           focusNode: focusNode,
           autofocus: autofocus,
-          onFocusChange: (_) => setBtnState(() {}),
+          onFocusChange: (hasFocus) {
+            setBtnState(() {});
+            if (hasFocus) {
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (btnCtx.mounted) {
+                  Scrollable.ensureVisible(
+                    btnCtx,
+                    alignment: 0.5,
+                    duration: const Duration(milliseconds: 140),
+                  );
+                }
+              });
+            }
+          },
           onKeyEvent: (node, event) {
-            if (event is! KeyDownEvent) return KeyEventResult.ignored;
-            if (event.logicalKey == LogicalKeyboardKey.select ||
-                event.logicalKey == LogicalKeyboardKey.enter ||
-                event.logicalKey == LogicalKeyboardKey.numpadEnter ||
-                event.logicalKey == LogicalKeyboardKey.space ||
-                event.logicalKey == LogicalKeyboardKey.gameButtonA) {
+            if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+              return KeyEventResult.ignored;
+            }
+            if (event is KeyDownEvent &&
+                (event.logicalKey == LogicalKeyboardKey.select ||
+                    event.logicalKey == LogicalKeyboardKey.enter ||
+                    event.logicalKey == LogicalKeyboardKey.numpadEnter ||
+                    event.logicalKey == LogicalKeyboardKey.space ||
+                    event.logicalKey == LogicalKeyboardKey.gameButtonA)) {
               if (onTap != null) onTap();
+              return KeyEventResult.handled;
+            }
+            if (event.logicalKey == LogicalKeyboardKey.arrowLeft &&
+                leftFocusNode != null) {
+              leftFocusNode.requestFocus();
+              return KeyEventResult.handled;
+            }
+            if (event.logicalKey == LogicalKeyboardKey.arrowRight &&
+                rightFocusNode != null) {
+              rightFocusNode.requestFocus();
               return KeyEventResult.handled;
             }
             if (event.logicalKey == LogicalKeyboardKey.arrowUp &&
@@ -14480,21 +14627,49 @@ class _TelegramPhotoGalleryDialogState
     double iconSize = 20,
     FocusNode? upFocusNode,
     FocusNode? downFocusNode,
+    FocusNode? leftFocusNode,
+    FocusNode? rightFocusNode,
   }) {
     return StatefulBuilder(
       builder: (btnCtx, setBtnState) {
         return Focus(
           focusNode: focusNode,
           autofocus: autofocus,
-          onFocusChange: (_) => setBtnState(() {}),
+          onFocusChange: (hasFocus) {
+            setBtnState(() {});
+            if (hasFocus) {
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (btnCtx.mounted) {
+                  Scrollable.ensureVisible(
+                    btnCtx,
+                    alignment: 0.5,
+                    duration: const Duration(milliseconds: 140),
+                  );
+                }
+              });
+            }
+          },
           onKeyEvent: (node, event) {
-            if (event is! KeyDownEvent) return KeyEventResult.ignored;
-            if (event.logicalKey == LogicalKeyboardKey.select ||
-                event.logicalKey == LogicalKeyboardKey.enter ||
-                event.logicalKey == LogicalKeyboardKey.numpadEnter ||
-                event.logicalKey == LogicalKeyboardKey.space ||
-                event.logicalKey == LogicalKeyboardKey.gameButtonA) {
+            if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+              return KeyEventResult.ignored;
+            }
+            if (event is KeyDownEvent &&
+                (event.logicalKey == LogicalKeyboardKey.select ||
+                    event.logicalKey == LogicalKeyboardKey.enter ||
+                    event.logicalKey == LogicalKeyboardKey.numpadEnter ||
+                    event.logicalKey == LogicalKeyboardKey.space ||
+                    event.logicalKey == LogicalKeyboardKey.gameButtonA)) {
               if (onTap != null) onTap();
+              return KeyEventResult.handled;
+            }
+            if (event.logicalKey == LogicalKeyboardKey.arrowLeft &&
+                leftFocusNode != null) {
+              leftFocusNode.requestFocus();
+              return KeyEventResult.handled;
+            }
+            if (event.logicalKey == LogicalKeyboardKey.arrowRight &&
+                rightFocusNode != null) {
+              rightFocusNode.requestFocus();
               return KeyEventResult.handled;
             }
             if (event.logicalKey == LogicalKeyboardKey.arrowUp &&
@@ -14589,19 +14764,65 @@ class _TelegramPhotoGalleryDialogState
     final activePos =
         _isGalleryHorizontalSeeking ? _gallerySeekPreviewPos : _videoPosition;
     final posMs = activePos.inMilliseconds.clamp(0, totalMs);
+    final bufMs = _videoBuffer.inMilliseconds.clamp(posMs, totalMs);
 
-    return Focus(
-      canRequestFocus: false,
-      onKeyEvent: (node, event) {
-        if (event is KeyDownEvent &&
-            (event.logicalKey == LogicalKeyboardKey.escape ||
-                event.logicalKey == LogicalKeyboardKey.goBack)) {
-          Navigator.of(context).pop();
-          return KeyEventResult.handled;
+    final topFocusChain = <FocusNode>[
+      if (isVideo && _videoPlayer != null) _topProxyFocusNode,
+      if (hasAlbumGroup) _topScopeFocusNode,
+      if (isVideo && widget.onOpenMiniPlayer != null) _topMiniFocusNode,
+      if (hasAlbumGroup && widget.onQueueAlbumDownload != null)
+        _topAlbumQueueFocusNode,
+      _topSaveFocusNode,
+      if (att?.url.isNotEmpty ?? false) _topQueueFocusNode,
+      _topCloseFocusNode,
+    ];
+
+    final bottomFocusChain = <FocusNode>[
+      _playPauseFocusNode,
+      _rewindFocusNode,
+      _forwardFocusNode,
+      if (list.length > 1) ...[
+        _bottomPrevFocusNode,
+        _bottomNextFocusNode,
+      ],
+      _speedFocusNode,
+      if (_videoPlayer != null) _bottomProxyFocusNode,
+      _muteFocusNode,
+      _bottomSaveFocusNode,
+      if (att?.url.isNotEmpty ?? false) _bottomQueueFocusNode,
+      _bottomExitFocusNode,
+    ];
+
+    final topDownDefault = list.length > 1
+        ? _prevItemFocusNode
+        : (isVideo ? _scrubberFocusNode : _focusNode);
+
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        if (DateTime.now().difference(_dialogOpenedAt) <
+            const Duration(milliseconds: 350)) {
+          return;
         }
-        return KeyEventResult.ignored;
+        Navigator.of(context).pop();
       },
-      child: Dialog(
+      child: Focus(
+        canRequestFocus: false,
+        onKeyEvent: (node, event) {
+          if (event.logicalKey == LogicalKeyboardKey.escape ||
+              event.logicalKey == LogicalKeyboardKey.goBack) {
+            if (event is KeyDownEvent) {
+              if (DateTime.now().difference(_dialogOpenedAt) >=
+                  const Duration(milliseconds: 350)) {
+                Navigator.of(context).pop();
+              }
+            }
+            return KeyEventResult.handled;
+          }
+          return KeyEventResult.ignored;
+        },
+        child: Dialog(
         backgroundColor: isMobileDialog ? Colors.black : Colors.transparent,
         insetPadding:
             isMobileDialog ? EdgeInsets.zero : const EdgeInsets.all(14),
@@ -14989,6 +15210,20 @@ class _TelegramPhotoGalleryDialogState
                           if (isVideo && _videoPlayer != null) ...[
                             const SizedBox(width: 6),
                             VideoProxyNodeSelector(
+                              focusNode: _topProxyFocusNode,
+                              leftFocusNode: _neighborInChain(
+                                topFocusChain,
+                                _topProxyFocusNode,
+                                -1,
+                                edgeTarget:
+                                    list.length > 1 ? _prevItemFocusNode : null,
+                              ),
+                              rightFocusNode: _neighborInChain(
+                                topFocusChain,
+                                _topProxyFocusNode,
+                                1,
+                              ),
+                              downFocusNode: topDownDefault,
                               proxyService: widget.appState.proxyService,
                               scenario: RequestScenario.telegram,
                               overlayStyle: true,
@@ -15011,6 +15246,7 @@ class _TelegramPhotoGalleryDialogState
                           if (hasAlbumGroup) ...[
                             const SizedBox(width: 6),
                             _buildGalleryTvButton(
+                              focusNode: _topScopeFocusNode,
                               icon: Icons.filter_none_rounded,
                               label: _albumScopeOnly
                                   ? '本组 (${widget.albumMessages!.length})'
@@ -15019,13 +15255,25 @@ class _TelegramPhotoGalleryDialogState
                                   ? const Color(0xFF2B5278)
                                   : const Color(0xCC0F1720),
                               onTap: _toggleScopeMode,
-                              downFocusNode:
-                                  isVideo ? _scrubberFocusNode : _focusNode,
+                              leftFocusNode: _neighborInChain(
+                                topFocusChain,
+                                _topScopeFocusNode,
+                                -1,
+                                edgeTarget:
+                                    list.length > 1 ? _prevItemFocusNode : null,
+                              ),
+                              rightFocusNode: _neighborInChain(
+                                topFocusChain,
+                                _topScopeFocusNode,
+                                1,
+                              ),
+                              downFocusNode: topDownDefault,
                             ),
                           ],
                           if (isVideo && widget.onOpenMiniPlayer != null) ...[
                             const SizedBox(width: 6),
                             _buildGalleryTvButton(
+                              focusNode: _topMiniFocusNode,
                               icon: Icons.picture_in_picture_alt_rounded,
                               label: '小窗',
                               onTap: () {
@@ -15034,13 +15282,26 @@ class _TelegramPhotoGalleryDialogState
                                 Navigator.of(context).pop();
                                 widget.onOpenMiniPlayer!(msg, posSec);
                               },
-                              downFocusNode: _scrubberFocusNode,
+                              leftFocusNode: _neighborInChain(
+                                topFocusChain,
+                                _topMiniFocusNode,
+                                -1,
+                                edgeTarget:
+                                    list.length > 1 ? _prevItemFocusNode : null,
+                              ),
+                              rightFocusNode: _neighborInChain(
+                                topFocusChain,
+                                _topMiniFocusNode,
+                                1,
+                              ),
+                              downFocusNode: topDownDefault,
                             ),
                           ],
                           if (hasAlbumGroup &&
                               widget.onQueueAlbumDownload != null) ...[
                             const SizedBox(width: 6),
                             _buildGalleryTvButton(
+                              focusNode: _topAlbumQueueFocusNode,
                               icon: _queuedAlbum
                                   ? Icons.check_circle_rounded
                                   : Icons.collections_bookmark_outlined,
@@ -15059,8 +15320,19 @@ class _TelegramPhotoGalleryDialogState
                                   ? null
                                   : () =>
                                       _handleQueueAlbum(widget.albumMessages!),
-                              downFocusNode:
-                                  isVideo ? _scrubberFocusNode : _focusNode,
+                              leftFocusNode: _neighborInChain(
+                                topFocusChain,
+                                _topAlbumQueueFocusNode,
+                                -1,
+                                edgeTarget:
+                                    list.length > 1 ? _prevItemFocusNode : null,
+                              ),
+                              rightFocusNode: _neighborInChain(
+                                topFocusChain,
+                                _topAlbumQueueFocusNode,
+                                1,
+                              ),
+                              downFocusNode: topDownDefault,
                             ),
                           ],
                           const SizedBox(width: 6),
@@ -15083,12 +15355,24 @@ class _TelegramPhotoGalleryDialogState
                             onTap: _savingLocalIds.contains(msg.id)
                                 ? null
                                 : () => _handleSaveLocal(msg),
-                            downFocusNode:
-                                isVideo ? _scrubberFocusNode : _focusNode,
+                            leftFocusNode: _neighborInChain(
+                              topFocusChain,
+                              _topSaveFocusNode,
+                              -1,
+                              edgeTarget:
+                                  list.length > 1 ? _prevItemFocusNode : null,
+                            ),
+                            rightFocusNode: _neighborInChain(
+                              topFocusChain,
+                              _topSaveFocusNode,
+                              1,
+                            ),
+                            downFocusNode: topDownDefault,
                           ),
                           if (att?.url.isNotEmpty ?? false) ...[
                             const SizedBox(width: 6),
                             _buildGalleryTvButton(
+                              focusNode: _topQueueFocusNode,
                               icon: _queuedIds.contains(msg.id)
                                   ? Icons.check_circle_rounded
                                   : (_failedIds.contains(msg.id)
@@ -15110,8 +15394,17 @@ class _TelegramPhotoGalleryDialogState
                               onTap: _queueingIds.contains(msg.id)
                                   ? null
                                   : () => _handleQueueSingle(msg),
-                              downFocusNode:
-                                  isVideo ? _scrubberFocusNode : _focusNode,
+                              leftFocusNode: _neighborInChain(
+                                topFocusChain,
+                                _topQueueFocusNode,
+                                -1,
+                              ),
+                              rightFocusNode: _neighborInChain(
+                                topFocusChain,
+                                _topQueueFocusNode,
+                                1,
+                              ),
+                              downFocusNode: topDownDefault,
                             ),
                           ],
                         ],
@@ -15125,7 +15418,16 @@ class _TelegramPhotoGalleryDialogState
                     label: isMobileDialog ? null : '关闭',
                     iconSize: 18,
                     onTap: () => Navigator.of(context).pop(),
-                    downFocusNode: isVideo ? _scrubberFocusNode : _focusNode,
+                    leftFocusNode: _neighborInChain(
+                      topFocusChain,
+                      _topCloseFocusNode,
+                      -1,
+                    ),
+                    rightFocusNode:
+                        list.length > 1 ? _nextItemFocusNode : null,
+                    downFocusNode: list.length > 1
+                        ? _nextItemFocusNode
+                        : (isVideo ? _scrubberFocusNode : _focusNode),
                   ),
                 ],
               ),
@@ -15223,21 +15525,31 @@ class _TelegramPhotoGalleryDialogState
               Positioned(
                 left: 12,
                 child: _buildGalleryTvIconButton(
+                  focusNode: _prevItemFocusNode,
                   icon: Icons.chevron_left_rounded,
+                  label: isMobileDialog ? null : '上一项',
                   iconSize: 28,
                   onTap: () => _step(-1),
                   upFocusNode: _topSaveFocusNode,
-                  downFocusNode: isVideo ? _playPauseFocusNode : null,
+                  downFocusNode:
+                      isVideo ? _scrubberFocusNode : _focusNode,
+                  leftFocusNode: _nextItemFocusNode,
+                  rightFocusNode: _nextItemFocusNode,
                 ),
               ),
               Positioned(
                 right: 12,
                 child: _buildGalleryTvIconButton(
+                  focusNode: _nextItemFocusNode,
                   icon: Icons.chevron_right_rounded,
+                  label: isMobileDialog ? null : '下一项',
                   iconSize: 28,
                   onTap: () => _step(1),
                   upFocusNode: _topCloseFocusNode,
-                  downFocusNode: isVideo ? _playPauseFocusNode : null,
+                  downFocusNode:
+                      isVideo ? _scrubberFocusNode : _focusNode,
+                  leftFocusNode: _prevItemFocusNode,
+                  rightFocusNode: _prevItemFocusNode,
                 ),
               ),
             ],
@@ -15327,7 +15639,11 @@ class _TelegramPhotoGalleryDialogState
                                   if (event is KeyDownEvent &&
                                       event.logicalKey ==
                                           LogicalKeyboardKey.arrowUp) {
-                                    _topSaveFocusNode.requestFocus();
+                                    if (list.length > 1) {
+                                      _prevItemFocusNode.requestFocus();
+                                    } else {
+                                      _topSaveFocusNode.requestFocus();
+                                    }
                                     return KeyEventResult.handled;
                                   }
                                   if (event is KeyDownEvent &&
@@ -15406,6 +15722,8 @@ class _TelegramPhotoGalleryDialogState
                                                           : const Color(
                                                               0xFF3E99EE,
                                                             ),
+                                                  secondaryActiveTrackColor:
+                                                      Colors.white54,
                                                   inactiveTrackColor:
                                                       Colors.white24,
                                                   thumbColor: isScrubFocused
@@ -15414,6 +15732,8 @@ class _TelegramPhotoGalleryDialogState
                                                 ),
                                                 child: Slider(
                                                   value: posMs.toDouble(),
+                                                  secondaryTrackValue:
+                                                      bufMs.toDouble(),
                                                   min: 0,
                                                   max: totalMs.toDouble(),
                                                   onChanged: (val) {
@@ -15453,7 +15773,7 @@ class _TelegramPhotoGalleryDialogState
                                                     BorderRadius.circular(6),
                                               ),
                                               child: const Text(
-                                                '◀▶ 调进度 · ▼ 切按钮',
+                                                '◀▶ 调进度 · ▲ 左右切换 · ▼ 切按钮',
                                                 style: TextStyle(
                                                   color: Colors.white,
                                                   fontSize: 10.5,
@@ -15486,47 +15806,127 @@ class _TelegramPhotoGalleryDialogState
                                   label: _isVideoPlaying ? '暂停' : '播放',
                                   onTap: () => _videoPlayer?.playOrPause(),
                                   upFocusNode: _scrubberFocusNode,
+                                  leftFocusNode: _neighborInChain(
+                                    bottomFocusChain,
+                                    _playPauseFocusNode,
+                                    -1,
+                                    edgeTarget: list.length > 1
+                                        ? _prevItemFocusNode
+                                        : null,
+                                  ),
+                                  rightFocusNode: _neighborInChain(
+                                    bottomFocusChain,
+                                    _playPauseFocusNode,
+                                    1,
+                                  ),
                                 ),
                                 const SizedBox(width: 6),
                                 _buildGalleryTvIconButton(
+                                  focusNode: _rewindFocusNode,
                                   icon: Icons.replay_5_rounded,
                                   label: '快退5s',
                                   onTap: () => _seekRelative(-5),
                                   upFocusNode: _scrubberFocusNode,
+                                  leftFocusNode: _neighborInChain(
+                                    bottomFocusChain,
+                                    _rewindFocusNode,
+                                    -1,
+                                  ),
+                                  rightFocusNode: _neighborInChain(
+                                    bottomFocusChain,
+                                    _rewindFocusNode,
+                                    1,
+                                  ),
                                 ),
                                 const SizedBox(width: 6),
                                 _buildGalleryTvIconButton(
+                                  focusNode: _forwardFocusNode,
                                   icon: Icons.forward_5_rounded,
                                   label: '快进5s',
                                   onTap: () => _seekRelative(5),
                                   upFocusNode: _scrubberFocusNode,
+                                  leftFocusNode: _neighborInChain(
+                                    bottomFocusChain,
+                                    _forwardFocusNode,
+                                    -1,
+                                  ),
+                                  rightFocusNode: _neighborInChain(
+                                    bottomFocusChain,
+                                    _forwardFocusNode,
+                                    1,
+                                  ),
                                 ),
                                 if (list.length > 1) ...[
                                   const SizedBox(width: 6),
                                   _buildGalleryTvIconButton(
+                                    focusNode: _bottomPrevFocusNode,
                                     icon: Icons.skip_previous_rounded,
                                     label: '上一项',
                                     onTap: () => _step(-1),
-                                    upFocusNode: _scrubberFocusNode,
+                                    upFocusNode: _prevItemFocusNode,
+                                    leftFocusNode: _neighborInChain(
+                                      bottomFocusChain,
+                                      _bottomPrevFocusNode,
+                                      -1,
+                                    ),
+                                    rightFocusNode: _neighborInChain(
+                                      bottomFocusChain,
+                                      _bottomPrevFocusNode,
+                                      1,
+                                    ),
                                   ),
                                   const SizedBox(width: 6),
                                   _buildGalleryTvIconButton(
+                                    focusNode: _bottomNextFocusNode,
                                     icon: Icons.skip_next_rounded,
                                     label: '下一项',
                                     onTap: () => _step(1),
-                                    upFocusNode: _scrubberFocusNode,
+                                    upFocusNode: _nextItemFocusNode,
+                                    leftFocusNode: _neighborInChain(
+                                      bottomFocusChain,
+                                      _bottomNextFocusNode,
+                                      -1,
+                                    ),
+                                    rightFocusNode: _neighborInChain(
+                                      bottomFocusChain,
+                                      _bottomNextFocusNode,
+                                      1,
+                                    ),
                                   ),
                                 ],
                                 const SizedBox(width: 6),
                                 _buildGalleryTvIconButton(
+                                  focusNode: _speedFocusNode,
                                   icon: Icons.speed_rounded,
                                   label: '${_playbackSpeed}x',
                                   onTap: _cycleSpeed,
                                   upFocusNode: _scrubberFocusNode,
+                                  leftFocusNode: _neighborInChain(
+                                    bottomFocusChain,
+                                    _speedFocusNode,
+                                    -1,
+                                  ),
+                                  rightFocusNode: _neighborInChain(
+                                    bottomFocusChain,
+                                    _speedFocusNode,
+                                    1,
+                                  ),
                                 ),
                                 if (_videoPlayer != null) ...[
                                   const SizedBox(width: 6),
                                   VideoProxyNodeSelector(
+                                    focusNode: _bottomProxyFocusNode,
+                                    upFocusNode: _scrubberFocusNode,
+                                    leftFocusNode: _neighborInChain(
+                                      bottomFocusChain,
+                                      _bottomProxyFocusNode,
+                                      -1,
+                                    ),
+                                    rightFocusNode: _neighborInChain(
+                                      bottomFocusChain,
+                                      _bottomProxyFocusNode,
+                                      1,
+                                    ),
                                     proxyService: widget.appState.proxyService,
                                     scenario: RequestScenario.telegram,
                                     overlayStyle: true,
@@ -15558,6 +15958,7 @@ class _TelegramPhotoGalleryDialogState
                                     mainAxisSize: MainAxisSize.min,
                                     children: [
                                       _buildGalleryTvIconButton(
+                                        focusNode: _muteFocusNode,
                                         icon: _isMuted || _volume <= 0
                                             ? Icons.volume_off_rounded
                                             : (_volume < 50
@@ -15568,6 +15969,16 @@ class _TelegramPhotoGalleryDialogState
                                             : '静音',
                                         onTap: _toggleMute,
                                         upFocusNode: _scrubberFocusNode,
+                                        leftFocusNode: _neighborInChain(
+                                          bottomFocusChain,
+                                          _muteFocusNode,
+                                          -1,
+                                        ),
+                                        rightFocusNode: _neighborInChain(
+                                          bottomFocusChain,
+                                          _muteFocusNode,
+                                          1,
+                                        ),
                                       ),
                                       if (!isMobileDialog) ...[
                                         SizedBox(
@@ -15622,6 +16033,7 @@ class _TelegramPhotoGalleryDialogState
                                 ),
                                 const SizedBox(width: 6),
                                 _buildGalleryTvIconButton(
+                                  focusNode: _bottomSaveFocusNode,
                                   icon: _savedLocalIds.contains(msg.id)
                                       ? Icons.check_circle_rounded
                                       : Icons.download_rounded,
@@ -15634,10 +16046,21 @@ class _TelegramPhotoGalleryDialogState
                                       ? null
                                       : () => _handleSaveLocal(msg),
                                   upFocusNode: _scrubberFocusNode,
+                                  leftFocusNode: _neighborInChain(
+                                    bottomFocusChain,
+                                    _bottomSaveFocusNode,
+                                    -1,
+                                  ),
+                                  rightFocusNode: _neighborInChain(
+                                    bottomFocusChain,
+                                    _bottomSaveFocusNode,
+                                    1,
+                                  ),
                                 ),
                                 if (att?.url.isNotEmpty ?? false) ...[
                                   const SizedBox(width: 6),
                                   _buildGalleryTvIconButton(
+                                    focusNode: _bottomQueueFocusNode,
                                     icon: _queuedIds.contains(msg.id)
                                         ? Icons.check_circle_rounded
                                         : Icons.cloud_download_outlined,
@@ -15650,14 +16073,38 @@ class _TelegramPhotoGalleryDialogState
                                         ? null
                                         : () => _handleQueueSingle(msg),
                                     upFocusNode: _scrubberFocusNode,
+                                    leftFocusNode: _neighborInChain(
+                                      bottomFocusChain,
+                                      _bottomQueueFocusNode,
+                                      -1,
+                                    ),
+                                    rightFocusNode: _neighborInChain(
+                                      bottomFocusChain,
+                                      _bottomQueueFocusNode,
+                                      1,
+                                    ),
                                   ),
                                 ],
                                 const SizedBox(width: 6),
                                 _buildGalleryTvIconButton(
+                                  focusNode: _bottomExitFocusNode,
                                   icon: Icons.close_rounded,
                                   label: '退出全屏',
                                   onTap: () => Navigator.of(context).pop(),
                                   upFocusNode: _scrubberFocusNode,
+                                  leftFocusNode: _neighborInChain(
+                                    bottomFocusChain,
+                                    _bottomExitFocusNode,
+                                    -1,
+                                  ),
+                                  rightFocusNode: _neighborInChain(
+                                    bottomFocusChain,
+                                    _bottomExitFocusNode,
+                                    1,
+                                    edgeTarget: list.length > 1
+                                        ? _nextItemFocusNode
+                                        : null,
+                                  ),
                                 ),
                               ],
                             ),
@@ -15837,6 +16284,7 @@ class _TelegramPhotoGalleryDialogState
             ),
           ],
         ),
+      ),
       ),
     );
   }

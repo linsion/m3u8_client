@@ -214,101 +214,205 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   Future<void> _showExitConfirmDialog() async {
     if (_isExitDialogShowing || !mounted) return;
     _isExitDialogShowing = true;
+    final dialogOpenedAt = DateTime.now();
+    final stayFocusNode = FocusNode(debugLabel: 'ExitDialog_Stay');
+    final exitFocusNode = FocusNode(debugLabel: 'ExitDialog_Exit');
     try {
       final shouldExit = await showDialog<bool>(
         context: context,
+        barrierDismissible: false,
         builder: (ctx) {
-          return AlertDialog(
-            backgroundColor: VideoPlatformTheme.bgElevated,
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(12),
-              side: BorderSide(color: VideoPlatformTheme.borderStrong),
-            ),
-            title: Row(
-              children: [
-                Icon(
-                  Icons.exit_to_app_rounded,
-                  size: 22,
-                  color: VideoPlatformTheme.accent,
+          Widget buildDialogActionBtn({
+            required FocusNode focusNode,
+            required FocusNode neighborNode,
+            required bool autofocus,
+            required String label,
+            required IconData icon,
+            required bool isPrimaryDanger,
+            required VoidCallback onTap,
+          }) {
+            return StatefulBuilder(
+              builder: (btnCtx, setBtnState) {
+                return Focus(
+                  focusNode: focusNode,
+                  autofocus: autofocus,
+                  onFocusChange: (_) => setBtnState(() {}),
+                  onKeyEvent: (node, event) {
+                    if (event is KeyUpEvent || event is KeyRepeatEvent) {
+                      if (event.logicalKey == LogicalKeyboardKey.goBack ||
+                          event.logicalKey == LogicalKeyboardKey.escape ||
+                          event.logicalKey == LogicalKeyboardKey.browserBack) {
+                        return KeyEventResult.handled;
+                      }
+                      return KeyEventResult.ignored;
+                    }
+                    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+                    if (event.logicalKey == LogicalKeyboardKey.arrowLeft ||
+                        event.logicalKey == LogicalKeyboardKey.arrowRight) {
+                      neighborNode.requestFocus();
+                      return KeyEventResult.handled;
+                    }
+                    if (event.logicalKey == LogicalKeyboardKey.select ||
+                        event.logicalKey == LogicalKeyboardKey.enter ||
+                        event.logicalKey == LogicalKeyboardKey.numpadEnter ||
+                        event.logicalKey == LogicalKeyboardKey.space ||
+                        event.logicalKey == LogicalKeyboardKey.gameButtonA) {
+                      onTap();
+                      return KeyEventResult.handled;
+                    }
+                    return KeyEventResult.ignored;
+                  },
+                  child: Builder(
+                    builder: (innerCtx) {
+                      final isFocused = Focus.of(innerCtx).hasPrimaryFocus;
+                      final bgColor = isPrimaryDanger
+                          ? (isFocused
+                              ? VideoPlatformTheme.danger
+                              : VideoPlatformTheme.accent)
+                          : (isFocused
+                              ? VideoPlatformTheme.accent.withValues(alpha: 0.25)
+                              : VideoPlatformTheme.bgCard);
+                      return GestureDetector(
+                        onTap: onTap,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 18,
+                            vertical: 10,
+                          ),
+                          decoration: BoxDecoration(
+                            color: bgColor,
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(
+                              color: isFocused
+                                  ? const Color(0xFFFFE066)
+                                  : VideoPlatformTheme.borderStrong,
+                              width: isFocused ? 2.4 : 1.0,
+                            ),
+                            boxShadow: isFocused
+                                ? [
+                                    BoxShadow(
+                                      color: (isPrimaryDanger
+                                              ? VideoPlatformTheme.danger
+                                              : VideoPlatformTheme.accent)
+                                          .withValues(alpha: 0.45),
+                                      blurRadius: 12,
+                                    ),
+                                  ]
+                                : null,
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                icon,
+                                size: 17,
+                                color: Colors.white,
+                              ),
+                              const SizedBox(width: 6),
+                              Text(
+                                label,
+                                style: TextStyle(
+                                  fontSize: 13.5,
+                                  fontWeight: isFocused
+                                      ? FontWeight.w700
+                                      : FontWeight.w600,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                );
+              },
+            );
+          }
+
+          return PopScope(
+            canPop: false,
+            onPopInvokedWithResult: (didPop, _) {
+              if (didPop) return;
+              // Ignore trailing ACTION_UP / key-repeat from the Back press that opened this dialog
+              if (DateTime.now().difference(dialogOpenedAt).inMilliseconds <
+                  650) {
+                return;
+              }
+              Navigator.of(ctx).pop(false);
+            },
+            child: Focus(
+              canRequestFocus: false,
+              onKeyEvent: (node, event) {
+                if (event.logicalKey == LogicalKeyboardKey.goBack ||
+                    event.logicalKey == LogicalKeyboardKey.escape ||
+                    event.logicalKey == LogicalKeyboardKey.browserBack) {
+                  if (event is KeyDownEvent &&
+                      DateTime.now()
+                              .difference(dialogOpenedAt)
+                              .inMilliseconds >=
+                          650) {
+                    Navigator.of(ctx).pop(false);
+                  }
+                  return KeyEventResult.handled;
+                }
+                return KeyEventResult.ignored;
+              },
+              child: AlertDialog(
+                backgroundColor: VideoPlatformTheme.bgElevated,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                  side: BorderSide(color: VideoPlatformTheme.borderStrong),
                 ),
-                const SizedBox(width: 8),
-                Text(
-                  '确认退出流光视频？',
+                title: Row(
+                  children: [
+                    Icon(
+                      Icons.exit_to_app_rounded,
+                      size: 22,
+                      color: VideoPlatformTheme.accent,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      '确认退出流光视频？',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                        color: VideoPlatformTheme.textPrimary,
+                      ),
+                    ),
+                  ],
+                ),
+                content: Text(
+                  '当前已返回主导航焦点，按“退出应用”将关闭流光视频，按“继续观看”或返回键留在应用。',
                   style: TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.w700,
-                    color: VideoPlatformTheme.textPrimary,
+                    fontSize: 13.5,
+                    color: VideoPlatformTheme.textSecondary,
+                    height: 1.45,
                   ),
                 ),
-              ],
-            ),
-            content: Text(
-              '当前已返回主导航焦点，按“退出应用”将关闭流光视频，按“继续观看”或返回键留在应用。',
-              style: TextStyle(
-                fontSize: 13.5,
-                color: VideoPlatformTheme.textSecondary,
-                height: 1.45,
+                actions: [
+                  buildDialogActionBtn(
+                    focusNode: stayFocusNode,
+                    neighborNode: exitFocusNode,
+                    autofocus: false,
+                    label: '继续观看',
+                    icon: Icons.play_circle_outline_rounded,
+                    isPrimaryDanger: false,
+                    onTap: () => Navigator.of(ctx).pop(false),
+                  ),
+                  const SizedBox(width: 8),
+                  buildDialogActionBtn(
+                    focusNode: exitFocusNode,
+                    neighborNode: stayFocusNode,
+                    autofocus: true,
+                    label: '退出应用',
+                    icon: Icons.power_settings_new_rounded,
+                    isPrimaryDanger: true,
+                    onTap: () => Navigator.of(ctx).pop(true),
+                  ),
+                ],
               ),
             ),
-            actions: [
-              Focus(
-                onFocusChange: (_) {},
-                child: Builder(
-                  builder: (btnCtx) {
-                    final isFocused = Focus.of(btnCtx).hasFocus;
-                    return OutlinedButton(
-                      style: OutlinedButton.styleFrom(
-                        side: BorderSide(
-                          color: isFocused
-                              ? Colors.white
-                              : VideoPlatformTheme.borderStrong,
-                          width: isFocused ? 2.2 : 1.0,
-                        ),
-                        backgroundColor: isFocused
-                            ? VideoPlatformTheme.accent.withValues(alpha: 0.22)
-                            : null,
-                      ),
-                      onPressed: () => Navigator.of(ctx).pop(false),
-                      child: Text(
-                        '继续观看',
-                        style: TextStyle(
-                          fontWeight:
-                              isFocused ? FontWeight.w700 : FontWeight.w500,
-                          color: isFocused
-                              ? Colors.white
-                              : VideoPlatformTheme.textPrimary,
-                        ),
-                      ),
-                    );
-                  },
-                ),
-              ),
-              Focus(
-                onFocusChange: (_) {},
-                child: Builder(
-                  builder: (btnCtx) {
-                    final isFocused = Focus.of(btnCtx).hasFocus;
-                    return FilledButton.icon(
-                      autofocus: true,
-                      style: FilledButton.styleFrom(
-                        backgroundColor: isFocused
-                            ? VideoPlatformTheme.danger
-                            : VideoPlatformTheme.accent,
-                        side: isFocused
-                            ? const BorderSide(color: Colors.white, width: 2.2)
-                            : null,
-                      ),
-                      onPressed: () => Navigator.of(ctx).pop(true),
-                      icon: const Icon(Icons.power_settings_new_rounded, size: 17),
-                      label: const Text(
-                        '退出应用',
-                        style: TextStyle(fontWeight: FontWeight.w700),
-                      ),
-                    );
-                  },
-                ),
-              ),
-            ],
           );
         },
       );
@@ -316,7 +420,10 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
         SystemNavigator.pop();
       }
     } finally {
+      stayFocusNode.dispose();
+      exitFocusNode.dispose();
       _isExitDialogShowing = false;
+      _lastBackHandledAt = DateTime.now();
     }
   }
 
@@ -325,7 +432,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     final now = DateTime.now();
     if (_lastBackHandledAt != null &&
         now.difference(_lastBackHandledAt!) <
-            const Duration(milliseconds: 280)) {
+            const Duration(milliseconds: 420)) {
       return;
     }
     _lastBackHandledAt = now;
@@ -415,13 +522,14 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
           child: Focus(
             canRequestFocus: false,
             onKeyEvent: (node, event) {
-              if (event is KeyDownEvent &&
-                  (event.logicalKey == LogicalKeyboardKey.goBack ||
-                      event.logicalKey == LogicalKeyboardKey.escape ||
-                      event.logicalKey == LogicalKeyboardKey.browserBack)) {
+              if (event.logicalKey == LogicalKeyboardKey.goBack ||
+                  event.logicalKey == LogicalKeyboardKey.escape ||
+                  event.logicalKey == LogicalKeyboardKey.browserBack) {
                 final route = ModalRoute.of(context);
                 if (route != null && route.isCurrent) {
-                  _handleRootPop(state);
+                  if (event is KeyDownEvent) {
+                    _handleRootPop(state);
+                  }
                   return KeyEventResult.handled;
                 }
               }
@@ -3131,7 +3239,7 @@ class _FloatingMiniPlayerOverlayState
     }
     _player = Player(
       configuration: const PlayerConfiguration(
-        bufferSize: 64 * 1024 * 1024,
+        bufferSize: 128 * 1024 * 1024,
       ),
     );
     _controller = VideoController(_player);
@@ -3191,18 +3299,20 @@ class _FloatingMiniPlayerOverlayState
       final props = <String, String>{
         'cache': 'yes',
         'cache-on-disk': 'no',
-        'cache-secs': '30',
-        'cache-pause-initial': 'no',
-        'cache-pause-wait': '0.1',
+        'cache-secs': '90',
+        'cache-pause': 'yes',
+        'cache-pause-initial': 'yes',
+        'cache-pause-wait': '3.5',
         'demuxer-thread': 'yes',
-        'demuxer-max-bytes': '67108864',
-        'demuxer-max-back-bytes': '16777216',
-        'demuxer-readahead-secs': '15',
+        'demuxer-max-bytes': '134217728',
+        'demuxer-max-back-bytes': '33554432',
+        'demuxer-readahead-secs': '45',
+        'stream-buffer-size': '4194304',
         'vd-lavc-threads': '0',
         'ad-lavc-threads': '0',
-        'demuxer-lavf-probesize': '262144',
+        'demuxer-lavf-probesize': '524288',
         'demuxer-lavf-analyzeduration': '0',
-        'network-timeout': '10',
+        'network-timeout': '15',
         'tls-verify': 'no',
         'keep-open': 'no',
         'hr-seek-framedrop': 'yes',

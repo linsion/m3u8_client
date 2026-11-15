@@ -2326,7 +2326,8 @@ class LocalProxyTunnelBridge {
       suffix = 'playlist.m3u8';
     } else if (lower.contains('.ts')) {
       suffix = 'segment.ts';
-    } else if (lower.contains('.mp4')) {
+    } else if (lower.contains('.mp4') ||
+        lower.contains('/api/telegram/video')) {
       suffix = 'video.mp4';
     } else if (lower.contains('.key')) {
       suffix = 'enc.key';
@@ -2677,7 +2678,7 @@ class LocalProxyTunnelBridge {
           if (segIndex != null && !forceDirect) {
             _scheduleLookaheadPrefetch(
               fromIndex: segIndex + 1,
-              count: 2,
+              count: 4,
               customHeaders: customHeaders,
               forceDirect: forceDirect,
               candidateNodes: candidateNodes,
@@ -3059,7 +3060,7 @@ class LocalProxyTunnelBridge {
       var lookaheadTriggeredForProxySeg = false;
       var streamedBytes = 0;
 
-      await for (final chunk in resp.timeout(const Duration(seconds: 15))) {
+      await for (final chunk in resp.timeout(const Duration(seconds: 45))) {
         if (clientClosed) {
           unawaited(
             resp.detachSocket().then((s) => s.destroy(), onError: (_) {}),
@@ -3088,13 +3089,13 @@ class LocalProxyTunnelBridge {
           if (!forceDirect &&
               segIndex != null &&
               !lookaheadTriggeredForProxySeg &&
-              (streamedBytes >= 256 * 1024 ||
+              (streamedBytes >= 192 * 1024 ||
                   (resp.contentLength > 0 &&
                       streamedBytes * 2 >= resp.contentLength))) {
             lookaheadTriggeredForProxySeg = true;
             _scheduleLookaheadPrefetch(
               fromIndex: segIndex + 1,
-              count: 2,
+              count: 4,
               customHeaders: customHeaders,
               forceDirect: forceDirect,
               candidateNodes: candidateNodes,
