@@ -27,7 +27,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   FlutterWindow window(project);
   Win32Window::Point origin(60, 40);
   Win32Window::Size size(1360, 860);
-  if (!window.Create(L"流光视频", origin, size)) {
+  if (!window.Create(L"\u6D41\u5149\u89C6\u9891", origin, size)) {
     return EXIT_FAILURE;
   }
   window.SetQuitOnClose(true);

@@ -107,13 +107,42 @@ class _LoginScreenState extends State<LoginScreen> {
                       Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(
-                            '流光视频',
-                            style: TextStyle(
-                              fontSize: 18,
-                              fontWeight: FontWeight.w700,
-                              color: VideoPlatformTheme.textPrimary,
-                            ),
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                '流光视频',
+                                style: TextStyle(
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.w700,
+                                  color: VideoPlatformTheme.textPrimary,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 6,
+                                  vertical: 1.5,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: VideoPlatformTheme.accent
+                                      .withValues(alpha: 0.16),
+                                  borderRadius: BorderRadius.circular(6),
+                                  border: Border.all(
+                                    color: VideoPlatformTheme.accent
+                                        .withValues(alpha: 0.4),
+                                  ),
+                                ),
+                                child: Text(
+                                  AppState.appShortVersion,
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w700,
+                                    color: VideoPlatformTheme.accent,
+                                  ),
+                                ),
+                              ),
+                            ],
                           ),
                           const SizedBox(height: 2),
                           Text(

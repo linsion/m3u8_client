@@ -105,6 +105,18 @@ class VodPlaybackProgress {
 }
 
 class AppState extends ChangeNotifier {
+  static const String appVersionName = String.fromEnvironment(
+    'FLUTTER_BUILD_NAME',
+    defaultValue: '1.1.3',
+  );
+  static const String appBuildNumber = String.fromEnvironment(
+    'FLUTTER_BUILD_NUMBER',
+    defaultValue: '14',
+  );
+  static String get appShortVersion => 'v$appVersionName';
+  static String get appFullVersion =>
+      'v$appVersionName (Build $appBuildNumber)';
+
   static const _prefServerConfigKey = 'm3u8_server_config_v1';
   static const _prefSelectedSourceIdKey = 'm3u8_selected_vod_source_id_v1';
   static const _prefSelectedLiveSourceKey = 'm3u8_selected_live_source_key_v1';
@@ -223,6 +235,7 @@ class AppState extends ChangeNotifier {
   ({String accountId, String peer, int messageId})? _pendingTelegramJumpTarget;
   VoidCallback? onNavigateToTelegramTab;
   bool Function()? activeChildBackHandler;
+  bool Function()? activeChildDownFromHeaderHandler;
 
   AppState() {
     proxyService = ProxyRoutingService();

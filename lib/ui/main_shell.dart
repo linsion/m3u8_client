@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -583,7 +584,11 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                                   Expanded(
                                     child: FocusTraversalGroup(
                                       child: KeyedSubtree(
-                                        key: ValueKey(state.themeId),
+                                        key: ValueKey(
+                                          _selectedIndex == 8
+                                              ? 'settings'
+                                              : '${_selectedIndex}_${state.themeId}',
+                                        ),
                                         child: _buildActiveScreen(state),
                                       ),
                                     ),
@@ -913,6 +918,28 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                       letterSpacing: 0.3,
                     ),
                   ),
+                  const SizedBox(width: 6),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 5,
+                      vertical: 1.5,
+                    ),
+                    decoration: BoxDecoration(
+                      color: VideoPlatformTheme.accent.withValues(alpha: 0.14),
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(
+                        color: VideoPlatformTheme.accent.withValues(alpha: 0.35),
+                      ),
+                    ),
+                    child: Text(
+                      AppState.appShortVersion,
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w700,
+                        color: VideoPlatformTheme.accent,
+                      ),
+                    ),
+                  ),
                 ],
               ],
             ),
@@ -1089,69 +1116,80 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     final tgUnread =
         state.telegramNotifications.totalUnreadNotificationCount;
 
-    return Container(
-      key: _sidebarContainerKey,
-      height: 68,
-      padding: const EdgeInsets.symmetric(horizontal: 24),
-      decoration: BoxDecoration(
-        color: VideoPlatformTheme.bgPrimary,
-        border: Border(
-          bottom: BorderSide(
-            color: VideoPlatformTheme.borderSubtle.withValues(alpha: 0.55),
+    return Focus(
+      canRequestFocus: false,
+      onKeyEvent: (node, event) {
+        if (event is KeyDownEvent &&
+            event.logicalKey == LogicalKeyboardKey.arrowDown) {
+          if (state.activeChildDownFromHeaderHandler?.call() == true) {
+            return KeyEventResult.handled;
+          }
+        }
+        return KeyEventResult.ignored;
+      },
+      child: Container(
+        key: _sidebarContainerKey,
+        height: 68,
+        padding: const EdgeInsets.symmetric(horizontal: 24),
+        decoration: BoxDecoration(
+          color: VideoPlatformTheme.bgPrimary,
+          border: Border(
+            bottom: BorderSide(
+              color: VideoPlatformTheme.borderSubtle.withValues(alpha: 0.55),
+            ),
           ),
         ),
-      ),
-      child: Row(
-        children: [
-          // Brand Logo & NetEase Filmly TV Identity
-          const AppBrandLogo(size: 32),
-          const SizedBox(width: 10),
-          Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    '流光影院',
-                    style: TextStyle(
-                      fontSize: 17,
-                      fontWeight: FontWeight.w800,
-                      color: VideoPlatformTheme.textPrimary,
-                      letterSpacing: 0.4,
-                    ),
-                  ),
-                  const SizedBox(width: 6),
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 5,
-                      vertical: 1,
-                    ),
-                    decoration: BoxDecoration(
-                      color: VideoPlatformTheme.accent,
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                    child: const Text(
-                      'TV',
+        child: Row(
+          children: [
+            // Brand Logo & NetEase Filmly TV Identity
+            const AppBrandLogo(size: 32),
+            const SizedBox(width: 10),
+            Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      '流光影院',
                       style: TextStyle(
-                        fontSize: 10,
-                        fontWeight: FontWeight.w900,
-                        color: Colors.black,
+                        fontSize: 17,
+                        fontWeight: FontWeight.w800,
+                        color: VideoPlatformTheme.textPrimary,
+                        letterSpacing: 0.4,
                       ),
                     ),
-                  ),
-                ],
-              ),
-              Text(
-                '爆米花海报墙系统',
-                style: TextStyle(
-                  fontSize: 10,
-                  color: VideoPlatformTheme.textMuted,
+                    const SizedBox(width: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 5,
+                        vertical: 1,
+                      ),
+                      decoration: BoxDecoration(
+                        color: VideoPlatformTheme.accent,
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: const Text(
+                        'TV',
+                        style: TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w900,
+                          color: Colors.black,
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
-              ),
-            ],
-          ),
+                Text(
+                  '爆米花海报墙 · ${AppState.appShortVersion}',
+                  style: TextStyle(
+                    fontSize: 10,
+                    color: VideoPlatformTheme.textMuted,
+                  ),
+                ),
+              ],
+            ),
           const SizedBox(width: 22),
           // Center: NetEase Filmly Floating Capsule Navigation Bar
           Expanded(
@@ -1275,6 +1313,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
           const SizedBox(width: 6),
           _buildTvModeButton(state),
         ],
+      ),
       ),
     );
   }
@@ -2283,7 +2322,16 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
             icon: Icons.settings_outlined,
             label: '偏好设置',
           ),
-          const SizedBox(height: 8),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+            child: Text(
+              '流光视频 ${AppState.appFullVersion}',
+              style: TextStyle(
+                fontSize: 10.5,
+                color: VideoPlatformTheme.textMuted,
+              ),
+            ),
+          ),
         ],
       ),
     );
@@ -3238,11 +3286,18 @@ class _FloatingMiniPlayerOverlayState
       _lastKnownPosition = Duration(seconds: _pendingSeekSeconds);
     }
     _player = Player(
-      configuration: const PlayerConfiguration(
-        bufferSize: 128 * 1024 * 1024,
+      configuration: PlayerConfiguration(
+        bufferSize: (Platform.isAndroid || Platform.isIOS)
+            ? 48 * 1024 * 1024
+            : 128 * 1024 * 1024,
       ),
     );
-    _controller = VideoController(_player);
+    _controller = VideoController(
+      _player,
+      configuration: VideoControllerConfiguration(
+        hwdec: Platform.isAndroid ? 'mediacodec-copy' : null,
+      ),
+    );
     _posSub = _player.stream.position.listen(_onPosition);
     _durSub = _player.stream.duration.listen(_onDuration);
     _playingSub = _player.stream.playing.listen(_onPlayingChanged);
@@ -3296,18 +3351,23 @@ class _FloatingMiniPlayerOverlayState
   Future<void> _configureMiniNativePlayer() async {
     try {
       final dynamic platform = _player.platform;
+      final isMobileOrTv = Platform.isAndroid || Platform.isIOS;
       final props = <String, String>{
+        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto-safe',
+        'hwdec-codecs': 'h264,hevc,vp8,vp9,av1',
+        'vd-lavc-check-hw-profile': 'yes',
+        'vd-lavc-software-fallback': 'yes',
         'cache': 'yes',
         'cache-on-disk': 'no',
-        'cache-secs': '90',
+        'cache-secs': widget.session.isLive ? '30' : '90',
         'cache-pause': 'yes',
-        'cache-pause-initial': 'yes',
-        'cache-pause-wait': '3.5',
+        'cache-pause-initial': widget.session.isLive ? 'no' : 'yes',
+        'cache-pause-wait': widget.session.isLive ? '1.5' : '3.5',
         'demuxer-thread': 'yes',
-        'demuxer-max-bytes': '134217728',
-        'demuxer-max-back-bytes': '33554432',
-        'demuxer-readahead-secs': '45',
-        'stream-buffer-size': '4194304',
+        'demuxer-max-bytes': isMobileOrTv ? '67108864' : '134217728',
+        'demuxer-max-back-bytes': isMobileOrTv ? '16777216' : '33554432',
+        'demuxer-readahead-secs': widget.session.isLive ? '20' : '45',
+        'stream-buffer-size': isMobileOrTv ? '2097152' : '4194304',
         'vd-lavc-threads': '0',
         'ad-lavc-threads': '0',
         'demuxer-lavf-probesize': '524288',
@@ -3315,15 +3375,13 @@ class _FloatingMiniPlayerOverlayState
         'network-timeout': '15',
         'tls-verify': 'no',
         'keep-open': 'no',
-        'hr-seek-framedrop': 'yes',
+        if (!widget.session.isLive) 'hr-seek-framedrop': 'yes',
         'stream-lavf-o':
             'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=4xx,5xx,reconnect_delay_max=5',
         'demuxer-lavf-o':
             'seg_max_retry=10,http_persistent=1,http_multiple=1,allowed_extensions=ALL,protocol_whitelist=file,http,https,httpproxy,tcp,tls,crypto,data,rtp,udp,subfile',
         if (widget.session.isLive) ...{
-          'loop-file': 'inf',
           'loop-playlist': 'inf',
-          'force-seekable': 'yes',
         },
       };
       for (final entry in props.entries) {

@@ -1244,8 +1244,9 @@ class ApiClient {
                 u.startsWith('https://') ||
                 u.startsWith('rtmp://') ||
                 u.startsWith('rtsp://') ||
-                u.startsWith('mitv://') ||
-                u.startsWith('tvbus://'),
+                u.startsWith('mms://') ||
+                u.startsWith('rtp://') ||
+                u.startsWith('udp://'),
           )
           .toList();
       if (validUrls.isEmpty) return;

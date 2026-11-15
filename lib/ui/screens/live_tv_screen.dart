@@ -159,11 +159,18 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
   void initState() {
     super.initState();
     _player = Player(
-      configuration: const PlayerConfiguration(
-        bufferSize: 96 * 1024 * 1024,
+      configuration: PlayerConfiguration(
+        bufferSize: (Platform.isAndroid || Platform.isIOS)
+            ? 32 * 1024 * 1024
+            : 64 * 1024 * 1024,
       ),
     );
-    _videoController = VideoController(_player);
+    _videoController = VideoController(
+      _player,
+      configuration: VideoControllerConfiguration(
+        hwdec: Platform.isAndroid ? 'mediacodec-copy' : null,
+      ),
+    );
     _configureLiveNativePlayer();
 
     _widthSub = _player.stream.width.listen((w) {
@@ -470,39 +477,43 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     );
   }
 
-  Future<void> _configureLiveNativePlayer() async {
+  Future<void> _configureLiveNativePlayer([Player? targetPlayer]) async {
     try {
-      final dynamic platform = _player.platform;
+      final dynamic platform = (targetPlayer ?? _player).platform;
+      final isMobileOrTv = Platform.isAndroid || Platform.isIOS;
       final props = <String, String>{
+        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto-safe',
+        'hwdec-codecs': 'h264,hevc,vp8,vp9,av1',
+        'vd-lavc-check-hw-profile': 'yes',
+        'vd-lavc-software-fallback': 'yes',
         'cache': 'yes',
         'cache-on-disk': 'no',
-        'cache-secs': '45',
+        'cache-secs': isMobileOrTv ? '30' : '45',
         'cache-pause': 'yes',
-        'cache-pause-initial': 'yes',
-        'cache-pause-wait': '2.5',
+        'cache-pause-initial': 'no',
+        'cache-pause-wait': '1.5',
         'demuxer-thread': 'yes',
-        'demuxer-max-bytes': '100663296',
-        'demuxer-max-back-bytes': '16777216',
-        'demuxer-readahead-secs': '25',
-        'stream-buffer-size': '2097152',
+        'demuxer-max-bytes': isMobileOrTv ? '50331648' : '83886080',
+        'demuxer-max-back-bytes': '8388608',
+        'demuxer-readahead-secs': isMobileOrTv ? '18' : '25',
+        'stream-buffer-size': '1048576',
         'vd-lavc-threads': '0',
         'ad-lavc-threads': '0',
         'demuxer-lavf-probesize': '524288',
         'demuxer-lavf-analyzeduration': '0',
         'network-timeout': '12',
         'tls-verify': 'no',
-        // Prevent libmpv from pausing permanently at temporary live stream EOF
+        // Never set force-seekable=yes or loop-file=inf on live streams:
+        // AndroidVideoController.widListener calls player.seek() on surface resize,
+        // which crashes libmpv/MediaCodec when force-seekable is enabled on live streams!
         'keep-open': 'no',
-        'loop-file': 'inf',
         'loop-playlist': 'inf',
-        'force-seekable': 'yes',
-        'hr-seek-framedrop': 'yes',
         // Enable FFmpeg/libavformat HTTP stream auto-reconnect
         'stream-lavf-o':
             'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=4xx,5xx,reconnect_delay_max=5',
         // Enable HTTP persistent keep-alive and pipelining
         'demuxer-lavf-o':
-            'seg_max_retry=10,live_start_index=-1,http_persistent=1,http_multiple=1,strict=experimental,allowed_extensions=ALL',
+            'seg_max_retry=10,live_start_index=-1,http_persistent=1,http_multiple=1,allowed_extensions=ALL',
       };
       for (final entry in props.entries) {
         await platform.setProperty(entry.key.trim(), entry.value);
@@ -678,11 +689,17 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     if (p == null) {
       p = Player(
         configuration: const PlayerConfiguration(
-          bufferSize: 32 * 1024 * 1024,
+          bufferSize: 24 * 1024 * 1024,
         ),
       );
       _subPlayers[slot] = p;
-      _subControllers[slot] = VideoController(p);
+      _subControllers[slot] = VideoController(
+        p,
+        configuration: VideoControllerConfiguration(
+          hwdec: Platform.isAndroid ? 'mediacodec-copy' : null,
+        ),
+      );
+      unawaited(_configureLiveNativePlayer(p));
     }
 
     setState(() {
@@ -932,6 +949,23 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
         routeLabel = '客户端代理';
       }
 
+      final parsedPlayUri = Uri.tryParse(finalPlayUrl.trim());
+      final schemeLower = parsedPlayUri?.scheme.toLowerCase() ?? '';
+      const allowedSchemes = {
+        'http',
+        'https',
+        'rtmp',
+        'rtmps',
+        'rtsp',
+        'mms',
+        'mmsh',
+        'rtp',
+        'udp',
+      };
+      if (finalPlayUrl.trim().isEmpty || !allowedSchemes.contains(schemeLower)) {
+        throw Exception('不支持或无效的直播流协议: $schemeLower');
+      }
+
       setState(() {
         _isResolving = false;
         _activeRouteLabel = routeLabel;
@@ -984,53 +1018,57 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     required int activeIndex,
     required int sessionId,
   }) async {
-    final chKey = '${channel.group}|${channel.name}';
-    final candidateIndices = <int>[];
-    for (var i = 0; i < channel.urls.length; i++) {
-      if (i != activeIndex && !_triedUrlIndices.contains(i)) {
-        candidateIndices.add(i);
-        if (candidateIndices.length >= 3) break;
-      }
-    }
-    if (candidateIndices.isEmpty) return;
-
-    int? fastestBackupIdx;
-    int fastestBackupMs = 999999;
-
-    final backupFuture = Future.wait(
-      candidateIndices.map((idx) async {
-        final probe = await widget.appState.api.probeVodStreamPlayableFast(
-          channel.urls[idx],
-          channel.headers,
-          timeout: const Duration(milliseconds: 1800),
-        );
-        if (probe.ok && probe.latencyMs < fastestBackupMs) {
-          fastestBackupMs = probe.latencyMs;
-          fastestBackupIdx = idx;
-          _preferredUrlIndexByChannel[chKey] = idx;
+    try {
+      final chKey = '${channel.group}|${channel.name}';
+      final candidateIndices = <int>[];
+      for (var i = 0; i < channel.urls.length; i++) {
+        if (i != activeIndex && !_triedUrlIndices.contains(i)) {
+          candidateIndices.add(i);
+          if (candidateIndices.length >= 3) break;
         }
-      }),
-    );
-
-    final primaryProbe = await widget.appState.api.probeVodStreamPlayableFast(
-      channel.urls[activeIndex],
-      channel.headers,
-      timeout: const Duration(milliseconds: 1800),
-    );
-    if (!mounted || sessionId != _playSessionId || _hasActivePlayback) return;
-
-    if (!primaryProbe.ok) {
-      await backupFuture;
-      if (!mounted || sessionId != _playSessionId || _hasActivePlayback) return;
-      if (fastestBackupIdx != null &&
-          !_triedUrlIndices.contains(fastestBackupIdx!)) {
-        _playChannel(
-          channel,
-          urlIndex: fastestBackupIdx,
-          resetTried: false,
-        );
       }
-    }
+      if (candidateIndices.isEmpty) return;
+
+      int? fastestBackupIdx;
+      int fastestBackupMs = 999999;
+
+      final backupFuture = Future.wait(
+        candidateIndices.map((idx) async {
+          try {
+            final probe = await widget.appState.api.probeVodStreamPlayableFast(
+              channel.urls[idx],
+              channel.headers,
+              timeout: const Duration(milliseconds: 1800),
+            );
+            if (probe.ok && probe.latencyMs < fastestBackupMs) {
+              fastestBackupMs = probe.latencyMs;
+              fastestBackupIdx = idx;
+              _preferredUrlIndexByChannel[chKey] = idx;
+            }
+          } catch (_) {}
+        }),
+      );
+
+      final primaryProbe = await widget.appState.api.probeVodStreamPlayableFast(
+        channel.urls[activeIndex],
+        channel.headers,
+        timeout: const Duration(milliseconds: 1800),
+      );
+      if (!mounted || sessionId != _playSessionId || _hasActivePlayback) return;
+
+      if (!primaryProbe.ok) {
+        await backupFuture;
+        if (!mounted || sessionId != _playSessionId || _hasActivePlayback) return;
+        if (fastestBackupIdx != null &&
+            !_triedUrlIndices.contains(fastestBackupIdx!)) {
+          _playChannel(
+            channel,
+            urlIndex: fastestBackupIdx,
+            resetTried: false,
+          );
+        }
+      }
+    } catch (_) {}
   }
 
   Future<void> _checkVisibleChannelsHealth(List<LiveChannel> channels) async {

@@ -344,9 +344,12 @@ class _TelegramScreenState extends State<TelegramScreen> {
   final TextEditingController _msgSearchCtrl = TextEditingController();
   final TextEditingController _composeController = TextEditingController();
   final TextEditingController _emojiSearchCtrl = TextEditingController();
+  final ScrollController _chatListScrollController = ScrollController();
   final ScrollController _messageScrollController = ScrollController();
   final FocusNode _composeFocusNode = FocusNode();
   final GlobalKey _captureBoundaryKey = GlobalKey();
+  final GlobalKey _chatListContainerKey = GlobalKey();
+  final GlobalKey _messageListContainerKey = GlobalKey();
 
   static const MethodChannel _nativeUtilsChannel = MethodChannel(
     'com.linsion.m3u8_client/native_utils',
@@ -1102,9 +1105,358 @@ class _TelegramScreenState extends State<TelegramScreen> {
     _msgSearchCtrl.dispose();
     _composeController.dispose();
     _emojiSearchCtrl.dispose();
+    _chatListScrollController.dispose();
     _messageScrollController.dispose();
     _composeFocusNode.dispose();
     super.dispose();
+  }
+
+  bool _isFocusNodeInsideContainer(FocusNode? node, GlobalKey containerKey) {
+    if (node == null) return false;
+    final containerCtx = containerKey.currentContext;
+    final nodeCtx = node.context;
+    if (containerCtx == null || nodeCtx == null) return false;
+    bool found = false;
+    nodeCtx.visitAncestorElements((ancestor) {
+      if (ancestor == containerCtx) {
+        found = true;
+        return false;
+      }
+      return true;
+    });
+    return found;
+  }
+
+  bool _areFocusNodesNested(FocusNode a, FocusNode b) {
+    final ctxA = a.context;
+    final ctxB = b.context;
+    if (ctxA == null || ctxB == null) return false;
+    if (ctxA == ctxB) return true;
+    bool nested = false;
+    ctxA.visitAncestorElements((ancestor) {
+      if (ancestor == ctxB) {
+        nested = true;
+        return false;
+      }
+      return true;
+    });
+    if (nested) return true;
+    ctxB.visitAncestorElements((ancestor) {
+      if (ancestor == ctxA) {
+        nested = true;
+        return false;
+      }
+      return true;
+    });
+    return nested;
+  }
+
+  FocusNode? _findVerticalFocusTargetInContainer({
+    required GlobalKey containerKey,
+    required FocusNode currentNode,
+    required bool moveUp,
+  }) {
+    final containerCtx = containerKey.currentContext;
+    if (containerCtx == null) return null;
+    final scope = FocusScope.of(containerCtx);
+    final currentRect = currentNode.rect;
+    if (currentRect.isEmpty) return null;
+
+    final containerBox = containerCtx.findRenderObject() as RenderBox?;
+    Rect? containerBounds;
+    if (containerBox != null && containerBox.hasSize) {
+      final topLeft = containerBox.localToGlobal(Offset.zero);
+      containerBounds =
+          topLeft & containerBox.size;
+    }
+
+    final candidates = <FocusNode>[];
+    for (final node in scope.traversalDescendants) {
+      if (node == currentNode || !node.canRequestFocus || node.context == null) {
+        continue;
+      }
+      if (!_isFocusNodeInsideContainer(node, containerKey)) {
+        continue;
+      }
+      if (_areFocusNodesNested(currentNode, node)) {
+        continue;
+      }
+      final r = node.rect;
+      if (r.isEmpty || r.width <= 0 || r.height <= 0) continue;
+      if (containerBounds != null) {
+        if (r.bottom < containerBounds.top - 120 ||
+            r.top > containerBounds.bottom + 120) {
+          continue;
+        }
+      }
+      if (moveUp) {
+        if (r.center.dy < currentRect.top - 2 && r.top < currentRect.top - 4) {
+          candidates.add(node);
+        }
+      } else {
+        if (r.center.dy > currentRect.bottom + 2 &&
+            r.bottom > currentRect.bottom + 4) {
+          candidates.add(node);
+        }
+      }
+    }
+
+    if (candidates.isEmpty) return null;
+
+    candidates.sort((a, b) {
+      final ra = a.rect;
+      final rb = b.rect;
+      if ((ra.center.dy - rb.center.dy).abs() <= 18) {
+        final dxA = (ra.center.dx - currentRect.center.dx).abs();
+        final dxB = (rb.center.dx - currentRect.center.dx).abs();
+        return dxA.compareTo(dxB);
+      }
+      if (moveUp) {
+        final distA = (currentRect.top - ra.bottom).abs();
+        final distB = (currentRect.top - rb.bottom).abs();
+        return distA.compareTo(distB);
+      } else {
+        final distA = (ra.top - currentRect.bottom).abs();
+        final distB = (rb.top - currentRect.bottom).abs();
+        return distA.compareTo(distB);
+      }
+    });
+
+    return candidates.first;
+  }
+
+  KeyEventResult _handleMessageListKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    final key = event.logicalKey;
+    final isUp = key == LogicalKeyboardKey.arrowUp;
+    final isDown = key == LogicalKeyboardKey.arrowDown;
+    if (!isUp && !isDown) {
+      return KeyEventResult.ignored;
+    }
+
+    final currentFocus = FocusManager.instance.primaryFocus;
+    if (currentFocus == null ||
+        !_isFocusNodeInsideContainer(currentFocus, _messageListContainerKey)) {
+      return KeyEventResult.ignored;
+    }
+
+    final containerBox =
+        _messageListContainerKey.currentContext?.findRenderObject()
+            as RenderBox?;
+    final currentRect = currentFocus.rect;
+    double? listTop;
+    double? listBottom;
+    double? listHeight;
+    if (containerBox != null && containerBox.hasSize) {
+      listTop = containerBox.localToGlobal(Offset.zero).dy;
+      listHeight = containerBox.size.height;
+      listBottom = listTop + listHeight;
+    }
+
+    if (_messageScrollController.hasClients) {
+      final pos = _messageScrollController.position;
+      if (isUp &&
+          listTop != null &&
+          listHeight != null &&
+          currentRect.top < listTop + listHeight * 0.42 &&
+          pos.pixels > 2) {
+        final nextPixels =
+            (pos.pixels - 220.0).clamp(0.0, pos.maxScrollExtent);
+        _messageScrollController.jumpTo(nextPixels);
+        if (nextPixels <= 180) {
+          _tryLoadOlderMessagesOnScroll();
+        }
+      } else if (isDown &&
+          listBottom != null &&
+          listHeight != null &&
+          currentRect.bottom > listBottom - listHeight * 0.38 &&
+          pos.pixels < pos.maxScrollExtent - 2) {
+        final nextPixels =
+            (pos.pixels + 220.0).clamp(0.0, pos.maxScrollExtent);
+        _messageScrollController.jumpTo(nextPixels);
+      }
+    }
+
+    final target = _findVerticalFocusTargetInContainer(
+      containerKey: _messageListContainerKey,
+      currentNode: currentFocus,
+      moveUp: isUp,
+    );
+
+    if (target != null) {
+      target.requestFocus();
+      if (_messageScrollController.hasClients &&
+          listTop != null &&
+          listBottom != null) {
+        final pos = _messageScrollController.position;
+        final tr = target.rect;
+        if (isUp && tr.top < listTop + 28 && pos.pixels > 2) {
+          final delta = (listTop + 56) - tr.top;
+          _messageScrollController.jumpTo(
+            (pos.pixels - delta).clamp(0.0, pos.maxScrollExtent),
+          );
+          if (_messageScrollController.position.pixels <= 180) {
+            _tryLoadOlderMessagesOnScroll();
+          }
+        } else if (isDown &&
+            tr.bottom > listBottom - 28 &&
+            pos.pixels < pos.maxScrollExtent - 2) {
+          final delta = tr.bottom - (listBottom - 56);
+          _messageScrollController.jumpTo(
+            (pos.pixels + delta).clamp(0.0, pos.maxScrollExtent),
+          );
+        }
+      }
+      return KeyEventResult.handled;
+    }
+
+    if (isUp) {
+      final hasMoreAbove = _messageScrollController.hasClients &&
+          (_messageScrollController.position.pixels > 2 ||
+              _isLoadingMessages ||
+              _nextMessageOffset > 0);
+      if (hasMoreAbove) {
+        if (_messageScrollController.hasClients &&
+            _messageScrollController.position.pixels > 0) {
+          final pos = _messageScrollController.position;
+          final nextPixels =
+              (pos.pixels - 280.0).clamp(0.0, pos.maxScrollExtent);
+          _messageScrollController.jumpTo(nextPixels);
+        }
+        if (!_messageScrollController.hasClients ||
+            _messageScrollController.position.pixels <= 220) {
+          _tryLoadOlderMessagesOnScroll();
+        }
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          final nextTarget = _findVerticalFocusTargetInContainer(
+            containerKey: _messageListContainerKey,
+            currentNode: currentFocus,
+            moveUp: true,
+          );
+          if (nextTarget != null) {
+            nextTarget.requestFocus();
+          } else {
+            currentFocus.requestFocus();
+          }
+        });
+        return KeyEventResult.handled;
+      }
+    } else if (isDown) {
+      final hasMoreBelow = _messageScrollController.hasClients &&
+          _messageScrollController.position.pixels <
+              _messageScrollController.position.maxScrollExtent - 2;
+      if (hasMoreBelow) {
+        final pos = _messageScrollController.position;
+        final nextPixels =
+            (pos.pixels + 280.0).clamp(0.0, pos.maxScrollExtent);
+        _messageScrollController.jumpTo(nextPixels);
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          final nextTarget = _findVerticalFocusTargetInContainer(
+            containerKey: _messageListContainerKey,
+            currentNode: currentFocus,
+            moveUp: false,
+          );
+          if (nextTarget != null) {
+            nextTarget.requestFocus();
+          } else {
+            currentFocus.requestFocus();
+          }
+        });
+        return KeyEventResult.handled;
+      }
+    }
+
+    return KeyEventResult.ignored;
+  }
+
+  KeyEventResult _handleChatListKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    final key = event.logicalKey;
+    final isUp = key == LogicalKeyboardKey.arrowUp;
+    final isDown = key == LogicalKeyboardKey.arrowDown;
+    if (!isUp && !isDown) {
+      return KeyEventResult.ignored;
+    }
+
+    final currentFocus = FocusManager.instance.primaryFocus;
+    if (currentFocus == null ||
+        !_isFocusNodeInsideContainer(currentFocus, _chatListContainerKey)) {
+      return KeyEventResult.ignored;
+    }
+
+    final containerBox =
+        _chatListContainerKey.currentContext?.findRenderObject() as RenderBox?;
+    final currentRect = currentFocus.rect;
+    double? listTop;
+    double? listBottom;
+    double? listHeight;
+    if (containerBox != null && containerBox.hasSize) {
+      listTop = containerBox.localToGlobal(Offset.zero).dy;
+      listHeight = containerBox.size.height;
+      listBottom = listTop + listHeight;
+    }
+
+    if (_chatListScrollController.hasClients) {
+      final pos = _chatListScrollController.position;
+      if (isUp &&
+          listTop != null &&
+          listHeight != null &&
+          currentRect.top < listTop + listHeight * 0.35 &&
+          pos.pixels > 2) {
+        _chatListScrollController.jumpTo(
+          (pos.pixels - 140.0).clamp(0.0, pos.maxScrollExtent),
+        );
+      } else if (isDown &&
+          listBottom != null &&
+          listHeight != null &&
+          currentRect.bottom > listBottom - listHeight * 0.35 &&
+          pos.pixels < pos.maxScrollExtent - 2) {
+        _chatListScrollController.jumpTo(
+          (pos.pixels + 140.0).clamp(0.0, pos.maxScrollExtent),
+        );
+      }
+    }
+
+    final target = _findVerticalFocusTargetInContainer(
+      containerKey: _chatListContainerKey,
+      currentNode: currentFocus,
+      moveUp: isUp,
+    );
+    if (target != null) {
+      target.requestFocus();
+      return KeyEventResult.handled;
+    }
+
+    if (isUp &&
+        _chatListScrollController.hasClients &&
+        _chatListScrollController.position.pixels > 2) {
+      final pos = _chatListScrollController.position;
+      _chatListScrollController.jumpTo(
+        (pos.pixels - 200.0).clamp(0.0, pos.maxScrollExtent),
+      );
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        final nextTarget = _findVerticalFocusTargetInContainer(
+          containerKey: _chatListContainerKey,
+          currentNode: currentFocus,
+          moveUp: true,
+        );
+        if (nextTarget != null) {
+          nextTarget.requestFocus();
+        } else {
+          currentFocus.requestFocus();
+        }
+      });
+      return KeyEventResult.handled;
+    }
+
+    return KeyEventResult.ignored;
   }
 
   bool _handleBackPress() {
@@ -5132,11 +5484,17 @@ class _TelegramScreenState extends State<TelegramScreen> {
                             }
                             return false;
                           },
-                          child: ListView.builder(
-                            physics: const AlwaysScrollableScrollPhysics(),
-                            itemCount: filteredChats.length +
-                                (_nextChatCursor.isNotEmpty ? 1 : 0),
-                            itemBuilder: (_, idx) {
+                          child: Focus(
+                            key: _chatListContainerKey,
+                            canRequestFocus: false,
+                            onKeyEvent: _handleChatListKeyEvent,
+                            child: ListView.builder(
+                              controller: _chatListScrollController,
+                              cacheExtent: 1000,
+                              physics: const AlwaysScrollableScrollPhysics(),
+                              itemCount: filteredChats.length +
+                                  (_nextChatCursor.isNotEmpty ? 1 : 0),
+                              itemBuilder: (_, idx) {
                             if (idx >= filteredChats.length) {
                               return Padding(
                                 padding: const EdgeInsets.all(12),
@@ -5445,6 +5803,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
                   );
                 },
               ),
+                    ),
                   ),
                 ),
       ),
@@ -6218,22 +6577,27 @@ class _TelegramScreenState extends State<TelegramScreen> {
                       }
                     }
 
-                    return Listener(
-                      onPointerSignal: (event) {
-                        if (event is PointerScrollEvent &&
-                            event.scrollDelta.dy < 0) {
-                          if (!_messageScrollController.hasClients ||
-                              _messageScrollController.position.pixels <= 96) {
-                            _tryLoadOlderMessagesOnScroll();
+                    return Focus(
+                      key: _messageListContainerKey,
+                      canRequestFocus: false,
+                      onKeyEvent: _handleMessageListKeyEvent,
+                      child: Listener(
+                        onPointerSignal: (event) {
+                          if (event is PointerScrollEvent &&
+                              event.scrollDelta.dy < 0) {
+                            if (!_messageScrollController.hasClients ||
+                                _messageScrollController.position.pixels <= 96) {
+                              _tryLoadOlderMessagesOnScroll();
+                            }
                           }
-                        }
-                      },
-                      child: ListView.builder(
-                        controller: _messageScrollController,
-                        padding: EdgeInsets.symmetric(
-                          horizontal: isMobile ? 8 : 18,
-                          vertical: isMobile ? 10 : 14,
-                        ),
+                        },
+                        child: ListView.builder(
+                          controller: _messageScrollController,
+                          cacheExtent: 1500,
+                          padding: EdgeInsets.symmetric(
+                            horizontal: isMobile ? 8 : 18,
+                            vertical: isMobile ? 10 : 14,
+                          ),
                         itemCount: groupedEntries.length +
                             (_nextMessageOffset > 0 ? 1 : 0),
                         itemBuilder: (context, idx) {
@@ -6357,6 +6721,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
                             ],
                           );
                         },
+                        ),
                       ),
                     );
                   },
@@ -7804,6 +8169,65 @@ class _TelegramScreenState extends State<TelegramScreen> {
         ],
       ),
     );
+
+    if (att == null) {
+      bubbleContent = StatefulBuilder(
+        builder: (bubbleCtx, setBubbleState) {
+          return Focus(
+            onFocusChange: (_) {
+              if (bubbleCtx.mounted) setBubbleState(() {});
+            },
+            onKeyEvent: (node, event) {
+              if (event is KeyDownEvent &&
+                  (event.logicalKey == LogicalKeyboardKey.select ||
+                      event.logicalKey == LogicalKeyboardKey.enter ||
+                      event.logicalKey == LogicalKeyboardKey.gameButtonA)) {
+                _markChatAsRead(
+                  chat,
+                  latestMessageDate: msg.date,
+                  maxMessageId: msg.id,
+                );
+                if (_selectionMode) {
+                  setState(() {
+                    if (isSelected) {
+                      _selectedMessageIds.remove(msg.id);
+                    } else {
+                      _selectedMessageIds.add(msg.id);
+                    }
+                  });
+                } else {
+                  final box = bubbleCtx.findRenderObject() as RenderBox?;
+                  final pos = box != null && box.hasSize
+                      ? box.localToGlobal(box.size.center(Offset.zero))
+                      : const Offset(400, 300);
+                  _showMessageContextMenu(tg, chat, msg, pos);
+                }
+                return KeyEventResult.handled;
+              }
+              return KeyEventResult.ignored;
+            },
+            child: Builder(
+              builder: (innerCtx) {
+                final hasFocus = Focus.of(innerCtx).hasPrimaryFocus;
+                return DecoratedBox(
+                  position: DecorationPosition.foreground,
+                  decoration: BoxDecoration(
+                    borderRadius: borderRadius,
+                    border: hasFocus
+                        ? Border.all(
+                            color: const Color(0xFFFFE066),
+                            width: 2.2,
+                          )
+                        : null,
+                  ),
+                  child: bubbleContent,
+                );
+              },
+            ),
+          );
+        },
+      );
+    }
 
     return GestureDetector(
       onTap: () {

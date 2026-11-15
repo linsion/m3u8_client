@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../models/models.dart';
 import '../../state/app_state.dart';
@@ -48,6 +49,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final TextEditingController _cookie115Ctrl = TextEditingController();
   bool _isBusy115 = false;
 
+  final ScrollController _settingsScrollController = ScrollController();
+  final Map<String, FocusNode> _themeCardFocusNodes = {
+    for (final p in VideoPlatformTheme.presets)
+      p.id: FocusNode(debugLabel: 'ThemeCard_${p.id}'),
+  };
+
   @override
   void initState() {
     super.initState();
@@ -56,11 +63,36 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _secretCtrl = TextEditingController(text: cfg.secret);
     _authMode = cfg.authMode;
     _preferDirectPlayback = cfg.preferDirectPlayback;
+    widget.appState.activeChildDownFromHeaderHandler = _focusActiveThemeCard;
     _loadBackendSettingsAnd115();
+  }
+
+  bool _focusActiveThemeCard() {
+    if (!mounted) return false;
+    if (_settingsScrollController.hasClients) {
+      _settingsScrollController.animateTo(
+        0,
+        duration: const Duration(milliseconds: 160),
+        curve: Curves.easeOutCubic,
+      );
+    }
+    final activeId = widget.appState.themeId;
+    final targetNode =
+        _themeCardFocusNodes[activeId] ?? _themeCardFocusNodes.values.first;
+    targetNode.requestFocus();
+    return true;
   }
 
   @override
   void dispose() {
+    if (widget.appState.activeChildDownFromHeaderHandler ==
+        _focusActiveThemeCard) {
+      widget.appState.activeChildDownFromHeaderHandler = null;
+    }
+    for (final node in _themeCardFocusNodes.values) {
+      node.dispose();
+    }
+    _settingsScrollController.dispose();
     _baseUrlCtrl.dispose();
     _secretCtrl.dispose();
     _mountPathCtrl.dispose();
@@ -303,142 +335,350 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final state = widget.appState;
+  Widget _buildThemePresetCard(
+    AppState state,
+    AppThemePalette p,
+    int index, {
+    double? width,
+  }) {
+    final presets = VideoPlatformTheme.presets;
+    final selected = p.id == state.themeId;
+    final focusNode = _themeCardFocusNodes[p.id];
 
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(20),
-      child: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 780),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              // 0. UI Theme Appearance Settings
-              _buildSectionCard(
-                title: '界面主题外观',
-                subtitle: '选择符合视频平台视觉习惯的暗色或日间主题配色，立即生效并自动保存',
-                child: Wrap(
-                  spacing: 10,
-                  runSpacing: 10,
-                  children: VideoPlatformTheme.presets.map((p) {
-                    final selected = p.id == state.themeId;
-                    return InkWell(
-                      borderRadius: BorderRadius.circular(6),
-                      onTap: () => state.setThemeId(p.id),
-                      child: Container(
-                        width: 142,
-                        padding: const EdgeInsets.all(10),
+    return Focus(
+      focusNode: focusNode,
+      onFocusChange: (_) {
+        if (mounted) setState(() {});
+      },
+      onKeyEvent: (node, event) {
+        if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+          return KeyEventResult.ignored;
+        }
+        final key = event.logicalKey;
+        if (key == LogicalKeyboardKey.arrowRight) {
+          final nextPreset = presets[(index + 1) % presets.length];
+          _themeCardFocusNodes[nextPreset.id]?.requestFocus();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.arrowLeft) {
+          final prevPreset =
+              presets[(index - 1 + presets.length) % presets.length];
+          _themeCardFocusNodes[prevPreset.id]?.requestFocus();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.arrowUp) {
+          if (_settingsScrollController.hasClients &&
+              _settingsScrollController.position.pixels > 0) {
+            _settingsScrollController.jumpTo(0);
+          }
+          return KeyEventResult.ignored;
+        }
+        if (event is KeyDownEvent &&
+            (key == LogicalKeyboardKey.select ||
+                key == LogicalKeyboardKey.enter ||
+                key == LogicalKeyboardKey.numpadEnter ||
+                key == LogicalKeyboardKey.space ||
+                key == LogicalKeyboardKey.gameButtonA)) {
+          state.setThemeId(p.id);
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) {
+              _themeCardFocusNodes[p.id]?.requestFocus();
+            }
+          });
+          return KeyEventResult.handled;
+        }
+        return KeyEventResult.ignored;
+      },
+      child: Builder(
+        builder: (ctx) {
+          final isFocused = Focus.of(ctx).hasPrimaryFocus;
+          return GestureDetector(
+            onTap: () {
+              state.setThemeId(p.id);
+              _themeCardFocusNodes[p.id]?.requestFocus();
+            },
+            child: MouseRegion(
+              cursor: SystemMouseCursors.click,
+              child: AnimatedScale(
+                scale: isFocused ? 1.04 : 1.0,
+                duration: const Duration(milliseconds: 140),
+                child: Container(
+                  width: width,
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: isFocused
+                        ? p.accent.withValues(alpha: 0.16)
+                        : VideoPlatformTheme.bgCard,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: isFocused
+                          ? const Color(0xFFFFE066)
+                          : (selected
+                              ? p.accent
+                              : VideoPlatformTheme.borderSubtle),
+                      width: isFocused ? 2.4 : (selected ? 1.6 : 1.0),
+                    ),
+                    boxShadow: isFocused
+                        ? [
+                            BoxShadow(
+                              color: p.accent.withValues(alpha: 0.45),
+                              blurRadius: 12,
+                              spreadRadius: 1,
+                            ),
+                          ]
+                        : null,
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      // Mini UI preview swatch
+                      Container(
+                        height: 38,
+                        padding: const EdgeInsets.all(6),
                         decoration: BoxDecoration(
-                          color: VideoPlatformTheme.bgCard,
-                          borderRadius: BorderRadius.circular(6),
-                          border: Border.all(
-                            color: selected
-                                ? p.accent
-                                : VideoPlatformTheme.borderSubtle,
-                            width: selected ? 1.5 : 1,
-                          ),
+                          color: p.bgPrimary,
+                          borderRadius: BorderRadius.circular(4),
+                          border: Border.all(color: p.borderSubtle),
                         ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
+                        child: Row(
                           children: [
-                            // Mini UI preview swatch
                             Container(
-                              height: 38,
-                              padding: const EdgeInsets.all(6),
+                              width: 18,
+                              height: double.infinity,
                               decoration: BoxDecoration(
-                                color: p.bgPrimary,
-                                borderRadius: BorderRadius.circular(4),
-                                border: Border.all(color: p.borderSubtle),
+                                color: p.bgElevated,
+                                borderRadius: BorderRadius.circular(2),
                               ),
-                              child: Row(
+                            ),
+                            const SizedBox(width: 5),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                mainAxisAlignment: MainAxisAlignment.center,
                                 children: [
                                   Container(
-                                    width: 18,
-                                    height: double.infinity,
+                                    width: 34,
+                                    height: 6,
                                     decoration: BoxDecoration(
-                                      color: p.bgElevated,
+                                      color: p.accent,
                                       borderRadius: BorderRadius.circular(2),
                                     ),
                                   ),
-                                  const SizedBox(width: 5),
-                                  Expanded(
-                                    child: Column(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      mainAxisAlignment:
-                                          MainAxisAlignment.center,
-                                      children: [
-                                        Container(
-                                          width: 34,
-                                          height: 6,
-                                          decoration: BoxDecoration(
-                                            color: p.accent,
-                                            borderRadius:
-                                                BorderRadius.circular(2),
-                                          ),
-                                        ),
-                                        const SizedBox(height: 4),
-                                        Container(
-                                          width: 52,
-                                          height: 4,
-                                          decoration: BoxDecoration(
-                                            color: p.textSecondary
-                                                .withValues(alpha: 0.5),
-                                            borderRadius:
-                                                BorderRadius.circular(2),
-                                          ),
-                                        ),
-                                      ],
+                                  const SizedBox(height: 4),
+                                  Container(
+                                    width: 52,
+                                    height: 4,
+                                    decoration: BoxDecoration(
+                                      color: p.textSecondary
+                                          .withValues(alpha: 0.5),
+                                      borderRadius: BorderRadius.circular(2),
                                     ),
                                   ),
                                 ],
                               ),
                             ),
-                            const SizedBox(height: 8),
-                            Row(
-                              children: [
-                                Expanded(
-                                  child: Text(
-                                    p.name,
-                                    style: TextStyle(
-                                      fontSize: 13,
-                                      fontWeight: selected
-                                          ? FontWeight.w600
-                                          : FontWeight.w500,
-                                      color: selected
-                                          ? p.accent
-                                          : VideoPlatformTheme.textPrimary,
-                                    ),
-                                  ),
-                                ),
-                                if (selected)
-                                  Icon(
-                                    Icons.check_circle,
-                                    size: 15,
-                                    color: p.accent,
-                                  ),
-                              ],
-                            ),
-                            const SizedBox(height: 2),
-                            Text(
-                              p.subtitle,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontSize: 11,
-                                color: VideoPlatformTheme.textMuted,
-                              ),
-                            ),
                           ],
                         ),
                       ),
-                    );
-                  }).toList(),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              p.name,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 13,
+                                fontWeight: (selected || isFocused)
+                                    ? FontWeight.w700
+                                    : FontWeight.w500,
+                                color: isFocused
+                                    ? VideoPlatformTheme.textPrimary
+                                    : (selected
+                                        ? p.accent
+                                        : VideoPlatformTheme.textPrimary),
+                              ),
+                            ),
+                          ),
+                          if (selected)
+                            Icon(
+                              Icons.check_circle,
+                              size: 15,
+                              color: p.accent,
+                            ),
+                        ],
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        isFocused && !selected ? '按确定键切换此主题' : p.subtitle,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: isFocused
+                              ? p.accent
+                              : VideoPlatformTheme.textMuted,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
-              const SizedBox(height: 16),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: widget.appState,
+      builder: (context, _) {
+        final state = widget.appState;
+        final activePreset = VideoPlatformTheme.presets.firstWhere(
+          (p) => p.id == state.themeId,
+          orElse: () => VideoPlatformTheme.presets.first,
+        );
+
+        return SingleChildScrollView(
+          controller: _settingsScrollController,
+          padding: const EdgeInsets.all(20),
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 780),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Version & Runtime Info Banner
+                  Container(
+                    width: double.infinity,
+                    margin: const EdgeInsets.only(bottom: 16),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 18,
+                      vertical: 14,
+                    ),
+                    decoration: BoxDecoration(
+                      color: VideoPlatformTheme.bgElevated,
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(
+                        color: VideoPlatformTheme.accent.withValues(alpha: 0.35),
+                      ),
+                    ),
+                    child: Wrap(
+                      spacing: 12,
+                      runSpacing: 8,
+                      alignment: WrapAlignment.spaceBetween,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Icons.verified_rounded,
+                              size: 20,
+                              color: VideoPlatformTheme.accent,
+                            ),
+                            const SizedBox(width: 10),
+                            Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text(
+                                      '流光视频客户端',
+                                      style: TextStyle(
+                                        fontSize: 15,
+                                        fontWeight: FontWeight.w700,
+                                        color: VideoPlatformTheme.textPrimary,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 8,
+                                        vertical: 2,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: VideoPlatformTheme.accent
+                                            .withValues(alpha: 0.18),
+                                        borderRadius: BorderRadius.circular(12),
+                                        border: Border.all(
+                                          color: VideoPlatformTheme.accent,
+                                        ),
+                                      ),
+                                      child: Text(
+                                        AppState.appFullVersion,
+                                        style: TextStyle(
+                                          fontSize: 11.5,
+                                          fontWeight: FontWeight.w700,
+                                          color: VideoPlatformTheme.accent,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 3),
+                                Text(
+                                  '当前主题：${activePreset.name} · 交互模式：${state.tvMode ? "TV 大屏遥控器模式" : "标准桌面/触屏模式"}',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: VideoPlatformTheme.textSecondary,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  // 0. UI Theme Appearance Settings
+                  _buildSectionCard(
+                    title: '界面主题外观',
+                    subtitle: state.tvMode
+                        ? '使用遥控器左右方向键选择主题，按确定/OK键立即切换并自动保存'
+                        : '选择符合视频平台视觉习惯的暗色或日间主题配色，立即生效并自动保存',
+                    child: LayoutBuilder(
+                      builder: (context, constraints) {
+                        final presets = VideoPlatformTheme.presets;
+                        if (constraints.maxWidth >= 640) {
+                          return Row(
+                            children: [
+                              for (var i = 0; i < presets.length; i++) ...[
+                                if (i > 0) const SizedBox(width: 10),
+                                Expanded(
+                                  child: _buildThemePresetCard(
+                                    state,
+                                    presets[i],
+                                    i,
+                                  ),
+                                ),
+                              ],
+                            ],
+                          );
+                        }
+                        return Wrap(
+                          spacing: 10,
+                          runSpacing: 10,
+                          children: [
+                            for (var i = 0; i < presets.length; i++)
+                              _buildThemePresetCard(
+                                state,
+                                presets[i],
+                                i,
+                                width: 142,
+                              ),
+                          ],
+                        );
+                      },
+                    ),
+                  ),
+                  const SizedBox(height: 16),
 
               // 1. Client Connection Settings
               _buildSectionCard(
@@ -1028,6 +1268,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
         ),
       ),
+    );
+      },
     );
   }
 

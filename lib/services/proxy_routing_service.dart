@@ -2934,90 +2934,133 @@ class LocalProxyTunnelBridge {
       final resp = opened.resp;
       var currentUri = opened.finalUri;
       final mime = resp.headers.contentType?.mimeType.toLowerCase() ?? '';
-      final isLikelyM3u8 = currentUri.path.toLowerCase().endsWith('.m3u8') ||
-          (reqUri?.path.toLowerCase().endsWith('.m3u8') ?? false) ||
-          mime.contains('mpegurl') ||
-          mime.contains('m3u');
+      final isLikelyM3u8 =
+          (resp.contentLength <= 0 || resp.contentLength <= 2 * 1024 * 1024) &&
+          (currentUri.path.toLowerCase().endsWith('.m3u8') ||
+              (reqUri?.path.toLowerCase().endsWith('.m3u8') ?? false) ||
+              mime.contains('mpegurl') ||
+              mime.contains('m3u'));
+
+      Uint8List? preBufferedBinaryChunk;
+      StreamIterator<List<int>>? activeStreamIterator;
 
       if (isLikelyM3u8 && resp.statusCode == 200) {
-        final rawBytes = await resp
-            .fold<List<int>>(<int>[], (acc, b) => acc..addAll(b))
-            .timeout(const Duration(seconds: 8));
-        recordDownstreamBytes(rawBytes.length);
-        var text = utf8.decode(rawBytes, allowMalformed: true);
-        if (text.contains('#EXTM3U')) {
-          // Resolve Master Playlist (`#EXT-X-STREAM-INF`) on the same warm keep-alive connection!
-          for (var depth = 0; depth < 2; depth++) {
-            if (!text.contains('#EXT-X-STREAM-INF')) break;
-            final variantUri =
-                M3u8AdRemover.extractBestVariantUri(text, currentUri);
-            if (variantUri == null) break;
-            final nextOpened = await openTargetUri(
-              variantUri,
-              preferredNode: winningNodeForSession,
-            );
-            if (nextOpened == null) break;
-            final nextBytes = await nextOpened.resp
-                .fold<List<int>>(<int>[], (acc, b) => acc..addAll(b))
-                .timeout(const Duration(seconds: 8));
-            recordDownstreamBytes(nextBytes.length);
-            final nextText = utf8.decode(nextBytes, allowMalformed: true);
-            if (!nextText.contains('#EXTM3U')) break;
-            currentUri = variantUri;
-            text = nextText;
-          }
-
-          if (cleanAds && text.contains('#EXTINF')) {
-            if (text.length > 20000) {
-              text = await compute(
-                LocalProxyTunnelBridge._stripAdsInBackgroundIsolate,
-                <String, String>{
-                  'text': text,
-                  'baseUri': currentUri.toString(),
-                },
-              );
-            } else {
-              final stripped = M3u8AdRemover.stripAdsFromMediaPlaylist(
-                text,
-                baseUri: currentUri,
-              );
-              text = stripped.cleanedM3u8;
+        final m3u8Buf = BytesBuilder(copy: false);
+        var verifiedM3u8Header = false;
+        var abortedAsBinaryStream = false;
+        final iter = StreamIterator<List<int>>(
+          resp.timeout(const Duration(seconds: 8)),
+        );
+        try {
+          while (await iter.moveNext()) {
+            final chunk = iter.current;
+            if (chunk.isEmpty) continue;
+            m3u8Buf.add(chunk);
+            recordDownstreamBytes(chunk.length);
+            if (!verifiedM3u8Header && m3u8Buf.length >= 7) {
+              final sample = m3u8Buf.toBytes();
+              final headLen = sample.length > 256 ? 256 : sample.length;
+              final headText =
+                  utf8.decode(sample.sublist(0, headLen), allowMalformed: true).trimLeft();
+              if (headText.startsWith('#EXTM3U') || headText.startsWith('#EXT')) {
+                verifiedM3u8Header = true;
+              } else {
+                abortedAsBinaryStream = true;
+                break;
+              }
+            }
+            if (m3u8Buf.length > 2 * 1024 * 1024) {
+              abortedAsBinaryStream = true;
+              break;
             }
           }
+        } catch (_) {
+          if (!verifiedM3u8Header) {
+            abortedAsBinaryStream = true;
+          }
+        }
 
-          final rewrittenM3u8 = _rewriteM3u8PlaylistThroughRelay(
-            text,
-            baseUri: currentUri,
-            headers: customHeaders,
-            cleanAds: cleanAds,
-            forceDirect: forceDirect,
-            candidateNodes: candidateNodes,
-          );
-          final outBytes = utf8.encode(rewrittenM3u8);
-          final respHeader = StringBuffer()
-            ..write('HTTP/1.1 200 OK\r\n')
-            ..write(
-                'Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n')
-            ..write('Content-Length: ${outBytes.length}\r\n')
-            ..write('Access-Control-Allow-Origin: *\r\n')
-            ..write('Cache-Control: no-cache\r\n')
-            ..write('Connection: close\r\n\r\n');
-          client.add(latin1.encode(respHeader.toString()));
-          client.add(outBytes);
-          await finishClientResponse();
-          return;
+        if (!abortedAsBinaryStream && m3u8Buf.length > 0) {
+          final rawBytes = m3u8Buf.takeBytes();
+          var text = utf8.decode(rawBytes, allowMalformed: true);
+          if (text.contains('#EXTM3U')) {
+            // Resolve Master Playlist (`#EXT-X-STREAM-INF`) on the same warm keep-alive connection!
+            for (var depth = 0; depth < 2; depth++) {
+              if (!text.contains('#EXT-X-STREAM-INF')) break;
+              final variantUri =
+                  M3u8AdRemover.extractBestVariantUri(text, currentUri);
+              if (variantUri == null) break;
+              final nextOpened = await openTargetUri(
+                variantUri,
+                preferredNode: winningNodeForSession,
+              );
+              if (nextOpened == null) break;
+              final nextBuf = BytesBuilder(copy: false);
+              var nextTooLarge = false;
+              await for (final b
+                  in nextOpened.resp.timeout(const Duration(seconds: 8))) {
+                if (b.isEmpty) continue;
+                nextBuf.add(b);
+                recordDownstreamBytes(b.length);
+                if (nextBuf.length > 2 * 1024 * 1024) {
+                  nextTooLarge = true;
+                  break;
+                }
+              }
+              if (nextTooLarge) break;
+              final nextBytes = nextBuf.takeBytes();
+              final nextText = utf8.decode(nextBytes, allowMalformed: true);
+              if (!nextText.contains('#EXTM3U')) break;
+              currentUri = variantUri;
+              text = nextText;
+            }
+
+            if (cleanAds && text.contains('#EXTINF')) {
+              if (text.length > 20000) {
+                text = await compute(
+                  LocalProxyTunnelBridge._stripAdsInBackgroundIsolate,
+                  <String, String>{
+                    'text': text,
+                    'baseUri': currentUri.toString(),
+                  },
+                );
+              } else {
+                final stripped = M3u8AdRemover.stripAdsFromMediaPlaylist(
+                  text,
+                  baseUri: currentUri,
+                );
+                text = stripped.cleanedM3u8;
+              }
+            }
+
+            final rewrittenM3u8 = _rewriteM3u8PlaylistThroughRelay(
+              text,
+              baseUri: currentUri,
+              headers: customHeaders,
+              cleanAds: cleanAds,
+              forceDirect: forceDirect,
+              candidateNodes: candidateNodes,
+            );
+            final outBytes = utf8.encode(rewrittenM3u8);
+            final respHeader = StringBuffer()
+              ..write('HTTP/1.1 200 OK\r\n')
+              ..write(
+                  'Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n')
+              ..write('Content-Length: ${outBytes.length}\r\n')
+              ..write('Access-Control-Allow-Origin: *\r\n')
+              ..write('Cache-Control: no-cache\r\n')
+              ..write('Connection: close\r\n\r\n');
+            client.add(latin1.encode(respHeader.toString()));
+            client.add(outBytes);
+            await finishClientResponse();
+            return;
+          } else {
+            preBufferedBinaryChunk = rawBytes;
+            activeStreamIterator = iter;
+          }
         } else {
-          // Not an M3U8 text body -> forward raw bytes directly
-          final respHeader = StringBuffer()
-            ..write('HTTP/1.1 ${resp.statusCode} OK\r\n')
-            ..write(
-                'Content-Type: ${resp.headers.value("content-type") ?? "application/octet-stream"}\r\n')
-            ..write('Content-Length: ${rawBytes.length}\r\n')
-            ..write('Connection: close\r\n\r\n');
-          client.add(latin1.encode(respHeader.toString()));
-          client.add(rawBytes);
-          await finishClientResponse();
-          return;
+          preBufferedBinaryChunk = m3u8Buf.takeBytes();
+          activeStreamIterator = iter;
         }
       }
 
@@ -3054,52 +3097,73 @@ class LocalProxyTunnelBridge {
       final shouldCacheSegment = (rangeHeader == null || rangeHeader.isEmpty) &&
           resp.statusCode == 200 &&
           segIndex != null &&
+          resp.contentLength > 0 &&
           resp.contentLength <= 8 * 1024 * 1024;
       final segmentAccumulator =
           shouldCacheSegment ? BytesBuilder(copy: false) : null;
       var lookaheadTriggeredForProxySeg = false;
       var streamedBytes = 0;
 
-      await for (final chunk in resp.timeout(const Duration(seconds: 45))) {
+      bool handleDownstreamChunk(List<int> chunk) {
+        if (chunk.isEmpty) return true;
+        recordDownstreamBytes(chunk.length);
+        streamedBytes += chunk.length;
+        try {
+          client.add(chunk);
+        } catch (_) {
+          clientClosed = true;
+          unawaited(
+            resp.detachSocket().then((s) => s.destroy(), onError: (_) {}),
+          );
+          return false;
+        }
+        if (segmentAccumulator != null &&
+            segmentAccumulator.length + chunk.length <= 8 * 1024 * 1024) {
+          segmentAccumulator.add(chunk);
+        }
+        if (!forceDirect &&
+            segIndex != null &&
+            !lookaheadTriggeredForProxySeg &&
+            (streamedBytes >= 192 * 1024 ||
+                (resp.contentLength > 0 &&
+                    streamedBytes * 2 >= resp.contentLength))) {
+          lookaheadTriggeredForProxySeg = true;
+          _scheduleLookaheadPrefetch(
+            fromIndex: segIndex + 1,
+            count: 4,
+            customHeaders: customHeaders,
+            forceDirect: forceDirect,
+            candidateNodes: candidateNodes,
+          );
+        }
+        return true;
+      }
+
+      if (preBufferedBinaryChunk != null && preBufferedBinaryChunk.isNotEmpty) {
+        handleDownstreamChunk(preBufferedBinaryChunk);
+      }
+
+      if (activeStreamIterator != null) {
+        while (!clientClosed && await activeStreamIterator.moveNext()) {
+          if (!handleDownstreamChunk(activeStreamIterator.current)) {
+            break;
+          }
+        }
         if (clientClosed) {
           unawaited(
             resp.detachSocket().then((s) => s.destroy(), onError: (_) {}),
           );
-          break;
         }
-        if (chunk.isNotEmpty) {
-          recordDownstreamBytes(chunk.length);
-          streamedBytes += chunk.length;
-          try {
-            client.add(chunk);
-          } catch (_) {
-            clientClosed = true;
+      } else {
+        await for (final chunk in resp.timeout(const Duration(seconds: 45))) {
+          if (clientClosed) {
             unawaited(
               resp.detachSocket().then((s) => s.destroy(), onError: (_) {}),
             );
             break;
           }
-          if (segmentAccumulator != null &&
-              segmentAccumulator.length + chunk.length <= 8 * 1024 * 1024) {
-            segmentAccumulator.add(chunk);
-          }
-          // Once the first 256KB (or >50%) of the current segment has been
-          // delivered to libmpv so first-frame decoding is already underway,
-          // schedule background lookahead prefetching for the next 2 segments!
-          if (!forceDirect &&
-              segIndex != null &&
-              !lookaheadTriggeredForProxySeg &&
-              (streamedBytes >= 192 * 1024 ||
-                  (resp.contentLength > 0 &&
-                      streamedBytes * 2 >= resp.contentLength))) {
-            lookaheadTriggeredForProxySeg = true;
-            _scheduleLookaheadPrefetch(
-              fromIndex: segIndex + 1,
-              count: 4,
-              customHeaders: customHeaders,
-              forceDirect: forceDirect,
-              candidateNodes: candidateNodes,
-            );
+          if (!handleDownstreamChunk(chunk)) {
+            break;
           }
         }
       }
