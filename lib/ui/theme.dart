@@ -239,6 +239,7 @@ class VideoPlatformTheme {
       scaffoldBackgroundColor: p.bgPrimary,
       colorScheme: colorScheme,
       dividerColor: p.borderSubtle,
+      focusColor: p.accent.withValues(alpha: 0.36),
       splashFactory: NoSplash.splashFactory,
       highlightColor: Colors.transparent,
       appBarTheme: AppBarTheme(
@@ -290,7 +291,7 @@ class VideoPlatformTheme {
         ),
         focusedBorder: OutlineInputBorder(
           borderRadius: BorderRadius.circular(6),
-          borderSide: BorderSide(color: p.accent, width: 1.2),
+          borderSide: BorderSide(color: p.accent, width: 2.2),
         ),
       ),
       filledButtonTheme: FilledButtonThemeData(
@@ -307,15 +308,15 @@ class VideoPlatformTheme {
           }),
           foregroundColor: WidgetStateProperty.all(Colors.white),
           elevation: WidgetStateProperty.resolveWith(
-            (states) => states.contains(WidgetState.focused) ? 6 : 0,
+            (states) => states.contains(WidgetState.focused) ? 8 : 0,
           ),
-          shadowColor: WidgetStateProperty.all(p.accent.withValues(alpha: 0.6)),
+          shadowColor: WidgetStateProperty.all(p.accent.withValues(alpha: 0.85)),
           padding: WidgetStateProperty.all(
             const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
           ),
           side: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.focused)) {
-              return const BorderSide(color: Colors.white, width: 2.2);
+              return const BorderSide(color: Colors.white, width: 2.6);
             }
             return BorderSide.none;
           }),
@@ -336,7 +337,7 @@ class VideoPlatformTheme {
         style: ButtonStyle(
           backgroundColor: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.focused)) {
-              return p.accent.withValues(alpha: 0.24);
+              return p.accent.withValues(alpha: 0.34);
             }
             if (states.contains(WidgetState.hovered)) {
               return p.bgHover;
@@ -345,13 +346,17 @@ class VideoPlatformTheme {
           }),
           foregroundColor: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.focused)) {
-              return p.accent;
+              return Colors.white;
             }
             return p.textPrimary;
           }),
+          elevation: WidgetStateProperty.resolveWith(
+            (states) => states.contains(WidgetState.focused) ? 6 : 0,
+          ),
+          shadowColor: WidgetStateProperty.all(p.accent.withValues(alpha: 0.7)),
           side: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.focused)) {
-              return BorderSide(color: p.accent, width: 2.2);
+              return const BorderSide(color: Colors.white, width: 2.5);
             }
             return BorderSide(color: p.borderStrong);
           }),
@@ -366,7 +371,7 @@ class VideoPlatformTheme {
           textStyle: WidgetStateProperty.all(
             const TextStyle(
               fontSize: 13,
-              fontWeight: FontWeight.w500,
+              fontWeight: FontWeight.w600,
             ),
           ),
         ),
@@ -375,7 +380,7 @@ class VideoPlatformTheme {
         style: ButtonStyle(
           backgroundColor: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.focused)) {
-              return p.accent.withValues(alpha: 0.24);
+              return p.accent.withValues(alpha: 0.34);
             }
             if (states.contains(WidgetState.hovered)) {
               return p.bgHover;
@@ -384,13 +389,13 @@ class VideoPlatformTheme {
           }),
           foregroundColor: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.focused)) {
-              return p.accent;
+              return Colors.white;
             }
             return p.textSecondary;
           }),
           side: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.focused)) {
-              return BorderSide(color: p.accent, width: 2.0);
+              return const BorderSide(color: Colors.white, width: 2.4);
             }
             return BorderSide.none;
           }),
@@ -405,7 +410,7 @@ class VideoPlatformTheme {
           textStyle: WidgetStateProperty.all(
             const TextStyle(
               fontSize: 13,
-              fontWeight: FontWeight.w500,
+              fontWeight: FontWeight.w600,
             ),
           ),
         ),
@@ -414,16 +419,22 @@ class VideoPlatformTheme {
         style: ButtonStyle(
           backgroundColor: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.focused)) {
-              return p.accent.withValues(alpha: 0.28);
+              return p.accent.withValues(alpha: 0.38);
             }
             if (states.contains(WidgetState.hovered)) {
               return p.bgHover;
             }
             return Colors.transparent;
           }),
+          foregroundColor: WidgetStateProperty.resolveWith((states) {
+            if (states.contains(WidgetState.focused)) {
+              return Colors.white;
+            }
+            return p.textPrimary;
+          }),
           side: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.focused)) {
-              return BorderSide(color: p.accent, width: 2.0);
+              return const BorderSide(color: Colors.white, width: 2.4);
             }
             return BorderSide.none;
           }),

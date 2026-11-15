@@ -67,6 +67,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
 
   void _selectTab(int index) {
     final screenW = MediaQuery.maybeSizeOf(context)?.width ?? 1024;
+    widget.appState.setImmersiveFullscreen(false);
     setState(() {
       _selectedIndex = index;
       _isMobileSidebarOpen = false;
@@ -231,8 +232,9 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
         }
         final screenWidth = MediaQuery.sizeOf(context).width;
         final isDesktop = screenWidth >= 860 || state.tvMode;
-        final isSidebarOpen =
-            isDesktop ? !_isSidebarCollapsed : _isMobileSidebarOpen;
+        final isImmersive = state.isImmersiveFullscreen;
+        final isSidebarOpen = !isImmersive &&
+            (isDesktop ? !_isSidebarCollapsed : _isMobileSidebarOpen);
         final useOverlaySidebar = screenWidth < 860;
         final miniSession = state.miniPlayerSession;
 
@@ -240,6 +242,10 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
           canPop: false,
           onPopInvokedWithResult: (didPop, _) {
             if (!didPop) {
+              if (state.isImmersiveFullscreen) {
+                state.setImmersiveFullscreen(false);
+                return;
+              }
               _handleRootPop(state);
             }
           },
@@ -251,35 +257,63 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                   _openCommandPalette,
             },
             child: Scaffold(
-              backgroundColor: VideoPlatformTheme.bgPrimary,
+              backgroundColor:
+                  isImmersive ? Colors.black : VideoPlatformTheme.bgPrimary,
               body: SafeArea(
+                top: !isImmersive,
+                bottom: !isImmersive,
+                left: !isImmersive,
+                right: !isImmersive,
                 child: Stack(
                   children: [
                     Column(
                       children: [
-                        _buildTopHeader(state, isDesktop, screenWidth),
+                        if (!isImmersive)
+                          FocusTraversalGroup(
+                            child: _buildTopHeader(
+                              state,
+                              isDesktop,
+                              screenWidth,
+                            ),
+                          ),
                         Expanded(
                           child: Stack(
                             children: [
                               Row(
                                 children: [
-                                  if (!useOverlaySidebar && isSidebarOpen)
-                                    _buildDesktopSidebar(
-                                      state,
-                                      onCollapse: () => setState(() {
-                                        _isSidebarCollapsed = true;
-                                        _isMobileSidebarOpen = false;
-                                      }),
+                                  if (!isImmersive &&
+                                      !useOverlaySidebar &&
+                                      isSidebarOpen)
+                                    FocusTraversalGroup(
+                                      child: _buildDesktopSidebar(
+                                        state,
+                                        onCollapse: () => setState(() {
+                                          _isSidebarCollapsed = true;
+                                          _isMobileSidebarOpen = false;
+                                        }),
+                                      ),
                                     ),
                                   Expanded(
-                                    child: KeyedSubtree(
-                                      key: ValueKey(state.themeId),
-                                      child: _buildActiveScreen(state),
+                                    child: FocusTraversalGroup(
+                                      child: KeyedSubtree(
+                                        key: ValueKey(state.themeId),
+                                        child: _buildActiveScreen(state),
+                                      ),
                                     ),
                                   ),
                                 ],
                               ),
-                              if (useOverlaySidebar && isSidebarOpen) ...[
+                              if (!isImmersive &&
+                                  !useOverlaySidebar &&
+                                  !isSidebarOpen)
+                                Positioned(
+                                  left: 0,
+                                  top: 12,
+                                  child: _buildCollapsedSidebarExpandHandle(),
+                                ),
+                              if (!isImmersive &&
+                                  useOverlaySidebar &&
+                                  isSidebarOpen) ...[
                                 Positioned.fill(
                                   child: GestureDetector(
                                     behavior: HitTestBehavior.opaque,
@@ -296,12 +330,14 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                                   left: 0,
                                   top: 0,
                                   bottom: 0,
-                                  child: _buildDesktopSidebar(
-                                    state,
-                                    onCollapse: () => setState(() {
-                                      _isSidebarCollapsed = true;
-                                      _isMobileSidebarOpen = false;
-                                    }),
+                                  child: FocusTraversalGroup(
+                                    child: _buildDesktopSidebar(
+                                      state,
+                                      onCollapse: () => setState(() {
+                                        _isSidebarCollapsed = true;
+                                        _isMobileSidebarOpen = false;
+                                      }),
+                                    ),
                                   ),
                                 ),
                               ],
@@ -310,7 +346,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                         ),
                       ],
                     ),
-                    if (miniSession != null)
+                    if (miniSession != null && !isImmersive)
                       _FloatingMiniPlayerOverlay(
                         key: ValueKey(miniSession.streamUrl),
                         appState: state,
@@ -341,12 +377,14 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                           }
                         },
                       ),
-                    _buildTelegramFloatingNotifications(state, isDesktop),
+                    if (!isImmersive)
+                      _buildTelegramFloatingNotifications(state, isDesktop),
                   ],
                 ),
               ),
-              bottomNavigationBar:
-                  isDesktop ? null : _buildMobileBottomBar(state),
+              bottomNavigationBar: (isDesktop || isImmersive)
+                  ? null
+                  : _buildMobileBottomBar(state),
             ),
           ),
         );
@@ -1402,30 +1440,55 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                 if (onCollapse != null)
                   InkWell(
                     borderRadius: BorderRadius.circular(5),
+                    onFocusChange: (_) {
+                      if (mounted) setState(() {});
+                    },
                     onTap: onCollapse,
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 6,
-                        vertical: 4,
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            Icons.chevron_left_rounded,
-                            size: 16,
-                            color: VideoPlatformTheme.accent,
+                    child: Builder(
+                      builder: (ctx) {
+                        final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                        return Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 4,
                           ),
-                          Text(
-                            '收起',
-                            style: TextStyle(
-                              fontSize: 11.5,
-                              fontWeight: FontWeight.w600,
-                              color: VideoPlatformTheme.accent,
+                          decoration: BoxDecoration(
+                            color: isFocused
+                                ? VideoPlatformTheme.accent
+                                : VideoPlatformTheme.accent
+                                    .withValues(alpha: 0.14),
+                            borderRadius: BorderRadius.circular(5),
+                            border: Border.all(
+                              color: isFocused
+                                  ? Colors.white
+                                  : VideoPlatformTheme.accent,
+                              width: isFocused ? 2.0 : 1.0,
                             ),
                           ),
-                        ],
-                      ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.chevron_left_rounded,
+                                size: 16,
+                                color: isFocused
+                                    ? Colors.white
+                                    : VideoPlatformTheme.accent,
+                              ),
+                              Text(
+                                '收起侧栏',
+                                style: TextStyle(
+                                  fontSize: 11.5,
+                                  fontWeight: FontWeight.w700,
+                                  color: isFocused
+                                      ? Colors.white
+                                      : VideoPlatformTheme.accent,
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
                     ),
                   ),
               ],
@@ -1490,6 +1553,60 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
             ),
           ),
           const Divider(height: 1),
+          if (onCollapse != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 4, 10, 2),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(6),
+                onFocusChange: (_) {
+                  if (mounted) setState(() {});
+                },
+                onTap: onCollapse,
+                child: Builder(
+                  builder: (ctx) {
+                    final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                    return Container(
+                      height: 36,
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      decoration: BoxDecoration(
+                        color: isFocused
+                            ? VideoPlatformTheme.accent.withValues(alpha: 0.32)
+                            : VideoPlatformTheme.bgCard,
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(
+                          color: isFocused
+                              ? Colors.white
+                              : VideoPlatformTheme.borderSubtle,
+                          width: isFocused ? 2.2 : 1.0,
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.first_page_rounded,
+                            size: 18,
+                            color: isFocused
+                                ? Colors.white
+                                : VideoPlatformTheme.accent,
+                          ),
+                          const SizedBox(width: 10),
+                          Text(
+                            '收起导航侧栏',
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              fontWeight: FontWeight.w600,
+                              color: isFocused
+                                  ? Colors.white
+                                  : VideoPlatformTheme.accent,
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ),
           _buildSidebarItem(
             index: 8,
             icon: Icons.settings_outlined,
@@ -1497,6 +1614,77 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
           ),
           const SizedBox(height: 8),
         ],
+      ),
+    );
+  }
+
+  Widget _buildCollapsedSidebarExpandHandle() {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: const BorderRadius.horizontal(
+          right: Radius.circular(8),
+        ),
+        onFocusChange: (_) {
+          if (mounted) setState(() {});
+        },
+        onTap: () {
+          setState(() {
+            _isSidebarCollapsed = false;
+            _isMobileSidebarOpen = true;
+          });
+        },
+        child: Builder(
+          builder: (ctx) {
+            final isFocused = Focus.of(ctx).hasPrimaryFocus;
+            return Tooltip(
+              message: '展开左侧导航菜单',
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 6,
+                  vertical: 8,
+                ),
+                decoration: BoxDecoration(
+                  color: isFocused
+                      ? VideoPlatformTheme.accent
+                      : VideoPlatformTheme.bgElevated.withValues(alpha: 0.92),
+                  borderRadius: const BorderRadius.horizontal(
+                    right: Radius.circular(8),
+                  ),
+                  border: Border.all(
+                    color: isFocused
+                        ? Colors.white
+                        : VideoPlatformTheme.borderStrong,
+                    width: isFocused ? 2.2 : 1.0,
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.last_page_rounded,
+                      size: 16,
+                      color: isFocused
+                          ? Colors.white
+                          : VideoPlatformTheme.accent,
+                    ),
+                    if (isFocused) ...[
+                      const SizedBox(width: 3),
+                      const Text(
+                        '展开导航',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
       ),
     );
   }

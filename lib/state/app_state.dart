@@ -131,6 +131,7 @@ class AppState extends ChangeNotifier {
   int _vodSkipIntroSeconds = 0;
   int _vodSkipOutroSeconds = 0;
   bool _tvMode = false;
+  bool _isImmersiveFullscreen = false;
   bool _supportsAirPlay = false;
   bool _initialized = false;
   bool _isAuthenticated = false;
@@ -301,7 +302,14 @@ class AppState extends ChangeNotifier {
   int get vodSkipIntroSeconds => _vodSkipIntroSeconds;
   int get vodSkipOutroSeconds => _vodSkipOutroSeconds;
   bool get tvMode => _tvMode;
+  bool get isImmersiveFullscreen => _isImmersiveFullscreen;
   bool get supportsAirPlay => _supportsAirPlay;
+
+  void setImmersiveFullscreen(bool value) {
+    if (_isImmersiveFullscreen == value) return;
+    _isImmersiveFullscreen = value;
+    notifyListeners();
+  }
   bool get initialized => _initialized;
   bool get isAuthenticated => _isAuthenticated;
   bool get isConnecting => _isConnecting;

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:ui';
 
@@ -87,13 +88,14 @@ class M3u8VideoClientApp extends StatelessWidget {
   }
 }
 
-/// Global Android TV / Apple TV / D-Pad Remote Key Interceptor.
+/// Global Android TV / Apple TV / D-Pad Remote Key & Focus Interceptor.
 /// Solves:
 /// 1. Auto-enables `tvMode` on Android TV boxes when any D-Pad key is pressed.
-/// 2. Escapes `TextField` (`EditableText`) directional arrow key focus traps.
-/// 3. Restores initial focus when no widget currently has primary focus.
-/// 4. Ensures OK / Center / Enter (`select`, `enter`, `gameButtonA`) reliably activates focused controls.
-class _TvRemoteKeyInterceptor extends StatelessWidget {
+/// 2. Suppresses automatic soft keyboard (IME) popup when D-Pad focus traverses over or switches into a `TextField` (`EditableText`); only opens the IME when the user explicitly presses OK / Enter on the focused input box.
+/// 3. Draws a global high-visibility TV focus ring overlay and auto-scrolls focused widgets into view so focus is never lost or hidden.
+/// 4. Escapes `TextField` (`EditableText`) directional arrow key focus traps.
+/// 5. Ensures OK / Center / Enter (`select`, `enter`, `gameButtonA`) reliably activates focused controls.
+class _TvRemoteKeyInterceptor extends StatefulWidget {
   final AppState appState;
   final Widget child;
 
@@ -101,6 +103,182 @@ class _TvRemoteKeyInterceptor extends StatelessWidget {
     required this.appState,
     required this.child,
   });
+
+  @override
+  State<_TvRemoteKeyInterceptor> createState() =>
+      _TvRemoteKeyInterceptorState();
+}
+
+class _TvRemoteKeyInterceptorState extends State<_TvRemoteKeyInterceptor> {
+  final GlobalKey _stackKey = GlobalKey();
+  FocusNode? _explicitlyActivatedEditableNode;
+  Rect? _focusedRect;
+  bool _focusedIsUnactivatedInput = false;
+  Timer? _imeHideGuardTimer1;
+  Timer? _imeHideGuardTimer2;
+  Timer? _rectRefreshTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    FocusManager.instance.addListener(_onGlobalFocusChanged);
+  }
+
+  @override
+  void dispose() {
+    FocusManager.instance.removeListener(_onGlobalFocusChanged);
+    _imeHideGuardTimer1?.cancel();
+    _imeHideGuardTimer2?.cancel();
+    _rectRefreshTimer?.cancel();
+    super.dispose();
+  }
+
+  void _suppressImeIfNeeded() {
+    if (!widget.appState.tvMode) return;
+    final primary = FocusManager.instance.primaryFocus;
+    if (primary == null || primary == _explicitlyActivatedEditableNode) return;
+    final ctx = primary.context;
+    if (ctx == null) return;
+    final editable = ctx.findAncestorStateOfType<EditableTextState>();
+    if (editable != null) {
+      SystemChannels.textInput.invokeMethod<void>('TextInput.hide');
+    }
+  }
+
+  void _onGlobalFocusChanged() {
+    if (!mounted) return;
+    final primary = FocusManager.instance.primaryFocus;
+    if (primary != _explicitlyActivatedEditableNode) {
+      _explicitlyActivatedEditableNode = null;
+    }
+
+    if (widget.appState.tvMode && primary != null) {
+      final ctx = primary.context;
+      final editable = ctx?.findAncestorStateOfType<EditableTextState>();
+      if (editable != null && primary != _explicitlyActivatedEditableNode) {
+        // Prevent TextField from immediately popping up the soft keyboard when focus lands on it
+        SystemChannels.textInput.invokeMethod<void>('TextInput.hide');
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _suppressImeIfNeeded();
+        });
+        _imeHideGuardTimer1?.cancel();
+        _imeHideGuardTimer2?.cancel();
+        _imeHideGuardTimer1 = Timer(
+          const Duration(milliseconds: 55),
+          _suppressImeIfNeeded,
+        );
+        _imeHideGuardTimer2 = Timer(
+          const Duration(milliseconds: 160),
+          _suppressImeIfNeeded,
+        );
+      }
+
+      // Ensure focused widget is scrolled into view on TV
+      if (ctx != null && ctx.mounted) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted || !ctx.mounted) return;
+          try {
+            final renderObj = ctx.findRenderObject();
+            if (renderObj is RenderBox && renderObj.hasSize) {
+              final screenH = MediaQuery.maybeSizeOf(ctx)?.height ?? 720;
+              if (renderObj.size.height < screenH * 0.6) {
+                Scrollable.ensureVisible(
+                  ctx,
+                  duration: const Duration(milliseconds: 140),
+                  curve: Curves.easeOutCubic,
+                  alignmentPolicy:
+                      ScrollPositionAlignmentPolicy.keepVisibleAtEnd,
+                );
+              }
+            }
+          } catch (_) {}
+          _updateFocusedRect();
+        });
+      }
+    }
+
+    _updateFocusedRect();
+    _rectRefreshTimer?.cancel();
+    _rectRefreshTimer = Timer(
+      const Duration(milliseconds: 165),
+      _updateFocusedRect,
+    );
+  }
+
+  void _updateFocusedRect() {
+    if (!mounted) return;
+    if (!widget.appState.tvMode) {
+      if (_focusedRect != null) {
+        setState(() {
+          _focusedRect = null;
+          _focusedIsUnactivatedInput = false;
+        });
+      }
+      return;
+    }
+
+    final primary = FocusManager.instance.primaryFocus;
+    final ctx = primary?.context;
+    final stackBox =
+        _stackKey.currentContext?.findRenderObject() as RenderBox?;
+    if (primary == null ||
+        primary is FocusScopeNode ||
+        ctx == null ||
+        !ctx.mounted ||
+        stackBox == null ||
+        !stackBox.hasSize) {
+      if (_focusedRect != null) {
+        setState(() {
+          _focusedRect = null;
+          _focusedIsUnactivatedInput = false;
+        });
+      }
+      return;
+    }
+
+    try {
+      final renderObj = ctx.findRenderObject();
+      if (renderObj is! RenderBox || !renderObj.hasSize || !renderObj.attached) {
+        if (_focusedRect != null) {
+          setState(() {
+            _focusedRect = null;
+            _focusedIsUnactivatedInput = false;
+          });
+        }
+        return;
+      }
+
+      final size = renderObj.size;
+      final stackSize = stackBox.size;
+      // Do not draw a focus ring around full-screen stages or huge containers (> 52% of screen area)
+      if (size.width <= 4 ||
+          size.height <= 4 ||
+          (size.width * size.height) >
+              (stackSize.width * stackSize.height * 0.52)) {
+        if (_focusedRect != null) {
+          setState(() {
+            _focusedRect = null;
+            _focusedIsUnactivatedInput = false;
+          });
+        }
+        return;
+      }
+
+      final topLeft = renderObj.localToGlobal(Offset.zero, ancestor: stackBox);
+      final nextRect = (topLeft & size).inflate(2.0);
+      final editable = ctx.findAncestorStateOfType<EditableTextState>();
+      final nextIsUnactivatedInput =
+          editable != null && primary != _explicitlyActivatedEditableNode;
+
+      if (_focusedRect != nextRect ||
+          _focusedIsUnactivatedInput != nextIsUnactivatedInput) {
+        setState(() {
+          _focusedRect = nextRect;
+          _focusedIsUnactivatedInput = nextIsUnactivatedInput;
+        });
+      }
+    } catch (_) {}
+  }
 
   bool _isDpadOrTvKey(LogicalKeyboardKey key) {
     return key == LogicalKeyboardKey.arrowUp ||
@@ -139,10 +317,12 @@ class _TvRemoteKeyInterceptor extends StatelessWidget {
     }
 
     final key = event.logicalKey;
-    if (Platform.isAndroid && !appState.tvMode && _isDpadOrTvKey(key)) {
+    if (Platform.isAndroid &&
+        !widget.appState.tvMode &&
+        _isDpadOrTvKey(key)) {
       FocusManager.instance.highlightStrategy =
           FocusHighlightStrategy.alwaysTraditional;
-      appState.setTvMode(true);
+      widget.appState.setTvMode(true);
     }
 
     final primary = FocusManager.instance.primaryFocus;
@@ -153,21 +333,32 @@ class _TvRemoteKeyInterceptor extends StatelessWidget {
 
     final dir = _directionForKey(key);
     if (dir != null) {
-      // 1. If trapped inside a TextField (EditableText), allow Up/Down (or Left/Right at text edges) to move focus out!
+      // 1. If focused on a TextField (EditableText):
+      //    - If IME has NOT been explicitly opened yet on TV, allow ALL 4 directional arrows to move focus freely!
+      //    - Even if IME is open, allow Up/Down (or Left/Right at text edges) to move focus out!
       if (editableState != null && primary != null) {
+        final imeNotOpenOnTv = widget.appState.tvMode &&
+            _explicitlyActivatedEditableNode != primary;
         final value = editableState.textEditingValue;
         final textLen = value.text.length;
         final cursorOffset = value.selection.baseOffset;
-        final shouldEscape = dir == TraversalDirection.up ||
+        final shouldEscape = imeNotOpenOnTv ||
+            dir == TraversalDirection.up ||
             dir == TraversalDirection.down ||
             textLen == 0 ||
             (dir == TraversalDirection.left && cursorOffset <= 0) ||
             (dir == TraversalDirection.right && cursorOffset >= textLen);
         if (shouldEscape) {
+          _explicitlyActivatedEditableNode = null;
+          SystemChannels.textInput.invokeMethod<void>('TextInput.hide');
           final moved = primary.focusInDirection(dir);
           if (!moved) {
-            primary.unfocus();
-            primary.enclosingScope?.nextFocus();
+            if (dir == TraversalDirection.down ||
+                dir == TraversalDirection.right) {
+              primary.enclosingScope?.nextFocus();
+            } else {
+              primary.enclosingScope?.previousFocus();
+            }
           }
           return KeyEventResult.handled;
         }
@@ -192,13 +383,27 @@ class _TvRemoteKeyInterceptor extends StatelessWidget {
       return KeyEventResult.ignored;
     }
 
-    // 3. Handle OK / Center / Enter activation fallback for widgets that only use GestureDetector or ButtonActivateIntent
+    // 3. On TV mode, if focused on an EditableText where the soft keyboard was suppressed,
+    //    pressing OK / Enter explicitly opens the soft keyboard!
+    if (event is KeyDownEvent &&
+        widget.appState.tvMode &&
+        _isActivateKey(key) &&
+        editableState != null &&
+        primary != null &&
+        _explicitlyActivatedEditableNode != primary) {
+      _explicitlyActivatedEditableNode = primary;
+      editableState.requestKeyboard();
+      SystemChannels.textInput.invokeMethod<void>('TextInput.show');
+      _updateFocusedRect();
+      return KeyEventResult.handled;
+    }
+
+    // 4. Handle OK / Center / Enter activation fallback for widgets that only use GestureDetector or ButtonActivateIntent
     if (event is KeyDownEvent &&
         _isActivateKey(key) &&
         editableState == null &&
         focusedCtx != null) {
-      final activateAction =
-          Actions.maybeFind<ActivateIntent>(focusedCtx);
+      final activateAction = Actions.maybeFind<ActivateIntent>(focusedCtx);
       if (activateAction != null &&
           activateAction.isEnabled(const ActivateIntent())) {
         // Standard Flutter Shortcuts will invoke ActivateIntent
@@ -227,6 +432,9 @@ class _TvRemoteKeyInterceptor extends StatelessWidget {
         } else if (w is IconButton && w.onPressed != null) {
           triggered = true;
           w.onPressed!();
+        } else if (w is ListTile && w.onTap != null) {
+          triggered = true;
+          w.onTap!();
         }
       }
 
@@ -234,7 +442,7 @@ class _TvRemoteKeyInterceptor extends StatelessWidget {
       if (!triggered) {
         int depth = 0;
         focusedCtx.visitAncestorElements((el) {
-          if (depth++ > 4 || triggered) return false;
+          if (depth++ > 5 || triggered) return false;
           tryTriggerWidget(el.widget);
           return !triggered;
         });
@@ -249,11 +457,82 @@ class _TvRemoteKeyInterceptor extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final rect = _focusedRect;
     return Focus(
       canRequestFocus: false,
       skipTraversal: true,
       onKeyEvent: _handleKeyEvent,
-      child: child,
+      child: NotificationListener<ScrollNotification>(
+        onNotification: (_) {
+          if (widget.appState.tvMode && _focusedRect != null) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              _updateFocusedRect();
+            });
+          }
+          return false;
+        },
+        child: Stack(
+          key: _stackKey,
+          fit: StackFit.expand,
+          children: [
+            widget.child,
+            if (widget.appState.tvMode && rect != null)
+              Positioned(
+                left: rect.left,
+                top: rect.top,
+                width: rect.width,
+                height: rect.height,
+                child: IgnorePointer(
+                  child: Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(
+                        color: const Color(0xFFFFE066),
+                        width: 2.6,
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: VideoPlatformTheme.accent
+                              .withValues(alpha: 0.65),
+                          blurRadius: 12,
+                          spreadRadius: 1.5,
+                        ),
+                      ],
+                    ),
+                    child: _focusedIsUnactivatedInput
+                        ? Align(
+                            alignment: Alignment.centerRight,
+                            child: Container(
+                              margin: const EdgeInsets.only(right: 6),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 7,
+                                vertical: 2,
+                              ),
+                              decoration: BoxDecoration(
+                                color: const Color(0xEE090E14),
+                                borderRadius: BorderRadius.circular(4),
+                                border: Border.all(
+                                  color: const Color(0xFFFFE066),
+                                ),
+                              ),
+                              child: const Text(
+                                '按 OK 键输入',
+                                style: TextStyle(
+                                  color: Color(0xFFFFE066),
+                                  fontSize: 10.5,
+                                  fontWeight: FontWeight.w700,
+                                  decoration: TextDecoration.none,
+                                ),
+                              ),
+                            ),
+                          )
+                        : null,
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
     );
   }
 }
