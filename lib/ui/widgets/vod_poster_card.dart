@@ -362,6 +362,7 @@ class VodPosterCard extends StatefulWidget {
   final VodItem item;
   final ApiClient api;
   final VoidCallback onTap;
+  final VoidCallback? onFocused;
   final bool showSourceBadge;
   final bool autofocus;
 
@@ -370,6 +371,7 @@ class VodPosterCard extends StatefulWidget {
     required this.item,
     required this.api,
     required this.onTap,
+    this.onFocused,
     this.showSourceBadge = false,
     this.autofocus = false,
   });
@@ -386,6 +388,7 @@ class _VodPosterCardState extends State<VodPosterCard> {
     if (_focused == focused) return;
     setState(() => _focused = focused);
     if (focused && mounted) {
+      widget.onFocused?.call();
       Scrollable.ensureVisible(
         context,
         alignment: 0.35,

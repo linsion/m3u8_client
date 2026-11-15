@@ -182,48 +182,56 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
   Widget build(BuildContext context) {
     final state = widget.appState;
 
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        // Top category filter bar or search status banner
-        if (state.searchKeyword.isNotEmpty)
-          _buildSearchStatusBar(state)
-        else
-          _buildCategoryFilterBar(state),
+    return PopScope(
+      canPop: !_categoriesExpanded,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _categoriesExpanded) {
+          setState(() => _categoriesExpanded = false);
+        }
+      },
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Top category filter bar or search status banner
+          if (state.searchKeyword.isNotEmpty)
+            _buildSearchStatusBar(state)
+          else
+            _buildCategoryFilterBar(state),
 
-        // Alist directory breadcrumbs if inside a folder
-        if (state.directoryBreadcrumbs.isNotEmpty &&
-            state.searchKeyword.isEmpty)
-          _buildDirectoryBreadcrumbs(state),
+          // Alist directory breadcrumbs if inside a folder
+          if (state.directoryBreadcrumbs.isNotEmpty &&
+              state.searchKeyword.isEmpty)
+            _buildDirectoryBreadcrumbs(state),
 
-        // Main content area + Floating All-Categories Overlay Drawer
-        Expanded(
-          child: Stack(
-            children: [
-              Positioned.fill(
-                child: _buildBodyContent(state),
-              ),
-              if (_categoriesExpanded && state.searchKeyword.isEmpty) ...[
+          // Main content area + Floating All-Categories Overlay Drawer
+          Expanded(
+            child: Stack(
+              children: [
                 Positioned.fill(
-                  child: GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onTap: () => setState(() => _categoriesExpanded = false),
-                    child: Container(
-                      color: Colors.black.withValues(alpha: 0.48),
+                  child: _buildBodyContent(state),
+                ),
+                if (_categoriesExpanded && state.searchKeyword.isEmpty) ...[
+                  Positioned.fill(
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () => setState(() => _categoriesExpanded = false),
+                      child: Container(
+                        color: Colors.black.withValues(alpha: 0.48),
+                      ),
                     ),
                   ),
-                ),
-                Positioned(
-                  top: 0,
-                  left: 0,
-                  right: 0,
-                  child: _buildExpandedCategoryDrawer(state),
-                ),
+                  Positioned(
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    child: _buildExpandedCategoryDrawer(state),
+                  ),
+                ],
               ],
-            ],
+            ),
           ),
-        ),
-      ],
+        ],
+      ),
     );
   }
 
@@ -345,6 +353,9 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
           // "全部分类" pill button that toggles the floating category dropdown window
           InkWell(
             borderRadius: BorderRadius.circular(7),
+            onFocusChange: (_) {
+              if (mounted) setState(() {});
+            },
             onTap: () {
               final nextExpanded = !_categoriesExpanded;
               setState(() => _categoriesExpanded = nextExpanded);
@@ -357,60 +368,72 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                 );
               }
             },
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 180),
-              padding: const EdgeInsets.symmetric(
-                horizontal: 10,
-                vertical: 5,
-              ),
-              decoration: BoxDecoration(
-                color: _categoriesExpanded
-                    ? VideoPlatformTheme.accent
-                    : VideoPlatformTheme.bgCard,
-                borderRadius: BorderRadius.circular(7),
-                border: Border.all(
-                  color: _categoriesExpanded
-                      ? VideoPlatformTheme.accent
-                      : VideoPlatformTheme.borderSubtle,
-                ),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    _categoriesExpanded
-                        ? Icons.close_fullscreen_rounded
-                        : Icons.grid_view_rounded,
-                    size: 14,
-                    color: _categoriesExpanded
-                        ? Colors.white
-                        : VideoPlatformTheme.accent,
+            child: Builder(
+              builder: (ctx) {
+                final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                return AnimatedContainer(
+                  duration: const Duration(milliseconds: 180),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 5,
                   ),
-                  const SizedBox(width: 5),
-                  Text(
-                    _categoriesExpanded
-                        ? '收起分类'
-                        : '全部分类 (${categories.length + 1})',
-                    style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.w600,
-                      color: _categoriesExpanded
-                          ? Colors.white
-                          : VideoPlatformTheme.textPrimary,
+                  decoration: BoxDecoration(
+                    color: _categoriesExpanded
+                        ? VideoPlatformTheme.accent
+                        : (isFocused
+                            ? VideoPlatformTheme.accent.withValues(alpha: 0.26)
+                            : VideoPlatformTheme.bgCard),
+                    borderRadius: BorderRadius.circular(7),
+                    border: Border.all(
+                      color: (_categoriesExpanded || isFocused)
+                          ? VideoPlatformTheme.accent
+                          : VideoPlatformTheme.borderSubtle,
+                      width: isFocused ? 2.0 : 1.0,
                     ),
                   ),
-                  const SizedBox(width: 2),
-                  Icon(
-                    _categoriesExpanded
-                        ? Icons.keyboard_arrow_up_rounded
-                        : Icons.keyboard_arrow_down_rounded,
-                    size: 16,
-                    color: _categoriesExpanded
-                        ? Colors.white
-                        : VideoPlatformTheme.textSecondary,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        _categoriesExpanded
+                            ? Icons.close_fullscreen_rounded
+                            : Icons.grid_view_rounded,
+                        size: 14,
+                        color: _categoriesExpanded
+                            ? Colors.white
+                            : VideoPlatformTheme.accent,
+                      ),
+                      const SizedBox(width: 5),
+                      Text(
+                        _categoriesExpanded
+                            ? '收起分类'
+                            : '全部分类 (${categories.length + 1})',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: _categoriesExpanded
+                              ? Colors.white
+                              : (isFocused
+                                  ? VideoPlatformTheme.accent
+                                  : VideoPlatformTheme.textPrimary),
+                        ),
+                      ),
+                      const SizedBox(width: 2),
+                      Icon(
+                        _categoriesExpanded
+                            ? Icons.keyboard_arrow_up_rounded
+                            : Icons.keyboard_arrow_down_rounded,
+                        size: 16,
+                        color: _categoriesExpanded
+                            ? Colors.white
+                            : (isFocused
+                                ? VideoPlatformTheme.accent
+                                : VideoPlatformTheme.textSecondary),
+                      ),
+                    ],
                   ),
-                ],
-              ),
+                );
+              },
             ),
           ),
           if (state.totalCount > 0) ...[
@@ -430,50 +453,61 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                 : '当前：仅搜索当前站点（点击开启全网聚合搜索）',
             child: InkWell(
               borderRadius: BorderRadius.circular(5),
+              onFocusChange: (_) {
+                if (mounted) setState(() {});
+              },
               onTap: () => state.setAggregatedSearch(!state.aggregatedSearch),
-              child: Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 8,
-                  vertical: 4,
-                ),
-                decoration: BoxDecoration(
-                  color: state.aggregatedSearch
-                      ? VideoPlatformTheme.accent.withValues(alpha: 0.16)
-                      : VideoPlatformTheme.bgCard,
-                  borderRadius: BorderRadius.circular(5),
-                  border: Border.all(
-                    color: state.aggregatedSearch
-                        ? VideoPlatformTheme.accent
-                        : VideoPlatformTheme.borderSubtle,
-                  ),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      state.aggregatedSearch
-                          ? Icons.travel_explore_rounded
-                          : Icons.location_on_outlined,
-                      size: 14,
-                      color: state.aggregatedSearch
-                          ? VideoPlatformTheme.accent
-                          : VideoPlatformTheme.textSecondary,
+              child: Builder(
+                builder: (ctx) {
+                  final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                  return Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 4,
                     ),
-                    const SizedBox(width: 4),
-                    Text(
-                      state.aggregatedSearch ? '全网搜' : '单站搜',
-                      style: TextStyle(
-                        fontSize: 11.5,
-                        fontWeight: state.aggregatedSearch
-                            ? FontWeight.w600
-                            : FontWeight.w400,
-                        color: state.aggregatedSearch
+                    decoration: BoxDecoration(
+                      color: isFocused
+                          ? VideoPlatformTheme.accent.withValues(alpha: 0.28)
+                          : (state.aggregatedSearch
+                              ? VideoPlatformTheme.accent.withValues(alpha: 0.16)
+                              : VideoPlatformTheme.bgCard),
+                      borderRadius: BorderRadius.circular(5),
+                      border: Border.all(
+                        color: (state.aggregatedSearch || isFocused)
                             ? VideoPlatformTheme.accent
-                            : VideoPlatformTheme.textSecondary,
+                            : VideoPlatformTheme.borderSubtle,
+                        width: isFocused ? 2.0 : 1.0,
                       ),
                     ),
-                  ],
-                ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          state.aggregatedSearch
+                              ? Icons.travel_explore_rounded
+                              : Icons.location_on_outlined,
+                          size: 14,
+                          color: (state.aggregatedSearch || isFocused)
+                              ? VideoPlatformTheme.accent
+                              : VideoPlatformTheme.textSecondary,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          state.aggregatedSearch ? '全网搜' : '单站搜',
+                          style: TextStyle(
+                            fontSize: 11.5,
+                            fontWeight: (state.aggregatedSearch || isFocused)
+                                ? FontWeight.w600
+                                : FontWeight.w400,
+                            color: (state.aggregatedSearch || isFocused)
+                                ? VideoPlatformTheme.accent
+                                : VideoPlatformTheme.textSecondary,
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                },
               ),
             ),
           ),
@@ -646,7 +680,7 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                     ),
                   ),
                   const Spacer(),
-                  if (categories.length > 6)
+                  if (categories.length > 6 && !state.tvMode)
                     SizedBox(
                       width: 190,
                       height: 30,
@@ -1137,28 +1171,56 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
   }) {
     return InkWell(
       borderRadius: BorderRadius.circular(14),
+      onFocusChange: (_) {
+        if (mounted) setState(() {});
+      },
       onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-        decoration: BoxDecoration(
-          color: selected
-              ? VideoPlatformTheme.accent
-              : VideoPlatformTheme.bgCard,
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(
-            color: selected
-                ? VideoPlatformTheme.accent
-                : VideoPlatformTheme.borderSubtle,
-          ),
-        ),
-        child: Text(
-          label,
-          style: TextStyle(
-            fontSize: 11.5,
-            color: selected ? Colors.white : VideoPlatformTheme.textSecondary,
-            fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
-          ),
-        ),
+      child: Builder(
+        builder: (ctx) {
+          final isFocused = Focus.of(ctx).hasPrimaryFocus;
+          if (isFocused) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (ctx.mounted) {
+                Scrollable.ensureVisible(
+                  ctx,
+                  alignment: 0.5,
+                  duration: const Duration(milliseconds: 140),
+                );
+              }
+            });
+          }
+          return Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            decoration: BoxDecoration(
+              color: selected
+                  ? VideoPlatformTheme.accent
+                  : (isFocused
+                      ? VideoPlatformTheme.accent.withValues(alpha: 0.25)
+                      : VideoPlatformTheme.bgCard),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(
+                color: (selected || isFocused)
+                    ? VideoPlatformTheme.accent
+                    : VideoPlatformTheme.borderSubtle,
+                width: isFocused ? 2.0 : 1.0,
+              ),
+            ),
+            child: Text(
+              label,
+              style: TextStyle(
+                fontSize: 11.5,
+                color: selected
+                    ? Colors.white
+                    : (isFocused
+                        ? VideoPlatformTheme.accent
+                        : VideoPlatformTheme.textSecondary),
+                fontWeight: (selected || isFocused)
+                    ? FontWeight.w600
+                    : FontWeight.w400,
+              ),
+            ),
+          );
+        },
       ),
     );
   }
@@ -1419,6 +1481,14 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                         autofocus: state.tvMode && index == 0,
                         showSourceBadge: state.searchKeyword.isNotEmpty &&
                             state.aggregatedSearch,
+                        onFocused: () {
+                          if (index >= items.length - 8 &&
+                              state.hasMoreVod &&
+                              !state.isLoadingVod &&
+                              !state.isLoadingMoreVod) {
+                            state.loadMoreVod();
+                          }
+                        },
                         onTap: () => _openVodItem(item),
                       );
                     },

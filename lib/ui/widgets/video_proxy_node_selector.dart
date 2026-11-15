@@ -356,55 +356,71 @@ class VideoProxyNodeSelector extends StatelessWidget {
             }
             return items;
           },
-          child: Container(
-            padding: EdgeInsets.symmetric(
-              horizontal: compact ? 6 : 10,
-              vertical: compact ? 2.5 : 5,
-            ),
-            decoration: BoxDecoration(
-              color: overlayStyle
-                  ? const Color(0xAA000000)
-                  : VideoPlatformTheme.bgCard,
-              borderRadius: BorderRadius.circular(compact ? 10 : 18),
-              border: Border.all(
-                color: isDirect
-                    ? (overlayStyle
-                        ? Colors.white.withValues(alpha: 0.22)
-                        : VideoPlatformTheme.borderSubtle)
-                    : const Color(0xFF34D399).withValues(alpha: 0.55),
-              ),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  isDirect ? Icons.public_off_rounded : Icons.vpn_lock_rounded,
-                  size: compact ? 11 : 13.5,
-                  color: badgeColor,
+          child: Builder(
+            builder: (ctx) {
+              final isFocused = Focus.of(ctx).hasFocus;
+              return Container(
+                padding: EdgeInsets.symmetric(
+                  horizontal: compact ? 6 : 10,
+                  vertical: compact ? 2.5 : 5,
                 ),
-                SizedBox(width: compact ? 3 : 5),
-                Text(
-                  _buildCurrentLabel(),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    color: overlayStyle
-                        ? Colors.white
-                        : VideoPlatformTheme.textPrimary,
-                    fontSize: compact ? 10 : 11.5,
-                    fontWeight: FontWeight.w600,
+                decoration: BoxDecoration(
+                  color: isFocused
+                      ? VideoPlatformTheme.accent.withValues(alpha: 0.28)
+                      : (overlayStyle
+                          ? const Color(0xAA000000)
+                          : VideoPlatformTheme.bgCard),
+                  borderRadius: BorderRadius.circular(compact ? 10 : 18),
+                  border: Border.all(
+                    color: isFocused
+                        ? VideoPlatformTheme.accent
+                        : (isDirect
+                            ? (overlayStyle
+                                ? Colors.white.withValues(alpha: 0.22)
+                                : VideoPlatformTheme.borderSubtle)
+                            : const Color(0xFF34D399).withValues(alpha: 0.55)),
+                    width: isFocused ? 2.0 : 1.0,
                   ),
                 ),
-                SizedBox(width: compact ? 1 : 2),
-                Icon(
-                  Icons.arrow_drop_down_rounded,
-                  size: compact ? 14 : 16,
-                  color: overlayStyle
-                      ? Colors.white70
-                      : VideoPlatformTheme.textSecondary,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      isDirect
+                          ? Icons.public_off_rounded
+                          : Icons.vpn_lock_rounded,
+                      size: compact ? 11 : 13.5,
+                      color: isFocused ? VideoPlatformTheme.accent : badgeColor,
+                    ),
+                    SizedBox(width: compact ? 3 : 5),
+                    Text(
+                      _buildCurrentLabel(),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: isFocused
+                            ? VideoPlatformTheme.accent
+                            : (overlayStyle
+                                ? Colors.white
+                                : VideoPlatformTheme.textPrimary),
+                        fontSize: compact ? 10 : 11.5,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    SizedBox(width: compact ? 1 : 2),
+                    Icon(
+                      Icons.arrow_drop_down_rounded,
+                      size: compact ? 14 : 16,
+                      color: isFocused
+                          ? VideoPlatformTheme.accent
+                          : (overlayStyle
+                              ? Colors.white70
+                              : VideoPlatformTheme.textSecondary),
+                    ),
+                  ],
                 ),
-              ],
-            ),
+              );
+            },
           ),
         );
       },

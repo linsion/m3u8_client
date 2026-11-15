@@ -42,6 +42,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   int _selectedIndex = 0;
   final TextEditingController _searchController = TextEditingController();
   String? _lastSniffedClipboardUrl;
+  DateTime? _lastBackPressedAt;
 
   @override
   void initState() {
@@ -161,6 +162,39 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     widget.appState.performSearch(trimmed);
   }
 
+  void _handleRootPop(AppState state) {
+    if (_selectedIndex == 0 && state.searchKeyword.isNotEmpty) {
+      _searchController.clear();
+      state.clearSearch();
+      setState(() {});
+      return;
+    }
+    if (_selectedIndex == 0 && state.directoryBreadcrumbs.isNotEmpty) {
+      state.navigateToDirectoryBreadcrumb(
+        state.directoryBreadcrumbs.length - 2,
+      );
+      return;
+    }
+    if (_selectedIndex != 0) {
+      _selectTab(0);
+      return;
+    }
+    final now = DateTime.now();
+    if (_lastBackPressedAt == null ||
+        now.difference(_lastBackPressedAt!) > const Duration(seconds: 2)) {
+      _lastBackPressedAt = now;
+      ScaffoldMessenger.of(context).clearSnackBars();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          duration: Duration(seconds: 2),
+          content: Text('再按一次返回键退出流光视频'),
+        ),
+      );
+      return;
+    }
+    SystemNavigator.pop();
+  }
+
   @override
   Widget build(BuildContext context) {
     return ListenableBuilder(
@@ -174,72 +208,81 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
             MediaQuery.sizeOf(context).width >= 860 || state.tvMode;
         final miniSession = state.miniPlayerSession;
 
-        return CallbackShortcuts(
-          bindings: <ShortcutActivator, VoidCallback>{
-            const SingleActivator(LogicalKeyboardKey.keyK, meta: true):
-                _openCommandPalette,
-            const SingleActivator(LogicalKeyboardKey.keyK, control: true):
-                _openCommandPalette,
+        return PopScope(
+          canPop: false,
+          onPopInvokedWithResult: (didPop, _) {
+            if (!didPop) {
+              _handleRootPop(state);
+            }
           },
-          child: Scaffold(
-            backgroundColor: VideoPlatformTheme.bgPrimary,
-            body: SafeArea(
-              child: Stack(
-                children: [
-                  Column(
-                    children: [
-                      _buildTopHeader(state, isDesktop),
-                      Expanded(
-                        child: Row(
-                          children: [
-                            if (isDesktop) _buildDesktopSidebar(state),
-                            Expanded(
-                              child: KeyedSubtree(
-                                key: ValueKey(state.themeId),
-                                child: _buildActiveScreen(state),
+          child: CallbackShortcuts(
+            bindings: <ShortcutActivator, VoidCallback>{
+              const SingleActivator(LogicalKeyboardKey.keyK, meta: true):
+                  _openCommandPalette,
+              const SingleActivator(LogicalKeyboardKey.keyK, control: true):
+                  _openCommandPalette,
+            },
+            child: Scaffold(
+              backgroundColor: VideoPlatformTheme.bgPrimary,
+              body: SafeArea(
+                child: Stack(
+                  children: [
+                    Column(
+                      children: [
+                        _buildTopHeader(state, isDesktop),
+                        Expanded(
+                          child: Row(
+                            children: [
+                              if (isDesktop) _buildDesktopSidebar(state),
+                              Expanded(
+                                child: KeyedSubtree(
+                                  key: ValueKey(state.themeId),
+                                  child: _buildActiveScreen(state),
+                                ),
                               ),
-                            ),
-                          ],
+                            ],
+                          ),
                         ),
-                      ),
-                    ],
-                  ),
-                  if (miniSession != null)
-                    _FloatingMiniPlayerOverlay(
-                      key: ValueKey(miniSession.streamUrl),
-                      appState: state,
-                      session: miniSession,
-                      onRestoreFullScreen: (currentPosSec) {
-                        state.closeMiniPlayer();
-                        if (miniSession.isLive) {
-                          _selectTab(1);
-                        } else if (miniSession.vodSource != null &&
-                            miniSession.vodId != null &&
-                            miniSession.vodId!.isNotEmpty) {
-                          Navigator.of(context).push(
-                            MaterialPageRoute(
-                              builder: (_) => VodDetailPlayerScreen(
-                                appState: state,
-                                source: miniSession.vodSource!,
-                                vodId: miniSession.vodId!,
-                                initialTitle: miniSession.vodTitle ??
-                                    miniSession.title,
-                                initialPoster: miniSession.vodPoster ?? '',
-                                initialGroupIndex: miniSession.groupIndex,
-                                initialEpisodeIndex: miniSession.episodeIndex,
-                                initialResumeSeconds: currentPosSec.toDouble(),
-                              ),
-                            ),
-                          );
-                        }
-                      },
+                      ],
                     ),
-                  _buildTelegramFloatingNotifications(state, isDesktop),
-                ],
+                    if (miniSession != null)
+                      _FloatingMiniPlayerOverlay(
+                        key: ValueKey(miniSession.streamUrl),
+                        appState: state,
+                        session: miniSession,
+                        onRestoreFullScreen: (currentPosSec) {
+                          state.closeMiniPlayer();
+                          if (miniSession.isLive) {
+                            _selectTab(1);
+                          } else if (miniSession.vodSource != null &&
+                              miniSession.vodId != null &&
+                              miniSession.vodId!.isNotEmpty) {
+                            Navigator.of(context).push(
+                              MaterialPageRoute(
+                                builder: (_) => VodDetailPlayerScreen(
+                                  appState: state,
+                                  source: miniSession.vodSource!,
+                                  vodId: miniSession.vodId!,
+                                  initialTitle: miniSession.vodTitle ??
+                                      miniSession.title,
+                                  initialPoster: miniSession.vodPoster ?? '',
+                                  initialGroupIndex: miniSession.groupIndex,
+                                  initialEpisodeIndex: miniSession.episodeIndex,
+                                  initialResumeSeconds:
+                                      currentPosSec.toDouble(),
+                                ),
+                              ),
+                            );
+                          }
+                        },
+                      ),
+                    _buildTelegramFloatingNotifications(state, isDesktop),
+                  ],
+                ),
               ),
+              bottomNavigationBar:
+                  isDesktop ? null : _buildMobileBottomBar(state),
             ),
-            bottomNavigationBar:
-                isDesktop ? null : _buildMobileBottomBar(state),
           ),
         );
       },
@@ -448,70 +491,106 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
           if (isDesktop) ...[
             const Spacer(),
             // Global Command Palette (Cmd/Ctrl + K) button
-            InkWell(
-              borderRadius: BorderRadius.circular(6),
-              onTap: _openCommandPalette,
-              child: Container(
-                height: 34,
-                padding: const EdgeInsets.symmetric(horizontal: 10),
-                decoration: BoxDecoration(
-                  color: VideoPlatformTheme.bgCard,
-                  borderRadius: BorderRadius.circular(6),
-                  border: Border.all(color: VideoPlatformTheme.borderSubtle),
-                ),
-                child: Row(
-                  children: [
-                    Icon(
-                      Icons.terminal_rounded,
-                      size: 14,
-                      color: VideoPlatformTheme.accent,
-                    ),
-                    const SizedBox(width: 5),
-                    Text(
-                      '命令面板 ⌘K',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: VideoPlatformTheme.textSecondary,
+            if (!state.tvMode) ...[
+              InkWell(
+                borderRadius: BorderRadius.circular(6),
+                onFocusChange: (_) {
+                  if (mounted) setState(() {});
+                },
+                onTap: _openCommandPalette,
+                child: Builder(
+                  builder: (ctx) {
+                    final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                    return Container(
+                      height: 34,
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      decoration: BoxDecoration(
+                        color: isFocused
+                            ? VideoPlatformTheme.accent.withValues(alpha: 0.24)
+                            : VideoPlatformTheme.bgCard,
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(
+                          color: isFocused
+                              ? VideoPlatformTheme.accent
+                              : VideoPlatformTheme.borderSubtle,
+                          width: isFocused ? 2.0 : 1.0,
+                        ),
                       ),
-                    ),
-                  ],
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.terminal_rounded,
+                            size: 14,
+                            color: VideoPlatformTheme.accent,
+                          ),
+                          const SizedBox(width: 5),
+                          Text(
+                            '命令面板 ⌘K',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: isFocused
+                                  ? VideoPlatformTheme.accent
+                                  : VideoPlatformTheme.textSecondary,
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
                 ),
               ),
-            ),
-            const SizedBox(width: 8),
+              const SizedBox(width: 8),
+            ],
             // Quick download indicator button
             InkWell(
               borderRadius: BorderRadius.circular(6),
+              onFocusChange: (_) {
+                if (mounted) setState(() {});
+              },
               onTap: () => setState(() => _selectedIndex = 2),
-              child: Container(
-                height: 34,
-                padding: const EdgeInsets.symmetric(horizontal: 10),
-                decoration: BoxDecoration(
-                  color: VideoPlatformTheme.bgCard,
-                  borderRadius: BorderRadius.circular(6),
-                  border: Border.all(color: VideoPlatformTheme.borderSubtle),
-                ),
-                child: Row(
-                  children: [
-                    Icon(
-                      Icons.downloading_rounded,
-                      size: 16,
-                      color: state.activeTasksCount > 0
-                          ? VideoPlatformTheme.accent
-                          : VideoPlatformTheme.textSecondary,
-                    ),
-                    const SizedBox(width: 6),
-                    Text(
-                      state.activeTasksCount > 0
-                          ? '下载中 (${state.activeTasksCount})'
-                          : '下载队列',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: VideoPlatformTheme.textSecondary,
+              child: Builder(
+                builder: (ctx) {
+                  final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                  return Container(
+                    height: 34,
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    decoration: BoxDecoration(
+                      color: isFocused
+                          ? VideoPlatformTheme.accent.withValues(alpha: 0.24)
+                          : VideoPlatformTheme.bgCard,
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(
+                        color: isFocused
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.borderSubtle,
+                        width: isFocused ? 2.0 : 1.0,
                       ),
                     ),
-                  ],
-                ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.downloading_rounded,
+                          size: 16,
+                          color: (state.activeTasksCount > 0 || isFocused)
+                              ? VideoPlatformTheme.accent
+                              : VideoPlatformTheme.textSecondary,
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          state.activeTasksCount > 0
+                              ? '下载中 (${state.activeTasksCount})'
+                              : '下载队列',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: isFocused
+                                ? VideoPlatformTheme.accent
+                                : VideoPlatformTheme.textSecondary,
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                },
               ),
             ),
             const SizedBox(width: 8),
@@ -625,6 +704,50 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
             ),
           ),
         ),
+        const SizedBox(width: 6),
+        InkWell(
+          borderRadius: BorderRadius.circular(6),
+          onFocusChange: (_) {
+            if (mounted) setState(() {});
+          },
+          onTap: () => state.setAggregatedSearch(!state.aggregatedSearch),
+          child: Builder(
+            builder: (ctx) {
+              final isFocused = Focus.of(ctx).hasPrimaryFocus;
+              return Container(
+                height: 36,
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: isFocused
+                      ? VideoPlatformTheme.accent.withValues(alpha: 0.28)
+                      : (state.aggregatedSearch
+                          ? VideoPlatformTheme.accent.withValues(alpha: 0.16)
+                          : VideoPlatformTheme.bgCard),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(
+                    color: (state.aggregatedSearch || isFocused)
+                        ? VideoPlatformTheme.accent
+                        : VideoPlatformTheme.borderSubtle,
+                    width: isFocused ? 2.0 : 1.0,
+                  ),
+                ),
+                child: Text(
+                  state.aggregatedSearch ? '全网搜' : '单站搜',
+                  style: TextStyle(
+                    fontSize: 11.5,
+                    fontWeight: (state.aggregatedSearch || isFocused)
+                        ? FontWeight.w700
+                        : FontWeight.w400,
+                    color: (state.aggregatedSearch || isFocused)
+                        ? VideoPlatformTheme.accent
+                        : VideoPlatformTheme.textSecondary,
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
         if (state.searchKeyword.isNotEmpty) ...[
           const SizedBox(width: 6),
           IconButton(
@@ -702,52 +825,65 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
 
     return InkWell(
       borderRadius: BorderRadius.circular(6),
+      onFocusChange: (_) {
+        if (mounted) setState(() {});
+      },
       onTap: () => _selectTab(6),
       onLongPress: () => svc.setProxyEnabled(!enabled),
-      child: Tooltip(
-        message: enabled
-            ? '代理已开启 (${active?.displayTitle ?? "未选节点"}) · 点击进入代理与分流管理，长按快速开关'
-            : '代理已关闭 · 点击配置良心云订阅与分场景路由，长按快速开启',
-        child: Container(
-          height: 34,
-          padding: const EdgeInsets.symmetric(horizontal: 10),
-          decoration: BoxDecoration(
-            color: enabled
-                ? VideoPlatformTheme.accent.withValues(alpha: 0.14)
-                : VideoPlatformTheme.bgCard,
-            borderRadius: BorderRadius.circular(6),
-            border: Border.all(
-              color: enabled
-                  ? VideoPlatformTheme.accent
-                  : VideoPlatformTheme.borderSubtle,
-            ),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(
-                enabled ? Icons.vpn_lock_rounded : Icons.public_off_rounded,
-                size: 15,
-                color: enabled
-                    ? VideoPlatformTheme.accent
-                    : VideoPlatformTheme.textSecondary,
-              ),
-              const SizedBox(width: 6),
-              Text(
-                enabled
-                    ? (active != null ? active.displayTitle : '代理已开')
-                    : '代理关闭',
-                style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: enabled ? FontWeight.w600 : FontWeight.normal,
-                  color: enabled
+      child: Builder(
+        builder: (ctx) {
+          final isFocused = Focus.of(ctx).hasPrimaryFocus;
+          return Tooltip(
+            message: enabled
+                ? '代理已开启 (${active?.displayTitle ?? "未选节点"}) · 点击进入代理与分流管理，长按快速开关'
+                : '代理已关闭 · 点击配置良心云订阅与分场景路由，长按快速开启',
+            child: Container(
+              height: 34,
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              decoration: BoxDecoration(
+                color: isFocused
+                    ? VideoPlatformTheme.accent.withValues(alpha: 0.26)
+                    : (enabled
+                        ? VideoPlatformTheme.accent.withValues(alpha: 0.14)
+                        : VideoPlatformTheme.bgCard),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(
+                  color: (enabled || isFocused)
                       ? VideoPlatformTheme.accent
-                      : VideoPlatformTheme.textSecondary,
+                      : VideoPlatformTheme.borderSubtle,
+                  width: isFocused ? 2.0 : 1.0,
                 ),
               ),
-            ],
-          ),
-        ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    enabled ? Icons.vpn_lock_rounded : Icons.public_off_rounded,
+                    size: 15,
+                    color: (enabled || isFocused)
+                        ? VideoPlatformTheme.accent
+                        : VideoPlatformTheme.textSecondary,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    enabled
+                        ? (active != null ? active.displayTitle : '代理已开')
+                        : '代理关闭',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: (enabled || isFocused)
+                          ? FontWeight.w600
+                          : FontWeight.normal,
+                      color: (enabled || isFocused)
+                          ? VideoPlatformTheme.accent
+                          : VideoPlatformTheme.textSecondary,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
       ),
     );
   }

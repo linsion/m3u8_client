@@ -319,30 +319,31 @@ class _LibraryHistoryScreenState extends State<LibraryHistoryScreen> {
               const SizedBox(width: 10),
               _buildTabButton(1, '我的收藏 (${state.favorites.length})'),
               const SizedBox(width: 14),
-              SizedBox(
-                width: 220,
-                height: 32,
-                child: TextField(
-                  controller: _searchCtrl,
-                  onChanged: (v) => setState(() => _searchQuery = v),
-                  style: const TextStyle(fontSize: 12.5),
-                  decoration: InputDecoration(
-                    hintText: '搜索片名、集数或站点...',
-                    prefixIcon: const Icon(Icons.search_rounded, size: 16),
-                    suffixIcon: _searchQuery.isNotEmpty
-                        ? IconButton(
-                            padding: EdgeInsets.zero,
-                            icon: const Icon(Icons.clear_rounded, size: 14),
-                            onPressed: () {
-                              _searchCtrl.clear();
-                              setState(() => _searchQuery = '');
-                            },
-                          )
-                        : null,
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 8),
+              if (!state.tvMode)
+                SizedBox(
+                  width: 220,
+                  height: 32,
+                  child: TextField(
+                    controller: _searchCtrl,
+                    onChanged: (v) => setState(() => _searchQuery = v),
+                    style: const TextStyle(fontSize: 12.5),
+                    decoration: InputDecoration(
+                      hintText: '搜索片名、集数或站点...',
+                      prefixIcon: const Icon(Icons.search_rounded, size: 16),
+                      suffixIcon: _searchQuery.isNotEmpty
+                          ? IconButton(
+                              padding: EdgeInsets.zero,
+                              icon: const Icon(Icons.clear_rounded, size: 14),
+                              onPressed: () {
+                                _searchCtrl.clear();
+                                setState(() => _searchQuery = '');
+                              },
+                            )
+                          : null,
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 8),
+                    ),
                   ),
                 ),
-              ),
               const Spacer(),
               if (_tabIndex == 1 && state.favorites.isNotEmpty)
                 OutlinedButton.icon(
@@ -585,31 +586,55 @@ class _LibraryHistoryScreenState extends State<LibraryHistoryScreen> {
       padding: const EdgeInsets.only(right: 8, top: 5, bottom: 5),
       child: InkWell(
         borderRadius: BorderRadius.circular(14),
+        onFocusChange: (_) {
+          if (mounted) setState(() {});
+        },
         onTap: () => setState(() => _sourceFilterKey = key),
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10),
-          alignment: Alignment.center,
-          decoration: BoxDecoration(
-            color: selected
-                ? VideoPlatformTheme.accent.withValues(alpha: 0.18)
-                : VideoPlatformTheme.bgCard,
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(
-              color: selected
-                  ? VideoPlatformTheme.accent
-                  : VideoPlatformTheme.borderSubtle,
-            ),
-          ),
-          child: Text(
-            label,
-            style: TextStyle(
-              fontSize: 11.5,
-              color: selected
-                  ? VideoPlatformTheme.accent
-                  : VideoPlatformTheme.textSecondary,
-              fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
-            ),
-          ),
+        child: Builder(
+          builder: (ctx) {
+            final isFocused = Focus.of(ctx).hasPrimaryFocus;
+            if (isFocused) {
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (ctx.mounted) {
+                  Scrollable.ensureVisible(
+                    ctx,
+                    alignment: 0.5,
+                    duration: const Duration(milliseconds: 140),
+                  );
+                }
+              });
+            }
+            return Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: isFocused
+                    ? VideoPlatformTheme.accent.withValues(alpha: 0.28)
+                    : (selected
+                        ? VideoPlatformTheme.accent.withValues(alpha: 0.18)
+                        : VideoPlatformTheme.bgCard),
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(
+                  color: (selected || isFocused)
+                      ? VideoPlatformTheme.accent
+                      : VideoPlatformTheme.borderSubtle,
+                  width: isFocused ? 2.0 : 1.0,
+                ),
+              ),
+              child: Text(
+                label,
+                style: TextStyle(
+                  fontSize: 11.5,
+                  color: (selected || isFocused)
+                      ? VideoPlatformTheme.accent
+                      : VideoPlatformTheme.textSecondary,
+                  fontWeight: (selected || isFocused)
+                      ? FontWeight.w600
+                      : FontWeight.w400,
+                ),
+              ),
+            );
+          },
         ),
       ),
     );
@@ -619,27 +644,49 @@ class _LibraryHistoryScreenState extends State<LibraryHistoryScreen> {
     final selected = _tabIndex == index;
     return InkWell(
       borderRadius: BorderRadius.circular(5),
+      onFocusChange: (_) {
+        if (mounted) setState(() {});
+      },
       onTap: () => setState(() {
         _tabIndex = index;
         _sourceFilterKey = '';
         _selectedKeys.clear();
       }),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-        decoration: BoxDecoration(
-          color: selected
-              ? VideoPlatformTheme.accent
-              : VideoPlatformTheme.bgCard,
-          borderRadius: BorderRadius.circular(5),
-        ),
-        child: Text(
-          label,
-          style: TextStyle(
-            fontSize: 13,
-            color: selected ? Colors.white : VideoPlatformTheme.textSecondary,
-            fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
-          ),
-        ),
+      child: Builder(
+        builder: (ctx) {
+          final isFocused = Focus.of(ctx).hasPrimaryFocus;
+          return Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+            decoration: BoxDecoration(
+              color: selected
+                  ? VideoPlatformTheme.accent
+                  : (isFocused
+                      ? VideoPlatformTheme.accent.withValues(alpha: 0.25)
+                      : VideoPlatformTheme.bgCard),
+              borderRadius: BorderRadius.circular(5),
+              border: Border.all(
+                color: (selected || isFocused)
+                    ? VideoPlatformTheme.accent
+                    : Colors.transparent,
+                width: isFocused ? 2.0 : 1.0,
+              ),
+            ),
+            child: Text(
+              label,
+              style: TextStyle(
+                fontSize: 13,
+                color: selected
+                    ? Colors.white
+                    : (isFocused
+                        ? VideoPlatformTheme.accent
+                        : VideoPlatformTheme.textSecondary),
+                fontWeight: (selected || isFocused)
+                    ? FontWeight.w600
+                    : FontWeight.w400,
+              ),
+            ),
+          );
+        },
       ),
     );
   }
@@ -656,6 +703,9 @@ class _LibraryHistoryScreenState extends State<LibraryHistoryScreen> {
 
     return InkWell(
       borderRadius: BorderRadius.circular(6),
+      onFocusChange: (_) {
+        if (mounted) setState(() {});
+      },
       onTap: () {
         if (_isBatchMode) {
           setState(() {
@@ -669,18 +719,34 @@ class _LibraryHistoryScreenState extends State<LibraryHistoryScreen> {
           _openLibraryItem(item);
         }
       },
-      child: Container(
-        padding: const EdgeInsets.all(10),
-        decoration: BoxDecoration(
-          color: VideoPlatformTheme.bgElevated,
-          borderRadius: BorderRadius.circular(6),
-          border: Border.all(
-            color: checked
-                ? VideoPlatformTheme.accent
-                : VideoPlatformTheme.borderSubtle,
-            width: checked ? 1.5 : 1.0,
-          ),
-        ),
+      child: Builder(
+        builder: (ctx) {
+          final isFocused = Focus.of(ctx).hasPrimaryFocus;
+          if (isFocused) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (ctx.mounted) {
+                Scrollable.ensureVisible(
+                  ctx,
+                  alignment: 0.4,
+                  duration: const Duration(milliseconds: 140),
+                );
+              }
+            });
+          }
+          return Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: isFocused
+                  ? VideoPlatformTheme.accent.withValues(alpha: 0.16)
+                  : VideoPlatformTheme.bgElevated,
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(
+                color: (checked || isFocused)
+                    ? VideoPlatformTheme.accent
+                    : VideoPlatformTheme.borderSubtle,
+                width: isFocused ? 2.2 : (checked ? 1.5 : 1.0),
+              ),
+            ),
         child: Row(
           children: [
             if (_isBatchMode) ...[
@@ -842,6 +908,8 @@ class _LibraryHistoryScreenState extends State<LibraryHistoryScreen> {
               ),
           ],
         ),
+      );
+        },
       ),
     );
   }

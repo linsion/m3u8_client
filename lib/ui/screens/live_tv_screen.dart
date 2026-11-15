@@ -1562,17 +1562,19 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
         children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
-            child: TextField(
-              onChanged: (v) => setState(() => _channelSearch = v),
-              decoration: InputDecoration(
-                hintText: '搜索频道名称（如：CCTV、卫视）...',
-                prefixIcon: Icon(
-                  Icons.search,
-                  size: 17,
-                  color: VideoPlatformTheme.textMuted,
-                ),
-              ),
-            ),
+            child: state.tvMode
+                ? _buildTvChannelSearchButton()
+                : TextField(
+                    onChanged: (v) => setState(() => _channelSearch = v),
+                    decoration: InputDecoration(
+                      hintText: '搜索频道名称（如：CCTV、卫视）...',
+                      prefixIcon: Icon(
+                        Icons.search,
+                        size: 17,
+                        color: VideoPlatformTheme.textMuted,
+                      ),
+                    ),
+                  ),
           ),
           if (groups.length > 1)
             SizedBox(
@@ -1601,25 +1603,59 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                     final selected = g == _selectedGroup;
                     return InkWell(
                       borderRadius: BorderRadius.circular(5),
+                      onFocusChange: (_) {
+                        if (mounted) setState(() {});
+                      },
                       onTap: () => setState(() => _selectedGroup = g),
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 10),
-                        alignment: Alignment.center,
-                        decoration: BoxDecoration(
-                          color: selected
-                              ? VideoPlatformTheme.accent
-                              : VideoPlatformTheme.bgCard,
-                          borderRadius: BorderRadius.circular(5),
-                        ),
-                        child: Text(
-                          g,
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: selected
-                                ? Colors.white
-                                : VideoPlatformTheme.textSecondary,
-                          ),
-                        ),
+                      child: Builder(
+                        builder: (ctx) {
+                          final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                          if (isFocused) {
+                            WidgetsBinding.instance.addPostFrameCallback((_) {
+                              if (ctx.mounted) {
+                                Scrollable.ensureVisible(
+                                  ctx,
+                                  alignment: 0.5,
+                                  duration: const Duration(milliseconds: 140),
+                                );
+                              }
+                            });
+                          }
+                          return Container(
+                            padding:
+                                const EdgeInsets.symmetric(horizontal: 10),
+                            alignment: Alignment.center,
+                            decoration: BoxDecoration(
+                              color: selected
+                                  ? VideoPlatformTheme.accent
+                                  : (isFocused
+                                      ? VideoPlatformTheme.accent
+                                          .withValues(alpha: 0.25)
+                                      : VideoPlatformTheme.bgCard),
+                              borderRadius: BorderRadius.circular(5),
+                              border: Border.all(
+                                color: (selected || isFocused)
+                                    ? VideoPlatformTheme.accent
+                                    : VideoPlatformTheme.borderSubtle,
+                                width: isFocused ? 2.0 : 1.0,
+                              ),
+                            ),
+                            child: Text(
+                              g,
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: (selected || isFocused)
+                                    ? FontWeight.w600
+                                    : FontWeight.w400,
+                                color: selected
+                                    ? Colors.white
+                                    : (isFocused
+                                        ? VideoPlatformTheme.accent
+                                        : VideoPlatformTheme.textSecondary),
+                              ),
+                            ),
+                          );
+                        },
                       ),
                     );
                   },
@@ -1643,6 +1679,121 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
           ),
         ],
       ),
+    );
+  }
+
+  Widget _buildTvChannelSearchButton() {
+    return Row(
+      children: [
+        Expanded(
+          child: InkWell(
+            borderRadius: BorderRadius.circular(6),
+            onFocusChange: (_) {
+              if (mounted) setState(() {});
+            },
+            onTap: () async {
+              final ctrl = TextEditingController(text: _channelSearch);
+              final res = await showDialog<String>(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  backgroundColor: VideoPlatformTheme.bgElevated,
+                  title: const Text(
+                    '搜索直播频道',
+                    style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+                  ),
+                  content: SizedBox(
+                    width: 360,
+                    child: TextField(
+                      controller: ctrl,
+                      autofocus: true,
+                      textInputAction: TextInputAction.search,
+                      onSubmitted: (v) => Navigator.of(ctx).pop(v),
+                      decoration: const InputDecoration(
+                        hintText: '输入频道名（如：CCTV、卫视）...',
+                        prefixIcon: Icon(Icons.search_rounded),
+                      ),
+                    ),
+                  ),
+                  actions: [
+                    if (_channelSearch.isNotEmpty)
+                      TextButton(
+                        onPressed: () => Navigator.of(ctx).pop(''),
+                        child: const Text('清空'),
+                      ),
+                    TextButton(
+                      onPressed: () => Navigator.of(ctx).pop(),
+                      child: const Text('取消'),
+                    ),
+                    FilledButton(
+                      onPressed: () => Navigator.of(ctx).pop(ctrl.text),
+                      child: const Text('确定'),
+                    ),
+                  ],
+                ),
+              );
+              if (res != null && mounted) {
+                setState(() => _channelSearch = res.trim());
+              }
+            },
+            child: Builder(
+              builder: (ctx) {
+                final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                return Container(
+                  height: 36,
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                  decoration: BoxDecoration(
+                    color: isFocused
+                        ? VideoPlatformTheme.accent.withValues(alpha: 0.24)
+                        : VideoPlatformTheme.bgInput,
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(
+                      color: isFocused
+                          ? VideoPlatformTheme.accent
+                          : VideoPlatformTheme.borderSubtle,
+                      width: isFocused ? 2.0 : 1.0,
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        Icons.search_rounded,
+                        size: 16,
+                        color: isFocused
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.textMuted,
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          _channelSearch.isEmpty
+                              ? '按遥控器 OK 键搜索频道...'
+                              : '筛选: $_channelSearch',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: _channelSearch.isNotEmpty
+                                ? VideoPlatformTheme.accent
+                                : VideoPlatformTheme.textMuted,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+          ),
+        ),
+        if (_channelSearch.isNotEmpty) ...[
+          const SizedBox(width: 4),
+          IconButton(
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.clear_rounded, size: 16),
+            onPressed: () => setState(() => _channelSearch = ''),
+          ),
+        ],
+      ],
     );
   }
 
@@ -1764,6 +1915,9 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                 children: [
                   // Collapsible Group Header
                   InkWell(
+                    onFocusChange: (_) {
+                      if (mounted) setState(() {});
+                    },
                     onTap: () {
                       setState(() {
                         if (isCollapsed) {
@@ -1773,67 +1927,98 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                         }
                       });
                     },
-                    child: Container(
-                      height: 36,
-                      padding: const EdgeInsets.symmetric(horizontal: 12),
-                      decoration: BoxDecoration(
-                        color: hasPlayingChannel
-                            ? VideoPlatformTheme.accent.withValues(alpha: 0.08)
-                            : VideoPlatformTheme.bgCard.withValues(alpha: 0.65),
-                        border: Border(
-                          bottom: BorderSide(
-                            color: VideoPlatformTheme.borderSubtle,
-                          ),
-                        ),
-                      ),
-                      child: Row(
-                        children: [
-                          Icon(
-                            isCollapsed
-                                ? Icons.keyboard_arrow_right_rounded
-                                : Icons.keyboard_arrow_down_rounded,
-                            size: 18,
-                            color: hasPlayingChannel
+                    child: Builder(
+                      builder: (hdrCtx) {
+                        final isHdrFocused =
+                            Focus.of(hdrCtx).hasPrimaryFocus;
+                        if (isHdrFocused) {
+                          WidgetsBinding.instance.addPostFrameCallback((_) {
+                            if (hdrCtx.mounted) {
+                              Scrollable.ensureVisible(
+                                hdrCtx,
+                                alignment: 0.4,
+                                duration: const Duration(milliseconds: 140),
+                              );
+                            }
+                          });
+                        }
+                        return Container(
+                          height: 36,
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          decoration: BoxDecoration(
+                            color: isHdrFocused
                                 ? VideoPlatformTheme.accent
-                                : VideoPlatformTheme.textSecondary,
-                          ),
-                          const SizedBox(width: 6),
-                          Expanded(
-                            child: Text(
-                              groupName,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontSize: 12.5,
-                                fontWeight: FontWeight.w600,
-                                color: hasPlayingChannel
+                                    .withValues(alpha: 0.25)
+                                : (hasPlayingChannel
                                     ? VideoPlatformTheme.accent
-                                    : VideoPlatformTheme.textPrimary,
+                                        .withValues(alpha: 0.08)
+                                    : VideoPlatformTheme.bgCard
+                                        .withValues(alpha: 0.65)),
+                            border: Border(
+                              top: isHdrFocused
+                                  ? BorderSide(
+                                      color: VideoPlatformTheme.accent,
+                                      width: 2.0,
+                                    )
+                                  : BorderSide.none,
+                              bottom: BorderSide(
+                                color: isHdrFocused
+                                    ? VideoPlatformTheme.accent
+                                    : VideoPlatformTheme.borderSubtle,
+                                width: isHdrFocused ? 2.0 : 1.0,
                               ),
                             ),
                           ),
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 7,
-                              vertical: 1.5,
-                            ),
-                            decoration: BoxDecoration(
-                              color: VideoPlatformTheme.bgElevated,
-                              borderRadius: BorderRadius.circular(10),
-                              border: Border.all(
-                                color: VideoPlatformTheme.borderSubtle,
+                          child: Row(
+                            children: [
+                              Icon(
+                                isCollapsed
+                                    ? Icons.keyboard_arrow_right_rounded
+                                    : Icons.keyboard_arrow_down_rounded,
+                                size: 18,
+                                color: (hasPlayingChannel || isHdrFocused)
+                                    ? VideoPlatformTheme.accent
+                                    : VideoPlatformTheme.textSecondary,
                               ),
-                            ),
-                            child: Text(
-                              '${groupChannels.length}',
-                              style: TextStyle(
-                                fontSize: 11,
-                                color: VideoPlatformTheme.textMuted,
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: Text(
+                                  groupName,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 12.5,
+                                    fontWeight: FontWeight.w600,
+                                    color: (hasPlayingChannel || isHdrFocused)
+                                        ? VideoPlatformTheme.accent
+                                        : VideoPlatformTheme.textPrimary,
+                                  ),
+                                ),
                               ),
-                            ),
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 7,
+                                  vertical: 1.5,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: VideoPlatformTheme.bgElevated,
+                                  borderRadius: BorderRadius.circular(10),
+                                  border: Border.all(
+                                    color: VideoPlatformTheme.borderSubtle,
+                                  ),
+                                ),
+                                child: Text(
+                                  '${groupChannels.length}',
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    color: VideoPlatformTheme.textMuted,
+                                  ),
+                                ),
+                              ),
+                            ],
                           ),
-                        ],
-                      ),
+                        );
+                      },
                     ),
                   ),
                   // Channels inside this group (hidden when collapsed)
