@@ -1534,25 +1534,27 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                                     vertical: 3,
                                   ),
                                   decoration: BoxDecoration(
-                                    color: const Color(0x29FFB800),
+                                    color: VideoPlatformTheme.accent
+                                        .withValues(alpha: 0.18),
                                     borderRadius: BorderRadius.circular(6),
                                     border: Border.all(
-                                      color: const Color(0x80FFB800),
+                                      color: VideoPlatformTheme.accent
+                                          .withValues(alpha: 0.5),
                                     ),
                                   ),
-                                  child: const Row(
+                                  child: Row(
                                     mainAxisSize: MainAxisSize.min,
                                     children: [
                                       Icon(
                                         Icons.auto_awesome_rounded,
                                         size: 13,
-                                        color: Color(0xFFFFC53D),
+                                        color: VideoPlatformTheme.accent,
                                       ),
-                                      SizedBox(width: 4),
+                                      const SizedBox(width: 4),
                                       Text(
                                         '流光影院 · 焦点巨幕',
                                         style: TextStyle(
-                                          color: Color(0xFFFFC53D),
+                                          color: VideoPlatformTheme.accent,
                                           fontSize: 11.5,
                                           fontWeight: FontWeight.w700,
                                         ),
@@ -1568,13 +1570,18 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                                       vertical: 3,
                                     ),
                                     decoration: BoxDecoration(
-                                      color: VideoPlatformTheme.bgCard,
+                                      color: const Color(0xD9101218),
                                       borderRadius: BorderRadius.circular(6),
+                                      border: Border.all(
+                                        color: VideoPlatformTheme.accent
+                                            .withValues(alpha: 0.45),
+                                        width: 0.7,
+                                      ),
                                     ),
                                     child: Text(
                                       heroItem.vodRemarks,
-                                      style: const TextStyle(
-                                        color: Colors.white,
+                                      style: TextStyle(
+                                        color: VideoPlatformTheme.accent,
                                         fontSize: 11.5,
                                         fontWeight: FontWeight.w600,
                                       ),
@@ -1893,18 +1900,20 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                                               vertical: 2,
                                             ),
                                             decoration: BoxDecoration(
-                                              color: const Color(0x2EFFB800),
+                                              color: VideoPlatformTheme.accent
+                                                  .withValues(alpha: 0.18),
                                               borderRadius:
                                                   BorderRadius.circular(5),
                                               border: Border.all(
-                                                color: const Color(0x80FFB800),
+                                                color: VideoPlatformTheme.accent
+                                                    .withValues(alpha: 0.5),
                                                 width: 0.8,
                                               ),
                                             ),
-                                            child: const Text(
+                                            child: Text(
                                               '🎬 流光精选',
                                               style: TextStyle(
-                                                color: Color(0xFFFFC53D),
+                                                color: VideoPlatformTheme.accent,
                                                 fontSize: 10.5,
                                                 fontWeight: FontWeight.w700,
                                               ),
@@ -1920,18 +1929,25 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                                                   vertical: 2,
                                                 ),
                                                 decoration: BoxDecoration(
-                                                  color: Colors.white
-                                                      .withValues(alpha: 0.12),
+                                                  color:
+                                                      const Color(0xD9101218),
                                                   borderRadius:
                                                       BorderRadius.circular(5),
+                                                  border: Border.all(
+                                                    color: VideoPlatformTheme
+                                                        .accent
+                                                        .withValues(alpha: 0.45),
+                                                    width: 0.7,
+                                                  ),
                                                 ),
                                                 child: Text(
                                                   item.vodRemarks,
                                                   maxLines: 1,
                                                   overflow:
                                                       TextOverflow.ellipsis,
-                                                  style: const TextStyle(
-                                                    color: Colors.white,
+                                                  style: TextStyle(
+                                                    color: VideoPlatformTheme
+                                                        .accent,
                                                     fontSize: 10.5,
                                                     fontWeight: FontWeight.w600,
                                                   ),
@@ -2054,7 +2070,7 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                           height: 5,
                           decoration: BoxDecoration(
                             color: active
-                                ? const Color(0xFFFFC53D)
+                                ? VideoPlatformTheme.accent
                                 : Colors.white.withValues(alpha: 0.32),
                             borderRadius: BorderRadius.circular(3),
                           ),
@@ -2246,8 +2262,9 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                                                   borderRadius:
                                                       BorderRadius.circular(4),
                                                   border: Border.all(
-                                                    color:
-                                                        const Color(0x66FFB800),
+                                                    color: VideoPlatformTheme
+                                                        .accent
+                                                        .withValues(alpha: 0.45),
                                                     width: 0.6,
                                                   ),
                                                 ),
@@ -2256,8 +2273,9 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                                                   maxLines: 1,
                                                   overflow:
                                                       TextOverflow.ellipsis,
-                                                  style: const TextStyle(
-                                                    color: Color(0xFFFFC53D),
+                                                  style: TextStyle(
+                                                    color: VideoPlatformTheme
+                                                        .accent,
                                                     fontSize: 10,
                                                     fontWeight: FontWeight.w700,
                                                   ),

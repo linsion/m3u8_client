@@ -2519,17 +2519,16 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     } else if (_selectedIndex == 1) {
       navIdx = 1; // 直播
     } else if (_selectedIndex == 5) {
-      navIdx = 2; // Telegram 对话
-    } else if (_selectedIndex == 4) {
-      navIdx = 3; // 片单
+      navIdx = 2; // 聊天 (Telegram)
     } else {
-      // Tabs 2 (下载), 3 (本地视频), 6 (代理), 7 (终端), 8 (设置) highlight "设置/我的"
-      navIdx = 4;
+      // Tabs 2 (下载), 3 (本地视频), 4 (片单), 6 (代理), 7 (终端), 8 (设置) highlight "设置"
+      navIdx = 3;
     }
 
     final moreLabel = switch (_selectedIndex) {
       2 => '下载',
       3 => '本地库',
+      4 => '片单',
       6 => '代理',
       7 => '终端',
       8 => '设置',
@@ -2537,15 +2536,25 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     };
 
     final isDark = VideoPlatformTheme.isDark;
-    final barBg = isDark
-        ? const Color(0xFF17212B).withValues(alpha: 0.92)
-        : const Color(0xFFF7F8FA).withValues(alpha: 0.94);
-    final topBorderColor = isDark
-        ? const Color(0xFF0E1621).withValues(alpha: 0.85)
-        : const Color(0xFFD8DCE0);
-    final tgBlue = isDark ? const Color(0xFF3E99F7) : const Color(0xFF2481CC);
-    final inactiveColor =
-        isDark ? const Color(0xFF7D8B99) : const Color(0xFF8E8E93);
+    final accentColor = VideoPlatformTheme.accent;
+    final capsuleBg = VideoPlatformTheme.bgElevated
+        .withValues(alpha: isDark ? 0.94 : 0.97);
+    final capsuleBorderColor = VideoPlatformTheme.borderSubtle
+        .withValues(alpha: isDark ? 0.85 : 0.75);
+    final inactiveColor = isDark
+        ? VideoPlatformTheme.textSecondary
+        : const Color(0xFF2C2C2E);
+    final activePillBg = isDark
+        ? accentColor.withValues(alpha: 0.16)
+        : accentColor.withValues(alpha: 0.10);
+    final shadowList = <BoxShadow>[
+      BoxShadow(
+        color: Colors.black.withValues(alpha: isDark ? 0.38 : 0.09),
+        blurRadius: 18,
+        offset: const Offset(0, 4),
+      ),
+    ];
+
     final unreadCount =
         state.telegramNotifications.totalUnreadNotificationCount;
     final activeTasks = state.activeTasksCount;
@@ -2559,27 +2568,27 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       VoidCallback onTap,
     })>[
       (
-        icon: Icons.video_library_outlined,
+        icon: Icons.video_library_rounded,
         activeIcon: Icons.video_library_rounded,
         label: '媒体库',
         badgeCount: 0,
-        badgeColor: tgBlue,
+        badgeColor: accentColor,
         onTap: () => _selectTab(0),
       ),
       (
-        icon: Icons.live_tv_outlined,
+        icon: Icons.live_tv_rounded,
         activeIcon: Icons.live_tv_rounded,
         label: '直播',
         badgeCount: 0,
-        badgeColor: tgBlue,
+        badgeColor: accentColor,
         onTap: () => _selectTab(1),
       ),
       (
-        icon: Icons.forum_outlined,
+        icon: Icons.forum_rounded,
         activeIcon: Icons.forum_rounded,
-        label: '对话',
+        label: '聊天',
         badgeCount: unreadCount,
-        badgeColor: tgBlue,
+        badgeColor: accentColor,
         onTap: () {
           if (_selectedIndex == 5 && state.activeChildBackHandler != null) {
             state.activeChildBackHandler!();
@@ -2589,140 +2598,207 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
         },
       ),
       (
-        icon: Icons.bookmarks_outlined,
-        activeIcon: Icons.bookmarks_rounded,
-        label: '片单',
-        badgeCount: 0,
-        badgeColor: tgBlue,
-        onTap: () => _selectTab(4),
-      ),
-      (
-        icon: Icons.settings_outlined,
+        icon: Icons.settings_rounded,
         activeIcon: Icons.settings_rounded,
         label: moreLabel,
         badgeCount: activeTasks,
-        badgeColor: const Color(0xFF34C759),
+        badgeColor: VideoPlatformTheme.success,
         onTap: () => _showMobileMoreHubSheet(state),
       ),
     ];
 
-    return ClipRect(
-      child: BackdropFilter(
-        filter: ImageFilter.blur(sigmaX: 22, sigmaY: 22),
-        child: Container(
-          decoration: BoxDecoration(
-            color: barBg,
-            border: Border(
-              top: BorderSide(color: topBorderColor, width: 0.6),
-            ),
-          ),
-          child: SafeArea(
-            top: false,
-            child: SizedBox(
-              height: 56,
-              child: Row(
-                children: List.generate(tabs.length, (idx) {
-                  final item = tabs[idx];
-                  final selected = navIdx == idx;
-                  final badgeText = item.badgeCount > 99
-                      ? '99+'
-                      : '${item.badgeCount}';
+    final hasActiveSearch = state.searchKeyword.isNotEmpty;
 
-                  return Expanded(
-                    child: GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onTap: () {
-                        HapticFeedback.selectionClick();
-                        item.onTap();
-                      },
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Stack(
-                            clipBehavior: Clip.none,
-                            alignment: Alignment.center,
-                            children: [
-                              AnimatedContainer(
-                                duration: const Duration(milliseconds: 200),
-                                curve: Curves.easeOutCubic,
-                                width: selected ? 54 : 36,
-                                height: 28,
-                                decoration: BoxDecoration(
-                                  color: selected
-                                      ? tgBlue.withValues(alpha: 0.16)
-                                      : Colors.transparent,
-                                  borderRadius: BorderRadius.circular(14),
-                                ),
-                                alignment: Alignment.center,
-                                child: AnimatedScale(
-                                  scale: selected ? 1.06 : 1.0,
-                                  duration: const Duration(milliseconds: 180),
-                                  curve: Curves.easeOutBack,
-                                  child: Icon(
-                                    selected ? item.activeIcon : item.icon,
-                                    size: 22,
-                                    color: selected ? tgBlue : inactiveColor,
+    return Container(
+      color: VideoPlatformTheme.bgPrimary,
+      child: SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+          child: Row(
+            children: [
+              // 1. Left Floating Stadium Capsule Bar (Telegram Floating Pill Style)
+              Expanded(
+                child: Container(
+                  height: 62,
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(31),
+                    boxShadow: shadowList,
+                  ),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(31),
+                    child: BackdropFilter(
+                      filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 6,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: capsuleBg,
+                          borderRadius: BorderRadius.circular(31),
+                          border: Border.all(
+                            color: capsuleBorderColor,
+                            width: 0.8,
+                          ),
+                        ),
+                        child: Row(
+                          children: List.generate(tabs.length, (idx) {
+                            final item = tabs[idx];
+                            final selected = navIdx == idx;
+                            final badgeText = item.badgeCount > 99
+                                ? '99+'
+                                : '${item.badgeCount}';
+
+                            return Expanded(
+                              child: GestureDetector(
+                                behavior: HitTestBehavior.opaque,
+                                onTap: () {
+                                  HapticFeedback.selectionClick();
+                                  item.onTap();
+                                },
+                                child: AnimatedContainer(
+                                  duration: const Duration(milliseconds: 200),
+                                  curve: Curves.easeOutCubic,
+                                  decoration: BoxDecoration(
+                                    color: selected
+                                        ? activePillBg
+                                        : Colors.transparent,
+                                    borderRadius: BorderRadius.circular(26),
+                                  ),
+                                  child: Column(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      Stack(
+                                        clipBehavior: Clip.none,
+                                        alignment: Alignment.center,
+                                        children: [
+                                          AnimatedScale(
+                                            scale: selected ? 1.06 : 1.0,
+                                            duration: const Duration(
+                                              milliseconds: 180,
+                                            ),
+                                            curve: Curves.easeOutBack,
+                                            child: Icon(
+                                              selected
+                                                  ? item.activeIcon
+                                                  : item.icon,
+                                              size: 24,
+                                              color: selected
+                                                  ? accentColor
+                                                  : inactiveColor,
+                                            ),
+                                          ),
+                                          if (item.badgeCount > 0)
+                                            Positioned(
+                                              right: -10,
+                                              top: -4,
+                                              child: Container(
+                                                constraints:
+                                                    const BoxConstraints(
+                                                  minWidth: 17,
+                                                  minHeight: 16,
+                                                ),
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                  horizontal: 4.5,
+                                                  vertical: 1,
+                                                ),
+                                                decoration: BoxDecoration(
+                                                  color: item.badgeColor,
+                                                  borderRadius:
+                                                      BorderRadius.circular(10),
+                                                  border: Border.all(
+                                                    color: VideoPlatformTheme
+                                                        .bgElevated,
+                                                    width: 1.5,
+                                                  ),
+                                                ),
+                                                alignment: Alignment.center,
+                                                child: Text(
+                                                  badgeText,
+                                                  style: const TextStyle(
+                                                    color: Colors.white,
+                                                    fontSize: 9.5,
+                                                    fontWeight: FontWeight.w700,
+                                                    height: 1.05,
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                        ],
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        item.label,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          fontSize: 11,
+                                          fontWeight: selected
+                                              ? FontWeight.w700
+                                              : FontWeight.w600,
+                                          color: selected
+                                              ? accentColor
+                                              : inactiveColor,
+                                          letterSpacing: 0.1,
+                                        ),
+                                      ),
+                                    ],
                                   ),
                                 ),
                               ),
-                              if (item.badgeCount > 0)
-                                Positioned(
-                                  right: selected ? 2 : -4,
-                                  top: -3,
-                                  child: Container(
-                                    constraints: const BoxConstraints(
-                                      minWidth: 17,
-                                      minHeight: 16,
-                                    ),
-                                    padding: const EdgeInsets.symmetric(
-                                      horizontal: 4.5,
-                                      vertical: 1,
-                                    ),
-                                    decoration: BoxDecoration(
-                                      color: item.badgeColor,
-                                      borderRadius: BorderRadius.circular(10),
-                                      border: Border.all(
-                                        color: isDark
-                                            ? const Color(0xFF17212B)
-                                            : const Color(0xFFF7F8FA),
-                                        width: 1.5,
-                                      ),
-                                    ),
-                                    alignment: Alignment.center,
-                                    child: Text(
-                                      badgeText,
-                                      style: const TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 9.5,
-                                        fontWeight: FontWeight.w700,
-                                        height: 1.05,
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                            ],
-                          ),
-                          const SizedBox(height: 2),
-                          Text(
-                            item.label,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: 10.5,
-                              fontWeight: selected
-                                  ? FontWeight.w600
-                                  : FontWeight.w500,
-                              color: selected ? tgBlue : inactiveColor,
-                              letterSpacing: 0.1,
-                            ),
-                          ),
-                        ],
+                            );
+                          }),
+                        ),
                       ),
                     ),
-                  );
-                }),
+                  ),
+                ),
               ),
-            ),
+              const SizedBox(width: 10),
+              // 2. Right Floating Circular Search Button (matching Telegram screenshot)
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () {
+                  HapticFeedback.selectionClick();
+                  _showTvSearchInputDialog(state);
+                },
+                child: Container(
+                  width: 62,
+                  height: 62,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    boxShadow: shadowList,
+                  ),
+                  child: ClipOval(
+                    child: BackdropFilter(
+                      filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
+                      child: Container(
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: capsuleBg,
+                          border: Border.all(
+                            color: hasActiveSearch
+                                ? accentColor
+                                : capsuleBorderColor,
+                            width: hasActiveSearch ? 1.4 : 0.8,
+                          ),
+                        ),
+                        alignment: Alignment.center,
+                        child: Icon(
+                          Icons.search_rounded,
+                          size: 27,
+                          color: hasActiveSearch
+                              ? accentColor
+                              : VideoPlatformTheme.textPrimary,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
           ),
         ),
       ),

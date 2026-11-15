@@ -480,7 +480,7 @@ class _VodPosterCardState extends State<VodPosterCard> {
                     fit: StackFit.expand,
                     children: [
                       _buildPosterImage(item),
-                      // Top-right NetEase Filmly (网易爆米花) Amber-Gold Remarks / Quality Badge
+                      // Top-right Theme-Colored Remarks / Quality Badge ("更新至xxx集")
                       if (item.vodRemarks.isNotEmpty)
                         Positioned(
                           top: 6,
@@ -495,7 +495,8 @@ class _VodPosterCardState extends State<VodPosterCard> {
                               color: const Color(0xD9101218),
                               borderRadius: BorderRadius.circular(5),
                               border: Border.all(
-                                color: const Color(0x66FFB800),
+                                color: VideoPlatformTheme.accent
+                                    .withValues(alpha: 0.45),
                                 width: 0.7,
                               ),
                             ),
@@ -503,8 +504,8 @@ class _VodPosterCardState extends State<VodPosterCard> {
                               item.vodRemarks,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                color: Color(0xFFFFC53D),
+                              style: TextStyle(
+                                color: VideoPlatformTheme.accent,
                                 fontSize: 10,
                                 fontWeight: FontWeight.w700,
                                 letterSpacing: 0.1,
