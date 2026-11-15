@@ -285,17 +285,22 @@ class _TelegramScreenState extends State<TelegramScreen> {
   String _nextChatCursor = '';
   bool _isLoadingChats = false;
   String _chatFilter = '';
+  bool _isMobileChatSearchOpen = false;
+  double _mobileBackSwipeDx = 0.0;
 
   TelegramChat? _selectedChat;
   bool _userExitedChat = false;
 
   bool get _isMobileLayout {
     final isMobilePlatform =
-        (Platform.isAndroid || Platform.isIOS) && !widget.appState.tvMode;
+        (Platform.isAndroid || Platform.isIOS) && !widget.appState.isHardwareTv;
     if (!mounted) return isMobilePlatform;
     final mq = MediaQuery.maybeSizeOf(context);
     if (mq != null) {
-      return mq.width < 860;
+      if (isMobilePlatform && mq.shortestSide < 600) {
+        return true;
+      }
+      return mq.width < 860 && !(widget.appState.tvMode && mq.width >= 760);
     }
     return isMobilePlatform;
   }
@@ -1133,6 +1138,14 @@ class _TelegramScreenState extends State<TelegramScreen> {
     }
     if (_selectedChat != null) {
       _exitCurrentChatOnMobile();
+      return true;
+    }
+    if (_isMobileChatSearchOpen || _chatFilter.isNotEmpty) {
+      setState(() {
+        _isMobileChatSearchOpen = false;
+        _chatFilter = '';
+        _chatSearchCtrl.clear();
+      });
       return true;
     }
     return false;
@@ -3647,7 +3660,13 @@ class _TelegramScreenState extends State<TelegramScreen> {
       key: _captureBoundaryKey,
       child: LayoutBuilder(
         builder: (context, constraints) {
-          final isDesktop = constraints.maxWidth >= 860 || widget.appState.tvMode;
+          final mqSize = MediaQuery.sizeOf(context);
+          final isPhoneDevice = (Platform.isAndroid || Platform.isIOS) &&
+              !widget.appState.isHardwareTv &&
+              mqSize.shortestSide < 600;
+          final isDesktop = !isPhoneDevice &&
+              constraints.maxWidth >= 760 &&
+              (constraints.maxWidth >= 860 || widget.appState.tvMode);
           final showInfoDrawer =
               isDesktop && _showRightInfoPanel && _selectedChat != null;
 
@@ -3681,11 +3700,35 @@ class _TelegramScreenState extends State<TelegramScreen> {
             );
           }
 
-          // Mobile / Compact layout
+          // Official Telegram Mobile (iOS / Android) Full-Screen Single-Page Stack Navigation:
+          // Page 1: Full-screen Chat List -> Tap Chat -> Page 2: Full-screen Conversation -> Tap Header -> Page 3: Full-screen Chat Info
           if (_selectedChat != null) {
-            return _showRightInfoPanel
-                ? _buildRightChatInfoPanel(tg, _selectedChat!)
-                : _buildConversationPane(tg, isMobile: true);
+            return GestureDetector(
+              behavior: HitTestBehavior.translucent,
+              onHorizontalDragStart: (details) {
+                _mobileBackSwipeDx = details.globalPosition.dx <= 42 ? 0.0 : -1.0;
+              },
+              onHorizontalDragUpdate: (details) {
+                if (_mobileBackSwipeDx >= 0) {
+                  _mobileBackSwipeDx += details.delta.dx;
+                }
+              },
+              onHorizontalDragEnd: (details) {
+                if (_mobileBackSwipeDx > 72 ||
+                    (_mobileBackSwipeDx >= 0 &&
+                        (details.primaryVelocity ?? 0) > 520)) {
+                  if (_showRightInfoPanel) {
+                    setState(() => _showRightInfoPanel = false);
+                  } else {
+                    _exitCurrentChatOnMobile();
+                  }
+                }
+                _mobileBackSwipeDx = -1.0;
+              },
+              child: _showRightInfoPanel
+                  ? _buildRightChatInfoPanel(tg, _selectedChat!)
+                  : _buildConversationPane(tg, isMobile: true),
+            );
           }
           return _buildDialogsSidebar(tg, isMobile: true);
         },
@@ -3996,7 +4039,359 @@ class _TelegramScreenState extends State<TelegramScreen> {
     );
   }
 
-  /// Left dialogs list matching official Telegram Desktop
+  void _showMobileTelegramAccountDrawer(_TgPalette tg) {
+    final activeAcc = _accounts.firstWhere(
+      (a) => a.id == _activeAccountId,
+      orElse: () => TelegramAccount(id: _activeAccountId, name: '当前账号'),
+    );
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: tg.sidebarBg,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (sheetCtx) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(
+                  child: Container(
+                    width: 36,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: tg.textMuted.withValues(alpha: 0.4),
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                // Active Account Profile Header
+                Row(
+                  children: [
+                    _buildPeerAvatar(
+                      activeAcc.id,
+                      activeAcc.name,
+                      size: 52,
+                      fontSize: 18,
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            activeAcc.displayLabel,
+                            style: TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w700,
+                              color: tg.textPrimary,
+                            ),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            _authStatus.authorized
+                                ? '在线 · ${_chats.length} 个会话'
+                                : (_authStatus.configured ? '待验证码登录' : '未配置 API'),
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              color: _authStatus.authorized
+                                  ? const Color(0xFF4ECC5E)
+                                  : tg.textSecondary,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    TextButton.icon(
+                      onPressed: () {
+                        Navigator.of(sheetCtx).pop();
+                        _showAccountSettingsDialog();
+                      },
+                      icon: Icon(
+                        Icons.manage_accounts_rounded,
+                        size: 18,
+                        color: tg.tgBlueBright,
+                      ),
+                      label: Text(
+                        '管理账号',
+                        style: TextStyle(color: tg.tgBlueBright),
+                      ),
+                    ),
+                  ],
+                ),
+                if (_accounts.length > 1) ...[
+                  const SizedBox(height: 12),
+                  Divider(height: 1, color: tg.borderLine),
+                  const SizedBox(height: 8),
+                  Text(
+                    '切换 Telegram 账号',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: tg.textMuted,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  ..._accounts.map(
+                    (acc) => ListTile(
+                      dense: true,
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+                      leading: _buildPeerAvatar(
+                        acc.id,
+                        acc.name,
+                        size: 34,
+                        fontSize: 13,
+                      ),
+                      title: Text(
+                        acc.displayLabel,
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: acc.id == _activeAccountId
+                              ? FontWeight.w600
+                              : FontWeight.w400,
+                          color: tg.textPrimary,
+                        ),
+                      ),
+                      trailing: acc.id == _activeAccountId
+                          ? Icon(
+                              Icons.check_circle_rounded,
+                              size: 19,
+                              color: tg.tgBlueBright,
+                            )
+                          : null,
+                      onTap: () async {
+                        Navigator.of(sheetCtx).pop();
+                        if (acc.id != _activeAccountId) {
+                          try {
+                            await widget.appState.api
+                                .setActiveTelegramAccount(acc.id);
+                          } catch (_) {}
+                          await _bootstrapTelegram(
+                            preferredAccountId: acc.id,
+                            forceRefresh: true,
+                          );
+                        }
+                      },
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 8),
+                Divider(height: 1, color: tg.borderLine),
+                ListTile(
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+                  leading: Icon(
+                    Icons.bookmark_outline_rounded,
+                    color: tg.tgBlueBright,
+                  ),
+                  title: Text(
+                    '收藏夹 (Saved Messages)',
+                    style: TextStyle(fontSize: 14.5, color: tg.textPrimary),
+                  ),
+                  onTap: () {
+                    Navigator.of(sheetCtx).pop();
+                    final selfChats = _chats.where(
+                      (c) =>
+                          c.self ||
+                          c.peer == 'self' ||
+                          c.peer.startsWith('self:') ||
+                          c.title.trim() == '收藏夹',
+                    );
+                    if (selfChats.isNotEmpty) {
+                      _selectChat(selfChats.first);
+                    } else {
+                      _selectChat(
+                        const TelegramChat(
+                          peer: 'self',
+                          title: '收藏夹',
+                          self: true,
+                        ),
+                      );
+                    }
+                  },
+                ),
+                ListTile(
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+                  leading: Icon(
+                    Icons.done_all_rounded,
+                    color: tg.tgBlueBright,
+                  ),
+                  title: Text(
+                    '全部会话标为已读',
+                    style: TextStyle(fontSize: 14.5, color: tg.textPrimary),
+                  ),
+                  onTap: () {
+                    Navigator.of(sheetCtx).pop();
+                    _markAllChatsAsRead();
+                  },
+                ),
+                ListTile(
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+                  leading: Icon(
+                    Icons.notifications_active_outlined,
+                    color: tg.textSecondary,
+                  ),
+                  title: Text(
+                    '消息推送与免打扰设置',
+                    style: TextStyle(fontSize: 14.5, color: tg.textPrimary),
+                  ),
+                  onTap: () {
+                    Navigator.of(sheetCtx).pop();
+                    _showNotificationSettingsDialog();
+                  },
+                ),
+                ListTile(
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+                  leading: Icon(
+                    Icons.settings_outlined,
+                    color: tg.textSecondary,
+                  ),
+                  title: Text(
+                    '账号登录与 API 配置',
+                    style: TextStyle(fontSize: 14.5, color: tg.textPrimary),
+                  ),
+                  onTap: () {
+                    Navigator.of(sheetCtx).pop();
+                    _showAccountSettingsDialog();
+                  },
+                ),
+                ListTile(
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+                  leading: Icon(
+                    Icons.sync_rounded,
+                    color: tg.textSecondary,
+                  ),
+                  title: Text(
+                    '重新同步会话与分组',
+                    style: TextStyle(fontSize: 14.5, color: tg.textPrimary),
+                  ),
+                  onTap: () {
+                    Navigator.of(sheetCtx).pop();
+                    _bootstrapTelegram(
+                      preferredAccountId: _activeAccountId,
+                      forceRefresh: true,
+                    );
+                  },
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  void _showMobileChatRowContextSheet(_TgPalette tg, TelegramChat chat) {
+    final isMuted = chat.muted ||
+        widget.appState.telegramNotifications.isPeerMuted(
+          _activeAccountId,
+          chat.peer,
+        );
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: tg.sidebarBg,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+      ),
+      builder: (sheetCtx) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 10),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                ListTile(
+                  leading: _buildPeerAvatar(
+                    chat.peer,
+                    chat.title,
+                    avatar: chat.avatar,
+                    isSelf: chat.self,
+                    size: 42,
+                    fontSize: 15,
+                  ),
+                  title: Text(
+                    chat.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 15.5,
+                      fontWeight: FontWeight.w700,
+                      color: tg.textPrimary,
+                    ),
+                  ),
+                  subtitle: Text(
+                    chat.preview.isNotEmpty
+                        ? chat.preview
+                        : (chat.broadcast ? '频道广播' : '会话'),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 12.5, color: tg.textSecondary),
+                  ),
+                ),
+                Divider(height: 1, color: tg.borderLine),
+                if (chat.unread > 0)
+                  ListTile(
+                    leading: Icon(
+                      Icons.mark_chat_read_outlined,
+                      color: tg.tgBlueBright,
+                    ),
+                    title: Text(
+                      '标记为已读',
+                      style: TextStyle(color: tg.textPrimary),
+                    ),
+                    onTap: () {
+                      Navigator.of(sheetCtx).pop();
+                      _markChatAsRead(chat);
+                    },
+                  ),
+                ListTile(
+                  leading: Icon(
+                    isMuted
+                        ? Icons.notifications_active_outlined
+                        : Icons.notifications_off_outlined,
+                    color: tg.textSecondary,
+                  ),
+                  title: Text(
+                    isMuted ? '开启此会话新消息通知' : '静音此会话通知',
+                    style: TextStyle(color: tg.textPrimary),
+                  ),
+                  onTap: () async {
+                    Navigator.of(sheetCtx).pop();
+                    await widget.appState.telegramNotifications
+                        .toggleLocalPeerMute(_activeAccountId, chat.peer);
+                    if (mounted) setState(() {});
+                  },
+                ),
+                ListTile(
+                  leading: Icon(
+                    Icons.info_outline_rounded,
+                    color: tg.textSecondary,
+                  ),
+                  title: Text(
+                    '查看共享媒体与会话资料',
+                    style: TextStyle(color: tg.textPrimary),
+                  ),
+                  onTap: () async {
+                    Navigator.of(sheetCtx).pop();
+                    await _selectChat(chat);
+                    if (mounted) {
+                      setState(() => _showRightInfoPanel = true);
+                    }
+                  },
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// Left dialogs list matching official Telegram Desktop & Official Telegram Mobile
   Widget _buildDialogsSidebar(_TgPalette tg, {required bool isMobile}) {
     final kw = _chatFilter.trim().toLowerCase();
     final filteredChats = _chats.where((c) {
@@ -4005,122 +4400,295 @@ class _TelegramScreenState extends State<TelegramScreen> {
           c.kind.toLowerCase().contains(kw) ||
           c.preview.toLowerCase().contains(kw);
     }).toList();
+    final totalUnreadChats = _chats.where((c) => c.unread > 0).length;
+    final showMobileSearchBar =
+        isMobile && (_isMobileChatSearchOpen || _chatFilter.isNotEmpty);
 
     return Container(
       color: tg.sidebarBg,
       child: Column(
         children: [
-          // Official Telegram Top Search Bar
-          Container(
-            height: 54,
-            padding: const EdgeInsets.symmetric(horizontal: 10),
-            child: Row(
-              children: [
-                if (isMobile)
-                  IconButton(
-                    onPressed: _showAccountSettingsDialog,
-                    icon: Icon(
-                      Icons.menu_rounded,
-                      size: 22,
-                      color: tg.textSecondary,
-                    ),
+          // Official Telegram Top AppBar (Mobile vs Desktop)
+          if (isMobile)
+            Container(
+              height: 54,
+              padding: const EdgeInsets.symmetric(horizontal: 6),
+              decoration: BoxDecoration(
+                color: tg.headerBg,
+                border: Border(
+                  bottom: BorderSide(
+                    color: _folders.length > 1
+                        ? Colors.transparent
+                        : tg.borderLine,
                   ),
-                Expanded(
-                  child: Container(
-                    height: 36,
-                    decoration: BoxDecoration(
-                      color: tg.searchFill,
-                      borderRadius: BorderRadius.circular(18),
-                    ),
-                    child: TextField(
-                      controller: _chatSearchCtrl,
-                      onChanged: (v) => setState(() => _chatFilter = v),
-                      style: TextStyle(fontSize: 13, color: tg.textPrimary),
-                      decoration: InputDecoration(
-                        filled: false,
-                        border: InputBorder.none,
-                        enabledBorder: InputBorder.none,
-                        focusedBorder: InputBorder.none,
-                        hintText: '搜索',
-                        hintStyle: TextStyle(
-                          fontSize: 13,
-                          color: tg.textMuted,
+                ),
+              ),
+              child: showMobileSearchBar
+                  ? Row(
+                      children: [
+                        IconButton(
+                          tooltip: '关闭搜索',
+                          onPressed: () {
+                            _chatSearchCtrl.clear();
+                            setState(() {
+                              _chatFilter = '';
+                              _isMobileChatSearchOpen = false;
+                            });
+                          },
+                          icon: Icon(
+                            Icons.arrow_back_rounded,
+                            size: 22,
+                            color: tg.textSecondary,
+                          ),
                         ),
-                        contentPadding:
-                            const EdgeInsets.symmetric(vertical: 9),
-                        prefixIcon: Icon(
-                          Icons.search_rounded,
-                          size: 18,
-                          color: tg.textMuted,
+                        Expanded(
+                          child: TextField(
+                            controller: _chatSearchCtrl,
+                            autofocus: true,
+                            onChanged: (v) => setState(() => _chatFilter = v),
+                            style: TextStyle(
+                              fontSize: 15,
+                              color: tg.textPrimary,
+                            ),
+                            decoration: InputDecoration(
+                              filled: false,
+                              border: InputBorder.none,
+                              enabledBorder: InputBorder.none,
+                              focusedBorder: InputBorder.none,
+                              hintText: '搜索会话、频道或消息...',
+                              hintStyle: TextStyle(
+                                fontSize: 14.5,
+                                color: tg.textMuted,
+                              ),
+                            ),
+                          ),
                         ),
-                        suffixIcon: _chatFilter.isNotEmpty
-                            ? IconButton(
-                                icon: Icon(
-                                  Icons.close_rounded,
-                                  size: 16,
-                                  color: tg.textMuted,
+                        if (_chatFilter.isNotEmpty)
+                          IconButton(
+                            onPressed: () {
+                              _chatSearchCtrl.clear();
+                              setState(() => _chatFilter = '');
+                            },
+                            icon: Icon(
+                              Icons.close_rounded,
+                              size: 20,
+                              color: tg.textMuted,
+                            ),
+                          ),
+                      ],
+                    )
+                  : Row(
+                      children: [
+                        IconButton(
+                          tooltip: 'Telegram 菜单与账号',
+                          onPressed: () => _showMobileTelegramAccountDrawer(tg),
+                          icon: Stack(
+                            clipBehavior: Clip.none,
+                            children: [
+                              Icon(
+                                Icons.menu_rounded,
+                                size: 24,
+                                color: tg.textPrimary,
+                              ),
+                              Positioned(
+                                right: -1,
+                                bottom: -1,
+                                child: Container(
+                                  width: 8,
+                                  height: 8,
+                                  decoration: BoxDecoration(
+                                    color: _authStatus.authorized
+                                        ? const Color(0xFF4ECC5E)
+                                    : const Color(0xFFF5A623),
+                                    shape: BoxShape.circle,
+                                    border: Border.all(
+                                      color: tg.headerBg,
+                                      width: 1.5,
+                                    ),
+                                  ),
                                 ),
-                                onPressed: () {
-                                  _chatSearchCtrl.clear();
-                                  setState(() => _chatFilter = '');
-                                },
-                              )
-                            : null,
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Row(
+                            children: [
+                              Flexible(
+                                child: Text(
+                                  _isLoadingChats ? '更新中...' : 'Telegram',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.w700,
+                                    color: tg.textPrimary,
+                                  ),
+                                ),
+                              ),
+                              if (totalUnreadChats > 0) ...[
+                                const SizedBox(width: 8),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 7,
+                                    vertical: 2,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: tg.tgBlueBright,
+                                    borderRadius: BorderRadius.circular(10),
+                                  ),
+                                  child: Text(
+                                    '$totalUnreadChats',
+                                    style: const TextStyle(
+                                      fontSize: 11.5,
+                                      fontWeight: FontWeight.w700,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
+                        ),
+                        if (_isLoadingChats)
+                          Padding(
+                            padding: const EdgeInsets.only(right: 6),
+                            child: SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: tg.tgBlueBright,
+                              ),
+                            ),
+                          ),
+                        if (totalUnreadChats > 0)
+                          IconButton(
+                            visualDensity: VisualDensity.compact,
+                            tooltip: '全部标为已读',
+                            onPressed: _markAllChatsAsRead,
+                            icon: Icon(
+                              Icons.done_all_rounded,
+                              size: 21,
+                              color: tg.tgBlueBright,
+                            ),
+                          ),
+                        IconButton(
+                          tooltip: '搜索会话',
+                          onPressed: () => setState(
+                            () => _isMobileChatSearchOpen = true,
+                          ),
+                          icon: Icon(
+                            Icons.search_rounded,
+                            size: 23,
+                            color: tg.textPrimary,
+                          ),
+                        ),
+                      ],
+                    ),
+            )
+          else
+            Container(
+              height: 54,
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Container(
+                      height: 36,
+                      decoration: BoxDecoration(
+                        color: tg.searchFill,
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                      child: TextField(
+                        controller: _chatSearchCtrl,
+                        onChanged: (v) => setState(() => _chatFilter = v),
+                        style: TextStyle(fontSize: 13, color: tg.textPrimary),
+                        decoration: InputDecoration(
+                          filled: false,
+                          border: InputBorder.none,
+                          enabledBorder: InputBorder.none,
+                          focusedBorder: InputBorder.none,
+                          hintText: '搜索',
+                          hintStyle: TextStyle(
+                            fontSize: 13,
+                            color: tg.textMuted,
+                          ),
+                          contentPadding:
+                              const EdgeInsets.symmetric(vertical: 9),
+                          prefixIcon: Icon(
+                            Icons.search_rounded,
+                            size: 18,
+                            color: tg.textMuted,
+                          ),
+                          suffixIcon: _chatFilter.isNotEmpty
+                              ? IconButton(
+                                  icon: Icon(
+                                    Icons.close_rounded,
+                                    size: 16,
+                                    color: tg.textMuted,
+                                  ),
+                                  onPressed: () {
+                                    _chatSearchCtrl.clear();
+                                    setState(() => _chatFilter = '');
+                                  },
+                                )
+                              : null,
+                        ),
                       ),
                     ),
                   ),
-                ),
-                const SizedBox(width: 4),
-                if (_chats.any((c) => c.unread > 0))
+                  const SizedBox(width: 4),
+                  if (_chats.any((c) => c.unread > 0))
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      onPressed: _markAllChatsAsRead,
+                      icon: Icon(
+                        Icons.done_all_rounded,
+                        size: 19,
+                        color: tg.tgBlueBright,
+                      ),
+                    ),
                   IconButton(
                     visualDensity: VisualDensity.compact,
-                    onPressed: _markAllChatsAsRead,
+                    onPressed: _showNotificationSettingsDialog,
                     icon: Icon(
-                      Icons.done_all_rounded,
+                      (widget.appState.telegramNotifications
+                                  .systemNotificationsEnabled ||
+                              widget.appState.telegramNotifications
+                                  .inAppNotificationsEnabled)
+                          ? Icons.notifications_active_outlined
+                          : Icons.notifications_off_outlined,
                       size: 19,
-                      color: tg.tgBlueBright,
+                      color: (widget.appState.telegramNotifications
+                                  .systemNotificationsEnabled ||
+                              widget.appState.telegramNotifications
+                                  .inAppNotificationsEnabled)
+                          ? tg.tgBlueBright
+                          : tg.textMuted,
                     ),
                   ),
-                IconButton(
-                  visualDensity: VisualDensity.compact,
-                  onPressed: _showNotificationSettingsDialog,
-                  icon: Icon(
-                    (widget.appState.telegramNotifications
-                                .systemNotificationsEnabled ||
-                            widget.appState.telegramNotifications
-                                .inAppNotificationsEnabled)
-                        ? Icons.notifications_active_outlined
-                        : Icons.notifications_off_outlined,
-                    size: 19,
-                    color: (widget.appState.telegramNotifications
-                                .systemNotificationsEnabled ||
-                            widget.appState.telegramNotifications
-                                .inAppNotificationsEnabled)
-                        ? tg.tgBlueBright
-                        : tg.textMuted,
-                  ),
-                ),
-                IconButton(
-                  visualDensity: VisualDensity.compact,
-                  onPressed: _isLoadingChats
-                      ? null
-                      : () => _loadFoldersAndChats(loadMore: false),
-                  icon: _isLoadingChats
-                      ? SizedBox(
-                          width: 15,
-                          height: 15,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            color: tg.tgBlueBright,
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    onPressed: _isLoadingChats
+                        ? null
+                        : () => _loadFoldersAndChats(loadMore: false),
+                    icon: _isLoadingChats
+                        ? SizedBox(
+                            width: 15,
+                            height: 15,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: tg.tgBlueBright,
+                            ),
+                          )
+                        : Icon(
+                            Icons.refresh_rounded,
+                            size: 19,
+                            color: tg.textSecondary,
                           ),
-                        )
-                      : Icon(
-                          Icons.refresh_rounded,
-                          size: 19,
-                          color: tg.textSecondary,
-                        ),
-                ),
-                if (!isMobile)
+                  ),
                   IconButton(
                     visualDensity: VisualDensity.compact,
                     tooltip: '收起左侧会话列表',
@@ -4133,22 +4701,23 @@ class _TelegramScreenState extends State<TelegramScreen> {
                       color: tg.textSecondary,
                     ),
                   ),
-              ],
+                ],
+              ),
             ),
-          ),
 
-          // Mobile horizontal folder tabs (on desktop they live in the far-left rail)
+          // Mobile horizontal folder tabs (Official Telegram Mobile style)
           if (isMobile && _folders.length > 1)
             Container(
-              height: 36,
+              height: 40,
               decoration: BoxDecoration(
+                color: tg.headerBg,
                 border: Border(bottom: BorderSide(color: tg.borderLine)),
               ),
               child: ListView.separated(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
+                padding: const EdgeInsets.symmetric(horizontal: 14),
                 scrollDirection: Axis.horizontal,
                 itemCount: _folders.length,
-                separatorBuilder: (_, __) => const SizedBox(width: 16),
+                separatorBuilder: (_, __) => const SizedBox(width: 20),
                 itemBuilder: (_, idx) {
                   final f = _folders[idx];
                   final selected = f.key == _selectedFolderKey;
@@ -4162,16 +4731,16 @@ class _TelegramScreenState extends State<TelegramScreen> {
                             color: selected
                                 ? tg.tgBlueBright
                                 : Colors.transparent,
-                            width: 2.5,
+                            width: 3.0,
                           ),
                         ),
                       ),
                       child: Text(
                         f.displayTitle,
                         style: TextStyle(
-                          fontSize: 13,
+                          fontSize: 14,
                           fontWeight:
-                              selected ? FontWeight.w600 : FontWeight.w500,
+                              selected ? FontWeight.w700 : FontWeight.w500,
                           color: selected ? tg.tgBlueBright : tg.textSecondary,
                         ),
                       ),
@@ -4200,83 +4769,100 @@ class _TelegramScreenState extends State<TelegramScreen> {
                           ),
                         ),
                       )
-                    : NotificationListener<ScrollNotification>(
-                        onNotification: (notification) {
-                          if (_nextChatCursor.isNotEmpty &&
-                              !_isLoadingChats &&
-                              notification.metrics.pixels >=
-                                  notification.metrics.maxScrollExtent - 100) {
-                            _loadFoldersAndChats(loadMore: true);
-                          }
-                          return false;
-                        },
-                        child: ListView.builder(
-                          itemCount: filteredChats.length +
-                              (_nextChatCursor.isNotEmpty ? 1 : 0),
-                          itemBuilder: (_, idx) {
-                          if (idx >= filteredChats.length) {
-                            return Padding(
-                              padding: const EdgeInsets.all(12),
-                              child: TextButton(
-                                onPressed: _isLoadingChats
-                                    ? null
-                                    : () =>
-                                        _loadFoldersAndChats(loadMore: true),
-                                child: Text(
-                                  _isLoadingChats ? '正在加载更多...' : '加载更多会话',
-                                  style: TextStyle(color: tg.tgBlueBright),
+                    : RefreshIndicator(
+                        color: tg.tgBlueBright,
+                        backgroundColor: tg.sidebarBg,
+                        onRefresh: () => _loadFoldersAndChats(loadMore: false),
+                        child: NotificationListener<ScrollNotification>(
+                          onNotification: (notification) {
+                            if (_nextChatCursor.isNotEmpty &&
+                                !_isLoadingChats &&
+                                notification.metrics.pixels >=
+                                    notification.metrics.maxScrollExtent - 100) {
+                              _loadFoldersAndChats(loadMore: true);
+                            }
+                            return false;
+                          },
+                          child: ListView.builder(
+                            physics: const AlwaysScrollableScrollPhysics(),
+                            itemCount: filteredChats.length +
+                                (_nextChatCursor.isNotEmpty ? 1 : 0),
+                            itemBuilder: (_, idx) {
+                            if (idx >= filteredChats.length) {
+                              return Padding(
+                                padding: const EdgeInsets.all(12),
+                                child: TextButton(
+                                  onPressed: _isLoadingChats
+                                      ? null
+                                      : () =>
+                                          _loadFoldersAndChats(loadMore: true),
+                                  child: Text(
+                                    _isLoadingChats ? '正在加载更多...' : '加载更多会话',
+                                    style: TextStyle(color: tg.tgBlueBright),
+                                  ),
                                 ),
-                              ),
-                            );
-                          }
-                          final chat = filteredChats[idx];
-                          final isSelected =
-                              !isMobile && _selectedChat?.peer == chat.peer;
+                              );
+                            }
+                            final chat = filteredChats[idx];
+                            final isSelected =
+                                !isMobile && _selectedChat?.peer == chat.peer;
 
-                          return Material(
-                            color: isSelected
-                                ? tg.sidebarSelected
-                                : Colors.transparent,
-                            child: InkWell(
-                              hoverColor: isSelected
+                            return Material(
+                              color: isSelected
                                   ? tg.sidebarSelected
-                                  : tg.sidebarHover,
-                              onFocusChange: (_) {
-                                if (mounted) setState(() {});
-                              },
-                              onTap: () => _selectChat(chat),
-                              child: Builder(
-                                builder: (itemCtx) {
-                                  final isFocused =
-                                      Focus.of(itemCtx).hasPrimaryFocus;
-                                  return Container(
-                                    height: 68,
-                                    padding: const EdgeInsets.symmetric(
-                                      horizontal: 10,
-                                    ),
-                                    decoration: BoxDecoration(
-                                      color: isFocused && !isSelected
-                                          ? tg.tgBlueBright
-                                              .withValues(alpha: 0.22)
-                                          : null,
-                                      border: isFocused
-                                          ? Border.all(
-                                              color: const Color(0xFFFFE066),
-                                              width: 2.0,
-                                            )
-                                          : null,
-                                    ),
-                                    child: Row(
-                                      children: [
-                                    _buildPeerAvatar(
-                                      chat.peer,
-                                      chat.title,
-                                      avatar: chat.avatar,
-                                      isSelf: chat.self,
-                                      size: 48,
-                                      fontSize: 17,
-                                    ),
-                                    const SizedBox(width: 11),
+                                  : Colors.transparent,
+                              child: InkWell(
+                                hoverColor: isSelected
+                                    ? tg.sidebarSelected
+                                    : tg.sidebarHover,
+                                onFocusChange: (_) {
+                                  if (mounted) setState(() {});
+                                },
+                                onTap: () => _selectChat(chat),
+                                onLongPress: isMobile
+                                    ? () =>
+                                        _showMobileChatRowContextSheet(tg, chat)
+                                    : null,
+                                child: Builder(
+                                  builder: (itemCtx) {
+                                    final isFocused =
+                                        Focus.of(itemCtx).hasPrimaryFocus;
+                                    return Container(
+                                      height: isMobile ? 72 : 68,
+                                      padding: EdgeInsets.symmetric(
+                                        horizontal: isMobile ? 12 : 10,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: isFocused && !isSelected
+                                            ? tg.tgBlueBright
+                                                .withValues(alpha: 0.22)
+                                            : null,
+                                        border: isFocused
+                                            ? Border.all(
+                                                color: const Color(0xFFFFE066),
+                                                width: 2.0,
+                                              )
+                                            : (isMobile
+                                                ? Border(
+                                                    bottom: BorderSide(
+                                                      color: tg.borderLine
+                                                          .withValues(alpha: 0.45),
+                                                      width: 0.6,
+                                                    ),
+                                                  )
+                                                : null),
+                                      ),
+                                      child: Row(
+                                        children: [
+                                      _buildPeerAvatar(
+                                        chat.peer,
+                                        chat.title,
+                                        avatar: chat.avatar,
+                                        isSelf: chat.self,
+                                        size: isMobile ? 52 : 48,
+                                        fontSize: isMobile ? 18 : 17,
+                                      ),
+                                      SizedBox(width: isMobile ? 12 : 11),
                                     Expanded(
                                       child: Column(
                                         mainAxisAlignment:
@@ -4503,6 +5089,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
                     },
                     ),
                   ),
+                ),
       ),
     ],
   ),
@@ -4676,15 +5263,230 @@ class _TelegramScreenState extends State<TelegramScreen> {
                 ),
               ),
               const SizedBox(width: 4),
-              Flexible(
-                flex: 0,
-                child: SingleChildScrollView(
-                  scrollDirection: Axis.horizontal,
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      // Quick media filter pills (All / Videos / Photos / Music / Files) on desktop
-                      if (!isMobile) ...[
+              if (isMobile)
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: '搜索消息',
+                      icon: Icon(
+                        Icons.search_rounded,
+                        size: 21,
+                        color: _showInChatSearch
+                            ? tg.tgBlueBright
+                            : tg.textSecondary,
+                      ),
+                      onPressed: () {
+                        setState(() {
+                          _showInChatSearch = !_showInChatSearch;
+                          if (!_showInChatSearch) {
+                            _msgSearchCtrl.clear();
+                            _messageFilter = '';
+                          }
+                        });
+                      },
+                    ),
+                    Builder(
+                      builder: (_) {
+                        final isMuted = chat.muted ||
+                            widget.appState.telegramNotifications.isPeerMuted(
+                              _activeAccountId,
+                              chat.peer,
+                            );
+                        return PopupMenuButton<String>(
+                          color: tg.sidebarBg,
+                          tooltip: '更多操作',
+                          icon: Icon(
+                            Icons.more_vert_rounded,
+                            size: 21,
+                            color: tg.textSecondary,
+                          ),
+                          onSelected: (action) async {
+                            switch (action) {
+                              case 'info':
+                                setState(() => _showRightInfoPanel = true);
+                                break;
+                              case 'mute':
+                                await widget.appState.telegramNotifications
+                                    .toggleLocalPeerMute(
+                                  _activeAccountId,
+                                  chat.peer,
+                                );
+                                if (!mounted) return;
+                                final nowMuted = widget
+                                    .appState.telegramNotifications
+                                    .isPeerMuted(_activeAccountId, chat.peer);
+                                setState(() {});
+                                _showDownloadHud(
+                                  nowMuted
+                                      ? '已将「${chat.title}」设为免打扰'
+                                      : '已恢复「${chat.title}」的新消息通知',
+                                  state: 'success',
+                                );
+                                break;
+                              case 'select':
+                                setState(() {
+                                  _selectionMode = !_selectionMode;
+                                  if (!_selectionMode) {
+                                    _selectedMessageIds.clear();
+                                  }
+                                });
+                                break;
+                              case 'refresh':
+                                _loadMessages(loadOlder: false);
+                                break;
+                              case 'export_md':
+                                _exportCurrentChatHistory(chat, asJson: false);
+                                break;
+                              case 'export_json':
+                                _exportCurrentChatHistory(chat, asJson: true);
+                                break;
+                            }
+                          },
+                          itemBuilder: (_) => [
+                            PopupMenuItem(
+                              value: 'info',
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    Icons.info_outline_rounded,
+                                    size: 18,
+                                    color: tg.tgBlueBright,
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Text(
+                                    '查看会话信息与共享媒体',
+                                    style: TextStyle(
+                                      fontSize: 13.5,
+                                      color: tg.textPrimary,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            PopupMenuItem(
+                              value: 'mute',
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    isMuted
+                                        ? Icons.notifications_active_outlined
+                                        : Icons.notifications_off_outlined,
+                                    size: 18,
+                                    color: isMuted
+                                        ? tg.tgBlueBright
+                                        : tg.textSecondary,
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Text(
+                                    isMuted ? '开启新消息通知' : '设为免打扰 (静音)',
+                                    style: TextStyle(
+                                      fontSize: 13.5,
+                                      color: tg.textPrimary,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            PopupMenuItem(
+                              value: 'select',
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    _selectionMode
+                                        ? Icons.close_rounded
+                                        : Icons.checklist_rounded,
+                                    size: 18,
+                                    color: tg.textSecondary,
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Text(
+                                    _selectionMode ? '退出多选模式' : '多选消息 (批量转存/转发)',
+                                    style: TextStyle(
+                                      fontSize: 13.5,
+                                      color: tg.textPrimary,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            PopupMenuItem(
+                              value: 'refresh',
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    Icons.refresh_rounded,
+                                    size: 18,
+                                    color: tg.textSecondary,
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Text(
+                                    '刷新最新消息',
+                                    style: TextStyle(
+                                      fontSize: 13.5,
+                                      color: tg.textPrimary,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const PopupMenuDivider(),
+                            PopupMenuItem(
+                              value: 'export_md',
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    Icons.description_outlined,
+                                    size: 18,
+                                    color: tg.textSecondary,
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Text(
+                                    '导出聊天记录 (.md)',
+                                    style: TextStyle(
+                                      fontSize: 13.5,
+                                      color: tg.textPrimary,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            PopupMenuItem(
+                              value: 'export_json',
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    Icons.data_object_rounded,
+                                    size: 18,
+                                    color: tg.textSecondary,
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Text(
+                                    '导出聊天记录 (.json)',
+                                    style: TextStyle(
+                                      fontSize: 13.5,
+                                      color: tg.textPrimary,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        );
+                      },
+                    ),
+                  ],
+                )
+              else
+                Flexible(
+                  flex: 0,
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        // Quick media filter pills (All / Videos / Photos / Music / Files) on desktop
                         _buildMediaFilterChip(tg, 'all', '全部'),
                         const SizedBox(width: 4),
                         _buildMediaFilterChip(
@@ -4707,166 +5509,165 @@ class _TelegramScreenState extends State<TelegramScreen> {
                         const SizedBox(width: 4),
                         _buildMediaFilterChip(tg, 'file', '文件'),
                         const SizedBox(width: 6),
+                        Builder(
+                          builder: (_) {
+                            final isMuted = chat.muted ||
+                                widget.appState.telegramNotifications
+                                    .isPeerMuted(
+                                  _activeAccountId,
+                                  chat.peer,
+                                );
+                            return IconButton(
+                              visualDensity: VisualDensity.compact,
+                              icon: Icon(
+                                isMuted
+                                    ? Icons.notifications_off_outlined
+                                    : Icons.notifications_active_outlined,
+                                size: 19,
+                                color: isMuted ? tg.textMuted : tg.tgBlueBright,
+                              ),
+                              onPressed: () async {
+                                await widget.appState.telegramNotifications
+                                    .toggleLocalPeerMute(
+                                  _activeAccountId,
+                                  chat.peer,
+                                );
+                                if (!mounted) return;
+                                final nowMuted = widget
+                                    .appState.telegramNotifications
+                                    .isPeerMuted(_activeAccountId, chat.peer);
+                                setState(() {});
+                                _showDownloadHud(
+                                  nowMuted
+                                      ? '已将「${chat.title}」设为静默免打扰，不再推送通知'
+                                      : '已恢复「${chat.title}」的新消息通知',
+                                  state: 'success',
+                                );
+                              },
+                            );
+                          },
+                        ),
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          icon: Icon(
+                            Icons.search_rounded,
+                            size: 19,
+                            color: _showInChatSearch
+                                ? tg.tgBlueBright
+                                : tg.textSecondary,
+                          ),
+                          onPressed: () {
+                            setState(() {
+                              _showInChatSearch = !_showInChatSearch;
+                              if (!_showInChatSearch) {
+                                _msgSearchCtrl.clear();
+                                _messageFilter = '';
+                              }
+                            });
+                          },
+                        ),
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          icon: Icon(
+                            _selectionMode
+                                ? Icons.check_circle_rounded
+                                : Icons.checklist_rounded,
+                            size: 19,
+                            color: _selectionMode
+                                ? tg.tgBlueBright
+                                : tg.textSecondary,
+                          ),
+                          onPressed: () {
+                            setState(() {
+                              _selectionMode = !_selectionMode;
+                              if (!_selectionMode) _selectedMessageIds.clear();
+                            });
+                          },
+                        ),
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          tooltip:
+                              _showRightInfoPanel ? '收起会话信息与媒体' : '展开会话信息与媒体',
+                          icon: Icon(
+                            Icons.view_sidebar_outlined,
+                            size: 19,
+                            color: _showRightInfoPanel
+                                ? tg.tgBlueBright
+                                : tg.textSecondary,
+                          ),
+                          onPressed: () => setState(
+                            () => _showRightInfoPanel = !_showRightInfoPanel,
+                          ),
+                        ),
+                        PopupMenuButton<String>(
+                          color: tg.sidebarBg,
+                          icon: Icon(
+                            Icons.file_download_outlined,
+                            size: 19,
+                            color: tg.textSecondary,
+                          ),
+                          onSelected: (fmt) {
+                            _exportCurrentChatHistory(
+                              chat,
+                              asJson: fmt == 'json',
+                            );
+                          },
+                          itemBuilder: (_) => [
+                            PopupMenuItem(
+                              value: 'md',
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    Icons.description_outlined,
+                                    size: 17,
+                                    color: tg.tgBlueBright,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Text(
+                                    '导出为 Markdown (.md)',
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      color: tg.textPrimary,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            PopupMenuItem(
+                              value: 'json',
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    Icons.data_object_rounded,
+                                    size: 17,
+                                    color: tg.textSecondary,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Text(
+                                    '导出为 JSON (.json)',
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      color: tg.textPrimary,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          icon: Icon(
+                            Icons.refresh_rounded,
+                            size: 19,
+                            color: tg.textSecondary,
+                          ),
+                          onPressed: () => _loadMessages(loadOlder: false),
+                        ),
                       ],
-                      Builder(
-                        builder: (_) {
-                          final isMuted = chat.muted ||
-                              widget.appState.telegramNotifications.isPeerMuted(
-                                _activeAccountId,
-                                chat.peer,
-                              );
-                          return IconButton(
-                            visualDensity: VisualDensity.compact,
-                            icon: Icon(
-                              isMuted
-                                  ? Icons.notifications_off_outlined
-                                  : Icons.notifications_active_outlined,
-                              size: 19,
-                              color: isMuted ? tg.textMuted : tg.tgBlueBright,
-                            ),
-                            onPressed: () async {
-                              await widget.appState.telegramNotifications
-                                  .toggleLocalPeerMute(
-                                _activeAccountId,
-                                chat.peer,
-                              );
-                              if (!mounted) return;
-                              final nowMuted = widget
-                                  .appState.telegramNotifications
-                                  .isPeerMuted(_activeAccountId, chat.peer);
-                              setState(() {});
-                              _showDownloadHud(
-                                nowMuted
-                                    ? '已将「${chat.title}」设为静默免打扰，不再推送通知'
-                                    : '已恢复「${chat.title}」的新消息通知',
-                                state: 'success',
-                              );
-                            },
-                          );
-                        },
-                      ),
-                      IconButton(
-                        visualDensity: VisualDensity.compact,
-                        icon: Icon(
-                          Icons.search_rounded,
-                          size: 19,
-                          color: _showInChatSearch
-                              ? tg.tgBlueBright
-                              : tg.textSecondary,
-                        ),
-                        onPressed: () {
-                          setState(() {
-                            _showInChatSearch = !_showInChatSearch;
-                            if (!_showInChatSearch) {
-                              _msgSearchCtrl.clear();
-                              _messageFilter = '';
-                            }
-                          });
-                        },
-                      ),
-                      IconButton(
-                        visualDensity: VisualDensity.compact,
-                        icon: Icon(
-                          _selectionMode
-                              ? Icons.check_circle_rounded
-                              : Icons.checklist_rounded,
-                          size: 19,
-                          color: _selectionMode
-                              ? tg.tgBlueBright
-                              : tg.textSecondary,
-                        ),
-                        onPressed: () {
-                          setState(() {
-                            _selectionMode = !_selectionMode;
-                            if (!_selectionMode) _selectedMessageIds.clear();
-                          });
-                        },
-                      ),
-                      IconButton(
-                        visualDensity: VisualDensity.compact,
-                        tooltip: _showRightInfoPanel ? '收起会话信息与媒体' : '展开会话信息与媒体',
-                        icon: Icon(
-                          isMobile
-                              ? Icons.info_outline_rounded
-                              : Icons.view_sidebar_outlined,
-                          size: 19,
-                          color: _showRightInfoPanel
-                              ? tg.tgBlueBright
-                              : tg.textSecondary,
-                        ),
-                        onPressed: () => setState(
-                          () => _showRightInfoPanel = !_showRightInfoPanel,
-                        ),
-                      ),
-                      PopupMenuButton<String>(
-                        color: tg.sidebarBg,
-                        icon: Icon(
-                          Icons.file_download_outlined,
-                          size: 19,
-                          color: tg.textSecondary,
-                        ),
-                        onSelected: (fmt) {
-                          _exportCurrentChatHistory(
-                            chat,
-                            asJson: fmt == 'json',
-                          );
-                        },
-                        itemBuilder: (_) => [
-                          PopupMenuItem(
-                            value: 'md',
-                            child: Row(
-                              children: [
-                                Icon(
-                                  Icons.description_outlined,
-                                  size: 17,
-                                  color: tg.tgBlueBright,
-                                ),
-                                const SizedBox(width: 8),
-                                Text(
-                                  '导出为 Markdown (.md)',
-                                  style: TextStyle(
-                                    fontSize: 13,
-                                    color: tg.textPrimary,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          PopupMenuItem(
-                            value: 'json',
-                            child: Row(
-                              children: [
-                                Icon(
-                                  Icons.data_object_rounded,
-                                  size: 17,
-                                  color: tg.textSecondary,
-                                ),
-                                const SizedBox(width: 8),
-                                Text(
-                                  '导出为 JSON (.json)',
-                                  style: TextStyle(
-                                    fontSize: 13,
-                                    color: tg.textPrimary,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ],
-                      ),
-                      IconButton(
-                        visualDensity: VisualDensity.compact,
-                        icon: Icon(
-                          Icons.refresh_rounded,
-                          size: 19,
-                          color: tg.textSecondary,
-                        ),
-                        onPressed: () => _loadMessages(loadOlder: false),
-                      ),
-                    ],
+                    ),
                   ),
                 ),
-              ),
             ],
           ),
         ),
@@ -5072,9 +5873,9 @@ class _TelegramScreenState extends State<TelegramScreen> {
                       },
                       child: ListView.builder(
                         controller: _messageScrollController,
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 18,
-                          vertical: 14,
+                        padding: EdgeInsets.symmetric(
+                          horizontal: isMobile ? 8 : 18,
+                          vertical: isMobile ? 10 : 14,
                         ),
                         itemCount: groupedEntries.length +
                             (_nextMessageOffset > 0 ? 1 : 0),
@@ -5692,12 +6493,18 @@ class _TelegramScreenState extends State<TelegramScreen> {
       ),
     );
 
+    final showLeftSenderAvatar = !isOutgoing &&
+        (!_isMobileLayout ||
+            (!chat.broadcast &&
+                !chat.peer.startsWith('user:') &&
+                !chat.self));
+
     return Row(
       mainAxisAlignment:
           isOutgoing ? MainAxisAlignment.end : MainAxisAlignment.start,
       crossAxisAlignment: CrossAxisAlignment.end,
       children: [
-        if (!isOutgoing) ...[
+        if (showLeftSenderAvatar) ...[
           _buildPeerAvatar(
             chat.broadcast ||
                     senderName == chat.title ||
@@ -6369,12 +7176,18 @@ class _TelegramScreenState extends State<TelegramScreen> {
       ),
     );
 
+    final showLeftSenderAvatar = !isOutgoing &&
+        (!_isMobileLayout ||
+            (!chat.broadcast &&
+                !chat.peer.startsWith('user:') &&
+                !chat.self));
+
     return Row(
       mainAxisAlignment:
           isOutgoing ? MainAxisAlignment.end : MainAxisAlignment.start,
       crossAxisAlignment: CrossAxisAlignment.end,
       children: [
-        if (!isOutgoing) ...[
+        if (showLeftSenderAvatar) ...[
           _buildPeerAvatar(
             chat.broadcast ||
                     senderName == chat.title ||
@@ -6672,7 +7485,11 @@ class _TelegramScreenState extends State<TelegramScreen> {
                 color: isSelected ? tg.tgBlueBright : Colors.white70,
               ),
             ),
-          if (!isOutgoing) ...[
+          if (!isOutgoing &&
+              (!_isMobileLayout ||
+                  (!chat.broadcast &&
+                      !chat.peer.startsWith('user:') &&
+                      !chat.self))) ...[
             _buildPeerAvatar(
               chat.broadcast ||
                       senderName == chat.title ||
@@ -8109,8 +8926,90 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
   /// Bottom Compose Bar / Selection Action Bar / Channel Read-Only Footer
   Widget _buildBottomBar(_TgPalette tg, TelegramChat chat) {
+    final isMobile = _isMobileLayout;
     // 1. Multi-selection toolbar
     if (_selectionMode) {
+      if (isMobile) {
+        return Container(
+          height: 52,
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          decoration: BoxDecoration(
+            color: tg.composeBg,
+            border: Border(top: BorderSide(color: tg.borderLine)),
+          ),
+          child: Row(
+            children: [
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                icon: Icon(
+                  Icons.close_rounded,
+                  size: 20,
+                  color: tg.textSecondary,
+                ),
+                onPressed: () {
+                  setState(() {
+                    _selectionMode = false;
+                    _selectedMessageIds.clear();
+                  });
+                },
+              ),
+              Text(
+                '已选 ${_selectedMessageIds.length}',
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: tg.textPrimary,
+                ),
+              ),
+              const Spacer(),
+              TextButton.icon(
+                style: TextButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                ),
+                onPressed: _selectedMessageIds.isEmpty
+                    ? null
+                    : () {
+                        final selectedList = _messages
+                            .where((m) => _selectedMessageIds.contains(m.id))
+                            .toList();
+                        _showForwardMessagesDialog(selectedList);
+                      },
+                icon: const Icon(Icons.forward_rounded, size: 16),
+                label: const Text('转发', style: TextStyle(fontSize: 12.5)),
+              ),
+              const SizedBox(width: 4),
+              FilledButton.icon(
+                style: FilledButton.styleFrom(
+                  backgroundColor: tg.tgBlueBright,
+                  visualDensity: VisualDensity.compact,
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                ),
+                onPressed: _selectedMessageIds.isEmpty
+                    ? null
+                    : _batchQueueSelectedDownloads,
+                icon: const Icon(Icons.cloud_download_outlined, size: 15),
+                label: const Text('转存', style: TextStyle(fontSize: 12.5)),
+              ),
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                tooltip: '删除所选',
+                onPressed: _selectedMessageIds.isEmpty
+                    ? null
+                    : () => _deleteMessagesByIds(_selectedMessageIds.toList()),
+                icon: Icon(
+                  Icons.delete_outline_rounded,
+                  size: 20,
+                  color: _selectedMessageIds.isEmpty
+                      ? tg.textMuted
+                      : const Color(0xFFE54D42),
+                ),
+              ),
+            ],
+          ),
+        );
+      }
+
       return Container(
         height: 54,
         padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -8182,6 +9081,63 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
     // 2. Read-only broadcast channel footer (official Telegram style)
     if (chat.readOnly) {
+      if (isMobile) {
+        final isMuted = chat.muted ||
+            widget.appState.telegramNotifications.isPeerMuted(
+              _activeAccountId,
+              chat.peer,
+            );
+        return Material(
+          color: tg.composeBg,
+          child: InkWell(
+            onTap: () async {
+              await widget.appState.telegramNotifications.toggleLocalPeerMute(
+                _activeAccountId,
+                chat.peer,
+              );
+              if (!mounted) return;
+              final nowMuted = widget.appState.telegramNotifications
+                  .isPeerMuted(_activeAccountId, chat.peer);
+              setState(() {});
+              _showDownloadHud(
+                nowMuted
+                    ? '已将频道「${chat.title}」设为免打扰'
+                    : '已开启频道「${chat.title}」的新消息通知',
+                state: 'success',
+              );
+            },
+            child: Container(
+              height: 46,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                border: Border(top: BorderSide(color: tg.borderLine)),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    isMuted
+                        ? Icons.notifications_active_outlined
+                        : Icons.notifications_off_outlined,
+                    size: 18,
+                    color: tg.tgBlueBright,
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    isMuted ? '开启频道通知 (取消静音)' : '静音频道',
+                    style: TextStyle(
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.w600,
+                      color: tg.tgBlueBright,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      }
+
       return Container(
         height: 48,
         alignment: Alignment.center,
@@ -8289,9 +9245,234 @@ class _TelegramScreenState extends State<TelegramScreen> {
           if (_stagedFiles.isNotEmpty || _uploadStatusText.isNotEmpty)
             _buildStagedAttachmentsBar(tg),
 
-          // E. Main Compose Input Row (Attach + Screenshot + Input + Format + Emoji + Send)
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          // E. Main Compose Input Row
+          if (isMobile)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  // 1. Emoji picker button on left (Official Telegram Android/iOS style)
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    onPressed: () =>
+                        setState(() => _showEmojiPanel = !_showEmojiPanel),
+                    icon: Icon(
+                      _showEmojiPanel
+                          ? Icons.keyboard_alt_outlined
+                          : Icons.sentiment_satisfied_alt_rounded,
+                      size: 23,
+                      color: _showEmojiPanel
+                          ? tg.tgBlueBright
+                          : tg.textSecondary,
+                    ),
+                  ),
+
+                  // 2. Rounded pill text field
+                  Expanded(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      decoration: BoxDecoration(
+                        color: tg.searchFill,
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: TextField(
+                        controller: _composeController,
+                        focusNode: _composeFocusNode,
+                        minLines: 1,
+                        maxLines: 5,
+                        textInputAction: TextInputAction.newline,
+                        maxLength: _stagedFiles.isNotEmpty ? 1024 : 4096,
+                        buildCounter: (
+                          _, {
+                          required currentLength,
+                          required isFocused,
+                          maxLength,
+                        }) =>
+                            null,
+                        onChanged: _onComposeTextChanged,
+                        style: TextStyle(
+                          fontSize: 14,
+                          height: 1.35,
+                          color: tg.textPrimary,
+                        ),
+                        decoration: InputDecoration(
+                          filled: false,
+                          border: InputBorder.none,
+                          enabledBorder: InputBorder.none,
+                          focusedBorder: InputBorder.none,
+                          isDense: true,
+                          contentPadding: const EdgeInsets.symmetric(
+                            vertical: 9,
+                          ),
+                          hintText: _stagedFiles.isNotEmpty
+                              ? '添加说明文字...'
+                              : '消息...',
+                          hintStyle: TextStyle(
+                            fontSize: 14,
+                            color: tg.textMuted,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+
+                  // 3. Attachment menu (`📎` Media / File / Quick reply / Format)
+                  PopupMenuButton<String>(
+                    color: tg.sidebarBg,
+                    offset: const Offset(0, -190),
+                    onSelected: (action) {
+                      switch (action) {
+                        case 'media':
+                          _pickFilesToAttach(mediaOnly: true, asFile: false);
+                          break;
+                        case 'file':
+                          _pickFilesToAttach(mediaOnly: false, asFile: true);
+                          break;
+                        case 'quick_reply':
+                          _showQuickRepliesDialog(tg);
+                          break;
+                        case 'format':
+                          setState(
+                            () => _showFormattingBar = !_showFormattingBar,
+                          );
+                          break;
+                      }
+                    },
+                    itemBuilder: (_) => [
+                      PopupMenuItem(
+                        value: 'media',
+                        child: Row(
+                          children: [
+                            Icon(
+                              Icons.photo_library_outlined,
+                              size: 18,
+                              color: tg.tgBlueBright,
+                            ),
+                            const SizedBox(width: 10),
+                            Text(
+                              '发送相册图片或视频',
+                              style: TextStyle(
+                                fontSize: 13.5,
+                                color: tg.textPrimary,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      PopupMenuItem(
+                        value: 'file',
+                        child: Row(
+                          children: [
+                            Icon(
+                              Icons.insert_drive_file_outlined,
+                              size: 18,
+                              color: tg.tgBlueBright,
+                            ),
+                            const SizedBox(width: 10),
+                            Text(
+                              '发送原文件 / 文档',
+                              style: TextStyle(
+                                fontSize: 13.5,
+                                color: tg.textPrimary,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      PopupMenuItem(
+                        value: 'quick_reply',
+                        child: Row(
+                          children: [
+                            Icon(
+                              Icons.bolt_rounded,
+                              size: 18,
+                              color: tg.textSecondary,
+                            ),
+                            const SizedBox(width: 10),
+                            Text(
+                              '快捷回复短语模板',
+                              style: TextStyle(
+                                fontSize: 13.5,
+                                color: tg.textPrimary,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      PopupMenuItem(
+                        value: 'format',
+                        child: Row(
+                          children: [
+                            Icon(
+                              Icons.text_format_rounded,
+                              size: 18,
+                              color: _showFormattingBar
+                                  ? tg.tgBlueBright
+                                  : tg.textSecondary,
+                            ),
+                            const SizedBox(width: 10),
+                            Text(
+                              _showFormattingBar ? '隐藏文字格式栏' : '文字格式 (加粗/代码/剧透)',
+                              style: TextStyle(
+                                fontSize: 13.5,
+                                color: tg.textPrimary,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 8,
+                      ),
+                      child: Icon(
+                        Icons.attach_file_rounded,
+                        size: 22,
+                        color: _stagedFiles.isNotEmpty
+                            ? tg.tgBlueBright
+                            : tg.textSecondary,
+                      ),
+                    ),
+                  ),
+
+                  // 4. Send button
+                  InkWell(
+                    borderRadius: BorderRadius.circular(20),
+                    onTap: canSendNow ? () => _sendMessage() : null,
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 150),
+                      width: 38,
+                      height: 38,
+                      decoration: BoxDecoration(
+                        color: canSendNow ? tg.tgBlueBright : tg.searchFill,
+                        shape: BoxShape.circle,
+                      ),
+                      alignment: Alignment.center,
+                      child: _isSendingMessage
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            )
+                          : Icon(
+                              Icons.send_rounded,
+                              size: 18,
+                              color: canSendNow ? Colors.white : tg.textMuted,
+                            ),
+                    ),
+                  ),
+                ],
+              ),
+            )
+          else
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [

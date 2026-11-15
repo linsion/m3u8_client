@@ -1258,8 +1258,8 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
             Expanded(
               child: LayoutBuilder(
                 builder: (context, constraints) {
-                  final isDesktop =
-                      constraints.maxWidth >= 860 || widget.appState.tvMode;
+                  final isDesktop = constraints.maxWidth >= 860 ||
+                      (widget.appState.tvMode && constraints.maxWidth >= 680);
                   if (isDesktop) {
                     return Row(
                       children: [
@@ -1604,8 +1604,8 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
 
   Widget _buildTopBar(AppState state, List<LiveChannel> visibleChannels) {
     final selectedSource = state.selectedLiveSource;
-    final isMobile =
-        MediaQuery.sizeOf(context).width < 860 && !state.tvMode;
+    final screenW = MediaQuery.sizeOf(context).width;
+    final isMobile = screenW < 680 || (screenW < 860 && !state.tvMode);
 
     if (isMobile) {
       return Container(
@@ -2090,8 +2090,8 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
       );
     }
 
-    final isMobile =
-        MediaQuery.sizeOf(context).width < 860 && !state.tvMode;
+    final screenW = MediaQuery.sizeOf(context).width;
+    final isMobile = screenW < 680 || (screenW < 860 && !state.tvMode);
 
     return Container(
       color: VideoPlatformTheme.bgElevated,
@@ -2107,7 +2107,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
             child: Row(
               children: [
                 Expanded(
-                  child: state.tvMode
+                  child: (state.tvMode && !isMobile)
                       ? _buildTvChannelSearchButton()
                       : SizedBox(
                           height: isMobile ? 34 : null,

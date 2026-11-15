@@ -397,11 +397,12 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
           return LoginScreen(appState: state);
         }
         final screenWidth = MediaQuery.sizeOf(context).width;
-        final isDesktop = screenWidth >= 860 || state.tvMode;
+        final effectiveTvMode = state.tvMode && screenWidth >= 680;
+        final isDesktop = screenWidth >= 860 || effectiveTvMode;
         final isImmersive = state.isImmersiveFullscreen;
         final isSidebarOpen = !isImmersive &&
             (isDesktop ? !_isSidebarCollapsed : _isMobileSidebarOpen);
-        final useOverlaySidebar = screenWidth < 860 && !state.tvMode;
+        final useOverlaySidebar = screenWidth < 860 && !effectiveTvMode;
         final miniSession = state.miniPlayerSession;
 
         return PopScope(
@@ -736,7 +737,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       );
     }
 
-    if (state.tvMode) {
+    if (state.tvMode && screenWidth >= 680) {
       return _buildTvLeanbackHeader(state, activeSource: activeSource);
     }
 

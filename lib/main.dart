@@ -210,10 +210,7 @@ class _TvRemoteKeyInterceptorState extends State<_TvRemoteKeyInterceptor> {
         key == LogicalKeyboardKey.channelUp ||
         key == LogicalKeyboardKey.channelDown ||
         key == LogicalKeyboardKey.gameButtonA ||
-        key == LogicalKeyboardKey.gameButtonSelect ||
-        key == LogicalKeyboardKey.mediaPlayPause ||
-        key == LogicalKeyboardKey.mediaFastForward ||
-        key == LogicalKeyboardKey.mediaRewind;
+        key == LogicalKeyboardKey.gameButtonSelect;
   }
 
   TraversalDirection? _directionForKey(LogicalKeyboardKey key) {
@@ -238,19 +235,26 @@ class _TvRemoteKeyInterceptorState extends State<_TvRemoteKeyInterceptor> {
     }
 
     final key = event.logicalKey;
-    if (Platform.isAndroid &&
-        !widget.appState.tvMode &&
-        _isDpadOrTvKey(key)) {
-      FocusManager.instance.highlightStrategy =
-          FocusHighlightStrategy.alwaysTraditional;
-      widget.appState.setTvMode(true);
-    }
-
     final primary = FocusManager.instance.primaryFocus;
     final focusedCtx = primary?.context;
     final editableState = focusedCtx != null
         ? (focusedCtx.findAncestorStateOfType<EditableTextState>())
         : null;
+
+    if (Platform.isAndroid &&
+        !widget.appState.tvMode &&
+        editableState == null &&
+        _isDpadOrTvKey(key)) {
+      final mqSize = MediaQuery.maybeSizeOf(context);
+      final isLandscapeTvScreen = mqSize != null &&
+          mqSize.width >= 720 &&
+          mqSize.width > mqSize.height;
+      if (widget.appState.isHardwareTv || isLandscapeTvScreen) {
+        FocusManager.instance.highlightStrategy =
+            FocusHighlightStrategy.alwaysTraditional;
+        widget.appState.setTvMode(true);
+      }
+    }
 
     final dir = _directionForKey(key);
     if (dir != null) {
@@ -385,11 +389,24 @@ class _TvRemoteKeyInterceptorState extends State<_TvRemoteKeyInterceptor> {
 
   @override
   Widget build(BuildContext context) {
-    return Focus(
-      canRequestFocus: false,
-      skipTraversal: true,
-      onKeyEvent: _handleKeyEvent,
-      child: widget.child,
+    return Listener(
+      behavior: HitTestBehavior.translucent,
+      onPointerDown: (event) {
+        if (event.kind == PointerDeviceKind.touch &&
+            widget.appState.tvMode &&
+            !widget.appState.isHardwareTv) {
+          final mqSize = MediaQuery.maybeSizeOf(context);
+          if (mqSize != null && mqSize.shortestSide < 600) {
+            widget.appState.setTvMode(false);
+          }
+        }
+      },
+      child: Focus(
+        canRequestFocus: false,
+        skipTraversal: true,
+        onKeyEvent: _handleKeyEvent,
+        child: widget.child,
+      ),
     );
   }
 }

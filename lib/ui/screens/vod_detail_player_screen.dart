@@ -2325,7 +2325,8 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                       builder: (ctx) {
                         final w = MediaQuery.sizeOf(ctx).width;
                         final isNarrow = w < 600;
-                        final isWide = w >= 860 || widget.appState.tvMode;
+                        final isWide =
+                            w >= 860 || (widget.appState.tvMode && w >= 680);
                         return Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
@@ -2493,7 +2494,8 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                 )
               : LayoutBuilder(
                   builder: (context, constraints) {
-                    if (widget.appState.tvMode) {
+                    if (widget.appState.tvMode &&
+                        constraints.maxWidth >= 680) {
                       return _buildTvLeanbackDetailLayout(constraints);
                     }
                     final isDesktopWide = constraints.maxWidth >= 860;
@@ -3707,7 +3709,8 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
 
     final screenSize = MediaQuery.sizeOf(context);
     final isMobilePortrait =
-        screenSize.width < 860 && !widget.appState.tvMode;
+        screenSize.width < 680 ||
+        (screenSize.width < 860 && !widget.appState.tvMode);
     final mobileStageHeight =
         (screenSize.width * 9 / 16).clamp(205.0, 275.0);
 

@@ -114,7 +114,7 @@ class AppState extends ChangeNotifier {
   static const _prefVodFilterM3u8AdsKey = 'm3u8_vod_filter_m3u8_ads_v1';
   static const _prefVodSkipIntroSecKey = 'm3u8_vod_skip_intro_sec_v1';
   static const _prefVodSkipOutroSecKey = 'm3u8_vod_skip_outro_sec_v1';
-  static const _prefTvModeKey = 'm3u8_tv_mode_v1';
+  static const _prefTvModeKey = 'm3u8_tv_mode_v2';
   static const _prefVodProgressMapKey = 'm3u8_vod_progress_map_v1';
   static const _prefPinnedSourcesKey = 'm3u8_pinned_vod_sources_v1';
   static const _prefHiddenSourcesKey = 'm3u8_hidden_vod_sources_v1';
@@ -131,6 +131,7 @@ class AppState extends ChangeNotifier {
   int _vodSkipIntroSeconds = 0;
   int _vodSkipOutroSeconds = 0;
   bool _tvMode = false;
+  bool _isHardwareTv = false;
   bool _isImmersiveFullscreen = false;
   bool _supportsAirPlay = false;
   bool _initialized = false;
@@ -303,6 +304,7 @@ class AppState extends ChangeNotifier {
   int get vodSkipIntroSeconds => _vodSkipIntroSeconds;
   int get vodSkipOutroSeconds => _vodSkipOutroSeconds;
   bool get tvMode => _tvMode;
+  bool get isHardwareTv => _isHardwareTv;
   bool get isImmersiveFullscreen => _isImmersiveFullscreen;
   bool get supportsAirPlay => _supportsAirPlay;
 
@@ -466,9 +468,18 @@ class AppState extends ChangeNotifier {
 
       // Detect Android TV (Leanback) or Apple TV (tvOS / AirPlay)
       final tvInfo = await TvPlatformService.detectPlatformTvInfo();
+      _isHardwareTv = tvInfo.isTv;
       _supportsAirPlay = tvInfo.supportsAirPlay;
-      if (savedTvMode == null && tvInfo.isTv) {
-        _tvMode = true;
+      if (tvInfo.isTv) {
+        _tvMode = savedTvMode ?? true;
+      } else if (!kIsWeb &&
+          (defaultTargetPlatform == TargetPlatform.android ||
+              defaultTargetPlatform == TargetPlatform.iOS)) {
+        // On Android/iOS phones & tablets (where hardware Leanback is false),
+        // always start in touch/mobile mode so a phone never gets stuck in TV mode.
+        _tvMode = false;
+      } else if (savedTvMode != null) {
+        _tvMode = savedTvMode;
       }
       await proxyService.initialize();
     } catch (_) {
