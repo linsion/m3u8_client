@@ -82,12 +82,39 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
 
   @override
   void dispose() {
+    if (widget.appState.activeChildBackHandler == _handleBackPress) {
+      widget.appState.activeChildBackHandler = null;
+    }
     widget.appState.removeListener(_onAppStateChanged);
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
     _categoryScrollController.dispose();
     _categoryFilterCtrl.dispose();
     super.dispose();
+  }
+
+  bool _handleBackPress() {
+    if (!mounted) return false;
+    final state = widget.appState;
+    if (_categoriesExpanded) {
+      setState(() => _categoriesExpanded = false);
+      return true;
+    }
+    if (state.directoryBreadcrumbs.isNotEmpty) {
+      state.navigateToDirectoryBreadcrumb(
+        state.directoryBreadcrumbs.length - 2,
+      );
+      return true;
+    }
+    if (state.searchKeyword.isNotEmpty) {
+      state.clearSearch();
+      return true;
+    }
+    if (state.selectedTypeId.isNotEmpty) {
+      _selectCategoryAndSync(state, '', 0);
+      return true;
+    }
+    return false;
   }
 
   void _onAppStateChanged() {
@@ -181,57 +208,50 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
   @override
   Widget build(BuildContext context) {
     final state = widget.appState;
+    state.activeChildBackHandler = _handleBackPress;
 
-    return PopScope(
-      canPop: !_categoriesExpanded,
-      onPopInvokedWithResult: (didPop, _) {
-        if (!didPop && _categoriesExpanded) {
-          setState(() => _categoriesExpanded = false);
-        }
-      },
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // Top category filter bar or search status banner
-          if (state.searchKeyword.isNotEmpty)
-            _buildSearchStatusBar(state)
-          else
-            _buildCategoryFilterBar(state),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // Top category filter bar or search status banner
+        if (state.searchKeyword.isNotEmpty)
+          _buildSearchStatusBar(state)
+        else
+          _buildCategoryFilterBar(state),
 
-          // Alist directory breadcrumbs if inside a folder
-          if (state.directoryBreadcrumbs.isNotEmpty &&
-              state.searchKeyword.isEmpty)
-            _buildDirectoryBreadcrumbs(state),
+        // Alist directory breadcrumbs if inside a folder
+        if (state.directoryBreadcrumbs.isNotEmpty &&
+            state.searchKeyword.isEmpty)
+          _buildDirectoryBreadcrumbs(state),
 
-          // Main content area + Floating All-Categories Overlay Drawer
-          Expanded(
-            child: Stack(
-              children: [
+        // Main content area + Floating All-Categories Overlay Drawer
+        Expanded(
+          child: Stack(
+            children: [
+              Positioned.fill(
+                child: _buildBodyContent(state),
+              ),
+              if (_categoriesExpanded && state.searchKeyword.isEmpty) ...[
                 Positioned.fill(
-                  child: _buildBodyContent(state),
-                ),
-                if (_categoriesExpanded && state.searchKeyword.isEmpty) ...[
-                  Positioned.fill(
-                    child: GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onTap: () => setState(() => _categoriesExpanded = false),
-                      child: Container(
-                        color: Colors.black.withValues(alpha: 0.48),
-                      ),
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () => setState(() => _categoriesExpanded = false),
+                    child: Container(
+                      color: Colors.black.withValues(alpha: 0.48),
                     ),
                   ),
-                  Positioned(
-                    top: 0,
-                    left: 0,
-                    right: 0,
-                    child: _buildExpandedCategoryDrawer(state),
-                  ),
-                ],
+                ),
+                Positioned(
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  child: _buildExpandedCategoryDrawer(state),
+                ),
               ],
-            ),
+            ],
           ),
-        ],
-      ),
+        ),
+      ],
     );
   }
 

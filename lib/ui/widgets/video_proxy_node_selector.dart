@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../services/proxy_routing_service.dart';
 import '../theme.dart';
@@ -8,7 +9,7 @@ import '../theme.dart';
 /// Dropdown selector for switching proxy nodes (or toggling Direct / Auto-Fastest)
 /// directly from any video playback interface (VOD Player, Live TV, Floating Mini-Player,
 /// Telegram Video Gallery).
-class VideoProxyNodeSelector extends StatelessWidget {
+class VideoProxyNodeSelector extends StatefulWidget {
   final ProxyRoutingService proxyService;
   final RequestScenario scenario;
   final ValueChanged<String>? onProxyChanged;
@@ -24,9 +25,24 @@ class VideoProxyNodeSelector extends StatelessWidget {
     this.overlayStyle = true,
   });
 
+  @override
+  State<VideoProxyNodeSelector> createState() => _VideoProxyNodeSelectorState();
+}
+
+class _VideoProxyNodeSelectorState extends State<VideoProxyNodeSelector> {
   static const String _kModeDirect = '__mode_direct__';
   static const String _kModeAuto = '__mode_auto__';
   static const String _kActionRetest = '__action_retest__';
+
+  final GlobalKey<PopupMenuButtonState<String>> _menuKey =
+      GlobalKey<PopupMenuButtonState<String>>();
+  bool _isFocused = false;
+
+  ProxyRoutingService get proxyService => widget.proxyService;
+  RequestScenario get scenario => widget.scenario;
+  ValueChanged<String>? get onProxyChanged => widget.onProxyChanged;
+  bool get compact => widget.compact;
+  bool get overlayStyle => widget.overlayStyle;
 
   bool _isDirectActive() {
     if (!proxyService.proxyEnabled) return true;
@@ -156,23 +172,43 @@ class VideoProxyNodeSelector extends StatelessWidget {
             ? Colors.white60
             : const Color(0xFF34D399);
 
-        return PopupMenuButton<String>(
-          tooltip: '切换视频播放代理节点',
-          offset: Offset(0, compact ? 26 : 34),
-          color: VideoPlatformTheme.bgElevated,
-          constraints: const BoxConstraints(
-            minWidth: 270,
-            maxWidth: 360,
-            maxHeight: 440,
-          ),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(10),
-            side: BorderSide(color: VideoPlatformTheme.borderStrong),
-          ),
-          onSelected: _handleSelection,
-          itemBuilder: (ctx) {
-            final items = <PopupMenuEntry<String>>[
-              PopupMenuItem<String>(
+        return Focus(
+          canRequestFocus: false,
+          onFocusChange: (focused) {
+            if (mounted && _isFocused != focused) {
+              setState(() => _isFocused = focused);
+            }
+          },
+          onKeyEvent: (node, event) {
+            if (event is KeyDownEvent &&
+                (event.logicalKey == LogicalKeyboardKey.select ||
+                    event.logicalKey == LogicalKeyboardKey.enter ||
+                    event.logicalKey == LogicalKeyboardKey.numpadEnter ||
+                    event.logicalKey == LogicalKeyboardKey.space ||
+                    event.logicalKey == LogicalKeyboardKey.gameButtonA)) {
+              _menuKey.currentState?.showButtonMenu();
+              return KeyEventResult.handled;
+            }
+            return KeyEventResult.ignored;
+          },
+          child: PopupMenuButton<String>(
+            key: _menuKey,
+            tooltip: '切换视频播放代理节点',
+            offset: Offset(0, compact ? 26 : 34),
+            color: VideoPlatformTheme.bgElevated,
+            constraints: const BoxConstraints(
+              minWidth: 270,
+              maxWidth: 360,
+              maxHeight: 440,
+            ),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(10),
+              side: BorderSide(color: VideoPlatformTheme.borderStrong),
+            ),
+            onSelected: _handleSelection,
+            itemBuilder: (ctx) {
+              final items = <PopupMenuEntry<String>>[
+                PopupMenuItem<String>(
                 value: _kModeDirect,
                 height: 38,
                 child: Row(
@@ -356,71 +392,85 @@ class VideoProxyNodeSelector extends StatelessWidget {
             }
             return items;
           },
-          child: Builder(
-            builder: (ctx) {
-              final isFocused = Focus.of(ctx).hasFocus;
-              return Container(
-                padding: EdgeInsets.symmetric(
-                  horizontal: compact ? 6 : 10,
-                  vertical: compact ? 2.5 : 5,
-                ),
-                decoration: BoxDecoration(
-                  color: isFocused
-                      ? VideoPlatformTheme.accent.withValues(alpha: 0.28)
-                      : (overlayStyle
-                          ? const Color(0xAA000000)
-                          : VideoPlatformTheme.bgCard),
-                  borderRadius: BorderRadius.circular(compact ? 10 : 18),
-                  border: Border.all(
+            child: Builder(
+              builder: (ctx) {
+                final isFocused = _isFocused || Focus.of(ctx).hasPrimaryFocus;
+                return AnimatedContainer(
+                  duration: const Duration(milliseconds: 110),
+                  padding: EdgeInsets.symmetric(
+                    horizontal: compact ? 7 : 10,
+                    vertical: compact ? 3 : 5,
+                  ),
+                  decoration: BoxDecoration(
                     color: isFocused
                         ? VideoPlatformTheme.accent
-                        : (isDirect
-                            ? (overlayStyle
-                                ? Colors.white.withValues(alpha: 0.22)
-                                : VideoPlatformTheme.borderSubtle)
-                            : const Color(0xFF34D399).withValues(alpha: 0.55)),
-                    width: isFocused ? 2.0 : 1.0,
-                  ),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      isDirect
-                          ? Icons.public_off_rounded
-                          : Icons.vpn_lock_rounded,
-                      size: compact ? 11 : 13.5,
-                      color: isFocused ? VideoPlatformTheme.accent : badgeColor,
-                    ),
-                    SizedBox(width: compact ? 3 : 5),
-                    Text(
-                      _buildCurrentLabel(),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        color: isFocused
-                            ? VideoPlatformTheme.accent
-                            : (overlayStyle
-                                ? Colors.white
-                                : VideoPlatformTheme.textPrimary),
-                        fontSize: compact ? 10 : 11.5,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    SizedBox(width: compact ? 1 : 2),
-                    Icon(
-                      Icons.arrow_drop_down_rounded,
-                      size: compact ? 14 : 16,
+                        : (overlayStyle
+                            ? const Color(0xBB090E14)
+                            : VideoPlatformTheme.bgCard),
+                    borderRadius: BorderRadius.circular(compact ? 10 : 18),
+                    border: Border.all(
                       color: isFocused
-                          ? VideoPlatformTheme.accent
-                          : (overlayStyle
-                              ? Colors.white70
-                              : VideoPlatformTheme.textSecondary),
+                          ? Colors.white
+                          : (isDirect
+                              ? (overlayStyle
+                                  ? Colors.white.withValues(alpha: 0.25)
+                                  : VideoPlatformTheme.borderSubtle)
+                              : const Color(0xFF34D399)
+                                  .withValues(alpha: 0.65)),
+                      width: isFocused ? 2.2 : 1.0,
                     ),
-                  ],
-                ),
-              );
-            },
+                    boxShadow: isFocused
+                        ? [
+                            BoxShadow(
+                              color: VideoPlatformTheme.accent
+                                  .withValues(alpha: 0.65),
+                              blurRadius: 10,
+                              spreadRadius: 1,
+                            ),
+                          ]
+                        : null,
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        isDirect
+                            ? Icons.public_off_rounded
+                            : Icons.vpn_lock_rounded,
+                        size: compact ? 11.5 : 13.5,
+                        color: isFocused ? Colors.white : badgeColor,
+                      ),
+                      SizedBox(width: compact ? 3 : 5),
+                      Text(
+                        _buildCurrentLabel(),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: isFocused
+                              ? Colors.white
+                              : (overlayStyle
+                                  ? Colors.white
+                                  : VideoPlatformTheme.textPrimary),
+                          fontSize: compact ? 10.5 : 11.5,
+                          fontWeight:
+                              isFocused ? FontWeight.w700 : FontWeight.w600,
+                        ),
+                      ),
+                      SizedBox(width: compact ? 1 : 2),
+                      Icon(
+                        Icons.arrow_drop_down_rounded,
+                        size: compact ? 14 : 16,
+                        color: isFocused
+                            ? Colors.white
+                            : (overlayStyle
+                                ? Colors.white70
+                                : VideoPlatformTheme.textSecondary),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
           ),
         );
       },

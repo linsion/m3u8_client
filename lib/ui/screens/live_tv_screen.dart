@@ -168,6 +168,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
 
     _widthSub = _player.stream.width.listen((w) {
       if ((w ?? 0) > 0 && mounted && !_isResolving) {
+        final wasActive = _hasActivePlayback;
         _hasActivePlayback = true;
         _consecutiveReconnects = 0;
         _startupTimer?.cancel();
@@ -176,7 +177,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
           _preferredUrlIndexByChannel['${ch.group}|${ch.name}'] =
               _currentUrlIndex;
         }
-        if (_playError != null) {
+        if (!wasActive || _playError != null) {
           setState(() => _playError = null);
         }
       }
@@ -184,9 +185,13 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
 
     _posSub = _player.stream.position.listen((pos) {
       if (pos >= const Duration(seconds: 1) && mounted && !_isResolving) {
+        final wasActive = _hasActivePlayback;
         _hasActivePlayback = true;
         _consecutiveReconnects = 0;
         _startupTimer?.cancel();
+        if (!wasActive) {
+          setState(() {});
+        }
       }
     });
 
@@ -578,6 +583,9 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
 
   @override
   void dispose() {
+    if (widget.appState.activeChildBackHandler == _handleBackPress) {
+      widget.appState.activeChildBackHandler = null;
+    }
     if (_isLiveFullscreen && (Platform.isAndroid || Platform.isIOS)) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     }
@@ -601,6 +609,34 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     _subChannels.clear();
     _player.dispose();
     super.dispose();
+  }
+
+  bool _isBackLogicalKey(LogicalKeyboardKey key) {
+    return key == LogicalKeyboardKey.goBack ||
+        key == LogicalKeyboardKey.escape ||
+        key == LogicalKeyboardKey.browserBack;
+  }
+
+  bool _handleBackPress() {
+    if (!mounted) return false;
+    if (_showFullscreenChannelDrawer) {
+      setState(() => _showFullscreenChannelDrawer = false);
+      _playerFocusNode.requestFocus();
+      return true;
+    }
+    if (_isLiveFullscreen) {
+      _toggleLiveFullscreen(forceValue: false);
+      return true;
+    }
+    if (_isMultiViewMode) {
+      _toggleMultiViewMode();
+      return true;
+    }
+    if (_channelSearch.isNotEmpty) {
+      setState(() => _channelSearch = '');
+      return true;
+    }
+    return false;
   }
 
   void _toggleMultiViewMode() {
@@ -883,18 +919,16 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
 
       String finalPlayUrl = playUrl;
       bool usingStreamRelay = false;
-      if (!forceProxy) {
-        final relayed = await widget.appState.proxyService.resolveProxiedStreamUrl(
-          RequestScenario.liveStream,
-          playUrl,
-          headers: headers,
-        );
-        if (!mounted || sessionId != _playSessionId) return;
-        if (relayed != playUrl && relayed.contains('/__m3u8_proxy__/')) {
-          finalPlayUrl = relayed;
-          usingStreamRelay = true;
-          routeLabel = '客户端代理';
-        }
+      final relayed = await widget.appState.proxyService.resolveProxiedStreamUrl(
+        RequestScenario.liveStream,
+        playUrl,
+        headers: headers,
+      );
+      if (!mounted || sessionId != _playSessionId) return;
+      if (relayed != playUrl && relayed.contains('/__m3u8_proxy__/')) {
+        finalPlayUrl = relayed;
+        usingStreamRelay = true;
+        routeLabel = '客户端代理';
       }
 
       setState(() {
@@ -913,9 +947,9 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
         play: true,
       );
 
-      // Concurrently probe the active signal and up to 3 backup signals right at startup:
-      // if the active signal fails HTTP probe while a backup signal responds fast, switch immediately!
-      if (!forceProxy && channel.urls.length > 1) {
+      // Concurrently probe the active signal and up to 3 backup signals right at startup
+      // when in direct mode (not competing with LocalProxyTunnelBridge relay).
+      if (!forceProxy && !usingStreamRelay && channel.urls.length > 1) {
         unawaited(
           _raceChannelSignalsAtStartup(
             channel: channel,
@@ -925,12 +959,15 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
         );
       }
 
-      // Start a 3.2-second fast watchdog: if this signal line hangs without
-      // producing any video frames and there are untested backup lines, switch automatically.
+      // Start startup watchdog: if this signal line hangs without producing any
+      // video frames or downstream bytes and there are untested backup lines, switch automatically.
       _startupTimer?.cancel();
-      _startupTimer = Timer(const Duration(milliseconds: 3200), () {
+      final watchdogMs = usingStreamRelay ? 5600 : 3500;
+      _startupTimer = Timer(Duration(milliseconds: watchdogMs), () {
         if (!mounted || sessionId != _playSessionId) return;
-        if (!_hasActivePlayback && !_isResolving) {
+        final hasFlow =
+            LocalProxyTunnelBridge.recentDownstreamBytesPerSecond > 512;
+        if (!_hasActivePlayback && !_isResolving && !hasFlow) {
           _tryNextSignalOrReportError(channel, '连接信号源超时');
         }
       });
@@ -1197,37 +1234,22 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
       _liveOsdVisible = false;
       _showFullscreenChannelDrawer = false;
     }
+    state.activeChildBackHandler = _handleBackPress;
 
-    return PopScope(
-      canPop: !_isLiveFullscreen && !_showFullscreenChannelDrawer,
-      onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) {
-          if (_showFullscreenChannelDrawer) {
-            setState(() => _showFullscreenChannelDrawer = false);
-            _playerFocusNode.requestFocus();
-          } else if (_isLiveFullscreen && _liveOsdVisible) {
-            _liveOsdTimer?.cancel();
-            setState(() => _liveOsdVisible = false);
-            _playerFocusNode.requestFocus();
-          } else if (_isLiveFullscreen) {
-            _toggleLiveFullscreen(forceValue: false);
-          }
-        }
+    return CallbackShortcuts(
+      bindings: <ShortcutActivator, VoidCallback>{
+        const SingleActivator(LogicalKeyboardKey.channelUp): () =>
+            _stepChannel(filteredChannels, -1),
+        const SingleActivator(LogicalKeyboardKey.pageUp): () =>
+            _stepChannel(filteredChannels, -1),
+        const SingleActivator(LogicalKeyboardKey.channelDown): () =>
+            _stepChannel(filteredChannels, 1),
+        const SingleActivator(LogicalKeyboardKey.pageDown): () =>
+            _stepChannel(filteredChannels, 1),
+        const SingleActivator(LogicalKeyboardKey.mediaPlayPause): () =>
+            _player.playOrPause(),
       },
-      child: CallbackShortcuts(
-        bindings: <ShortcutActivator, VoidCallback>{
-          const SingleActivator(LogicalKeyboardKey.channelUp): () =>
-              _stepChannel(filteredChannels, -1),
-          const SingleActivator(LogicalKeyboardKey.pageUp): () =>
-              _stepChannel(filteredChannels, -1),
-          const SingleActivator(LogicalKeyboardKey.channelDown): () =>
-              _stepChannel(filteredChannels, 1),
-          const SingleActivator(LogicalKeyboardKey.pageDown): () =>
-              _stepChannel(filteredChannels, 1),
-          const SingleActivator(LogicalKeyboardKey.mediaPlayPause): () =>
-              _player.playOrPause(),
-        },
-        child: Column(
+      child: Column(
           children: [
             if (!_isLiveFullscreen)
               FocusTraversalGroup(
@@ -1494,7 +1516,6 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
           ),
         ),
       ],
-      ),
       ),
     );
   }
@@ -2555,7 +2576,21 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
 
     return Focus(
       focusNode: _playerFocusNode,
+      onFocusChange: (_) {
+        if (mounted) setState(() {});
+      },
       onKeyEvent: (node, event) {
+        if (_isBackLogicalKey(event.logicalKey)) {
+          return KeyEventResult.ignored;
+        }
+        if (!node.hasPrimaryFocus) {
+          if (_isLiveFullscreen &&
+              event is KeyDownEvent &&
+              !_showFullscreenChannelDrawer) {
+            _pokeLiveOsd();
+          }
+          return KeyEventResult.ignored;
+        }
         if (event is KeyDownEvent) {
           final key = event.logicalKey;
           if (key == LogicalKeyboardKey.select ||
@@ -2734,12 +2769,28 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                                           widget.appState.proxyService,
                                       scenario: RequestScenario.liveStream,
                                       overlayStyle: true,
-                                      onProxyChanged: (_) {
+                                      onProxyChanged: (msg) {
+                                        _channelOsdTimer?.cancel();
+                                        setState(() {
+                                          _channelOsdText = msg;
+                                          _useServerProxy = false;
+                                          _playError = null;
+                                        });
+                                        _channelOsdTimer = Timer(
+                                          const Duration(seconds: 3),
+                                          () {
+                                            if (mounted) {
+                                              setState(
+                                                () => _channelOsdText = null,
+                                              );
+                                            }
+                                          },
+                                        );
                                         _playChannel(
                                           ch,
                                           urlIndex: _currentUrlIndex,
                                           resetTried: false,
-                                          isAutoReconnect: true,
+                                          isAutoReconnect: false,
                                         );
                                       },
                                     ),
@@ -2862,13 +2913,119 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                                   ],
                                 ),
                               ),
-                            if (_isResolving)
-                              Container(
-                                color: const Color(0x88000000),
-                                alignment: Alignment.center,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2.5,
-                                  color: VideoPlatformTheme.accent,
+                            if (ch != null &&
+                                _playError == null &&
+                                (_isResolving || !_hasActivePlayback))
+                              IgnorePointer(
+                                child: Center(
+                                  child: Container(
+                                    margin: const EdgeInsets.symmetric(
+                                      horizontal: 24,
+                                    ),
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 20,
+                                      vertical: 16,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: const Color(0xD80A111A),
+                                      borderRadius: BorderRadius.circular(14),
+                                      border: Border.all(
+                                        color: VideoPlatformTheme.accent
+                                            .withValues(alpha: 0.45),
+                                      ),
+                                      boxShadow: const [
+                                        BoxShadow(
+                                          color: Color(0x77000000),
+                                          blurRadius: 16,
+                                          offset: Offset(0, 6),
+                                        ),
+                                      ],
+                                    ),
+                                    child: Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        SizedBox(
+                                          width: 28,
+                                          height: 28,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 2.6,
+                                            color: VideoPlatformTheme.accent,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 11),
+                                        Text(
+                                          _isResolving
+                                              ? '正在解析直播频道信号源...'
+                                              : (_activeRouteLabel == '客户端代理'
+                                                  ? '正在通过代理加速连接直播信号源，加载画面...'
+                                                  : '正在连接直播信号源，加载首帧画面...'),
+                                          textAlign: TextAlign.center,
+                                          style: const TextStyle(
+                                            color: Colors.white,
+                                            fontSize: 13,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 8),
+                                        Wrap(
+                                          spacing: 8,
+                                          runSpacing: 6,
+                                          alignment: WrapAlignment.center,
+                                          crossAxisAlignment:
+                                              WrapCrossAlignment.center,
+                                          children: [
+                                            Container(
+                                              padding:
+                                                  const EdgeInsets.symmetric(
+                                                horizontal: 8,
+                                                vertical: 3,
+                                              ),
+                                              decoration: BoxDecoration(
+                                                color: Colors.white
+                                                    .withValues(alpha: 0.08),
+                                                borderRadius:
+                                                    BorderRadius.circular(8),
+                                              ),
+                                              child: Text(
+                                                '${ch.name} · 信号源 ${_currentUrlIndex + 1}/${ch.urls.length}',
+                                                style: const TextStyle(
+                                                  color: Colors.white70,
+                                                  fontSize: 11.5,
+                                                ),
+                                              ),
+                                            ),
+                                            Container(
+                                              padding:
+                                                  const EdgeInsets.symmetric(
+                                                horizontal: 8,
+                                                vertical: 3,
+                                              ),
+                                              decoration: BoxDecoration(
+                                                color: VideoPlatformTheme.accent
+                                                    .withValues(alpha: 0.16),
+                                                borderRadius:
+                                                    BorderRadius.circular(8),
+                                              ),
+                                              child: Text(
+                                                _activeRouteLabel == '客户端代理'
+                                                    ? '代理: ${widget.appState.proxyService.resolveNodeForScenario(RequestScenario.liveStream)?.displayTitle ?? "加速节点"}'
+                                                    : '通道: $_activeRouteLabel',
+                                                style: TextStyle(
+                                                  color:
+                                                      VideoPlatformTheme.accent,
+                                                  fontSize: 11.5,
+                                                  fontWeight: FontWeight.w600,
+                                                ),
+                                              ),
+                                            ),
+                                            VideoDownloadSpeedBadge(
+                                              player: _player,
+                                            ),
+                                          ],
+                                        ),
+                                      ],
+                                    ),
+                                  ),
                                 ),
                               ),
                             if (_playError != null && !_isResolving)
@@ -2925,11 +3082,25 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                               ),
                             // Fullscreen Translucent Channel Overlay Drawer (OK / Left Arrow in Fullscreen)
                             if (_isLiveFullscreen &&
-                                _showFullscreenChannelDrawer)
+                                _showFullscreenChannelDrawer) ...[
+                              Positioned.fill(
+                                child: GestureDetector(
+                                  behavior: HitTestBehavior.opaque,
+                                  onTap: () {
+                                    setState(() {
+                                      _showFullscreenChannelDrawer = false;
+                                      _liveOsdVisible = false;
+                                    });
+                                    _playerFocusNode.requestFocus();
+                                  },
+                                  child: Container(color: Colors.black38),
+                                ),
+                              ),
                               _buildFullscreenChannelOverlayDrawer(
                                 groups: groups,
                                 filteredChannels: activeList,
                               ),
+                            ],
                             // Fullscreen Auto-Hiding Bottom Control Bar (wakes on Right Arrow / Mouse Move)
                             if (_isLiveFullscreen &&
                                 _liveOsdVisible &&
@@ -2948,7 +3119,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                           ],
                         ),
                 ),
-                if (!compact && !_isLiveFullscreen && ch != null)
+                if (!_isLiveFullscreen && ch != null)
                   _buildLiveBottomControlBar(
                     ch,
                     activeList,
@@ -3324,7 +3495,9 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
             ),
           ),
           ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 270),
+            constraints: BoxConstraints(
+              maxWidth: MediaQuery.sizeOf(context).width < 680 ? 118 : 240,
+            ),
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -3334,234 +3507,283 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
-                    fontSize: 13.5,
+                    fontSize: 13,
                     fontWeight: FontWeight.w600,
                     color: VideoPlatformTheme.textPrimary,
                   ),
                 ),
                 Text(
-                  '${epg.timeSlot} ${epg.currentTitle}  ·  下一档: ${epg.nextTitle}',
+                  '${epg.timeSlot} ${epg.currentTitle}',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
-                    fontSize: 11,
+                    fontSize: 10.5,
                     color: VideoPlatformTheme.textSecondary,
                   ),
                 ),
               ],
             ),
           ),
-          const SizedBox(width: 12),
-          if (ch.urls.length > 1)
-            Flexible(
+          const SizedBox(width: 8),
+          Expanded(
+            child: Align(
+              alignment: Alignment.centerRight,
               child: SingleChildScrollView(
                 scrollDirection: Axis.horizontal,
                 child: Row(
-                  children: List.generate(ch.urls.length, (idx) {
-                    final active = idx == _currentUrlIndex;
-                    final lineUrl = ch.urls[idx];
-                    final isIpv6Line = lineUrl.contains('[2') ||
-                        lineUrl.toLowerCase().contains('ipv6');
-                    final lat = _latencyMsByUrl[lineUrl];
-                    return Padding(
-                      padding: const EdgeInsets.only(right: 6),
-                      child: InkWell(
-                        borderRadius: BorderRadius.circular(4),
-                        onFocusChange: (_) {
-                          if (overlayMode) _pokeLiveOsd();
-                          if (mounted) setState(() {});
-                        },
-                        onTap: () {
-                          if (overlayMode) _pokeLiveOsd();
-                          _playChannel(ch, urlIndex: idx);
-                        },
-                        child: Builder(
-                          builder: (ctx) {
-                            final isFocused = Focus.of(ctx).hasPrimaryFocus;
-                            return Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 8,
-                                vertical: 4,
-                              ),
-                              decoration: BoxDecoration(
-                                color: active
-                                    ? VideoPlatformTheme.accent
-                                    : (isFocused
-                                        ? VideoPlatformTheme.accent
-                                            .withValues(alpha: 0.28)
-                                        : VideoPlatformTheme.bgCard),
-                                borderRadius: BorderRadius.circular(4),
-                                border: Border.all(
-                                  color: isFocused
-                                      ? Colors.white
-                                      : (active
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (ch.urls.length > 1)
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: List.generate(ch.urls.length, (idx) {
+                          final active = idx == _currentUrlIndex;
+                          final lineUrl = ch.urls[idx];
+                          final isIpv6Line = lineUrl.contains('[2') ||
+                              lineUrl.toLowerCase().contains('ipv6');
+                          final lat = _latencyMsByUrl[lineUrl];
+                          return Padding(
+                            padding: const EdgeInsets.only(right: 6),
+                            child: InkWell(
+                              borderRadius: BorderRadius.circular(4),
+                              onFocusChange: (_) {
+                                if (overlayMode) _pokeLiveOsd();
+                                if (mounted) setState(() {});
+                              },
+                              onTap: () {
+                                if (overlayMode) _pokeLiveOsd();
+                                _playChannel(ch, urlIndex: idx);
+                              },
+                              child: Builder(
+                                builder: (ctx) {
+                                  final isFocused =
+                                      Focus.of(ctx).hasPrimaryFocus;
+                                  return Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                      vertical: 4,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: active
                                           ? VideoPlatformTheme.accent
-                                          : Colors.transparent),
-                                  width: isFocused ? 2.0 : 1.0,
-                                ),
+                                          : (isFocused
+                                              ? VideoPlatformTheme.accent
+                                                  .withValues(alpha: 0.28)
+                                              : VideoPlatformTheme.bgCard),
+                                      borderRadius: BorderRadius.circular(4),
+                                      border: Border.all(
+                                        color: isFocused
+                                            ? Colors.white
+                                            : (active
+                                                ? VideoPlatformTheme.accent
+                                                : Colors.transparent),
+                                        width: isFocused ? 2.0 : 1.0,
+                                      ),
+                                    ),
+                                    child: Text(
+                                      [
+                                        '信号 ${idx + 1}',
+                                        if (isIpv6Line) 'IPv6',
+                                        if (lat != null && lat > 0) '${lat}ms',
+                                      ].join('·'),
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        fontWeight: (active || isFocused)
+                                            ? FontWeight.w700
+                                            : FontWeight.w400,
+                                        color: (active || isFocused)
+                                            ? Colors.white
+                                            : VideoPlatformTheme.textSecondary,
+                                      ),
+                                    ),
+                                  );
+                                },
                               ),
-                              child: Text(
-                                [
-                                  '信号 ${idx + 1}',
-                                  if (isIpv6Line) 'IPv6',
-                                  if (lat != null && lat > 0) '${lat}ms',
-                                ].join('·'),
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  fontWeight: (active || isFocused)
-                                      ? FontWeight.w700
-                                      : FontWeight.w400,
-                                  color: (active || isFocused)
-                                      ? Colors.white
-                                      : VideoPlatformTheme.textSecondary,
+                            ),
+                          );
+                        }),
+                      ),
+                    if (overlayMode)
+                      Padding(
+                        padding: const EdgeInsets.only(right: 4),
+                        child: OutlinedButton.icon(
+                          onPressed: () {
+                            setState(() {
+                              _showFullscreenChannelDrawer = true;
+                              _liveOsdVisible = true;
+                            });
+                            _liveOsdTimer?.cancel();
+                          },
+                          icon: const Icon(Icons.list_alt_rounded, size: 15),
+                          label: const Text('选台'),
+                        ),
+                      ),
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: '上一频道 (遥控器上键 / CH▲)',
+                      onPressed: () {
+                        if (overlayMode) _pokeLiveOsd();
+                        _stepChannel(activeList, -1);
+                      },
+                      icon: const Icon(Icons.skip_previous_rounded, size: 18),
+                    ),
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: '下一频道 (遥控器下键 / CH▼)',
+                      onPressed: () {
+                        if (overlayMode) _pokeLiveOsd();
+                        _stepChannel(activeList, 1);
+                      },
+                      icon: const Icon(Icons.skip_next_rounded, size: 18),
+                    ),
+                    if (ch.urls.length > 1)
+                      IconButton(
+                        visualDensity: VisualDensity.compact,
+                        tooltip: '切换备用信号源',
+                        onPressed: () {
+                          if (overlayMode) _pokeLiveOsd();
+                          _stepSignalLine(1);
+                        },
+                        icon: const Icon(Icons.swap_horiz_rounded, size: 18),
+                      ),
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: '🔴 录制当前直播流到下载队列',
+                      onPressed: _activeStreamUrl.isEmpty
+                          ? null
+                          : () {
+                              if (overlayMode) _pokeLiveOsd();
+                              _recordCurrentLiveStream();
+                            },
+                      icon: Icon(
+                        Icons.fiber_manual_record_rounded,
+                        size: 18,
+                        color: VideoPlatformTheme.danger,
+                      ),
+                    ),
+                    if (!overlayMode)
+                      IconButton(
+                        visualDensity: VisualDensity.compact,
+                        tooltip: '小窗悬浮播放（切换其他页面不中断直播）',
+                        onPressed: _activeStreamUrl.isEmpty
+                            ? null
+                            : _enterLiveMiniPlayer,
+                        icon: const Icon(
+                          Icons.picture_in_picture_alt_rounded,
+                          size: 18,
+                        ),
+                      ),
+                    PopupMenuButton<String>(
+                      tooltip: 'Apple TV 隔空播放 / 外部 TV 播放器',
+                      icon: const Icon(Icons.cast_connected_rounded, size: 18),
+                      onSelected: (action) async {
+                        final lineUrl = ch.urls.isNotEmpty
+                            ? ch.urls[
+                                _currentUrlIndex.clamp(0, ch.urls.length - 1)]
+                            : '';
+                        if (action == 'airplay') {
+                          final messenger = ScaffoldMessenger.of(context);
+                          final ok = await TvPlatformService.showAirPlayPicker();
+                          if (!ok && mounted) {
+                            messenger.showSnackBar(
+                              const SnackBar(
+                                content: Text(
+                                  '当前系统环境不支持原生 AirPlay 弹窗，请使用系统控制中心或外部 TV 播放器',
                                 ),
                               ),
                             );
-                          },
+                          }
+                        } else if (lineUrl.isNotEmpty) {
+                          await TvPlatformService.openInTvExternalPlayer(
+                            lineUrl,
+                            playerType: action,
+                          );
+                        }
+                      },
+                      itemBuilder: (_) => [
+                        if (widget.appState.supportsAirPlay)
+                          const PopupMenuItem(
+                            value: 'airplay',
+                            child: Row(
+                              children: [
+                                Icon(Icons.airplay_rounded, size: 17),
+                                SizedBox(width: 8),
+                                Text('投屏至 Apple TV (AirPlay 2)'),
+                              ],
+                            ),
+                          ),
+                        const PopupMenuItem(
+                          value: 'infuse',
+                          child: Row(
+                            children: [
+                              Icon(
+                                Icons.play_circle_outline_rounded,
+                                size: 17,
+                              ),
+                              SizedBox(width: 8),
+                              Text('使用 Apple TV / iOS Infuse 打开'),
+                            ],
+                          ),
                         ),
-                      ),
-                    );
-                  }),
-                ),
-              ),
-            ),
-          const Spacer(),
-          IconButton(
-            tooltip: '上一频道 (遥控器上键 / CH▲)',
-            onPressed: () {
-              if (overlayMode) _pokeLiveOsd();
-              _stepChannel(activeList, -1);
-            },
-            icon: const Icon(Icons.skip_previous_rounded, size: 18),
-          ),
-          IconButton(
-            tooltip: '下一频道 (遥控器下键 / CH▼)',
-            onPressed: () {
-              if (overlayMode) _pokeLiveOsd();
-              _stepChannel(activeList, 1);
-            },
-            icon: const Icon(Icons.skip_next_rounded, size: 18),
-          ),
-          if (ch.urls.length > 1)
-            IconButton(
-              tooltip: '切换备用信号源',
-              onPressed: () {
-                if (overlayMode) _pokeLiveOsd();
-                _stepSignalLine(1);
-              },
-              icon: const Icon(Icons.swap_horiz_rounded, size: 18),
-            ),
-          IconButton(
-            tooltip: '🔴 录制当前直播流到下载队列',
-            onPressed: _activeStreamUrl.isEmpty
-                ? null
-                : () {
-                    if (overlayMode) _pokeLiveOsd();
-                    _recordCurrentLiveStream();
-                  },
-            icon: Icon(
-              Icons.fiber_manual_record_rounded,
-              size: 18,
-              color: VideoPlatformTheme.danger,
-            ),
-          ),
-          if (!overlayMode)
-            IconButton(
-              tooltip: '小窗悬浮播放（切换其他页面不中断直播）',
-              onPressed:
-                  _activeStreamUrl.isEmpty ? null : _enterLiveMiniPlayer,
-              icon: const Icon(
-                Icons.picture_in_picture_alt_rounded,
-                size: 18,
-              ),
-            ),
-          PopupMenuButton<String>(
-            tooltip: 'Apple TV 隔空播放 / 外部 TV 播放器',
-            icon: const Icon(Icons.cast_connected_rounded, size: 18),
-            onSelected: (action) async {
-              final lineUrl = ch.urls.isNotEmpty
-                  ? ch.urls[_currentUrlIndex.clamp(0, ch.urls.length - 1)]
-                  : '';
-              if (action == 'airplay') {
-                final messenger = ScaffoldMessenger.of(context);
-                final ok = await TvPlatformService.showAirPlayPicker();
-                if (!ok && mounted) {
-                  messenger.showSnackBar(
-                    const SnackBar(
-                      content: Text(
-                        '当前系统环境不支持原生 AirPlay 弹窗，请使用系统控制中心或外部 TV 播放器',
-                      ),
+                        const PopupMenuItem(
+                          value: 'vlc',
+                          child: Row(
+                            children: [
+                              Icon(Icons.smart_display_outlined, size: 17),
+                              SizedBox(width: 8),
+                              Text('使用 Android TV / Apple TV VLC 打开'),
+                            ],
+                          ),
+                        ),
+                      ],
                     ),
-                  );
-                }
-              } else if (lineUrl.isNotEmpty) {
-                await TvPlatformService.openInTvExternalPlayer(
-                  lineUrl,
-                  playerType: action,
-                );
-              }
-            },
-            itemBuilder: (_) => [
-              if (widget.appState.supportsAirPlay)
-                const PopupMenuItem(
-                  value: 'airplay',
-                  child: Row(
-                    children: [
-                      Icon(Icons.airplay_rounded, size: 17),
-                      SizedBox(width: 8),
-                      Text('投屏至 Apple TV (AirPlay 2)'),
-                    ],
-                  ),
-                ),
-              const PopupMenuItem(
-                value: 'infuse',
-                child: Row(
-                  children: [
-                    Icon(
-                      Icons.play_circle_outline_rounded,
-                      size: 17,
+                    const SizedBox(width: 6),
+                    VideoProxyNodeSelector(
+                      proxyService: widget.appState.proxyService,
+                      scenario: RequestScenario.liveStream,
+                      overlayStyle: overlayMode,
+                      compact: true,
+                      onProxyChanged: (_) {
+                        if (overlayMode) _pokeLiveOsd();
+                        _playChannel(
+                          ch,
+                          urlIndex: _currentUrlIndex,
+                          resetTried: false,
+                          isAutoReconnect: true,
+                        );
+                      },
                     ),
-                    SizedBox(width: 8),
-                    Text('使用 Apple TV / iOS Infuse 打开'),
+                    const SizedBox(width: 6),
+                    OutlinedButton.icon(
+                      onPressed: () {
+                        if (overlayMode) _pokeLiveOsd();
+                        setState(() => _useServerProxy = !_useServerProxy);
+                        _playChannel(ch, urlIndex: _currentUrlIndex);
+                      },
+                      icon: Icon(
+                        _useServerProxy
+                            ? Icons.dns_rounded
+                            : Icons.bolt_rounded,
+                        size: 15,
+                      ),
+                      label: Text(_activeRouteLabel),
+                    ),
+                    const SizedBox(width: 6),
+                    FilledButton.tonalIcon(
+                      onPressed: () => _toggleLiveFullscreen(),
+                      icon: Icon(
+                        _isLiveFullscreen
+                            ? Icons.fullscreen_exit_rounded
+                            : Icons.fullscreen_rounded,
+                        size: 17,
+                        color: VideoPlatformTheme.accent,
+                      ),
+                      label: Text(_isLiveFullscreen ? '退出全屏' : '全屏放大'),
+                    ),
                   ],
                 ),
               ),
-              const PopupMenuItem(
-                value: 'vlc',
-                child: Row(
-                  children: [
-                    Icon(Icons.smart_display_outlined, size: 17),
-                    SizedBox(width: 8),
-                    Text('使用 Android TV / Apple TV VLC 打开'),
-                  ],
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(width: 6),
-          OutlinedButton.icon(
-            onPressed: () {
-              if (overlayMode) _pokeLiveOsd();
-              setState(() => _useServerProxy = !_useServerProxy);
-              _playChannel(ch, urlIndex: _currentUrlIndex);
-            },
-            icon: Icon(
-              _useServerProxy ? Icons.dns_rounded : Icons.bolt_rounded,
-              size: 15,
             ),
-            label: Text(_activeRouteLabel),
-          ),
-          const SizedBox(width: 6),
-          FilledButton.tonalIcon(
-            onPressed: () => _toggleLiveFullscreen(),
-            icon: Icon(
-              _isLiveFullscreen
-                  ? Icons.fullscreen_exit_rounded
-                  : Icons.fullscreen_rounded,
-              size: 17,
-              color: VideoPlatformTheme.accent,
-            ),
-            label: Text(_isLiveFullscreen ? '退出全屏' : '全屏放大'),
           ),
         ],
       ),

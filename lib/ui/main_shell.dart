@@ -45,7 +45,12 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   bool _showMobileSearchInput = false;
   final TextEditingController _searchController = TextEditingController();
   String? _lastSniffedClipboardUrl;
-  DateTime? _lastBackPressedAt;
+  DateTime? _lastBackHandledAt;
+  bool _isExitDialogShowing = false;
+  final GlobalKey _sidebarContainerKey = GlobalKey();
+  final Map<int, FocusNode> _sidebarTabFocusNodes = {
+    for (int i = 0; i <= 8; i++) i: FocusNode(debugLabel: 'SidebarTab_$i'),
+  };
 
   @override
   void initState() {
@@ -71,7 +76,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     setState(() {
       _selectedIndex = index;
       _isMobileSidebarOpen = false;
-      if (screenW < 920) {
+      if (screenW < 860 && !widget.appState.tvMode) {
         _isSidebarCollapsed = true;
       }
     });
@@ -84,6 +89,9 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   void dispose() {
     if (widget.appState.onNavigateToTelegramTab != null) {
       widget.appState.onNavigateToTelegramTab = null;
+    }
+    for (final node in _sidebarTabFocusNodes.values) {
+      node.dispose();
     }
     WidgetsBinding.instance.removeObserver(this);
     _searchController.dispose();
@@ -173,22 +181,179 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     widget.appState.performSearch(trimmed);
   }
 
+  bool _isFocusInsideSidebar() {
+    final primary = FocusManager.instance.primaryFocus;
+    if (primary == null) return false;
+    if (_sidebarTabFocusNodes.values.contains(primary)) {
+      return true;
+    }
+    final sidebarCtx = _sidebarContainerKey.currentContext;
+    final focusedCtx = primary.context;
+    if (sidebarCtx == null || focusedCtx == null) return false;
+    bool inside = false;
+    focusedCtx.visitAncestorElements((ancestor) {
+      if (ancestor == sidebarCtx) {
+        inside = true;
+        return false;
+      }
+      return true;
+    });
+    return inside;
+  }
+
+  void _focusSidebarTab(int index) {
+    if (_isSidebarCollapsed) {
+      setState(() => _isSidebarCollapsed = false);
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final node = _sidebarTabFocusNodes[index] ?? _sidebarTabFocusNodes[0];
+      node?.requestFocus();
+    });
+  }
+
+  Future<void> _showExitConfirmDialog() async {
+    if (_isExitDialogShowing || !mounted) return;
+    _isExitDialogShowing = true;
+    try {
+      final shouldExit = await showDialog<bool>(
+        context: context,
+        builder: (ctx) {
+          return AlertDialog(
+            backgroundColor: VideoPlatformTheme.bgElevated,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+              side: BorderSide(color: VideoPlatformTheme.borderStrong),
+            ),
+            title: Row(
+              children: [
+                Icon(
+                  Icons.exit_to_app_rounded,
+                  size: 22,
+                  color: VideoPlatformTheme.accent,
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  '确认退出流光视频？',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w700,
+                    color: VideoPlatformTheme.textPrimary,
+                  ),
+                ),
+              ],
+            ),
+            content: Text(
+              '当前已返回主导航焦点，按“退出应用”将关闭流光视频，按“继续观看”或返回键留在应用。',
+              style: TextStyle(
+                fontSize: 13.5,
+                color: VideoPlatformTheme.textSecondary,
+                height: 1.45,
+              ),
+            ),
+            actions: [
+              Focus(
+                onFocusChange: (_) {},
+                child: Builder(
+                  builder: (btnCtx) {
+                    final isFocused = Focus.of(btnCtx).hasFocus;
+                    return OutlinedButton(
+                      style: OutlinedButton.styleFrom(
+                        side: BorderSide(
+                          color: isFocused
+                              ? Colors.white
+                              : VideoPlatformTheme.borderStrong,
+                          width: isFocused ? 2.2 : 1.0,
+                        ),
+                        backgroundColor: isFocused
+                            ? VideoPlatformTheme.accent.withValues(alpha: 0.22)
+                            : null,
+                      ),
+                      onPressed: () => Navigator.of(ctx).pop(false),
+                      child: Text(
+                        '继续观看',
+                        style: TextStyle(
+                          fontWeight:
+                              isFocused ? FontWeight.w700 : FontWeight.w500,
+                          color: isFocused
+                              ? Colors.white
+                              : VideoPlatformTheme.textPrimary,
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+              Focus(
+                onFocusChange: (_) {},
+                child: Builder(
+                  builder: (btnCtx) {
+                    final isFocused = Focus.of(btnCtx).hasFocus;
+                    return FilledButton.icon(
+                      autofocus: true,
+                      style: FilledButton.styleFrom(
+                        backgroundColor: isFocused
+                            ? VideoPlatformTheme.danger
+                            : VideoPlatformTheme.accent,
+                        side: isFocused
+                            ? const BorderSide(color: Colors.white, width: 2.2)
+                            : null,
+                      ),
+                      onPressed: () => Navigator.of(ctx).pop(true),
+                      icon: const Icon(Icons.power_settings_new_rounded, size: 17),
+                      label: const Text(
+                        '退出应用',
+                        style: TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          );
+        },
+      );
+      if (shouldExit == true && mounted) {
+        SystemNavigator.pop();
+      }
+    } finally {
+      _isExitDialogShowing = false;
+    }
+  }
+
   void _handleRootPop(AppState state) {
-    if (_isMobileSidebarOpen) {
-      setState(() => _isMobileSidebarOpen = false);
+    if (_isExitDialogShowing) return;
+    final now = DateTime.now();
+    if (_lastBackHandledAt != null &&
+        now.difference(_lastBackHandledAt!) <
+            const Duration(milliseconds: 280)) {
       return;
     }
-    final screenW = MediaQuery.maybeSizeOf(context)?.width ?? 1024;
-    if ((screenW >= 860 || state.tvMode) &&
-        !_isSidebarCollapsed &&
-        screenW < 960) {
-      setState(() => _isSidebarCollapsed = true);
+    _lastBackHandledAt = now;
+
+    // Step 1: Let the active child screen handle its own sub-states first
+    // (e.g. exiting Live TV fullscreen, closing channel drawer, exiting Telegram chat/selection, stepping up folders/categories)
+    if (state.activeChildBackHandler?.call() == true) {
+      return;
+    }
+
+    // Step 2: Fallback immersive fullscreen exit
+    if (state.isImmersiveFullscreen) {
+      state.setImmersiveFullscreen(false);
+      return;
+    }
+
+    // Step 3: Close mobile overlay drawer or mobile search input if open
+    if (_isMobileSidebarOpen) {
+      setState(() => _isMobileSidebarOpen = false);
       return;
     }
     if (_showMobileSearchInput) {
       setState(() => _showMobileSearchInput = false);
       return;
     }
+
+    // Step 4: Clear VOD search or Alist directory breadcrumbs if on VOD Home
     if (_selectedIndex == 0 && state.searchKeyword.isNotEmpty) {
       _searchController.clear();
       state.clearSearch();
@@ -201,24 +366,30 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       );
       return;
     }
-    if (_selectedIndex != 0) {
-      _selectTab(0);
-      return;
+
+    // Step 5: On TV / Desktop layout, step focus back from Right Content Area -> Left Navigation Sidebar -> Main Tab 0 Focus
+    final screenW = MediaQuery.maybeSizeOf(context)?.width ?? 1024;
+    final isDesktopOrTv = screenW >= 860 || state.tvMode;
+    if (isDesktopOrTv) {
+      if (_isSidebarCollapsed || !_isFocusInsideSidebar()) {
+        _focusSidebarTab(_selectedIndex);
+        return;
+      }
+      if (_selectedIndex != 0) {
+        _selectTab(0);
+        _focusSidebarTab(0);
+        return;
+      }
+    } else {
+      // Mobile layout: step back to Home Tab 0 before prompting to exit
+      if (_selectedIndex != 0) {
+        _selectTab(0);
+        return;
+      }
     }
-    final now = DateTime.now();
-    if (_lastBackPressedAt == null ||
-        now.difference(_lastBackPressedAt!) > const Duration(seconds: 2)) {
-      _lastBackPressedAt = now;
-      ScaffoldMessenger.of(context).clearSnackBars();
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          duration: Duration(seconds: 2),
-          content: Text('再按一次返回键退出流光视频'),
-        ),
-      );
-      return;
-    }
-    SystemNavigator.pop();
+
+    // Step 6: Already at the Main Focus (Tab 0 & Main Sidebar Focus) -> Ask confirmation to exit app
+    _showExitConfirmDialog();
   }
 
   @override
@@ -235,21 +406,32 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
         final isImmersive = state.isImmersiveFullscreen;
         final isSidebarOpen = !isImmersive &&
             (isDesktop ? !_isSidebarCollapsed : _isMobileSidebarOpen);
-        final useOverlaySidebar = screenWidth < 860;
+        final useOverlaySidebar = screenWidth < 860 && !state.tvMode;
         final miniSession = state.miniPlayerSession;
 
         return PopScope(
           canPop: false,
           onPopInvokedWithResult: (didPop, _) {
             if (!didPop) {
-              if (state.isImmersiveFullscreen) {
-                state.setImmersiveFullscreen(false);
-                return;
-              }
               _handleRootPop(state);
             }
           },
-          child: CallbackShortcuts(
+          child: Focus(
+            canRequestFocus: false,
+            onKeyEvent: (node, event) {
+              if (event is KeyDownEvent &&
+                  (event.logicalKey == LogicalKeyboardKey.goBack ||
+                      event.logicalKey == LogicalKeyboardKey.escape ||
+                      event.logicalKey == LogicalKeyboardKey.browserBack)) {
+                final route = ModalRoute.of(context);
+                if (route != null && route.isCurrent) {
+                  _handleRootPop(state);
+                  return KeyEventResult.handled;
+                }
+              }
+              return KeyEventResult.ignored;
+            },
+            child: CallbackShortcuts(
             bindings: <ShortcutActivator, VoidCallback>{
               const SingleActivator(LogicalKeyboardKey.keyK, meta: true):
                   _openCommandPalette,
@@ -387,8 +569,9 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                   : _buildMobileBottomBar(state),
             ),
           ),
-        );
-      },
+        ),
+      );
+    },
     );
   }
 
@@ -1406,6 +1589,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
 
   Widget _buildDesktopSidebar(AppState state, {VoidCallback? onCollapse}) {
     return Container(
+      key: _sidebarContainerKey,
       width: 196,
       decoration: BoxDecoration(
         color: VideoPlatformTheme.bgElevated,
@@ -1713,6 +1897,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 2),
       child: InkWell(
+        focusNode: _sidebarTabFocusNodes[index],
         borderRadius: BorderRadius.circular(6),
         focusColor: VideoPlatformTheme.accent.withValues(alpha: 0.28),
         onFocusChange: (_) {

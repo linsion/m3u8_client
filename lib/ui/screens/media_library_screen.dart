@@ -45,6 +45,29 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
     }
   }
 
+  @override
+  void dispose() {
+    if (widget.appState.activeChildBackHandler == _handleBackPress) {
+      widget.appState.activeChildBackHandler = null;
+    }
+    super.dispose();
+  }
+
+  bool _handleBackPress() {
+    if (!mounted) return false;
+    if (_searchFilter.isNotEmpty) {
+      setState(() => _searchFilter = '');
+      return true;
+    }
+    final dir = widget.appState.currentDirectory;
+    final currentPath = dir?.path ?? '';
+    if (currentPath.isNotEmpty) {
+      widget.appState.loadFiles(path: dir?.parent ?? '');
+      return true;
+    }
+    return false;
+  }
+
   Future<void> _loadBookmarks() async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -489,6 +512,7 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
   @override
   Widget build(BuildContext context) {
     final state = widget.appState;
+    state.activeChildBackHandler = _handleBackPress;
     final dir = state.currentDirectory;
     final currentPath = dir?.path ?? '';
     final isBookmarked =

@@ -119,8 +119,10 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
   StreamSubscription<bool>? _completedSub;
   StreamSubscription<String>? _errorSub;
   StreamSubscription<bool>? _bufferingSub;
+  StreamSubscription<int?>? _widthSub;
   Timer? _startupWatchdogTimer;
   Timer? _bufferingLagTimer;
+  bool _hasRenderedFirstFrame = false;
   bool _usingClientProxy = false;
   int _clientProxyRetryCountForEpisode = 0;
   bool _bypassClientProxyForCurrentEpisode = false;
@@ -137,6 +139,34 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
   Duration _lastValidDuration = Duration.zero;
   int _prematureEofRecoveryCount = 0;
   DateTime _lastHistorySync = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime? _lastBackHandledAt;
+  bool _isVerticalVolumeDragging = false;
+  double _volumePercent = 100.0;
+
+  bool _isBackLogicalKey(LogicalKeyboardKey key) {
+    return key == LogicalKeyboardKey.goBack ||
+        key == LogicalKeyboardKey.escape ||
+        key == LogicalKeyboardKey.browserBack;
+  }
+
+  void _handleBackPress() {
+    if (!mounted) return;
+    final now = DateTime.now();
+    if (_lastBackHandledAt != null &&
+        now.difference(_lastBackHandledAt!) <
+            const Duration(milliseconds: 280)) {
+      return;
+    }
+    _lastBackHandledAt = now;
+
+    if (_isFullscreenMode) {
+      _toggleFullscreenMode(forceValue: false);
+      return;
+    }
+    if (Navigator.of(context).canPop()) {
+      Navigator.of(context).pop();
+    }
+  }
 
   @override
   void initState() {
@@ -194,7 +224,15 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         _playNextEpisodeIfAvailable();
       }
     });
+    _widthSub = _player.stream.width.listen((w) {
+      if ((w ?? 0) > 0 && !_hasRenderedFirstFrame && mounted) {
+        setState(() => _hasRenderedFirstFrame = true);
+      }
+    });
     _bufferingSub = _player.stream.buffering.listen((isBuffering) {
+      if (mounted) {
+        setState(() {});
+      }
       _bufferingLagTimer?.cancel();
       if (isBuffering && _usingClientProxy) {
         final hasStarted = _player.state.duration > Duration.zero ||
@@ -412,6 +450,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     _completedSub?.cancel();
     _errorSub?.cancel();
     _bufferingSub?.cancel();
+    _widthSub?.cancel();
     _player.dispose();
     super.dispose();
   }
@@ -436,6 +475,9 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
 
   void _onPositionUpdate(Duration pos) {
     if (pos > Duration.zero) {
+      if (!_hasRenderedFirstFrame && mounted) {
+        setState(() => _hasRenderedFirstFrame = true);
+      }
       if ((pos - _lastValidPosition).inSeconds.abs() >= 3) {
         _prematureEofRecoveryCount = 0;
       }
@@ -549,6 +591,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
   }) async {
     setState(() {
       _isLoadingDetail = true;
+      _hasRenderedFirstFrame = false;
       _detailError = null;
     });
 
@@ -656,6 +699,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     setState(() {
       _currentEpisode = episode;
       _isResolvingPlay = true;
+      _hasRenderedFirstFrame = false;
       _playError = null;
       _pendingSeekSeconds = effectiveSeek;
       _hasAppliedInitialSeek = false;
@@ -812,7 +856,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     String finalMediaTarget = playUrl;
     bool usingLocalStreamRelay = false;
 
-    if (!forceProxy && !bypassClientProxy) {
+    if (!bypassClientProxy) {
       final relayed = await widget.appState.proxyService.resolveProxiedStreamUrl(
         RequestScenario.vodStream,
         playUrl,
@@ -829,10 +873,17 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     await _applyVodStreamHeaders(
       headers,
       streamUrl: finalMediaTarget,
-      bypassClientProxy: bypassClientProxy || forceProxy || usingLocalStreamRelay,
+      bypassClientProxy: bypassClientProxy || usingLocalStreamRelay,
     );
     if (usingLocalStreamRelay) {
       _usingClientProxy = !finalMediaTarget.contains('direct=1');
+    }
+
+    if (mounted) {
+      setState(() {
+        _hasRenderedFirstFrame =
+            (_player.state.width ?? 0) > 0 || _player.state.position > Duration.zero;
+      });
     }
 
     _activeStreamUrl = finalMediaTarget;
@@ -848,15 +899,15 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       await _player.setRate(_playbackSpeed);
     }
 
-    // 1. Concurrent fast playability probe on the primary stream: if the origin URL
-    // immediately fails or returns 4xx/5xx while libmpv hasn't started yet, switch right away!
-    if (!forceProxy && playUrl.startsWith('http')) {
+    // 1. Concurrent fast playability probe on direct streams (when not already
+    // handled by LocalProxyTunnelBridge relay, to avoid competing proxy handshakes).
+    if (!forceProxy && !usingLocalStreamRelay && playUrl.startsWith('http')) {
       unawaited(
         widget.appState.api
             .probeVodStreamPlayableFast(
           playUrl,
           headers,
-          timeout: const Duration(milliseconds: 2200),
+          timeout: const Duration(milliseconds: 2500),
         )
             .then((probe) {
           if (!mounted || activeAttemptId != _playAttemptSessionId) return;
@@ -864,7 +915,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
             final hasStarted = _player.state.duration > Duration.zero ||
                 _player.state.position > Duration.zero ||
                 (_player.state.width ?? 0) > 0 ||
-                LocalProxyTunnelBridge.recentDownstreamBytesPerSecond > 2048;
+                LocalProxyTunnelBridge.recentDownstreamBytesPerSecond > 512;
             if (!hasStarted) {
               _triggerFastStartupFallback(reason: '主线路探测不可达');
             }
@@ -873,14 +924,15 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       );
     }
 
-    // 2. Fast 3.8-second startup watchdog for ALL playback modes (both Direct & Proxy):
-    // if no frames, duration, or downstream bytes have arrived within 3.8s, switch immediately!
-    _startupWatchdogTimer = Timer(const Duration(milliseconds: 3800), () {
+    // 2. Startup watchdog: give proxy tunnels adequate time for TLS + first segment
+    // and never abort while downstream bytes are actively flowing!
+    final watchdogMs = _usingClientProxy ? 6800 : 4200;
+    _startupWatchdogTimer = Timer(Duration(milliseconds: watchdogMs), () {
       if (!mounted || activeAttemptId != _playAttemptSessionId) return;
       final hasStarted = _player.state.duration > Duration.zero ||
           _player.state.position > Duration.zero ||
           (_player.state.width ?? 0) > 0 ||
-          LocalProxyTunnelBridge.recentDownstreamBytesPerSecond > 4096;
+          LocalProxyTunnelBridge.recentDownstreamBytesPerSecond > 512;
       if (!hasStarted) {
         _triggerFastStartupFallback(reason: '当前线路响应超时');
       }
@@ -1169,13 +1221,18 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       _pendingSeekSeconds = curPosSec;
       _hasAppliedInitialSeek = false;
     }
-    _bypassClientProxyForCurrentEpisode = false;
-    _clientProxyRetryCountForEpisode = 0;
+    setState(() {
+      _useServerProxy = false;
+      _bypassClientProxyForCurrentEpisode = false;
+      _clientProxyRetryCountForEpisode = 0;
+      _hasRenderedFirstFrame = false;
+      _playError = null;
+    });
     final resolved = _resolvedPlayback;
     if (resolved != null) {
       _openResolvedStream(
         resolved,
-        forceProxy: _useServerProxy,
+        forceProxy: resolved.backendProxyPlayback && resolved.directUrl.isEmpty,
         bypassClientProxy: false,
       );
     } else if (_currentEpisode != null) {
@@ -2162,19 +2219,25 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         : (widget.initialTitle.isNotEmpty ? widget.initialTitle : '视频播放');
 
     return PopScope(
-      canPop: !_isFullscreenMode,
+      canPop: false,
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop && _isFullscreenMode) {
-          if (_fullscreenControlsVisible) {
-            _fullscreenControlsTimer?.cancel();
-            setState(() => _fullscreenControlsVisible = false);
-            _fullscreenStageFocusNode.requestFocus();
-          } else {
-            _toggleFullscreenMode(forceValue: false);
-          }
+        if (!didPop) {
+          _handleBackPress();
         }
       },
-      child: CallbackShortcuts(
+      child: Focus(
+        canRequestFocus: false,
+        onKeyEvent: (node, event) {
+          if (event is KeyDownEvent && _isBackLogicalKey(event.logicalKey)) {
+            final route = ModalRoute.of(context);
+            if (route != null && route.isCurrent) {
+              _handleBackPress();
+              return KeyEventResult.handled;
+            }
+          }
+          return KeyEventResult.ignored;
+        },
+        child: CallbackShortcuts(
         bindings: <ShortcutActivator, VoidCallback>{
           const SingleActivator(LogicalKeyboardKey.mediaPlayPause): () =>
               _player.playOrPause(),
@@ -2332,10 +2395,16 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                     focusNode: _fullscreenStageFocusNode,
                     autofocus: true,
                     onKeyEvent: (node, event) {
+                      if (_isBackLogicalKey(event.logicalKey)) {
+                        return KeyEventResult.ignored;
+                      }
                       if (event is KeyDownEvent || event is KeyRepeatEvent) {
                         final wasHidden = !_fullscreenControlsVisible;
                         _pokeFullscreenControls(focusBar: wasHidden);
-                        if (wasHidden) {
+                        if (!wasHidden && !node.hasPrimaryFocus) {
+                          return KeyEventResult.ignored;
+                        }
+                        if (wasHidden || node.hasPrimaryFocus) {
                           if (event.logicalKey ==
                               LogicalKeyboardKey.arrowLeft) {
                             _rewindSeconds(15);
@@ -2354,10 +2423,11 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                       LogicalKeyboardKey.gameButtonA)) {
                             _player.playOrPause();
                             return KeyEventResult.handled;
-                          } else if (event.logicalKey ==
-                                  LogicalKeyboardKey.arrowUp ||
-                              event.logicalKey ==
-                                  LogicalKeyboardKey.arrowDown) {
+                          } else if (wasHidden &&
+                              (event.logicalKey ==
+                                      LogicalKeyboardKey.arrowUp ||
+                                  event.logicalKey ==
+                                      LogicalKeyboardKey.arrowDown)) {
                             return KeyEventResult.handled;
                           }
                         }
@@ -2556,6 +2626,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                   },
                 ),
         ),
+      ),
       ),
     );
   }
@@ -2811,7 +2882,9 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         if (mounted) setState(() {});
       },
       onKeyEvent: (node, event) {
-        if (onPressed == null) return KeyEventResult.ignored;
+        if (onPressed == null || _isBackLogicalKey(event.logicalKey)) {
+          return KeyEventResult.ignored;
+        }
         if (event is KeyDownEvent) {
           if (_isFullscreenMode) _pokeFullscreenControls();
           if (event.logicalKey == LogicalKeyboardKey.select ||
@@ -2827,14 +2900,14 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       },
       child: Builder(
         builder: (ctx) {
-          final hasFocus = Focus.of(ctx).hasFocus;
+          final hasFocus = Focus.of(ctx).hasPrimaryFocus;
           return Tooltip(
             message: tooltip ?? label,
             child: InkWell(
+              canRequestFocus: false,
               borderRadius: BorderRadius.circular(6),
               onTap: onPressed,
-              child: AnimatedContainer(
-                duration: const Duration(milliseconds: 120),
+              child: Container(
                 padding: EdgeInsets.symmetric(
                   horizontal: showLabel ? 10 : 8,
                   vertical: 6,
@@ -2952,6 +3025,9 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                       if (mounted) setState(() {});
                     },
                     onKeyEvent: (node, event) {
+                      if (_isBackLogicalKey(event.logicalKey)) {
+                        return KeyEventResult.ignored;
+                      }
                       if (event is KeyDownEvent || event is KeyRepeatEvent) {
                         if (_isFullscreenMode) _pokeFullscreenControls();
                         if (event.logicalKey == LogicalKeyboardKey.arrowLeft) {
@@ -2964,9 +3040,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                         } else if (_isFullscreenMode &&
                             event is KeyDownEvent &&
                             event.logicalKey == LogicalKeyboardKey.arrowUp) {
-                          _fullscreenControlsTimer?.cancel();
-                          setState(() => _fullscreenControlsVisible = false);
-                          _fullscreenStageFocusNode.requestFocus();
+                          node.focusInDirection(TraversalDirection.up);
                           return KeyEventResult.handled;
                         }
                       }
@@ -2974,9 +3048,8 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                     },
                     child: Builder(
                       builder: (ctx) {
-                        final hasBarFocus = Focus.of(ctx).hasFocus;
-                        return AnimatedContainer(
-                          duration: const Duration(milliseconds: 120),
+                        final hasBarFocus = Focus.of(ctx).hasPrimaryFocus;
+                        return Container(
                           padding: const EdgeInsets.symmetric(
                             horizontal: 8,
                             vertical: 2,
@@ -3172,6 +3245,14 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                   onPressed: _showCrossSiteSourceSwitchDialog,
                                 ),
                               ],
+                              const SizedBox(width: 8),
+                              VideoProxyNodeSelector(
+                                proxyService: widget.appState.proxyService,
+                                scenario: RequestScenario.vodStream,
+                                overlayStyle: isFullscreen,
+                                compact: true,
+                                onProxyChanged: _onProxyNodeSwitched,
+                              ),
                             ],
                           ),
                         ),
@@ -3217,7 +3298,34 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
 
     final Widget stageContent = GestureDetector(
         behavior: HitTestBehavior.translucent,
+        onTap: isFullscreen
+            ? null
+            : () {
+                if (!widget.appState.tvMode &&
+                    _currentEpisode != null &&
+                    !_isResolvingPlay) {
+                  _player.playOrPause();
+                }
+              },
         onDoubleTap: () => _player.playOrPause(),
+        onVerticalDragStart: (_) {
+          if (_currentEpisode == null || _isResolvingPlay) return;
+          setState(() => _isVerticalVolumeDragging = true);
+        },
+        onVerticalDragUpdate: (details) {
+          if (!_isVerticalVolumeDragging) return;
+          final stageH = isFullscreen
+              ? screenSize.height.clamp(240.0, 1200.0)
+              : mobileStageHeight;
+          final deltaVol = (-details.delta.dy / stageH) * 120.0;
+          final nextVol = (_volumePercent + deltaVol).clamp(0.0, 100.0);
+          setState(() => _volumePercent = nextVol);
+          _player.setVolume(nextVol);
+        },
+        onVerticalDragEnd: (_) {
+          if (!_isVerticalVolumeDragging) return;
+          setState(() => _isVerticalVolumeDragging = false);
+        },
         onHorizontalDragStart: (_) {
           if (_currentEpisode == null || _isResolvingPlay) return;
           final curSec = _player.state.position.inSeconds > 0
@@ -3328,6 +3436,87 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                       ),
                     ),
                   ),
+                ),
+              if (_isVerticalVolumeDragging && !_isHorizontalSeeking)
+                Center(
+                  child: IgnorePointer(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 18,
+                        vertical: 10,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xE0090E14),
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(
+                          color: VideoPlatformTheme.accent,
+                          width: 1.4,
+                        ),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            _volumePercent <= 0
+                                ? Icons.volume_off_rounded
+                                : (_volumePercent < 50
+                                    ? Icons.volume_down_rounded
+                                    : Icons.volume_up_rounded),
+                            color: VideoPlatformTheme.accent,
+                            size: 20,
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            '音量 ${_volumePercent.round()}%',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 14,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              if (!_isHorizontalSeeking &&
+                  !_isVerticalVolumeDragging &&
+                  !_isLoadingDetail &&
+                  !_isResolvingPlay &&
+                  _hasRenderedFirstFrame &&
+                  !_player.state.buffering &&
+                  _playError == null &&
+                  _currentEpisode != null)
+                StreamBuilder<bool>(
+                  stream: _player.stream.playing,
+                  initialData: _player.state.playing,
+                  builder: (_, playSnap) {
+                    final isPlaying = playSnap.data ?? false;
+                    if (isPlaying) return const SizedBox.shrink();
+                    return Center(
+                      child: GestureDetector(
+                        onTap: () => _player.play(),
+                        child: Container(
+                          width: 62,
+                          height: 62,
+                          decoration: BoxDecoration(
+                            color: const Color(0xAA090E14),
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: VideoPlatformTheme.accent,
+                              width: 2.0,
+                            ),
+                          ),
+                          alignment: Alignment.center,
+                          child: const Icon(
+                            Icons.play_arrow_rounded,
+                            color: Colors.white,
+                            size: 38,
+                          ),
+                        ),
+                      ),
+                    );
+                  },
                 ),
               if (_isLongPressFastForward)
                 Positioned(
@@ -3587,27 +3776,117 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                   ],
                 ),
               ),
-            if (_isResolvingPlay)
-              Container(
-                color: const Color(0x99000000),
-                alignment: Alignment.center,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    SizedBox(
-                      width: 28,
-                      height: 28,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2.5,
-                        color: VideoPlatformTheme.accent,
+            if (_playError == null &&
+                _detailError == null &&
+                (_isLoadingDetail ||
+                    _isResolvingPlay ||
+                    (_currentEpisode != null && !_hasRenderedFirstFrame) ||
+                    _player.state.buffering))
+              IgnorePointer(
+                child: Center(
+                  child: Container(
+                    margin: const EdgeInsets.symmetric(horizontal: 24),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 20,
+                      vertical: 16,
+                    ),
+                    decoration: BoxDecoration(
+                      color: const Color(0xD80A111A),
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(
+                        color: VideoPlatformTheme.accent.withValues(alpha: 0.45),
                       ),
+                      boxShadow: const [
+                        BoxShadow(
+                          color: Color(0x77000000),
+                          blurRadius: 16,
+                          offset: Offset(0, 6),
+                        ),
+                      ],
                     ),
-                    SizedBox(height: 10),
-                    Text(
-                      '正在解析播放地址...',
-                      style: TextStyle(color: Colors.white, fontSize: 13),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        SizedBox(
+                          width: 28,
+                          height: 28,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2.6,
+                            color: VideoPlatformTheme.accent,
+                          ),
+                        ),
+                        const SizedBox(height: 11),
+                        Text(
+                          _isLoadingDetail
+                              ? '正在连接片源 (${_activeSource.name}) 获取剧集信息...'
+                              : (_isResolvingPlay
+                                  ? '正在解析播放地址 (${_currentEpisode?.groupName ?? "默认线路"})...'
+                                  : (!_hasRenderedFirstFrame
+                                      ? (_usingClientProxy
+                                          ? '正在通过代理加速连接视频源，加载首帧画面...'
+                                          : (_useServerProxy
+                                              ? '正在通过服务端中转连接视频源，加载首帧画面...'
+                                              : '正在直连视频源，加载首帧画面...'))
+                                      : '正在缓冲视频数据，请稍候...')),
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 6,
+                          alignment: WrapAlignment.center,
+                          crossAxisAlignment: WrapCrossAlignment.center,
+                          children: [
+                            if (_currentEpisode != null)
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 8,
+                                  vertical: 3,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.white.withValues(alpha: 0.08),
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                                child: Text(
+                                  '${_currentEpisode!.groupName} · ${_currentEpisode!.title}',
+                                  style: const TextStyle(
+                                    color: Colors.white70,
+                                    fontSize: 11.5,
+                                  ),
+                                ),
+                              ),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 3,
+                              ),
+                              decoration: BoxDecoration(
+                                color: VideoPlatformTheme.accent
+                                    .withValues(alpha: 0.16),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Text(
+                                _usingClientProxy
+                                    ? '代理: ${widget.appState.proxyService.resolveNodeForScenario(RequestScenario.vodStream)?.displayTitle ?? "加速节点"}'
+                                    : (_useServerProxy ? '通道: 服务端中转' : '通道: 客户端直连'),
+                                style: TextStyle(
+                                  color: VideoPlatformTheme.accent,
+                                  fontSize: 11.5,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                            VideoDownloadSpeedBadge(player: _player),
+                          ],
+                        ),
+                      ],
                     ),
-                  ],
+                  ),
                 ),
               ),
             if (_playError != null && !_isResolvingPlay)
@@ -3672,7 +3951,13 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     );
 
     final Widget focusableStage = Focus(
+      onFocusChange: (_) {
+        if (mounted) setState(() {});
+      },
       onKeyEvent: (node, event) {
+        if (!node.hasPrimaryFocus) {
+          return KeyEventResult.ignored;
+        }
         if (event is KeyDownEvent || event is KeyRepeatEvent) {
           if (event.logicalKey == LogicalKeyboardKey.arrowLeft) {
             _rewindSeconds(15);
@@ -3697,7 +3982,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       },
       child: Builder(
         builder: (ctx) {
-          final hasStageFocus = Focus.of(ctx).hasFocus;
+          final hasStageFocus = Focus.of(ctx).hasPrimaryFocus;
           return Stack(
             fit: StackFit.expand,
             children: [
@@ -3940,111 +4225,123 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
             label: Text(_useServerProxy ? '服务端中转' : '直连播放'),
           ),
           // Speed selector
-          PopupMenuButton<double>(
-            tooltip: '倍速播放（长按画面也可3.0x快进）',
-            initialValue: _playbackSpeed,
-            onSelected: (speed) {
-              setState(() => _playbackSpeed = speed);
-              _player.setRate(speed);
+          Focus(
+            canRequestFocus: false,
+            onFocusChange: (_) {
+              if (mounted) setState(() {});
             },
-            itemBuilder: (_) => const [
-              PopupMenuItem(value: 0.75, child: Text('0.75x')),
-              PopupMenuItem(value: 1.0, child: Text('1.0x 正常')),
-              PopupMenuItem(value: 1.25, child: Text('1.25x')),
-              PopupMenuItem(value: 1.5, child: Text('1.5x')),
-              PopupMenuItem(value: 2.0, child: Text('2.0x')),
-              PopupMenuItem(value: 3.0, child: Text('3.0x 极速')),
-            ],
-            child: Builder(
-              builder: (ctx) {
-                final isFocused = Focus.of(ctx).hasFocus;
-                return Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: isFocused
-                        ? VideoPlatformTheme.accent.withValues(alpha: 0.24)
-                        : Colors.transparent,
-                    borderRadius: BorderRadius.circular(6),
-                    border: Border.all(
-                      color: isFocused
-                          ? VideoPlatformTheme.accent
-                          : VideoPlatformTheme.borderStrong,
-                      width: isFocused ? 2.0 : 1.0,
-                    ),
-                  ),
-                  child: Text(
-                    '倍速 ${_playbackSpeed}x',
-                    style: TextStyle(
-                      fontSize: 13,
-                      fontWeight:
-                          isFocused ? FontWeight.w600 : FontWeight.w400,
-                      color: isFocused
-                          ? VideoPlatformTheme.accent
-                          : VideoPlatformTheme.textPrimary,
-                    ),
-                  ),
-                );
+            child: PopupMenuButton<double>(
+              tooltip: '倍速播放（长按画面也可3.0x快进）',
+              initialValue: _playbackSpeed,
+              onSelected: (speed) {
+                setState(() => _playbackSpeed = speed);
+                _player.setRate(speed);
               },
-            ),
-          ),
-          // Aspect ratio selector
-          PopupMenuButton<String>(
-            tooltip: '切换画面比例',
-            initialValue: _videoAspectMode,
-            onSelected: (mode) {
-              setState(() => _videoAspectMode = mode);
-            },
-            itemBuilder: (_) => const [
-              PopupMenuItem(value: 'fit', child: Text('适应屏幕 (默认)')),
-              PopupMenuItem(value: '16:9', child: Text('强制 16:9')),
-              PopupMenuItem(value: '4:3', child: Text('强制 4:3')),
-              PopupMenuItem(value: 'cover', child: Text('铺满裁剪 (去黑边)')),
-            ],
-            child: Builder(
-              builder: (ctx) {
-                final isFocused = Focus.of(ctx).hasFocus;
-                return Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: isFocused
-                        ? VideoPlatformTheme.accent.withValues(alpha: 0.24)
-                        : Colors.transparent,
-                    borderRadius: BorderRadius.circular(6),
-                    border: Border.all(
+              itemBuilder: (_) => const [
+                PopupMenuItem(value: 0.75, child: Text('0.75x')),
+                PopupMenuItem(value: 1.0, child: Text('1.0x 正常')),
+                PopupMenuItem(value: 1.25, child: Text('1.25x')),
+                PopupMenuItem(value: 1.5, child: Text('1.5x')),
+                PopupMenuItem(value: 2.0, child: Text('2.0x')),
+                PopupMenuItem(value: 3.0, child: Text('3.0x 极速')),
+              ],
+              child: Builder(
+                builder: (ctx) {
+                  final isFocused = Focus.of(ctx).hasFocus;
+                  return Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    decoration: BoxDecoration(
                       color: isFocused
-                          ? VideoPlatformTheme.accent
-                          : VideoPlatformTheme.borderStrong,
-                      width: isFocused ? 2.0 : 1.0,
+                          ? VideoPlatformTheme.accent.withValues(alpha: 0.24)
+                          : Colors.transparent,
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(
+                        color: isFocused
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.borderStrong,
+                        width: isFocused ? 2.0 : 1.0,
+                      ),
                     ),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        Icons.aspect_ratio_rounded,
-                        size: 15,
+                    child: Text(
+                      '倍速 ${_playbackSpeed}x',
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight:
+                            isFocused ? FontWeight.w600 : FontWeight.w400,
                         color: isFocused
                             ? VideoPlatformTheme.accent
                             : VideoPlatformTheme.textPrimary,
                       ),
-                      const SizedBox(width: 5),
-                      Text(
-                        '比例 ${_videoAspectMode == 'fit' ? '适应' : (_videoAspectMode == 'cover' ? '铺满' : _videoAspectMode)}',
-                        style: TextStyle(
-                          fontSize: 13,
-                          fontWeight:
-                              isFocused ? FontWeight.w600 : FontWeight.w400,
+                    ),
+                  );
+                },
+              ),
+            ),
+          ),
+          // Aspect ratio selector
+          Focus(
+            canRequestFocus: false,
+            onFocusChange: (_) {
+              if (mounted) setState(() {});
+            },
+            child: PopupMenuButton<String>(
+              tooltip: '切换画面比例',
+              initialValue: _videoAspectMode,
+              onSelected: (mode) {
+                setState(() => _videoAspectMode = mode);
+              },
+              itemBuilder: (_) => const [
+                PopupMenuItem(value: 'fit', child: Text('适应屏幕 (默认)')),
+                PopupMenuItem(value: '16:9', child: Text('强制 16:9')),
+                PopupMenuItem(value: '4:3', child: Text('强制 4:3')),
+                PopupMenuItem(value: 'cover', child: Text('铺满裁剪 (去黑边)')),
+              ],
+              child: Builder(
+                builder: (ctx) {
+                  final isFocused = Focus.of(ctx).hasFocus;
+                  return Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: isFocused
+                          ? VideoPlatformTheme.accent.withValues(alpha: 0.24)
+                          : Colors.transparent,
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(
+                        color: isFocused
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.borderStrong,
+                        width: isFocused ? 2.0 : 1.0,
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.aspect_ratio_rounded,
+                          size: 15,
                           color: isFocused
                               ? VideoPlatformTheme.accent
                               : VideoPlatformTheme.textPrimary,
                         ),
-                      ),
-                    ],
-                  ),
-                );
-              },
+                        const SizedBox(width: 5),
+                        Text(
+                          '比例 ${_videoAspectMode == 'fit' ? '适应' : (_videoAspectMode == 'cover' ? '铺满' : _videoAspectMode)}',
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight:
+                                isFocused ? FontWeight.w600 : FontWeight.w400,
+                            color: isFocused
+                                ? VideoPlatformTheme.accent
+                                : VideoPlatformTheme.textPrimary,
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
             ),
           ),
           // External Subtitle loader button

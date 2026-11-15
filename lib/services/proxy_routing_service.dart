@@ -2051,47 +2051,80 @@ class _SsCrypto {
     return s;
   }
 
-  static void _gf128MulInPlace(Uint8List x, Uint8List h) {
-    final z = Uint8List(16);
-    final v = Uint8List.fromList(h);
-    for (var i = 0; i < 128; i++) {
-      if ((x[i >> 3] & (0x80 >> (i & 7))) != 0) {
-        for (var j = 0; j < 16; j++) {
-          z[j] ^= v[j];
+  static Uint8List _ghash(Uint8List h, Uint8List ciphertext) {
+    final hBd = ByteData.sublistView(h);
+    final h0 = hBd.getUint32(0, Endian.big);
+    final h1 = hBd.getUint32(4, Endian.big);
+    final h2 = hBd.getUint32(8, Endian.big);
+    final h3 = hBd.getUint32(12, Endian.big);
+
+    var y0 = 0, y1 = 0, y2 = 0, y3 = 0;
+
+    void gfMulBlock() {
+      var z0 = 0, z1 = 0, z2 = 0, z3 = 0;
+      var v0 = h0, v1 = h1, v2 = h2, v3 = h3;
+      for (var wIdx = 0; wIdx < 4; wIdx++) {
+        final word =
+            wIdx == 0 ? y0 : (wIdx == 1 ? y1 : (wIdx == 2 ? y2 : y3));
+        for (var bit = 31; bit >= 0; bit--) {
+          if ((word & (1 << bit)) != 0) {
+            z0 ^= v0;
+            z1 ^= v1;
+            z2 ^= v2;
+            z3 ^= v3;
+          }
+          final lsb = v3 & 1;
+          v3 = ((v3 >>> 1) | ((v2 & 1) << 31)) & 0xffffffff;
+          v2 = ((v2 >>> 1) | ((v1 & 1) << 31)) & 0xffffffff;
+          v1 = ((v1 >>> 1) | ((v0 & 1) << 31)) & 0xffffffff;
+          v0 = (v0 >>> 1) & 0xffffffff;
+          if (lsb != 0) {
+            v0 ^= 0xe1000000;
+          }
         }
       }
-      final lsb = (v[15] & 1) != 0;
-      for (var j = 15; j > 0; j--) {
-        v[j] = ((v[j] >> 1) | ((v[j - 1] & 1) << 7)) & 0xff;
-      }
-      v[0] = (v[0] >> 1) & 0xff;
-      if (lsb) {
-        v[0] ^= 0xe1;
-      }
+      y0 = z0;
+      y1 = z1;
+      y2 = z2;
+      y3 = z3;
     }
-    x.setRange(0, 16, z);
-  }
 
-  static Uint8List _ghash(Uint8List h, Uint8List ciphertext) {
-    final y = Uint8List(16);
-    for (var offset = 0; offset < ciphertext.length; offset += 16) {
-      final end = min(offset + 16, ciphertext.length);
-      for (var i = offset; i < end; i++) {
-        y[i - offset] ^= ciphertext[i];
+    final ctLen = ciphertext.length;
+    final fullEnd = ctLen & ~15;
+    final ctBd = ByteData.sublistView(ciphertext);
+    for (var offset = 0; offset < fullEnd; offset += 16) {
+      y0 ^= ctBd.getUint32(offset, Endian.big);
+      y1 ^= ctBd.getUint32(offset + 4, Endian.big);
+      y2 ^= ctBd.getUint32(offset + 8, Endian.big);
+      y3 ^= ctBd.getUint32(offset + 12, Endian.big);
+      gfMulBlock();
+    }
+    if (fullEnd < ctLen) {
+      final tail = Uint8List(16);
+      for (var i = fullEnd; i < ctLen; i++) {
+        tail[i - fullEnd] = ciphertext[i];
       }
-      _gf128MulInPlace(y, h);
+      final tailBd = ByteData.sublistView(tail);
+      y0 ^= tailBd.getUint32(0, Endian.big);
+      y1 ^= tailBd.getUint32(4, Endian.big);
+      y2 ^= tailBd.getUint32(8, Endian.big);
+      y3 ^= tailBd.getUint32(12, Endian.big);
+      gfMulBlock();
     }
+
     // Length block: 64-bit AAD length (0) || 64-bit ciphertext bit length
-    final bitLen = ciphertext.length * 8;
-    final lenBlock = Uint8List(16);
-    final bd = ByteData.sublistView(lenBlock);
-    bd.setUint32(8, (bitLen ~/ 0x100000000) & 0xffffffff, Endian.big);
-    bd.setUint32(12, bitLen & 0xffffffff, Endian.big);
-    for (var i = 0; i < 16; i++) {
-      y[i] ^= lenBlock[i];
-    }
-    _gf128MulInPlace(y, h);
-    return y;
+    final bitLen = ctLen * 8;
+    y2 ^= (bitLen ~/ 0x100000000) & 0xffffffff;
+    y3 ^= bitLen & 0xffffffff;
+    gfMulBlock();
+
+    final out = Uint8List(16);
+    final outBd = ByteData.sublistView(out);
+    outBd.setUint32(0, y0, Endian.big);
+    outBd.setUint32(4, y1, Endian.big);
+    outBd.setUint32(8, y2, Endian.big);
+    outBd.setUint32(12, y3, Endian.big);
+    return out;
   }
 
   static Uint8List _aesCtrXor(
@@ -2185,8 +2218,8 @@ class LocalProxyTunnelBridge {
   final void Function(String nodeId, {required bool success, int? rttMs})?
       _onNodeFeedback;
 
-  HttpClient? _streamRelayHttpClient;
-  String? _streamRelayNodeId;
+  final Map<String, HttpClient> _streamRelayClientsByNodeId =
+      <String, HttpClient>{};
   HttpClient? _directRelayHttpClient;
 
   /// Multi-connection concurrent HLS segment prefetching & parallel chunk state.
@@ -2337,14 +2370,15 @@ class LocalProxyTunnelBridge {
     _inFlightSegmentFetches.clear();
     _prefetchedSegmentCache.clear();
     _prefetchedCacheTotalBytes = 0;
-    try {
-      _streamRelayHttpClient?.close(force: true);
-    } catch (_) {}
+    for (final hc in _streamRelayClientsByNodeId.values) {
+      try {
+        hc.close(force: true);
+      } catch (_) {}
+    }
+    _streamRelayClientsByNodeId.clear();
     try {
       _directRelayHttpClient?.close(force: true);
     } catch (_) {}
-    _streamRelayHttpClient = null;
-    _streamRelayNodeId = null;
     _directRelayHttpClient = null;
     try {
       await s?.close();
@@ -2364,16 +2398,21 @@ class LocalProxyTunnelBridge {
   }
 
   HttpClient _getOrCreateStreamRelayHttpClient(ProxyNode node) {
-    if (_streamRelayHttpClient != null && _streamRelayNodeId == node.id) {
-      return _streamRelayHttpClient!;
+    final existing = _streamRelayClientsByNodeId[node.id];
+    if (existing != null) {
+      return existing;
     }
-    try {
-      _streamRelayHttpClient?.close(force: false);
-    } catch (_) {}
+    if (_streamRelayClientsByNodeId.length >= 6) {
+      final oldestKey = _streamRelayClientsByNodeId.keys.first;
+      final removed = _streamRelayClientsByNodeId.remove(oldestKey);
+      try {
+        removed?.close(force: false);
+      } catch (_) {}
+    }
 
     final hc = HttpClient()
       ..idleTimeout = const Duration(seconds: 45)
-      ..maxConnectionsPerHost = 12
+      ..maxConnectionsPerHost = 8
       ..badCertificateCallback = (cert, host, port) => true;
 
     hc.connectionFactory = (Uri uri, String? proxyHost, int? proxyPort) async {
@@ -2389,8 +2428,7 @@ class LocalProxyTunnelBridge {
       return ConnectionTask.fromSocket(socketFuture, () {});
     };
 
-    _streamRelayHttpClient = hc;
-    _streamRelayNodeId = node.id;
+    _streamRelayClientsByNodeId[node.id] = hc;
     return hc;
   }
 
@@ -2402,7 +2440,7 @@ class LocalProxyTunnelBridge {
     required Duration timeout,
   }) async {
     final proto = node.protocol.toLowerCase();
-    if (proto == 'trojan') {
+    if (proto == 'trojan' && node.network.toLowerCase() != 'ws') {
       final rawSocket = await Socket.connect(
         node.server,
         node.port,
@@ -2615,11 +2653,13 @@ class LocalProxyTunnelBridge {
         return;
       }
 
-      // 1. If this request is for a known playlist segment, immediately trigger
-      // multi-connection concurrent prefetching of the next [prefetchLookaheadCount]
-      // segments in the background!
+      // 1. If this request is for a known playlist segment in direct mode,
+      // trigger multi-connection concurrent prefetching immediately.
+      // In proxy mode (!forceDirect), we defer lookahead prefetch until after
+      // the current segment opens/streams so seg[0] gets 100% exclusive proxy
+      // bandwidth for instant first-frame rendering!
       final segIndex = _playlistSegmentIndexMap[targetUrl];
-      if (segIndex != null) {
+      if (segIndex != null && forceDirect) {
         _scheduleLookaheadPrefetch(
           fromIndex: segIndex + 1,
           count: prefetchLookaheadCount,
@@ -2634,6 +2674,15 @@ class LocalProxyTunnelBridge {
       if (rangeHeader == null || rangeHeader.isEmpty) {
         final cached = _prefetchedSegmentCache[targetUrl];
         if (cached != null) {
+          if (segIndex != null && !forceDirect) {
+            _scheduleLookaheadPrefetch(
+              fromIndex: segIndex + 1,
+              count: 2,
+              customHeaders: customHeaders,
+              forceDirect: forceDirect,
+              candidateNodes: candidateNodes,
+            );
+          }
           final respHeader = StringBuffer()
             ..write('HTTP/1.1 200 OK\r\n')
             ..write('Content-Type: ${cached.contentType}\r\n')
@@ -2651,6 +2700,15 @@ class LocalProxyTunnelBridge {
         if (inFlight != null) {
           final awaited = await inFlight;
           if (awaited != null) {
+            if (segIndex != null && !forceDirect) {
+              _scheduleLookaheadPrefetch(
+                fromIndex: segIndex + 1,
+                count: 2,
+                customHeaders: customHeaders,
+                forceDirect: forceDirect,
+                candidateNodes: candidateNodes,
+              );
+            }
             final respHeader = StringBuffer()
               ..write('HTTP/1.1 200 OK\r\n')
               ..write('Content-Type: ${awaited.contentType}\r\n')
@@ -2699,14 +2757,7 @@ class LocalProxyTunnelBridge {
                   onTimeout: () {},
                 );
             return null;
-          } catch (_) {
-            if (attempt == 0) {
-              try {
-                _directRelayHttpClient?.close(force: true);
-              } catch (_) {}
-              _directRelayHttpClient = null;
-            }
-          }
+          } catch (_) {}
         }
         return null;
       }
@@ -2716,7 +2767,7 @@ class LocalProxyTunnelBridge {
         ProxyNode node,
         Uri uri, {
         String? activeRange,
-        Duration timeout = const Duration(milliseconds: 3800),
+        Duration timeout = const Duration(milliseconds: 4200),
       }) async {
         for (var attempt = 0; attempt < 2; attempt++) {
           final sw = Stopwatch()..start();
@@ -2755,13 +2806,6 @@ class LocalProxyTunnelBridge {
             _onNodeFeedback?.call(node.id, success: false);
             return null;
           } catch (_) {
-            if (_streamRelayNodeId == node.id) {
-              try {
-                _streamRelayHttpClient?.close(force: true);
-              } catch (_) {}
-              _streamRelayHttpClient = null;
-              _streamRelayNodeId = null;
-            }
             if (attempt == 1) {
               _onNodeFeedback?.call(node.id, success: false);
             }
@@ -2998,23 +3042,81 @@ class LocalProxyTunnelBridge {
         ..write('Connection: close\r\n\r\n');
       client.add(latin1.encode(respHeader.toString()));
 
+      var clientClosed = false;
+      unawaited(
+        client.done.then(
+          (_) => clientClosed = true,
+          onError: (_) => clientClosed = true,
+        ),
+      );
+
       final shouldCacheSegment = (rangeHeader == null || rangeHeader.isEmpty) &&
           resp.statusCode == 200 &&
           segIndex != null &&
           resp.contentLength <= 8 * 1024 * 1024;
-      final segmentAccumulator = shouldCacheSegment ? BytesBuilder(copy: false) : null;
+      final segmentAccumulator =
+          shouldCacheSegment ? BytesBuilder(copy: false) : null;
+      var lookaheadTriggeredForProxySeg = false;
+      var streamedBytes = 0;
 
       await for (final chunk in resp.timeout(const Duration(seconds: 15))) {
+        if (clientClosed) {
+          unawaited(
+            resp.detachSocket().then((s) => s.destroy(), onError: (_) {}),
+          );
+          break;
+        }
         if (chunk.isNotEmpty) {
           recordDownstreamBytes(chunk.length);
-          client.add(chunk);
+          streamedBytes += chunk.length;
+          try {
+            client.add(chunk);
+          } catch (_) {
+            clientClosed = true;
+            unawaited(
+              resp.detachSocket().then((s) => s.destroy(), onError: (_) {}),
+            );
+            break;
+          }
           if (segmentAccumulator != null &&
               segmentAccumulator.length + chunk.length <= 8 * 1024 * 1024) {
             segmentAccumulator.add(chunk);
           }
+          // Once the first 256KB (or >50%) of the current segment has been
+          // delivered to libmpv so first-frame decoding is already underway,
+          // schedule background lookahead prefetching for the next 2 segments!
+          if (!forceDirect &&
+              segIndex != null &&
+              !lookaheadTriggeredForProxySeg &&
+              (streamedBytes >= 256 * 1024 ||
+                  (resp.contentLength > 0 &&
+                      streamedBytes * 2 >= resp.contentLength))) {
+            lookaheadTriggeredForProxySeg = true;
+            _scheduleLookaheadPrefetch(
+              fromIndex: segIndex + 1,
+              count: 2,
+              customHeaders: customHeaders,
+              forceDirect: forceDirect,
+              candidateNodes: candidateNodes,
+            );
+          }
         }
       }
-      if (segmentAccumulator != null && segmentAccumulator.length > 0) {
+      if (!clientClosed &&
+          !forceDirect &&
+          segIndex != null &&
+          !lookaheadTriggeredForProxySeg) {
+        _scheduleLookaheadPrefetch(
+          fromIndex: segIndex + 1,
+          count: 2,
+          customHeaders: customHeaders,
+          forceDirect: forceDirect,
+          candidateNodes: candidateNodes,
+        );
+      }
+      if (!clientClosed &&
+          segmentAccumulator != null &&
+          segmentAccumulator.length > 0) {
         _storePrefetchedSegment(
           targetUrl,
           segmentAccumulator.takeBytes(),
@@ -3342,15 +3444,20 @@ class LocalProxyTunnelBridge {
 
     if (discoveredSegments.isNotEmpty) {
       _registerPlaylistSegments(discoveredSegments);
-      // Immediately launch multi-connection concurrent prefetching for the
-      // initial segments so the player gets instant zero-wait segment hits!
-      _scheduleLookaheadPrefetch(
-        fromIndex: 0,
-        count: prefetchLookaheadCount,
-        customHeaders: headers,
-        forceDirect: forceDirect,
-        candidateNodes: candidateNodes,
-      );
+      if (forceDirect) {
+        // In direct mode, immediately launch multi-connection concurrent prefetching
+        // for the initial segments so the player gets instant zero-wait segment hits.
+        _scheduleLookaheadPrefetch(
+          fromIndex: 0,
+          count: prefetchLookaheadCount,
+          customHeaders: headers,
+          forceDirect: forceDirect,
+          candidateNodes: candidateNodes,
+        );
+      }
+      // In proxy mode (!forceDirect), do NOT pre-occupy seg[0] in _inFlightSegmentFetches
+      // before libmpv requests seg[0]; let libmpv stream seg[0] chunk-by-chunk directly
+      // with 100% exclusive proxy bandwidth so the first video frame renders immediately!
     }
 
     return sb.toString();
@@ -4126,24 +4233,9 @@ class LocalProxyTunnelBridge {
     required List<int> initialBodyBytes,
     required Duration timeout,
   }) async {
-    final rawSocket = await Socket.connect(
-      node.server,
-      node.port,
-      timeout: timeout,
-    );
-    try {
-      rawSocket.setOption(SocketOption.tcpNoDelay, true);
-    } catch (_) {}
-
     final sni = node.sni.isNotEmpty
         ? node.sni
         : (node.wsHost.isNotEmpty ? node.wsHost : node.server);
-    final tlsSocket = await SecureSocket.secure(
-      rawSocket,
-      host: sni,
-      onBadCertificate: (_) => true,
-    ).timeout(timeout);
-    final tunnel = _wrapRawSocketBuffered(tlsSocket);
 
     final hashHex = _Sha224.hexDigest(node.password);
     final hostBytes = utf8.encode(targetHost);
@@ -4168,6 +4260,98 @@ class LocalProxyTunnelBridge {
     if (initialBodyBytes.isNotEmpty) {
       trojanHeader.addAll(initialBodyBytes);
     }
+
+    if (node.network.toLowerCase() == 'ws') {
+      final hc = HttpClient()
+        ..connectionTimeout = timeout
+        ..badCertificateCallback = (cert, host, port) => true;
+      hc.connectionFactory = (Uri uri, String? proxyHost, int? proxyPort) async {
+        final raw = await Socket.connect(
+          node.server,
+          node.port,
+          timeout: timeout,
+        );
+        try {
+          raw.setOption(SocketOption.tcpNoDelay, true);
+        } catch (_) {}
+        if (node.tls || uri.scheme == 'wss') {
+          final tls = await SecureSocket.secure(
+            raw,
+            host: sni,
+            onBadCertificate: (_) => true,
+          ).timeout(timeout);
+          return ConnectionTask.fromSocket(Future.value(tls), () {});
+        }
+        return ConnectionTask.fromSocket(Future.value(raw), () {});
+      };
+
+      final wsScheme = node.tls ? 'wss' : 'ws';
+      final wsHostHeader = node.wsHost.isNotEmpty ? node.wsHost : sni;
+      final normalizedPath = node.wsPath.isEmpty
+          ? '/'
+          : (node.wsPath.startsWith('/') ? node.wsPath : '/${node.wsPath}');
+      final wsUrl = '$wsScheme://$wsHostHeader:${node.port}$normalizedPath';
+
+      final ws = await WebSocket.connect(
+        wsUrl,
+        headers: {'Host': wsHostHeader},
+        customClient: hc,
+      ).timeout(timeout);
+
+      ws.add(Uint8List.fromList(trojanHeader));
+      final outController = StreamController<Uint8List>();
+      ws.listen(
+        (dynamic msg) {
+          final List<int> bytes = msg is List<int>
+              ? msg
+              : (msg is String ? latin1.encode(msg) : const <int>[]);
+          if (bytes.isNotEmpty && !outController.isClosed) {
+            outController.add(Uint8List.fromList(bytes));
+          }
+        },
+        onDone: () {
+          if (!outController.isClosed) outController.close();
+          hc.close(force: true);
+        },
+        onError: (_) {
+          if (!outController.isClosed) outController.close();
+          hc.close(force: true);
+        },
+      );
+
+      return _UpstreamTunnel(
+        send: (d) {
+          if (d.isEmpty) return;
+          try {
+            ws.add(Uint8List.fromList(d));
+          } catch (_) {}
+        },
+        stream: outController.stream,
+        close: () {
+          try {
+            ws.close();
+          } catch (_) {}
+          hc.close(force: true);
+          if (!outController.isClosed) outController.close();
+        },
+      );
+    }
+
+    final rawSocket = await Socket.connect(
+      node.server,
+      node.port,
+      timeout: timeout,
+    );
+    try {
+      rawSocket.setOption(SocketOption.tcpNoDelay, true);
+    } catch (_) {}
+
+    final tlsSocket = await SecureSocket.secure(
+      rawSocket,
+      host: sni,
+      onBadCertificate: (_) => true,
+    ).timeout(timeout);
+    final tunnel = _wrapRawSocketBuffered(tlsSocket);
     tlsSocket.add(trojanHeader);
     return tunnel;
   }
@@ -5171,14 +5355,14 @@ class ProxyRoutingService extends ChangeNotifier {
     if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
       return trimmed;
     }
-    if (uri.path.contains('/__m3u8_proxy__/') ||
-        uri.path.toLowerCase().startsWith('/api/vod/proxy')) {
+    if (uri.path.contains('/__m3u8_proxy__/')) {
       return trimmed;
     }
     final effective = resolveEffectiveRoute(scenario, targetUri: uri);
     if (effective != ScenarioRouteMode.proxyNode) {
       if (scenario == RequestScenario.vodStream &&
-          trimmed.toLowerCase().contains('.m3u8')) {
+          trimmed.toLowerCase().contains('.m3u8') &&
+          !uri.path.toLowerCase().startsWith('/api/vod/proxy')) {
         final directPort = await _localBridge.ensureStarted();
         if (directPort > 0) {
           return _localBridge.buildStreamRelayUrl(
@@ -5217,8 +5401,7 @@ class ProxyRoutingService extends ChangeNotifier {
     Uri? streamUri,
   }) async {
     if (streamUri != null &&
-        (streamUri.path.toLowerCase().startsWith('/api/vod/proxy') ||
-            streamUri.path.contains('/__m3u8_proxy__/') ||
+        (streamUri.path.contains('/__m3u8_proxy__/') ||
             streamUri.host == '127.0.0.1' ||
             streamUri.host == 'localhost')) {
       return '';

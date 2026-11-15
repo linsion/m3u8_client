@@ -1077,6 +1077,9 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
   @override
   void dispose() {
+    if (widget.appState.activeChildBackHandler == _handleBackPress) {
+      widget.appState.activeChildBackHandler = null;
+    }
     widget.appState.removeListener(_onAppStateChanged);
     _notifEventSub?.cancel();
     _saveCurrentChatToMemoryCache();
@@ -1097,6 +1100,42 @@ class _TelegramScreenState extends State<TelegramScreen> {
     _messageScrollController.dispose();
     _composeFocusNode.dispose();
     super.dispose();
+  }
+
+  bool _handleBackPress() {
+    if (!mounted) return false;
+    if (_selectionMode) {
+      setState(() {
+        _selectionMode = false;
+        _selectedMessageIds.clear();
+      });
+      return true;
+    }
+    if (_showEmojiPanel) {
+      setState(() => _showEmojiPanel = false);
+      return true;
+    }
+    if (_showInChatSearch) {
+      setState(() {
+        _showInChatSearch = false;
+        _messageFilter = '';
+        _msgSearchCtrl.clear();
+      });
+      return true;
+    }
+    if (_showRightInfoPanel) {
+      setState(() => _showRightInfoPanel = false);
+      return true;
+    }
+    if (!_isMobileLayout && _isDialogsSidebarCollapsed) {
+      setState(() => _isDialogsSidebarCollapsed = false);
+      return true;
+    }
+    if (_selectedChat != null) {
+      _exitCurrentChatOnMobile();
+      return true;
+    }
+    return false;
   }
 
   void _startLivePolling() {
@@ -3591,6 +3630,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
   @override
   Widget build(BuildContext context) {
+    widget.appState.activeChildBackHandler = _handleBackPress;
     final tg = _TgPalette(VideoPlatformTheme.isDark);
 
     if (!_authStatus.authorized && !_isLoadingChats) {
@@ -3607,7 +3647,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
       key: _captureBoundaryKey,
       child: LayoutBuilder(
         builder: (context, constraints) {
-          final isDesktop = constraints.maxWidth >= 860;
+          final isDesktop = constraints.maxWidth >= 860 || widget.appState.tvMode;
           final showInfoDrawer =
               isDesktop && _showRightInfoPanel && _selectedChat != null;
 
@@ -3643,21 +3683,9 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
           // Mobile / Compact layout
           if (_selectedChat != null) {
-            return PopScope(
-              canPop: false,
-              onPopInvokedWithResult: (didPop, _) {
-                if (!didPop) {
-                  if (_showRightInfoPanel) {
-                    setState(() => _showRightInfoPanel = false);
-                  } else {
-                    _exitCurrentChatOnMobile();
-                  }
-                }
-              },
-              child: _showRightInfoPanel
-                  ? _buildRightChatInfoPanel(tg, _selectedChat!)
-                  : _buildConversationPane(tg, isMobile: true),
-            );
+            return _showRightInfoPanel
+                ? _buildRightChatInfoPanel(tg, _selectedChat!)
+                : _buildConversationPane(tg, isMobile: true);
           }
           return _buildDialogsSidebar(tg, isMobile: true);
         },
@@ -4213,13 +4241,33 @@ class _TelegramScreenState extends State<TelegramScreen> {
                               hoverColor: isSelected
                                   ? tg.sidebarSelected
                                   : tg.sidebarHover,
+                              onFocusChange: (_) {
+                                if (mounted) setState(() {});
+                              },
                               onTap: () => _selectChat(chat),
-                              child: Container(
-                                height: 68,
-                                padding:
-                                    const EdgeInsets.symmetric(horizontal: 10),
-                                child: Row(
-                                  children: [
+                              child: Builder(
+                                builder: (itemCtx) {
+                                  final isFocused =
+                                      Focus.of(itemCtx).hasPrimaryFocus;
+                                  return Container(
+                                    height: 68,
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 10,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: isFocused && !isSelected
+                                          ? tg.tgBlueBright
+                                              .withValues(alpha: 0.22)
+                                          : null,
+                                      border: isFocused
+                                          ? Border.all(
+                                              color: const Color(0xFFFFE066),
+                                              width: 2.0,
+                                            )
+                                          : null,
+                                    ),
+                                    child: Row(
+                                      children: [
                                     _buildPeerAvatar(
                                       chat.peer,
                                       chat.title,
@@ -4447,16 +4495,18 @@ class _TelegramScreenState extends State<TelegramScreen> {
                                     ),
                                   ],
                                 ),
-                              ),
-                            ),
-                          );
-                        },
+                              );
+                            },
+                          ),
                         ),
-                      ),
-          ),
-        ],
+                      );
+                    },
+                    ),
+                  ),
       ),
-    );
+    ],
+  ),
+);
   }
 
   /// Main Chat Window matching official Telegram Desktop
@@ -7203,317 +7253,442 @@ class _TelegramScreenState extends State<TelegramScreen> {
       return Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          GestureDetector(
-            onTap: () => _openMediaGalleryViewer(chat, msg),
-            child: Container(
-              height: isVideo ? 280 : 230,
-              margin: const EdgeInsets.fromLTRB(4, 4, 4, 0),
-              decoration: BoxDecoration(
-                color: const Color(0xFF0A1017),
-                borderRadius: BorderRadius.circular(10),
-              ),
-              clipBehavior: Clip.antiAlias,
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  if (isPhoto || att.hasThumbnail || att.thumbnail.isNotEmpty)
-                    Image.network(
-                      thumbUrl,
-                      headers: widget.appState.api.authHeaders,
-                      fit: BoxFit.cover,
-                      errorBuilder: (_, __, ___) => isVideo
-                          ? _TelegramVideoFrameFallback(
-                              streamUrl:
-                                  widget.appState.api.buildTelegramVideoStreamUrl(
-                                accountId: _activeAccountId,
-                                peer: chat.peer,
-                                messageId: msg.id,
-                              ),
-                              headers: widget.appState.api.authHeaders,
-                              fallbackIconColor: tg.textMuted,
+          Focus(
+            onFocusChange: (_) {
+              if (mounted) setState(() {});
+            },
+            onKeyEvent: (node, event) {
+              if (!node.hasPrimaryFocus) {
+                return KeyEventResult.ignored;
+              }
+              if (event is KeyDownEvent &&
+                  (event.logicalKey == LogicalKeyboardKey.select ||
+                      event.logicalKey == LogicalKeyboardKey.enter ||
+                      event.logicalKey == LogicalKeyboardKey.numpadEnter ||
+                      event.logicalKey == LogicalKeyboardKey.space ||
+                      event.logicalKey == LogicalKeyboardKey.gameButtonA)) {
+                _openMediaGalleryViewer(chat, msg);
+                return KeyEventResult.handled;
+              }
+              return KeyEventResult.ignored;
+            },
+            child: Builder(
+              builder: (mediaCtx) {
+                final isMediaFocused = Focus.of(mediaCtx).hasPrimaryFocus;
+                return GestureDetector(
+                  onTap: () => _openMediaGalleryViewer(chat, msg),
+                  child: Container(
+                    height: isVideo ? 280 : 230,
+                    margin: const EdgeInsets.fromLTRB(4, 4, 4, 0),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF0A1017),
+                      borderRadius: BorderRadius.circular(10),
+                      border: isMediaFocused
+                          ? Border.all(
+                              color: const Color(0xFFFFE066),
+                              width: 2.6,
                             )
-                          : Container(
-                              color: const Color(0xFF101923),
-                              alignment: Alignment.center,
-                              child: Icon(
-                                Icons.image_outlined,
-                                size: 46,
-                                color: tg.textMuted,
+                          : null,
+                      boxShadow: isMediaFocused
+                          ? [
+                              BoxShadow(
+                                color: tg.tgBlueBright.withValues(alpha: 0.65),
+                                blurRadius: 12,
+                                spreadRadius: 1,
                               ),
-                            ),
-                    )
-                  else
-                    _TelegramVideoFrameFallback(
-                      streamUrl:
-                          widget.appState.api.buildTelegramVideoStreamUrl(
-                        accountId: _activeAccountId,
-                        peer: chat.peer,
-                        messageId: msg.id,
-                      ),
-                      headers: widget.appState.api.authHeaders,
-                      fallbackIconColor: tg.textMuted,
+                            ]
+                          : null,
                     ),
-                  // Top-left official Telegram duration + size pill
-                  if (isVideo)
-                    Positioned(
-                      top: 8,
-                      left: 8,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 8,
-                          vertical: 3,
-                        ),
-                        decoration: BoxDecoration(
-                          color: const Color(0xA6000000),
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                        child: Text(
-                          [
-                            _formatDurationClock(att.duration),
-                            if (att.formattedSize.isNotEmpty) att.formattedSize,
-                          ].join(' · '),
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 11,
-                            fontWeight: FontWeight.w500,
+                    clipBehavior: Clip.antiAlias,
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        if (isPhoto ||
+                            att.hasThumbnail ||
+                            att.thumbnail.isNotEmpty)
+                          Image.network(
+                            thumbUrl,
+                            headers: widget.appState.api.authHeaders,
+                            fit: BoxFit.cover,
+                            errorBuilder: (_, __, ___) => isVideo
+                                ? _TelegramVideoFrameFallback(
+                                    streamUrl: widget.appState.api
+                                        .buildTelegramVideoStreamUrl(
+                                      accountId: _activeAccountId,
+                                      peer: chat.peer,
+                                      messageId: msg.id,
+                                    ),
+                                    headers: widget.appState.api.authHeaders,
+                                    fallbackIconColor: tg.textMuted,
+                                  )
+                                : Container(
+                                    color: const Color(0xFF101923),
+                                    alignment: Alignment.center,
+                                    child: Icon(
+                                      Icons.image_outlined,
+                                      size: 46,
+                                      color: tg.textMuted,
+                                    ),
+                                  ),
+                          )
+                        else
+                          _TelegramVideoFrameFallback(
+                            streamUrl:
+                                widget.appState.api.buildTelegramVideoStreamUrl(
+                              accountId: _activeAccountId,
+                              peer: chat.peer,
+                              messageId: msg.id,
+                            ),
+                            headers: widget.appState.api.authHeaders,
+                            fallbackIconColor: tg.textMuted,
                           ),
-                        ),
-                      ),
-                    ),
-                  // Center official Telegram translucent play button
-                  if (isVideo)
-                    Center(
-                      child: Container(
-                        width: 54,
-                        height: 54,
-                        decoration: const BoxDecoration(
-                          color: Color(0x99000000),
-                          shape: BoxShape.circle,
-                        ),
-                        alignment: Alignment.center,
-                        child: const Icon(
-                          Icons.play_arrow_rounded,
-                          color: Colors.white,
-                          size: 34,
-                        ),
-                      ),
-                    ),
-                  // Bottom filename + quick action bar overlay
-                  Positioned(
-                    left: 0,
-                    right: 0,
-                    bottom: 0,
-                    child: Container(
-                      padding: const EdgeInsets.fromLTRB(10, 18, 8, 6),
-                      decoration: const BoxDecoration(
-                        gradient: LinearGradient(
-                          begin: Alignment.bottomCenter,
-                          end: Alignment.topCenter,
-                          colors: [
-                            Color(0xCC000000),
-                            Color(0x00000000),
-                          ],
-                        ),
-                      ),
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: Text(
-                              att.displayName,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 11.5,
-                                fontWeight: FontWeight.w500,
-                              ),
-                            ),
-                          ),
-                          if (isVideo)
-                            InkWell(
-                              onTap: () => _openVideoInMiniPlayer(chat, msg),
-                              child: Container(
-                                margin: const EdgeInsets.only(right: 6),
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 7,
-                                  vertical: 3,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: const Color(0x99000000),
-                                  borderRadius: BorderRadius.circular(10),
-                                ),
-                                child: const Row(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    Icon(
-                                      Icons.picture_in_picture_alt_rounded,
-                                      size: 12,
-                                      color: Colors.white,
-                                    ),
-                                    SizedBox(width: 3),
-                                    Text(
-                                      '小窗',
-                                      style: TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 10.5,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          InkWell(
-                            onTap: isSavingLocal
-                                ? null
-                                : () => _saveAttachmentToLocalDownloads(
-                                      chat,
-                                      msg,
-                                    ),
-                            child: AnimatedContainer(
-                              duration: const Duration(milliseconds: 220),
-                              margin: const EdgeInsets.only(right: 6),
+                        // Top-left official Telegram duration + size pill
+                        if (isVideo)
+                          Positioned(
+                            top: 8,
+                            left: 8,
+                            child: Container(
                               padding: const EdgeInsets.symmetric(
-                                horizontal: 7,
+                                horizontal: 8,
                                 vertical: 3,
                               ),
                               decoration: BoxDecoration(
-                                color: isSavedLocal
-                                    ? const Color(0xCC2EBE70)
-                                    : (isFailedLocal
-                                        ? const Color(0xCCE54D42)
-                                        : const Color(0x99000000)),
+                                color: const Color(0xA6000000),
                                 borderRadius: BorderRadius.circular(10),
                               ),
-                              child: AnimatedSwitcher(
-                                duration: const Duration(milliseconds: 200),
-                                transitionBuilder: (child, anim) =>
-                                    ScaleTransition(scale: anim, child: child),
-                                child: Row(
-                                  key: ValueKey(
-                                    'local_${msg.id}_${isSavingLocal}_${isSavedLocal}_$isFailedLocal',
-                                  ),
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    if (isSavingLocal)
-                                      const SizedBox(
-                                        width: 11,
-                                        height: 11,
-                                        child: CircularProgressIndicator(
-                                          strokeWidth: 1.8,
-                                          color: Colors.white,
-                                        ),
-                                      )
-                                    else
-                                      Icon(
-                                        isSavedLocal
-                                            ? Icons.check_circle_rounded
-                                            : (isFailedLocal
-                                                ? Icons.error_outline_rounded
-                                                : Icons.download_rounded),
-                                        size: 12,
-                                        color: Colors.white,
-                                      ),
-                                    const SizedBox(width: 3),
-                                    Text(
-                                      isSavingLocal
-                                          ? '保存中...'
-                                          : (isSavedLocal
-                                              ? '已存本机'
-                                              : (isFailedLocal
-                                                  ? '重试保存'
-                                                  : '保存本机')),
-                                      style: const TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 10.5,
-                                        fontWeight: FontWeight.w600,
-                                      ),
-                                    ),
-                                  ],
+                              child: Text(
+                                [
+                                  _formatDurationClock(att.duration),
+                                  if (att.formattedSize.isNotEmpty)
+                                    att.formattedSize,
+                                ].join(' · '),
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w500,
                                 ),
                               ),
                             ),
                           ),
-                          if (att.url.isNotEmpty)
-                            InkWell(
-                              onTap: isQueueing
-                                  ? null
-                                  : () => _queueTelegramDownload(
-                                        url: att.url,
-                                        name: att.displayName,
-                                      ),
-                              child: AnimatedContainer(
-                                duration: const Duration(milliseconds: 220),
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 8,
-                                  vertical: 3,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: isQueued
-                                      ? const Color(0xE62EBE70)
-                                      : (isFailed
-                                          ? const Color(0xE6E54D42)
-                                          : tg.tgBlueBright),
-                                  borderRadius: BorderRadius.circular(10),
-                                ),
-                                child: AnimatedSwitcher(
-                                  duration: const Duration(milliseconds: 200),
-                                  transitionBuilder: (child, anim) =>
-                                      ScaleTransition(
-                                        scale: anim,
-                                        child: child,
-                                      ),
-                                  child: Row(
-                                    key: ValueKey(
-                                      'queue_${msg.id}_${isQueueing}_${isQueued}_$isFailed',
-                                    ),
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      if (isQueueing)
-                                        const SizedBox(
-                                          width: 11,
-                                          height: 11,
-                                          child: CircularProgressIndicator(
-                                            strokeWidth: 1.8,
-                                            color: Colors.white,
-                                          ),
-                                        )
-                                      else
-                                        Icon(
-                                          isQueued
-                                              ? Icons.check_circle_rounded
-                                              : (isFailed
-                                                  ? Icons.error_outline_rounded
-                                                  : Icons
-                                                      .cloud_download_outlined),
-                                          size: 13,
-                                          color: Colors.white,
-                                        ),
-                                      const SizedBox(width: 4),
-                                      Text(
-                                        isQueueing
-                                            ? '添加中...'
-                                            : (isQueued
-                                                ? '已入队 ✓'
-                                                : (isFailed
-                                                    ? '失败·重试'
-                                                    : '转存下载')),
-                                        style: const TextStyle(
-                                          color: Colors.white,
-                                          fontSize: 11,
-                                          fontWeight: FontWeight.w600,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
+                        // Center official Telegram translucent play button
+                        if (isVideo)
+                          Center(
+                            child: Container(
+                              width: isMediaFocused ? 60 : 54,
+                              height: isMediaFocused ? 60 : 54,
+                              decoration: BoxDecoration(
+                                color: isMediaFocused
+                                    ? tg.tgBlueBright
+                                    : const Color(0x99000000),
+                                shape: BoxShape.circle,
+                                border: isMediaFocused
+                                    ? Border.all(
+                                        color: const Color(0xFFFFE066),
+                                        width: 2.2,
+                                      )
+                                    : null,
+                              ),
+                              alignment: Alignment.center,
+                              child: const Icon(
+                                Icons.play_arrow_rounded,
+                                color: Colors.white,
+                                size: 34,
                               ),
                             ),
-                        ],
-                      ),
+                          ),
+                        // Bottom filename + quick action bar overlay
+                        Positioned(
+                          left: 0,
+                          right: 0,
+                          bottom: 0,
+                          child: Container(
+                            padding: const EdgeInsets.fromLTRB(10, 18, 8, 6),
+                            decoration: const BoxDecoration(
+                              gradient: LinearGradient(
+                                begin: Alignment.bottomCenter,
+                                end: Alignment.topCenter,
+                                colors: [
+                                  Color(0xCC000000),
+                                  Color(0x00000000),
+                                ],
+                              ),
+                            ),
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: Text(
+                                    att.displayName,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 11.5,
+                                      fontWeight: FontWeight.w500,
+                                    ),
+                                  ),
+                                ),
+                                if (isVideo)
+                                  InkWell(
+                                    onFocusChange: (_) {
+                                      if (mounted) setState(() {});
+                                    },
+                                    onTap: () =>
+                                        _openVideoInMiniPlayer(chat, msg),
+                                    child: Builder(
+                                      builder: (pipCtx) {
+                                        final isPipFocused =
+                                            Focus.of(pipCtx).hasPrimaryFocus;
+                                        return Container(
+                                          margin:
+                                              const EdgeInsets.only(right: 6),
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 7,
+                                            vertical: 3,
+                                          ),
+                                          decoration: BoxDecoration(
+                                            color: isPipFocused
+                                                ? tg.tgBlueBright
+                                                : const Color(0x99000000),
+                                            borderRadius:
+                                                BorderRadius.circular(10),
+                                            border: isPipFocused
+                                                ? Border.all(
+                                                    color: const Color(
+                                                      0xFFFFE066,
+                                                    ),
+                                                    width: 1.8,
+                                                  )
+                                                : null,
+                                          ),
+                                          child: const Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              Icon(
+                                                Icons
+                                                    .picture_in_picture_alt_rounded,
+                                                size: 12,
+                                                color: Colors.white,
+                                              ),
+                                              SizedBox(width: 3),
+                                              Text(
+                                                '小窗',
+                                                style: TextStyle(
+                                                  color: Colors.white,
+                                                  fontSize: 10.5,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        );
+                                      },
+                                    ),
+                                  ),
+                                InkWell(
+                                  onFocusChange: (_) {
+                                    if (mounted) setState(() {});
+                                  },
+                                  onTap: isSavingLocal
+                                      ? null
+                                      : () => _saveAttachmentToLocalDownloads(
+                                            chat,
+                                            msg,
+                                          ),
+                                  child: Builder(
+                                    builder: (saveCtx) {
+                                      final isSaveFocused =
+                                          Focus.of(saveCtx).hasPrimaryFocus;
+                                      return Container(
+                                        margin: const EdgeInsets.only(right: 6),
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 7,
+                                          vertical: 3,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: isSavedLocal
+                                              ? const Color(0xCC2EBE70)
+                                              : (isFailedLocal
+                                                  ? const Color(0xCCE54D42)
+                                                  : (isSaveFocused
+                                                      ? tg.tgBlueBright
+                                                      : const Color(
+                                                          0x99000000,
+                                                        ))),
+                                          borderRadius:
+                                              BorderRadius.circular(10),
+                                          border: isSaveFocused
+                                              ? Border.all(
+                                                  color:
+                                                      const Color(0xFFFFE066),
+                                                  width: 1.8,
+                                                )
+                                              : null,
+                                        ),
+                                        child: AnimatedSwitcher(
+                                          duration: const Duration(
+                                            milliseconds: 200,
+                                          ),
+                                          transitionBuilder: (child, anim) =>
+                                              ScaleTransition(
+                                            scale: anim,
+                                            child: child,
+                                          ),
+                                          child: Row(
+                                            key: ValueKey(
+                                              'local_${msg.id}_${isSavingLocal}_${isSavedLocal}_$isFailedLocal',
+                                            ),
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              if (isSavingLocal)
+                                                const SizedBox(
+                                                  width: 11,
+                                                  height: 11,
+                                                  child:
+                                                      CircularProgressIndicator(
+                                                    strokeWidth: 1.8,
+                                                    color: Colors.white,
+                                                  ),
+                                                )
+                                              else
+                                                Icon(
+                                                  isSavedLocal
+                                                      ? Icons
+                                                          .check_circle_rounded
+                                                      : (isFailedLocal
+                                                          ? Icons
+                                                              .error_outline_rounded
+                                                          : Icons
+                                                              .download_rounded),
+                                                  size: 12,
+                                                  color: Colors.white,
+                                                ),
+                                              const SizedBox(width: 3),
+                                              Text(
+                                                isSavingLocal
+                                                    ? '保存中...'
+                                                    : (isSavedLocal
+                                                        ? '已存本机'
+                                                        : (isFailedLocal
+                                                            ? '重试保存'
+                                                            : '保存本机')),
+                                                style: const TextStyle(
+                                                  color: Colors.white,
+                                                  fontSize: 10.5,
+                                                  fontWeight: FontWeight.w600,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      );
+                                    },
+                                  ),
+                                ),
+                                if (att.url.isNotEmpty)
+                                  InkWell(
+                                    onFocusChange: (_) {
+                                      if (mounted) setState(() {});
+                                    },
+                                    onTap: isQueueing
+                                        ? null
+                                        : () => _queueTelegramDownload(
+                                              url: att.url,
+                                              name: att.displayName,
+                                            ),
+                                    child: Builder(
+                                      builder: (qCtx) {
+                                        final isQueueFocused =
+                                            Focus.of(qCtx).hasPrimaryFocus;
+                                        return Container(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 8,
+                                            vertical: 3,
+                                          ),
+                                          decoration: BoxDecoration(
+                                            color: isQueued
+                                                ? const Color(0xE62EBE70)
+                                                : (isFailed
+                                                    ? const Color(0xE6E54D42)
+                                                    : tg.tgBlueBright),
+                                            borderRadius:
+                                                BorderRadius.circular(10),
+                                            border: isQueueFocused
+                                                ? Border.all(
+                                                    color: const Color(
+                                                      0xFFFFE066,
+                                                    ),
+                                                    width: 1.8,
+                                                  )
+                                                : null,
+                                          ),
+                                          child: AnimatedSwitcher(
+                                            duration: const Duration(
+                                              milliseconds: 200,
+                                            ),
+                                            transitionBuilder: (child, anim) =>
+                                                ScaleTransition(
+                                              scale: anim,
+                                              child: child,
+                                            ),
+                                            child: Row(
+                                              key: ValueKey(
+                                                'queue_${msg.id}_${isQueueing}_${isQueued}_$isFailed',
+                                              ),
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                if (isQueueing)
+                                                  const SizedBox(
+                                                    width: 11,
+                                                    height: 11,
+                                                    child:
+                                                        CircularProgressIndicator(
+                                                      strokeWidth: 1.8,
+                                                      color: Colors.white,
+                                                    ),
+                                                  )
+                                                else
+                                                  Icon(
+                                                    isQueued
+                                                        ? Icons
+                                                            .check_circle_rounded
+                                                        : (isFailed
+                                                            ? Icons
+                                                                .error_outline_rounded
+                                                            : Icons
+                                                                .cloud_download_outlined),
+                                                    size: 13,
+                                                    color: Colors.white,
+                                                  ),
+                                                const SizedBox(width: 4),
+                                                Text(
+                                                  isQueueing
+                                                      ? '添加中...'
+                                                      : (isQueued
+                                                          ? '已入队 ✓'
+                                                          : (isFailed
+                                                              ? '失败·重试'
+                                                              : '转存下载')),
+                                                  style: const TextStyle(
+                                                    color: Colors.white,
+                                                    fontSize: 11,
+                                                    fontWeight: FontWeight.w600,
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        );
+                                      },
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
-                ],
-              ),
+                );
+              },
             ),
           ),
         ],
@@ -7567,7 +7742,11 @@ class _TelegramScreenState extends State<TelegramScreen> {
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
       child: Row(
         children: [
-          GestureDetector(
+          InkWell(
+            customBorder: const CircleBorder(),
+            onFocusChange: (_) {
+              if (mounted) setState(() {});
+            },
             onTap: () {
               if (canPreview) {
                 _openFilePreviewDialog(chat, msg);
@@ -7575,21 +7754,32 @@ class _TelegramScreenState extends State<TelegramScreen> {
                 _saveAttachmentToLocalDownloads(chat, msg);
               }
             },
-            child: Container(
-              width: 44,
-              height: 44,
-              decoration: BoxDecoration(
-                color: tg.tgBlueBright,
-                shape: BoxShape.circle,
-              ),
-              alignment: Alignment.center,
-              child: Icon(
-                isQueued
-                    ? Icons.check_rounded
-                    : Icons.insert_drive_file_rounded,
-                color: Colors.white,
-                size: 22,
-              ),
+            child: Builder(
+              builder: (fileCtx) {
+                final isFileFocused = Focus.of(fileCtx).hasPrimaryFocus;
+                return Container(
+                  width: 44,
+                  height: 44,
+                  decoration: BoxDecoration(
+                    color: tg.tgBlueBright,
+                    shape: BoxShape.circle,
+                    border: isFileFocused
+                        ? Border.all(
+                            color: const Color(0xFFFFE066),
+                            width: 2.2,
+                          )
+                        : null,
+                  ),
+                  alignment: Alignment.center,
+                  child: Icon(
+                    isQueued
+                        ? Icons.check_rounded
+                        : Icons.insert_drive_file_rounded,
+                    color: Colors.white,
+                    size: 22,
+                  ),
+                );
+              },
             ),
           ),
           const SizedBox(width: 10),
@@ -11469,11 +11659,18 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
       if (att.duration > 0) {
         _duration = Duration(seconds: att.duration);
       }
-      final streamUrl = widget.appState.api.buildTelegramVideoStreamUrl(
+      final rawStreamUrl = widget.appState.api.buildTelegramVideoStreamUrl(
         accountId: widget.accountId,
         peer: widget.chat.peer,
         messageId: widget.message.id,
       );
+      final streamUrl =
+          await widget.appState.proxyService.resolveProxiedStreamUrl(
+        RequestScenario.telegram,
+        rawStreamUrl,
+        headers: widget.appState.api.authHeaders,
+      );
+      final usingLocalRelay = streamUrl.contains('/__m3u8_proxy__/');
       _playingSub = p.stream.playing.listen((playing) {
         if (mounted) setState(() => _isPlaying = playing);
       });
@@ -11505,7 +11702,11 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
           _pendingResumeSeconds = posSec;
           unawaited(
             p.open(
-              Media(streamUrl, httpHeaders: widget.appState.api.authHeaders),
+              Media(
+                streamUrl,
+                httpHeaders:
+                    usingLocalRelay ? const {} : widget.appState.api.authHeaders,
+              ),
               play: true,
             ),
           );
@@ -11519,7 +11720,11 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
       await _configureTelegramPlayer(p);
       await p.setVolume(_isMuted ? 0 : _volume);
       await p.open(
-        Media(streamUrl, httpHeaders: widget.appState.api.authHeaders),
+        Media(
+          streamUrl,
+          httpHeaders:
+              usingLocalRelay ? const {} : widget.appState.api.authHeaders,
+        ),
         play: true,
       );
       return;
@@ -11561,6 +11766,7 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
   bool _isInlineHorizontalSeeking = false;
   Duration _inlineSeekStartPos = Duration.zero;
   Duration _inlineSeekPreviewPos = Duration.zero;
+  bool _isTileFocused = false;
 
   String _fmtInlineClock(Duration d) {
     final total = d.inSeconds;
@@ -11593,61 +11799,108 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
         _isInlineHorizontalSeeking ? _inlineSeekPreviewPos : _position;
     final progress = (activePos.inMilliseconds / totalMs).clamp(0.0, 1.0);
 
-    return GestureDetector(
-      onTap: () {
-        if (widget.selectionMode) {
-          widget.onToggleSelect();
-          return;
+    return Focus(
+      onFocusChange: (focused) {
+        if (mounted && _isTileFocused != focused) {
+          setState(() => _isTileFocused = focused);
         }
-        if (_isInlineMode && _inlinePlayer != null) {
-          _inlinePlayer!.pause();
-        }
-        widget.onOpenGallery();
       },
-      onHorizontalDragStart: (isVideo && _isInlineMode && _inlinePlayer != null)
-          ? (_) {
-              setState(() {
-                _isInlineHorizontalSeeking = true;
-                _inlineSeekStartPos = _position;
-                _inlineSeekPreviewPos = _position;
-              });
+      onKeyEvent: (node, event) {
+        if (!node.hasPrimaryFocus) {
+          return KeyEventResult.ignored;
+        }
+        if (event is KeyDownEvent &&
+            (event.logicalKey == LogicalKeyboardKey.select ||
+                event.logicalKey == LogicalKeyboardKey.enter ||
+                event.logicalKey == LogicalKeyboardKey.numpadEnter ||
+                event.logicalKey == LogicalKeyboardKey.space ||
+                event.logicalKey == LogicalKeyboardKey.gameButtonA)) {
+          if (widget.selectionMode) {
+            widget.onToggleSelect();
+          } else {
+            if (_isInlineMode && _inlinePlayer != null) {
+              _inlinePlayer!.pause();
             }
-          : null,
-      onHorizontalDragUpdate: (isVideo && _isInlineMode && _inlinePlayer != null)
-          ? (details) {
-              if (!_isInlineHorizontalSeeking) return;
-              final boxWidth = context.size?.width ?? 220.0;
-              final maxSec = _duration.inSeconds > 0
-                  ? _duration.inSeconds
-                  : (att?.duration != null && att!.duration > 0
-                      ? att.duration
-                      : 120);
-              final spanSec = maxSec.clamp(30, 180);
-              final deltaMs =
-                  ((details.delta.dx / boxWidth) * spanSec * 1000).round();
-              final nextMs = (_inlineSeekPreviewPos.inMilliseconds + deltaMs)
-                  .clamp(0, maxSec * 1000);
-              setState(() {
-                _inlineSeekPreviewPos = Duration(milliseconds: nextMs);
-              });
-            }
-          : null,
-      onHorizontalDragEnd: (isVideo && _isInlineMode && _inlinePlayer != null)
-          ? (_) {
-              if (!_isInlineHorizontalSeeking) return;
-              final target = _inlineSeekPreviewPos;
-              setState(() {
-                _isInlineHorizontalSeeking = false;
-                _position = target;
-              });
-              _inlinePlayer?.seek(target);
-            }
-          : null,
-      onSecondaryTapDown: (d) => widget.onShowContextMenu(d.globalPosition),
-      onLongPressStart: (d) => widget.onShowContextMenu(d.globalPosition),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(6),
-        child: Stack(
+            widget.onOpenGallery();
+          }
+          return KeyEventResult.handled;
+        }
+        return KeyEventResult.ignored;
+      },
+      child: GestureDetector(
+        onTap: () {
+          if (widget.selectionMode) {
+            widget.onToggleSelect();
+            return;
+          }
+          if (_isInlineMode && _inlinePlayer != null) {
+            _inlinePlayer!.pause();
+          }
+          widget.onOpenGallery();
+        },
+        onHorizontalDragStart: (isVideo && _isInlineMode && _inlinePlayer != null)
+            ? (_) {
+                setState(() {
+                  _isInlineHorizontalSeeking = true;
+                  _inlineSeekStartPos = _position;
+                  _inlineSeekPreviewPos = _position;
+                });
+              }
+            : null,
+        onHorizontalDragUpdate: (isVideo && _isInlineMode && _inlinePlayer != null)
+            ? (details) {
+                if (!_isInlineHorizontalSeeking) return;
+                final boxWidth = context.size?.width ?? 220.0;
+                final maxSec = _duration.inSeconds > 0
+                    ? _duration.inSeconds
+                    : (att?.duration != null && att!.duration > 0
+                        ? att.duration
+                        : 120);
+                final spanSec = maxSec.clamp(30, 180);
+                final deltaMs =
+                    ((details.delta.dx / boxWidth) * spanSec * 1000).round();
+                final nextMs = (_inlineSeekPreviewPos.inMilliseconds + deltaMs)
+                    .clamp(0, maxSec * 1000);
+                setState(() {
+                  _inlineSeekPreviewPos = Duration(milliseconds: nextMs);
+                });
+              }
+            : null,
+        onHorizontalDragEnd: (isVideo && _isInlineMode && _inlinePlayer != null)
+            ? (_) {
+                if (!_isInlineHorizontalSeeking) return;
+                final target = _inlineSeekPreviewPos;
+                setState(() {
+                  _isInlineHorizontalSeeking = false;
+                  _position = target;
+                });
+                _inlinePlayer?.seek(target);
+              }
+            : null,
+        onSecondaryTapDown: (d) => widget.onShowContextMenu(d.globalPosition),
+        onLongPressStart: (d) => widget.onShowContextMenu(d.globalPosition),
+        child: Container(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(6),
+            border: _isTileFocused
+                ? Border.all(
+                    color: const Color(0xFFFFE066),
+                    width: 2.6,
+                  )
+                : null,
+            boxShadow: _isTileFocused
+                ? [
+                    BoxShadow(
+                      color: widget.tg.tgBlueBright.withValues(alpha: 0.65),
+                      blurRadius: 12,
+                      spreadRadius: 1,
+                    ),
+                  ]
+                : null,
+          ),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(6),
+            child: Stack(
           fit: StackFit.expand,
           children: [
             // 1. Base visual layer: Inline video player OR Thumbnail + Video first-frame fallback
@@ -11907,12 +12160,19 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
             else if (isVideo && !(_isInlineMode && _isPlaying))
               Center(
                 child: Container(
-                  width: 42,
-                  height: 42,
+                  width: _isTileFocused ? 46 : 42,
+                  height: _isTileFocused ? 46 : 42,
                   decoration: BoxDecoration(
-                    color: const Color(0xA6000000),
+                    color: _isTileFocused
+                        ? widget.tg.tgBlueBright
+                        : const Color(0xA6000000),
                     shape: BoxShape.circle,
-                    border: Border.all(color: Colors.white38, width: 1.2),
+                    border: Border.all(
+                      color: _isTileFocused
+                          ? const Color(0xFFFFE066)
+                          : Colors.white38,
+                      width: _isTileFocused ? 2.0 : 1.2,
+                    ),
                   ),
                   alignment: Alignment.center,
                   child: const Icon(
@@ -12113,6 +12373,8 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
               ),
             ),
           ],
+        ),
+      ),
         ),
       ),
     );
@@ -12378,11 +12640,13 @@ class _TelegramPhotoGalleryDialogState
         att.duration > 0 ? Duration(seconds: att.duration) : Duration.zero;
     _isVideoBuffering = true;
 
-    final streamUrl = widget.appState.api.buildTelegramVideoStreamUrl(
+    final rawStreamUrl = widget.appState.api.buildTelegramVideoStreamUrl(
       accountId: widget.accountId,
       peer: widget.chat.peer,
       messageId: msg.id,
     );
+    var activeStreamUrl = rawStreamUrl;
+    var usingLocalRelay = false;
 
     _playingSub = p.stream.playing.listen((playing) {
       if (mounted) setState(() => _isVideoPlaying = playing);
@@ -12390,7 +12654,10 @@ class _TelegramPhotoGalleryDialogState
     _posSub = p.stream.position.listen((pos) {
       if (!mounted) return;
       if (pos > Duration.zero) {
-        setState(() => _videoPosition = pos);
+        setState(() {
+          _videoPosition = pos;
+          _isVideoBuffering = false;
+        });
       }
       if (_pendingGalleryResumeSeconds > 2 && _videoDuration.inSeconds > 0) {
         final target = _pendingGalleryResumeSeconds;
@@ -12418,7 +12685,11 @@ class _TelegramPhotoGalleryDialogState
         _pendingGalleryResumeSeconds = posSec;
         unawaited(
           p.open(
-            Media(streamUrl, httpHeaders: widget.appState.api.authHeaders),
+            Media(
+              activeStreamUrl,
+              httpHeaders:
+                  usingLocalRelay ? const {} : widget.appState.api.authHeaders,
+            ),
             play: true,
           ),
         );
@@ -12428,10 +12699,22 @@ class _TelegramPhotoGalleryDialogState
     if (mounted) setState(() {});
 
     try {
+      activeStreamUrl =
+          await widget.appState.proxyService.resolveProxiedStreamUrl(
+        RequestScenario.telegram,
+        rawStreamUrl,
+        headers: widget.appState.api.authHeaders,
+      );
+      if (!mounted || _videoPlayer != p) return;
+      usingLocalRelay = activeStreamUrl.contains('/__m3u8_proxy__/');
       await _configureGalleryVideoPlayer(p);
       await p.setVolume(_isMuted ? 0 : _volume);
       await p.open(
-        Media(streamUrl, httpHeaders: widget.appState.api.authHeaders),
+        Media(
+          activeStreamUrl,
+          httpHeaders:
+              usingLocalRelay ? const {} : widget.appState.api.authHeaders,
+        ),
         play: true,
       );
       if (_playbackSpeed != 1.0) {
@@ -12557,40 +12840,16 @@ class _TelegramPhotoGalleryDialogState
         _isGalleryHorizontalSeeking ? _gallerySeekPreviewPos : _videoPosition;
     final posMs = activePos.inMilliseconds.clamp(0, totalMs);
 
-    return KeyboardListener(
-      focusNode: _focusNode,
-      autofocus: true,
-      onKeyEvent: (event) {
-        if (event is KeyDownEvent) {
-          if (event.logicalKey == LogicalKeyboardKey.arrowLeft) {
-            if (isVideo) {
-              _seekRelative(-5);
-            } else {
-              _step(-1);
-            }
-          } else if (event.logicalKey == LogicalKeyboardKey.arrowRight) {
-            if (isVideo) {
-              _seekRelative(5);
-            } else {
-              _step(1);
-            }
-          } else if (event.logicalKey == LogicalKeyboardKey.arrowUp && isVideo) {
-            _stepVolume(5);
-          } else if (event.logicalKey == LogicalKeyboardKey.arrowDown &&
-              isVideo) {
-            _stepVolume(-5);
-          } else if ((event.logicalKey == LogicalKeyboardKey.space ||
-                  event.logicalKey == LogicalKeyboardKey.select ||
-                  event.logicalKey == LogicalKeyboardKey.enter) &&
-              isVideo) {
-            _videoPlayer?.playOrPause();
-          } else if (event.logicalKey == LogicalKeyboardKey.keyM && isVideo) {
-            _toggleMute();
-          } else if (event.logicalKey == LogicalKeyboardKey.escape ||
-              event.logicalKey == LogicalKeyboardKey.goBack) {
-            Navigator.of(context).pop();
-          }
+    return Focus(
+      canRequestFocus: false,
+      onKeyEvent: (node, event) {
+        if (event is KeyDownEvent &&
+            (event.logicalKey == LogicalKeyboardKey.escape ||
+                event.logicalKey == LogicalKeyboardKey.goBack)) {
+          Navigator.of(context).pop();
+          return KeyEventResult.handled;
         }
+        return KeyEventResult.ignored;
       },
       child: Dialog(
         backgroundColor: isMobileDialog ? Colors.black : Colors.transparent,
@@ -12607,7 +12866,61 @@ class _TelegramPhotoGalleryDialogState
                   : (list.length > 1
                       ? (isVideo ? 136 : 84)
                       : (isVideo ? 68 : 16)),
-              child: isVideo
+              child: Focus(
+                focusNode: _focusNode,
+                autofocus: true,
+                onFocusChange: (_) {
+                  if (mounted) setState(() {});
+                },
+                onKeyEvent: (node, event) {
+                  if (!node.hasPrimaryFocus) {
+                    return KeyEventResult.ignored;
+                  }
+                  if (event is KeyDownEvent || event is KeyRepeatEvent) {
+                    if (event.logicalKey == LogicalKeyboardKey.arrowLeft) {
+                      if (isVideo) {
+                        _seekRelative(-5);
+                      } else if (event is KeyDownEvent) {
+                        _step(-1);
+                      }
+                      return KeyEventResult.handled;
+                    } else if (event.logicalKey ==
+                        LogicalKeyboardKey.arrowRight) {
+                      if (isVideo) {
+                        _seekRelative(5);
+                      } else if (event is KeyDownEvent) {
+                        _step(1);
+                      }
+                      return KeyEventResult.handled;
+                    } else if (event is KeyDownEvent &&
+                        event.logicalKey == LogicalKeyboardKey.arrowUp) {
+                      node.focusInDirection(TraversalDirection.up);
+                      return KeyEventResult.handled;
+                    } else if (event is KeyDownEvent &&
+                        event.logicalKey == LogicalKeyboardKey.arrowDown) {
+                      node.focusInDirection(TraversalDirection.down);
+                      return KeyEventResult.handled;
+                    } else if (event is KeyDownEvent &&
+                        (event.logicalKey == LogicalKeyboardKey.space ||
+                            event.logicalKey == LogicalKeyboardKey.select ||
+                            event.logicalKey == LogicalKeyboardKey.enter ||
+                            event.logicalKey ==
+                                LogicalKeyboardKey.numpadEnter ||
+                            event.logicalKey ==
+                                LogicalKeyboardKey.gameButtonA) &&
+                        isVideo) {
+                      _videoPlayer?.playOrPause();
+                      return KeyEventResult.handled;
+                    } else if (event is KeyDownEvent &&
+                        event.logicalKey == LogicalKeyboardKey.keyM &&
+                        isVideo) {
+                      _toggleMute();
+                      return KeyEventResult.handled;
+                    }
+                  }
+                  return KeyEventResult.ignored;
+                },
+                child: isVideo
                   ? Listener(
                       onPointerSignal: (signal) {
                         if (signal is PointerScrollEvent) {
@@ -12718,19 +13031,97 @@ class _TelegramPhotoGalleryDialogState
                                 ],
                               ),
                             )
-                          else if (_isVideoBuffering)
-                            Container(
-                              padding: const EdgeInsets.all(14),
-                              decoration: const BoxDecoration(
-                                color: Color(0x99000000),
-                                shape: BoxShape.circle,
-                              ),
-                              child: const SizedBox(
-                                width: 28,
-                                height: 28,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2.5,
-                                  color: Colors.white,
+                          else if (_isVideoBuffering ||
+                              (_videoPosition == Duration.zero &&
+                                  (_videoPlayer?.state.width ?? 0) == 0))
+                            IgnorePointer(
+                              child: Container(
+                                margin: const EdgeInsets.symmetric(
+                                  horizontal: 24,
+                                ),
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 18,
+                                  vertical: 14,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xD80A111A),
+                                  borderRadius: BorderRadius.circular(14),
+                                  border: Border.all(
+                                    color: const Color(0xFF5EB5F7)
+                                        .withValues(alpha: 0.45),
+                                  ),
+                                  boxShadow: const [
+                                    BoxShadow(
+                                      color: Color(0x77000000),
+                                      blurRadius: 16,
+                                      offset: Offset(0, 6),
+                                    ),
+                                  ],
+                                ),
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    const SizedBox(
+                                      width: 28,
+                                      height: 28,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2.6,
+                                        color: Color(0xFF5EB5F7),
+                                      ),
+                                    ),
+                                    const SizedBox(height: 10),
+                                    Text(
+                                      _videoPosition == Duration.zero
+                                          ? '正在连接 Telegram 视频流，加载首帧画面...'
+                                          : '正在缓冲 Telegram 视频数据...',
+                                      textAlign: TextAlign.center,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 13,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 8),
+                                    Wrap(
+                                      spacing: 8,
+                                      runSpacing: 6,
+                                      alignment: WrapAlignment.center,
+                                      crossAxisAlignment:
+                                          WrapCrossAlignment.center,
+                                      children: [
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 8,
+                                            vertical: 3,
+                                          ),
+                                          decoration: BoxDecoration(
+                                            color: const Color(0xFF5EB5F7)
+                                                .withValues(alpha: 0.16),
+                                            borderRadius:
+                                                BorderRadius.circular(8),
+                                          ),
+                                          child: Text(
+                                            widget.appState.proxyService
+                                                        .resolveEffectiveRoute(
+                                                      RequestScenario.telegram,
+                                                    ) ==
+                                                    ScenarioRouteMode.proxyNode
+                                                ? '代理: ${widget.appState.proxyService.resolveNodeForScenario(RequestScenario.telegram)?.displayTitle ?? "加速节点"}'
+                                                : '通道: 客户端直连',
+                                            style: const TextStyle(
+                                              color: Color(0xFF5EB5F7),
+                                              fontSize: 11.5,
+                                              fontWeight: FontWeight.w600,
+                                            ),
+                                          ),
+                                        ),
+                                        if (_videoPlayer != null)
+                                          VideoDownloadSpeedBadge(
+                                            player: _videoPlayer!,
+                                          ),
+                                      ],
+                                    ),
+                                  ],
                                 ),
                               ),
                             )
@@ -12739,11 +13130,15 @@ class _TelegramPhotoGalleryDialogState
                               width: 68,
                               height: 68,
                               decoration: BoxDecoration(
-                                color: const Color(0xA6000000),
+                                color: _focusNode.hasPrimaryFocus
+                                    ? const Color(0xFF3E99EE)
+                                    : const Color(0xA6000000),
                                 shape: BoxShape.circle,
                                 border: Border.all(
-                                  color: Colors.white38,
-                                  width: 1.5,
+                                  color: _focusNode.hasPrimaryFocus
+                                      ? const Color(0xFFFFE066)
+                                      : Colors.white38,
+                                  width: _focusNode.hasPrimaryFocus ? 2.2 : 1.5,
                                 ),
                               ),
                               alignment: Alignment.center,
@@ -12774,6 +13169,7 @@ class _TelegramPhotoGalleryDialogState
                         ),
                       ),
                     ),
+              ),
             ),
 
             // 2. Top Official Telegram Action & Counter Bar
@@ -13242,26 +13638,61 @@ class _TelegramPhotoGalleryDialogState
                           const SizedBox(width: 8),
                           InkWell(
                             borderRadius: BorderRadius.circular(8),
+                            onFocusChange: (_) {
+                              if (mounted) setState(() {});
+                            },
                             onTap: _cycleSpeed,
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 7,
-                                vertical: 3,
-                              ),
-                              decoration: BoxDecoration(
-                                color: Colors.white12,
-                                borderRadius: BorderRadius.circular(8),
-                              ),
-                              child: Text(
-                                '${_playbackSpeed}x',
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 11.5,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
+                            child: Builder(
+                              builder: (spdCtx) {
+                                final isSpdFocused =
+                                    Focus.of(spdCtx).hasPrimaryFocus;
+                                return Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 7,
+                                    vertical: 3,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: isSpdFocused
+                                        ? const Color(0xFF3E99EE)
+                                        : Colors.white12,
+                                    borderRadius: BorderRadius.circular(8),
+                                    border: isSpdFocused
+                                        ? Border.all(
+                                            color: const Color(0xFFFFE066),
+                                            width: 1.8,
+                                          )
+                                        : null,
+                                  ),
+                                  child: Text(
+                                    '${_playbackSpeed}x',
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 11.5,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                );
+                              },
                             ),
                           ),
+                          if (_videoPlayer != null) ...[
+                            const SizedBox(width: 6),
+                            VideoProxyNodeSelector(
+                              proxyService: widget.appState.proxyService,
+                              scenario: RequestScenario.telegram,
+                              overlayStyle: true,
+                              compact: true,
+                              onProxyChanged: (statusMsg) {
+                                _showGalleryHud(statusMsg, state: 'success');
+                                final curSec = _videoPosition.inSeconds;
+                                _syncVideoPlayerForCurrentItem().then((_) {
+                                  if (curSec > 2) {
+                                    _pendingGalleryResumeSeconds = curSec;
+                                  }
+                                });
+                              },
+                            ),
+                          ],
                           const SizedBox(width: 4),
                           Listener(
                             onPointerSignal: (signal) {

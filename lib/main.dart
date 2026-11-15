@@ -110,13 +110,10 @@ class _TvRemoteKeyInterceptor extends StatefulWidget {
 }
 
 class _TvRemoteKeyInterceptorState extends State<_TvRemoteKeyInterceptor> {
-  final GlobalKey _stackKey = GlobalKey();
   FocusNode? _explicitlyActivatedEditableNode;
-  Rect? _focusedRect;
   bool _focusedIsUnactivatedInput = false;
   Timer? _imeHideGuardTimer1;
   Timer? _imeHideGuardTimer2;
-  Timer? _rectRefreshTimer;
 
   @override
   void initState() {
@@ -129,7 +126,6 @@ class _TvRemoteKeyInterceptorState extends State<_TvRemoteKeyInterceptor> {
     FocusManager.instance.removeListener(_onGlobalFocusChanged);
     _imeHideGuardTimer1?.cancel();
     _imeHideGuardTimer2?.cancel();
-    _rectRefreshTimer?.cancel();
     super.dispose();
   }
 
@@ -152,10 +148,12 @@ class _TvRemoteKeyInterceptorState extends State<_TvRemoteKeyInterceptor> {
       _explicitlyActivatedEditableNode = null;
     }
 
+    bool nextIsUnactivatedInput = false;
     if (widget.appState.tvMode && primary != null) {
       final ctx = primary.context;
       final editable = ctx?.findAncestorStateOfType<EditableTextState>();
       if (editable != null && primary != _explicitlyActivatedEditableNode) {
+        nextIsUnactivatedInput = true;
         // Prevent TextField from immediately popping up the soft keyboard when focus lands on it
         SystemChannels.textInput.invokeMethod<void>('TextInput.hide');
         WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -192,92 +190,15 @@ class _TvRemoteKeyInterceptorState extends State<_TvRemoteKeyInterceptor> {
               }
             }
           } catch (_) {}
-          _updateFocusedRect();
         });
       }
     }
 
-    _updateFocusedRect();
-    _rectRefreshTimer?.cancel();
-    _rectRefreshTimer = Timer(
-      const Duration(milliseconds: 165),
-      _updateFocusedRect,
-    );
-  }
-
-  void _updateFocusedRect() {
-    if (!mounted) return;
-    if (!widget.appState.tvMode) {
-      if (_focusedRect != null) {
-        setState(() {
-          _focusedRect = null;
-          _focusedIsUnactivatedInput = false;
-        });
-      }
-      return;
+    if (_focusedIsUnactivatedInput != nextIsUnactivatedInput) {
+      setState(() {
+        _focusedIsUnactivatedInput = nextIsUnactivatedInput;
+      });
     }
-
-    final primary = FocusManager.instance.primaryFocus;
-    final ctx = primary?.context;
-    final stackBox =
-        _stackKey.currentContext?.findRenderObject() as RenderBox?;
-    if (primary == null ||
-        primary is FocusScopeNode ||
-        ctx == null ||
-        !ctx.mounted ||
-        stackBox == null ||
-        !stackBox.hasSize) {
-      if (_focusedRect != null) {
-        setState(() {
-          _focusedRect = null;
-          _focusedIsUnactivatedInput = false;
-        });
-      }
-      return;
-    }
-
-    try {
-      final renderObj = ctx.findRenderObject();
-      if (renderObj is! RenderBox || !renderObj.hasSize || !renderObj.attached) {
-        if (_focusedRect != null) {
-          setState(() {
-            _focusedRect = null;
-            _focusedIsUnactivatedInput = false;
-          });
-        }
-        return;
-      }
-
-      final size = renderObj.size;
-      final stackSize = stackBox.size;
-      // Do not draw a focus ring around full-screen stages or huge containers (> 52% of screen area)
-      if (size.width <= 4 ||
-          size.height <= 4 ||
-          (size.width * size.height) >
-              (stackSize.width * stackSize.height * 0.52)) {
-        if (_focusedRect != null) {
-          setState(() {
-            _focusedRect = null;
-            _focusedIsUnactivatedInput = false;
-          });
-        }
-        return;
-      }
-
-      final topLeft = renderObj.localToGlobal(Offset.zero, ancestor: stackBox);
-      final nextRect = (topLeft & size).inflate(2.0);
-      final editable = ctx.findAncestorStateOfType<EditableTextState>();
-      final nextIsUnactivatedInput =
-          editable != null && primary != _explicitlyActivatedEditableNode;
-
-      if (_focusedRect != nextRect ||
-          _focusedIsUnactivatedInput != nextIsUnactivatedInput) {
-        setState(() {
-          _focusedRect = nextRect;
-          _focusedIsUnactivatedInput = nextIsUnactivatedInput;
-        });
-      }
-    } catch (_) {}
   }
 
   bool _isDpadOrTvKey(LogicalKeyboardKey key) {
@@ -394,15 +315,22 @@ class _TvRemoteKeyInterceptorState extends State<_TvRemoteKeyInterceptor> {
       _explicitlyActivatedEditableNode = primary;
       editableState.requestKeyboard();
       SystemChannels.textInput.invokeMethod<void>('TextInput.show');
-      _updateFocusedRect();
+      if (_focusedIsUnactivatedInput) {
+        setState(() => _focusedIsUnactivatedInput = false);
+      }
       return KeyEventResult.handled;
     }
 
-    // 4. Handle OK / Center / Enter activation fallback for widgets that only use GestureDetector or ButtonActivateIntent
+    // 4. Handle OK / Center / Enter activation fallback for widgets that only use GestureDetector, PopupMenuButton, or ButtonActivateIntent
     if (event is KeyDownEvent &&
         _isActivateKey(key) &&
         editableState == null &&
         focusedCtx != null) {
+      final popupState = focusedCtx.findAncestorStateOfType<PopupMenuButtonState>();
+      if (popupState != null && popupState.mounted) {
+        popupState.showButtonMenu();
+        return KeyEventResult.handled;
+      }
       final activateAction = Actions.maybeFind<ActivateIntent>(focusedCtx);
       if (activateAction != null &&
           activateAction.isEnabled(const ActivateIntent())) {
@@ -457,82 +385,11 @@ class _TvRemoteKeyInterceptorState extends State<_TvRemoteKeyInterceptor> {
 
   @override
   Widget build(BuildContext context) {
-    final rect = _focusedRect;
     return Focus(
       canRequestFocus: false,
       skipTraversal: true,
       onKeyEvent: _handleKeyEvent,
-      child: NotificationListener<ScrollNotification>(
-        onNotification: (_) {
-          if (widget.appState.tvMode && _focusedRect != null) {
-            WidgetsBinding.instance.addPostFrameCallback((_) {
-              _updateFocusedRect();
-            });
-          }
-          return false;
-        },
-        child: Stack(
-          key: _stackKey,
-          fit: StackFit.expand,
-          children: [
-            widget.child,
-            if (widget.appState.tvMode && rect != null)
-              Positioned(
-                left: rect.left,
-                top: rect.top,
-                width: rect.width,
-                height: rect.height,
-                child: IgnorePointer(
-                  child: Container(
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(
-                        color: const Color(0xFFFFE066),
-                        width: 2.6,
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color: VideoPlatformTheme.accent
-                              .withValues(alpha: 0.65),
-                          blurRadius: 12,
-                          spreadRadius: 1.5,
-                        ),
-                      ],
-                    ),
-                    child: _focusedIsUnactivatedInput
-                        ? Align(
-                            alignment: Alignment.centerRight,
-                            child: Container(
-                              margin: const EdgeInsets.only(right: 6),
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 7,
-                                vertical: 2,
-                              ),
-                              decoration: BoxDecoration(
-                                color: const Color(0xEE090E14),
-                                borderRadius: BorderRadius.circular(4),
-                                border: Border.all(
-                                  color: const Color(0xFFFFE066),
-                                ),
-                              ),
-                              child: const Text(
-                                '按 OK 键输入',
-                                style: TextStyle(
-                                  color: Color(0xFFFFE066),
-                                  fontSize: 10.5,
-                                  fontWeight: FontWeight.w700,
-                                  decoration: TextDecoration.none,
-                                ),
-                              ),
-                            ),
-                          )
-                        : null,
-                  ),
-                ),
-              ),
-          ],
-        ),
-      ),
+      child: widget.child,
     );
   }
 }

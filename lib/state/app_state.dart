@@ -221,6 +221,7 @@ class AppState extends ChangeNotifier {
   bool _activeReadingAtBottom = true;
   ({String accountId, String peer, int messageId})? _pendingTelegramJumpTarget;
   VoidCallback? onNavigateToTelegramTab;
+  bool Function()? activeChildBackHandler;
 
   AppState() {
     proxyService = ProxyRoutingService();
