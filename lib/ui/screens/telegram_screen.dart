@@ -1167,15 +1167,22 @@ class _TelegramScreenState extends State<TelegramScreen> {
         _isSendingMessage) {
       return;
     }
+    final pollAccountId = _activeAccountId;
+    final pollEpoch = _accountSwitchEpoch;
     try {
       final activeChat = _selectedChat;
       if (activeChat != null && !_showScrollToBottomBtn) {
         final msgRes = await widget.appState.api.fetchTelegramMessages(
-          accountId: _activeAccountId,
+          accountId: pollAccountId,
           peer: activeChat.peer,
           offsetId: 0,
         );
-        if (!mounted || _selectedChat?.peer != activeChat.peer) return;
+        if (!mounted ||
+            _accountSwitchEpoch != pollEpoch ||
+            _activeAccountId != pollAccountId ||
+            _selectedChat?.peer != activeChat.peer) {
+          return;
+        }
         if (msgRes.messages.isNotEmpty) {
           final currentLastId = _messages.isNotEmpty ? _messages.last.id : 0;
           final fetchedLastId = msgRes.messages.last.id;
@@ -1214,6 +1221,11 @@ class _TelegramScreenState extends State<TelegramScreen> {
             }
           }
         }
+      }
+      if (!mounted ||
+          _accountSwitchEpoch != pollEpoch ||
+          _activeAccountId != pollAccountId) {
+        return;
       }
       // Refresh chat list metadata (such as read_outbox_max_id) in background
       await _loadFoldersAndChats(loadMore: false, silent: true);
@@ -1292,11 +1304,182 @@ class _TelegramScreenState extends State<TelegramScreen> {
     }
   }
 
+  int _accountSwitchEpoch = 0;
+
+  /// Fast, race-free Telegram account switcher:
+  /// 1. Saves current account's state to memory cache before mutating `_activeAccountId`.
+  /// 2. Immediately switches UI state to `targetAccountId` (showing warm cached chats in 0ms or a clean loading indicator so the old account's chat list never lingers).
+  /// 3. Fires `setActiveTelegramAccount` in parallel and concurrently fetches status, folders, and chats.
+  Future<void> _switchTelegramAccount(
+    String targetAccountId, {
+    bool forceRefresh = false,
+  }) async {
+    final cleanTarget = targetAccountId.trim();
+    if (cleanTarget.isEmpty) return;
+    if (cleanTarget == _activeAccountId && !forceRefresh) return;
+
+    _livePollTimer?.cancel();
+    _saveCurrentDraft();
+    _saveCurrentChatToMemoryCache();
+    _stopOutgoingTyping();
+
+    final epoch = ++_accountSwitchEpoch;
+    final cachedFolders = _cachedFoldersByAccount[cleanTarget];
+    final cachedChatData = _cachedChatsByAccountFolder['$cleanTarget|0'];
+    final cachedSelected =
+        _isMobileLayout ? null : _cachedSelectedChatByAccount[cleanTarget];
+
+    setState(() {
+      _activeAccountId = cleanTarget;
+      _cachedActiveAccountId = cleanTarget;
+      _selectedFolderKey = '0';
+      _cachedSelectedFolderKey = '0';
+      _folders = (cachedFolders != null && cachedFolders.isNotEmpty)
+          ? List<TelegramFolder>.from(cachedFolders)
+          : const [TelegramFolder(key: '0', title: '全部会话')];
+      _selectedMessageIds.clear();
+      _selectionMode = false;
+      _mediaTypeFilter = 'all';
+
+      if (cachedChatData != null && cachedChatData.chats.isNotEmpty) {
+        final targetSel = cachedSelected ??
+            (!_isMobileLayout && !_userExitedChat
+                ? cachedChatData.chats.first
+                : null);
+        _chats = _applyReadStateToChats(
+          cachedChatData.chats,
+          activeSelectedPeer: targetSel?.peer,
+        );
+        _nextChatCursor = cachedChatData.nextCursor;
+        _selectedChat = targetSel;
+        _isLoadingChats = false;
+        _statusIsError = false;
+        _statusBanner = '${_chats.length} 个会话';
+        if (targetSel != null) {
+          _restoreDraftForChat(targetSel);
+          final cachedMsgs = _cachedMessagesByPeer[_peerReadKey(targetSel.peer)];
+          if (cachedMsgs != null && cachedMsgs.messages.isNotEmpty) {
+            _messages = List<TelegramMessage>.from(cachedMsgs.messages);
+            _nextMessageOffset = cachedMsgs.nextOffset;
+            _isLoadingMessages = false;
+          } else {
+            _messages = [];
+            _nextMessageOffset = 0;
+          }
+        } else {
+          _messages = [];
+          _nextMessageOffset = 0;
+        }
+      } else {
+        _chats = [];
+        _nextChatCursor = '';
+        _selectedChat = null;
+        _messages = [];
+        _nextMessageOffset = 0;
+        _isLoadingChats = true;
+        _statusIsError = false;
+        _statusBanner = '正在切换账号...';
+      }
+    });
+    _syncReadingContext();
+
+    // Notify backend of active account in parallel without blocking chat list load
+    unawaited(
+      widget.appState.api
+          .setActiveTelegramAccount(cleanTarget)
+          .catchError((_) {}),
+    );
+
+    try {
+      // Launch status, accounts, and folders+chats requests in parallel so the new
+      // account's chat list loads in 1 single network roundtrip instead of 4 sequential ones!
+      final statusFuture = widget.appState.api.fetchTelegramStatus(cleanTarget);
+      final accountsFuture = widget.appState.api
+          .fetchTelegramAccounts()
+          .catchError((_) => (
+                activeId: cleanTarget,
+                accounts: _accounts,
+              ));
+      final chatsLoadFuture = _loadFoldersAndChats(
+        loadMore: false,
+        silent: cachedChatData != null &&
+            cachedChatData.chats.isNotEmpty &&
+            !forceRefresh,
+      );
+
+      final status = await statusFuture;
+      if (!mounted ||
+          _accountSwitchEpoch != epoch ||
+          _activeAccountId != cleanTarget) {
+        return;
+      }
+
+      final accData = await accountsFuture;
+      if (!mounted ||
+          _accountSwitchEpoch != epoch ||
+          _activeAccountId != cleanTarget) {
+        return;
+      }
+
+      setState(() {
+        if (accData.accounts.isNotEmpty) {
+          _accounts = accData.accounts;
+          _cachedAccounts = List<TelegramAccount>.from(_accounts);
+        }
+        _authStatus = status;
+        _cachedAuthStatus = status;
+      });
+
+      if (!status.authorized) {
+        setState(() {
+          _isLoadingChats = false;
+          _chats = [];
+          _messages = [];
+          _selectedChat = null;
+          _statusBanner = status.configured ? '待验证码登录' : '未配置 API';
+        });
+        return;
+      }
+
+      await chatsLoadFuture;
+      if (!mounted ||
+          _accountSwitchEpoch != epoch ||
+          _activeAccountId != cleanTarget) {
+        return;
+      }
+      _startLivePolling();
+    } catch (e) {
+      if (!mounted ||
+          _accountSwitchEpoch != epoch ||
+          _activeAccountId != cleanTarget) {
+        return;
+      }
+      if (_chats.isEmpty) {
+        setState(() {
+          _isLoadingChats = false;
+          _statusIsError = true;
+          _statusBanner = '切换账号异常';
+        });
+      }
+    }
+  }
+
   Future<void> _bootstrapTelegram({
     String? preferredAccountId,
     bool forceRefresh = false,
   }) async {
+    if (preferredAccountId != null &&
+        preferredAccountId.trim().isNotEmpty &&
+        preferredAccountId.trim() != _activeAccountId) {
+      await _switchTelegramAccount(
+        preferredAccountId.trim(),
+        forceRefresh: true,
+      );
+      return;
+    }
+
     _livePollTimer?.cancel();
+    final epoch = ++_accountSwitchEpoch;
     final hasWarmCache = !forceRefresh &&
         _chats.isNotEmpty &&
         _authStatus.authorized &&
@@ -1314,11 +1497,22 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
     try {
       final accData = await widget.appState.api.fetchTelegramAccounts();
+      if (!mounted || _accountSwitchEpoch != epoch) return;
       final chosenId = preferredAccountId ?? accData.activeId;
-      final status = await widget.appState.api.fetchTelegramStatus(chosenId);
-      if (!mounted) return;
-
       final switchedAccount = chosenId != _activeAccountId;
+
+      if (switchedAccount) {
+        setState(() {
+          _accounts = accData.accounts;
+          _cachedAccounts = List<TelegramAccount>.from(_accounts);
+        });
+        await _switchTelegramAccount(chosenId, forceRefresh: true);
+        return;
+      }
+
+      final status = await widget.appState.api.fetchTelegramStatus(chosenId);
+      if (!mounted || _accountSwitchEpoch != epoch) return;
+
       setState(() {
         _accounts = accData.accounts;
         _activeAccountId = chosenId;
@@ -1342,9 +1536,10 @@ class _TelegramScreenState extends State<TelegramScreen> {
       await _loadFoldersAndChats(
         silent: hasWarmCache && !switchedAccount,
       );
+      if (!mounted || _accountSwitchEpoch != epoch) return;
       _startLivePolling();
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || _accountSwitchEpoch != epoch) return;
       if (!hasWarmCache) {
         setState(() {
           _isLoadingChats = false;
@@ -1371,6 +1566,10 @@ class _TelegramScreenState extends State<TelegramScreen> {
         _nextChatCursor = cachedFolderData.nextCursor;
         _isLoadingChats = false;
         _statusBanner = '${_chats.length} 个会话';
+      } else {
+        _chats = [];
+        _nextChatCursor = '';
+        _isLoadingChats = true;
       }
     });
     _loadFoldersAndChats(
@@ -1383,6 +1582,10 @@ class _TelegramScreenState extends State<TelegramScreen> {
     bool loadMore = false,
     bool silent = false,
   }) async {
+    final reqAccountId = _activeAccountId;
+    final reqFolderKey = _selectedFolderKey;
+    final reqEpoch = _accountSwitchEpoch;
+
     if (!silent) {
       setState(() {
         _isLoadingChats = true;
@@ -1391,24 +1594,35 @@ class _TelegramScreenState extends State<TelegramScreen> {
     }
 
     try {
-      if (!loadMore) {
-        try {
-          final loadedFolders =
-              await widget.appState.api.fetchTelegramFolders(_activeAccountId);
-          if (mounted && loadedFolders.isNotEmpty) {
-            _folders = loadedFolders;
-            _cachedFoldersByAccount[_activeAccountId] =
-                List<TelegramFolder>.from(loadedFolders);
-          }
-        } catch (_) {}
-      }
+      // Fetch folders and chats concurrently instead of sequentially
+      final Future<List<TelegramFolder>?> foldersFuture = !loadMore
+          ? widget.appState.api
+              .fetchTelegramFolders(reqAccountId)
+              .then<List<TelegramFolder>?>((v) => v)
+              .catchError((_) => null)
+          : Future<List<TelegramFolder>?>.value(null);
 
-      final res = await widget.appState.api.fetchTelegramChats(
-        accountId: _activeAccountId,
-        folder: _selectedFolderKey,
+      final chatsFuture = widget.appState.api.fetchTelegramChats(
+        accountId: reqAccountId,
+        folder: reqFolderKey,
         cursor: loadMore ? _nextChatCursor : '',
       );
-      if (!mounted) return;
+
+      final res = await chatsFuture;
+      final loadedFolders = await foldersFuture;
+
+      if (!mounted ||
+          _accountSwitchEpoch != reqEpoch ||
+          _activeAccountId != reqAccountId ||
+          _selectedFolderKey != reqFolderKey) {
+        return;
+      }
+
+      if (loadedFolders != null && loadedFolders.isNotEmpty) {
+        _folders = loadedFolders;
+        _cachedFoldersByAccount[reqAccountId] =
+            List<TelegramFolder>.from(loadedFolders);
+      }
 
       setState(() {
         if (loadMore) {
@@ -1422,13 +1636,15 @@ class _TelegramScreenState extends State<TelegramScreen> {
             ...incoming,
           ];
         } else {
+          final currentSelBelongsToList = _selectedChat != null &&
+              res.chats.any((c) => c.peer == _selectedChat!.peer);
           final shouldAutoSelectFirst = !_isMobileLayout &&
-              !silent &&
               !_userExitedChat &&
-              _selectedChat == null &&
+              (_selectedChat == null || !currentSelBelongsToList) &&
               res.chats.isNotEmpty;
-          final initialTargetPeer = _selectedChat?.peer ??
-              (shouldAutoSelectFirst ? res.chats.first.peer : null);
+          final initialTargetPeer = shouldAutoSelectFirst
+              ? res.chats.first.peer
+              : _selectedChat?.peer;
           _chats = _applyReadStateToChats(
             res.chats,
             activeSelectedPeer: initialTargetPeer,
@@ -1444,6 +1660,8 @@ class _TelegramScreenState extends State<TelegramScreen> {
               _nextMessageOffset = cachedMsgs.nextOffset;
               _loadMessages(loadOlder: false, silent: true);
             } else {
+              _messages = [];
+              _nextMessageOffset = 0;
               _loadMessages(loadOlder: false);
             }
           } else if (_selectedChat != null) {
@@ -1452,6 +1670,9 @@ class _TelegramScreenState extends State<TelegramScreen> {
             );
             if (updatedSelected.isNotEmpty) {
               _selectedChat = updatedSelected.first.copyWith(unread: 0);
+              if (_messages.isEmpty && !_isLoadingMessages) {
+                _loadMessages(loadOlder: false);
+              }
             }
           }
         }
@@ -1462,7 +1683,12 @@ class _TelegramScreenState extends State<TelegramScreen> {
       _saveCurrentChatToMemoryCache();
       unawaited(_persistReadState());
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted ||
+          _accountSwitchEpoch != reqEpoch ||
+          _activeAccountId != reqAccountId ||
+          _selectedFolderKey != reqFolderKey) {
+        return;
+      }
       if (!silent) {
         setState(() {
           _isLoadingChats = false;
@@ -1544,6 +1770,8 @@ class _TelegramScreenState extends State<TelegramScreen> {
     final chat = _selectedChat;
     if (chat == null) return;
     if (loadOlder && (_isLoadingMessages || _nextMessageOffset <= 0)) return;
+    final reqAccountId = _activeAccountId;
+    final reqEpoch = _accountSwitchEpoch;
 
     final hadClientsBefore = loadOlder && _messageScrollController.hasClients;
     final prevMaxExtent = hadClientsBefore
@@ -1561,11 +1789,16 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
     try {
       final res = await widget.appState.api.fetchTelegramMessages(
-        accountId: _activeAccountId,
+        accountId: reqAccountId,
         peer: chat.peer,
         offsetId: loadOlder ? _nextMessageOffset : 0,
       );
-      if (!mounted || _selectedChat?.peer != chat.peer) return;
+      if (!mounted ||
+          _accountSwitchEpoch != reqEpoch ||
+          _activeAccountId != reqAccountId ||
+          _selectedChat?.peer != chat.peer) {
+        return;
+      }
 
       int addedOlderCount = 0;
       final prevLastId = _messages.isNotEmpty ? _messages.last.id : 0;
@@ -3748,130 +3981,231 @@ class _TelegramScreenState extends State<TelegramScreen> {
       color: tg.folderRailBg,
       child: Column(
         children: [
-          const SizedBox(height: 10),
-          // Top menu / Account switcher button
-          PopupMenuButton<String>(
-            color: tg.sidebarBg,
-            onSelected: (val) async {
-              if (val == '__settings__') {
-                _showAccountSettingsDialog();
-              } else if (val == '__refresh__') {
-                _bootstrapTelegram(
-                  preferredAccountId: _activeAccountId,
-                  forceRefresh: true,
-                );
-              } else if (val != _activeAccountId) {
-                try {
-                  await widget.appState.api.setActiveTelegramAccount(val);
-                } catch (_) {}
-                await _bootstrapTelegram(
-                  preferredAccountId: val,
-                  forceRefresh: true,
-                );
-              }
-            },
-            itemBuilder: (_) => [
-              ..._accounts.map(
-                (a) => PopupMenuItem<String>(
-                  value: a.id,
-                  child: Row(
-                    children: [
-                      _buildPeerAvatar(
-                        a.id,
-                        a.name,
-                        size: 26,
-                        fontSize: 11,
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Text(
-                          a.displayLabel,
-                          style: TextStyle(
-                            fontSize: 13,
-                            fontWeight: a.id == _activeAccountId
-                                ? FontWeight.w600
-                                : FontWeight.w400,
-                            color: tg.textPrimary,
+          const SizedBox(height: 8),
+          // If multiple accounts exist, render direct 1-click / TV-focusable account pills right on the rail!
+          if (_accounts.length > 1)
+            ..._accounts.map((acc) {
+              final isCurrent = acc.id == _activeAccountId;
+              return StatefulBuilder(
+                builder: (accCtx, setAccState) {
+                  return InkWell(
+                    borderRadius: BorderRadius.circular(12),
+                    onFocusChange: (_) {
+                      if (accCtx.mounted) setAccState(() {});
+                    },
+                    onTap: () {
+                      if (!isCurrent) {
+                        _switchTelegramAccount(acc.id);
+                      } else {
+                        _showAccountSettingsDialog();
+                      }
+                    },
+                    child: Builder(
+                      builder: (innerCtx) {
+                        final isFocused = Focus.of(innerCtx).hasPrimaryFocus;
+                        return Container(
+                          width: 64,
+                          margin: const EdgeInsets.symmetric(vertical: 3),
+                          padding: const EdgeInsets.symmetric(
+                            vertical: 5,
+                            horizontal: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            color: isFocused
+                                ? tg.tgBlueBright.withValues(alpha: 0.28)
+                                : (isCurrent
+                                    ? tg.tgBlueBright.withValues(alpha: 0.14)
+                                    : Colors.transparent),
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(
+                              color: isFocused
+                                  ? const Color(0xFFFFE066)
+                                  : (isCurrent
+                                      ? tg.tgBlueBright
+                                      : Colors.transparent),
+                              width: isFocused ? 2.2 : 1.5,
+                            ),
+                          ),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Stack(
+                                clipBehavior: Clip.none,
+                                children: [
+                                  _buildPeerAvatar(
+                                    acc.id,
+                                    acc.name,
+                                    size: 34,
+                                    fontSize: 13,
+                                  ),
+                                  if (isCurrent)
+                                    Positioned(
+                                      right: -1,
+                                      bottom: -1,
+                                      child: Container(
+                                        width: 11,
+                                        height: 11,
+                                        decoration: BoxDecoration(
+                                          color: _authStatus.authorized
+                                              ? const Color(0xFF4ECC5E)
+                                              : const Color(0xFFF5A623),
+                                          shape: BoxShape.circle,
+                                          border: Border.all(
+                                            color: tg.folderRailBg,
+                                            width: 1.8,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                ],
+                              ),
+                              const SizedBox(height: 3),
+                              Text(
+                                acc.name.trim().isNotEmpty
+                                    ? acc.name.trim()
+                                    : acc.id,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  fontSize: 9.5,
+                                  fontWeight: (isCurrent || isFocused)
+                                      ? FontWeight.w700
+                                      : FontWeight.w400,
+                                  color: (isCurrent || isFocused)
+                                      ? Colors.white
+                                      : tg.folderRailIconInactive,
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+                  );
+                },
+              );
+            })
+          else
+            // Single account: focusable avatar button opening menu / settings
+            PopupMenuButton<String>(
+              color: tg.sidebarBg,
+              onSelected: (val) async {
+                if (val == '__settings__') {
+                  _showAccountSettingsDialog();
+                } else if (val == '__refresh__') {
+                  _bootstrapTelegram(
+                    preferredAccountId: _activeAccountId,
+                    forceRefresh: true,
+                  );
+                } else if (val != _activeAccountId) {
+                  await _switchTelegramAccount(val);
+                }
+              },
+              itemBuilder: (_) => [
+                ..._accounts.map(
+                  (a) => PopupMenuItem<String>(
+                    value: a.id,
+                    child: Row(
+                      children: [
+                        _buildPeerAvatar(
+                          a.id,
+                          a.name,
+                          size: 26,
+                          fontSize: 11,
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            a.displayLabel,
+                            style: TextStyle(
+                              fontSize: 13,
+                              fontWeight: a.id == _activeAccountId
+                                  ? FontWeight.w600
+                                  : FontWeight.w400,
+                              color: tg.textPrimary,
+                            ),
                           ),
                         ),
+                        if (a.id == _activeAccountId)
+                          Icon(
+                            Icons.check_rounded,
+                            size: 16,
+                            color: tg.tgBlueBright,
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+                const PopupMenuDivider(),
+                PopupMenuItem<String>(
+                  value: '__settings__',
+                  child: Row(
+                    children: [
+                      Icon(
+                        Icons.settings_outlined,
+                        size: 18,
+                        color: tg.textSecondary,
                       ),
-                      if (a.id == _activeAccountId)
-                        Icon(
-                          Icons.check_rounded,
-                          size: 16,
-                          color: tg.tgBlueBright,
-                        ),
+                      const SizedBox(width: 10),
+                      Text(
+                        '账号与 API 登录配置...',
+                        style: TextStyle(fontSize: 13, color: tg.textPrimary),
+                      ),
                     ],
                   ),
                 ),
-              ),
-              const PopupMenuDivider(),
-              PopupMenuItem<String>(
-                value: '__settings__',
-                child: Row(
-                  children: [
-                    Icon(
-                      Icons.settings_outlined,
-                      size: 18,
-                      color: tg.textSecondary,
-                    ),
-                    const SizedBox(width: 10),
-                    Text(
-                      '账号与 API 登录配置...',
-                      style: TextStyle(fontSize: 13, color: tg.textPrimary),
-                    ),
-                  ],
-                ),
-              ),
-              PopupMenuItem<String>(
-                value: '__refresh__',
-                child: Row(
-                  children: [
-                    Icon(
-                      Icons.sync_rounded,
-                      size: 18,
-                      color: tg.textSecondary,
-                    ),
-                    const SizedBox(width: 10),
-                    Text(
-                      '重新同步会话列表',
-                      style: TextStyle(fontSize: 13, color: tg.textPrimary),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 8),
-              child: Stack(
-                clipBehavior: Clip.none,
-                children: [
-                  _buildPeerAvatar(
-                    activeAcc.id,
-                    activeAcc.name,
-                    size: 38,
-                    fontSize: 14,
+                PopupMenuItem<String>(
+                  value: '__refresh__',
+                  child: Row(
+                    children: [
+                      Icon(
+                        Icons.sync_rounded,
+                        size: 18,
+                        color: tg.textSecondary,
+                      ),
+                      const SizedBox(width: 10),
+                      Text(
+                        '重新同步会话列表',
+                        style: TextStyle(fontSize: 13, color: tg.textPrimary),
+                      ),
+                    ],
                   ),
-                  Positioned(
-                    right: -1,
-                    bottom: -1,
-                    child: Container(
-                      width: 12,
-                      height: 12,
-                      decoration: BoxDecoration(
-                        color: _authStatus.authorized
-                            ? const Color(0xFF4ECC5E)
-                            : const Color(0xFFF5A623),
-                        shape: BoxShape.circle,
-                        border: Border.all(color: tg.folderRailBg, width: 2),
+                ),
+              ],
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                child: Stack(
+                  clipBehavior: Clip.none,
+                  children: [
+                    _buildPeerAvatar(
+                      activeAcc.id,
+                      activeAcc.name,
+                      size: 38,
+                      fontSize: 14,
+                    ),
+                    Positioned(
+                      right: -1,
+                      bottom: -1,
+                      child: Container(
+                        width: 12,
+                        height: 12,
+                        decoration: BoxDecoration(
+                          color: _authStatus.authorized
+                              ? const Color(0xFF4ECC5E)
+                              : const Color(0xFFF5A623),
+                          shape: BoxShape.circle,
+                          border: Border.all(color: tg.folderRailBg, width: 2),
+                        ),
                       ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
-          ),
           const SizedBox(height: 6),
+          Divider(height: 1, indent: 12, endIndent: 12, color: tg.borderLine),
+          const SizedBox(height: 4),
           // Vertical folder tabs
           Expanded(
             child: ListView.builder(
@@ -3895,57 +4229,79 @@ class _TelegramScreenState extends State<TelegramScreen> {
                   iconData = Icons.movie_outlined;
                 }
 
-                return InkWell(
-                  onTap: () => _switchFolder(f.key),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      vertical: 10,
-                      horizontal: 4,
-                    ),
-                    decoration: BoxDecoration(
-                      border: Border(
-                        left: BorderSide(
-                          color: selected
-                              ? tg.folderRailIconActive
-                              : Colors.transparent,
-                          width: 3,
-                        ),
+                return StatefulBuilder(
+                  builder: (fCtx, setFState) {
+                    return InkWell(
+                      onFocusChange: (_) {
+                        if (fCtx.mounted) setFState(() {});
+                      },
+                      onTap: () => _switchFolder(f.key),
+                      child: Builder(
+                        builder: (innerCtx) {
+                          final isFocused = Focus.of(innerCtx).hasPrimaryFocus;
+                          return Container(
+                            padding: const EdgeInsets.symmetric(
+                              vertical: 10,
+                              horizontal: 4,
+                            ),
+                            decoration: BoxDecoration(
+                              color: isFocused
+                                  ? tg.tgBlueBright.withValues(alpha: 0.22)
+                                  : Colors.transparent,
+                              border: isFocused
+                                  ? Border.all(
+                                      color: const Color(0xFFFFE066),
+                                      width: 2.0,
+                                    )
+                                  : Border(
+                                      left: BorderSide(
+                                        color: selected
+                                            ? tg.folderRailIconActive
+                                            : Colors.transparent,
+                                        width: 3,
+                                      ),
+                                    ),
+                            ),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  iconData,
+                                  size: 24,
+                                  color: (selected || isFocused)
+                                      ? tg.folderRailIconActive
+                                      : tg.folderRailIconInactive,
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  f.title,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    fontWeight: (selected || isFocused)
+                                        ? FontWeight.w600
+                                        : FontWeight.w400,
+                                    color: (selected || isFocused)
+                                        ? tg.folderRailIconActive
+                                        : tg.folderRailIconInactive,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
                       ),
-                    ),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          iconData,
-                          size: 24,
-                          color: selected
-                              ? tg.folderRailIconActive
-                              : tg.folderRailIconInactive,
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          f.title,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                            fontSize: 10,
-                            fontWeight:
-                                selected ? FontWeight.w600 : FontWeight.w400,
-                            color: selected
-                                ? tg.folderRailIconActive
-                                : tg.folderRailIconInactive,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
+                    );
+                  },
                 );
               },
             ),
           ),
           // Bottom settings button on rail
           IconButton(
+            tooltip: '账号与 API 登录配置',
             onPressed: _showAccountSettingsDialog,
             icon: Icon(
               Icons.settings_outlined,
@@ -4167,14 +4523,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
                       onTap: () async {
                         Navigator.of(sheetCtx).pop();
                         if (acc.id != _activeAccountId) {
-                          try {
-                            await widget.appState.api
-                                .setActiveTelegramAccount(acc.id);
-                          } catch (_) {}
-                          await _bootstrapTelegram(
-                            preferredAccountId: acc.id,
-                            forceRefresh: true,
-                          );
+                          await _switchTelegramAccount(acc.id);
                         }
                       },
                     ),
@@ -4811,23 +5160,29 @@ class _TelegramScreenState extends State<TelegramScreen> {
                               color: isSelected
                                   ? tg.sidebarSelected
                                   : Colors.transparent,
-                              child: InkWell(
-                                hoverColor: isSelected
-                                    ? tg.sidebarSelected
-                                    : tg.sidebarHover,
-                                onFocusChange: (_) {
-                                  if (mounted) setState(() {});
-                                },
-                                onTap: () => _selectChat(chat),
-                                onLongPress: isMobile
-                                    ? () =>
-                                        _showMobileChatRowContextSheet(tg, chat)
-                                    : null,
-                                child: Builder(
-                                  builder: (itemCtx) {
-                                    final isFocused =
-                                        Focus.of(itemCtx).hasPrimaryFocus;
-                                    return Container(
+                              child: StatefulBuilder(
+                                builder: (rowStateCtx, setRowState) {
+                                  return InkWell(
+                                    hoverColor: isSelected
+                                        ? tg.sidebarSelected
+                                        : tg.sidebarHover,
+                                    onFocusChange: (_) {
+                                      if (rowStateCtx.mounted) {
+                                        setRowState(() {});
+                                      }
+                                    },
+                                    onTap: () => _selectChat(chat),
+                                    onLongPress: isMobile
+                                        ? () => _showMobileChatRowContextSheet(
+                                            tg,
+                                            chat,
+                                          )
+                                        : null,
+                                    child: Builder(
+                                      builder: (itemCtx) {
+                                        final isFocused =
+                                            Focus.of(itemCtx).hasPrimaryFocus;
+                                        return Container(
                                       height: isMobile ? 72 : 68,
                                       padding: EdgeInsets.symmetric(
                                         horizontal: isMobile ? 12 : 10,
@@ -5084,10 +5439,12 @@ class _TelegramScreenState extends State<TelegramScreen> {
                               );
                             },
                           ),
-                        ),
-                      );
-                    },
+                        );
+                      },
                     ),
+                  );
+                },
+              ),
                   ),
                 ),
       ),
@@ -10856,6 +11213,7 @@ class _TelegramAccountConfigDialogState
                                     : (val) async {
                                         if (val == null) return;
                                         setState(() => _accountId = val);
+                                        widget.onChanged(val);
                                         await widget.appState.api
                                             .setActiveTelegramAccount(val);
                                         await _refreshState();
@@ -13598,6 +13956,10 @@ class _TelegramPhotoGalleryDialog extends StatefulWidget {
 class _TelegramPhotoGalleryDialogState
     extends State<_TelegramPhotoGalleryDialog> {
   final FocusNode _focusNode = FocusNode();
+  final FocusNode _scrubberFocusNode = FocusNode();
+  final FocusNode _playPauseFocusNode = FocusNode();
+  final FocusNode _topSaveFocusNode = FocusNode();
+  final FocusNode _topCloseFocusNode = FocusNode();
   late bool _albumScopeOnly;
   late int _currentIndex;
 
@@ -13743,6 +14105,10 @@ class _TelegramPhotoGalleryDialogState
     _dialogHudTimer?.cancel();
     _disposeVideoPlayer();
     _focusNode.dispose();
+    _scrubberFocusNode.dispose();
+    _playPauseFocusNode.dispose();
+    _topSaveFocusNode.dispose();
+    _topCloseFocusNode.dispose();
     super.dispose();
   }
 
@@ -13877,7 +14243,15 @@ class _TelegramPhotoGalleryDialogState
       }
     });
 
-    if (mounted) setState(() {});
+    if (mounted) {
+      setState(() {});
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        if (!_playPauseFocusNode.hasFocus && !_scrubberFocusNode.hasFocus) {
+          _playPauseFocusNode.requestFocus();
+        }
+      });
+    }
 
     try {
       activeStreamUrl =
@@ -14001,6 +14375,201 @@ class _TelegramPhotoGalleryDialogState
     return h > 0 ? '$h:$m:$s' : '$m:$s';
   }
 
+  Widget _buildGalleryTvButton({
+    FocusNode? focusNode,
+    bool autofocus = false,
+    required IconData icon,
+    required String label,
+    required VoidCallback? onTap,
+    Color bgColor = const Color(0xCC1E2C3A),
+    Color iconColor = Colors.white,
+    FocusNode? upFocusNode,
+    FocusNode? downFocusNode,
+  }) {
+    return StatefulBuilder(
+      builder: (btnCtx, setBtnState) {
+        return Focus(
+          focusNode: focusNode,
+          autofocus: autofocus,
+          onFocusChange: (_) => setBtnState(() {}),
+          onKeyEvent: (node, event) {
+            if (event is! KeyDownEvent) return KeyEventResult.ignored;
+            if (event.logicalKey == LogicalKeyboardKey.select ||
+                event.logicalKey == LogicalKeyboardKey.enter ||
+                event.logicalKey == LogicalKeyboardKey.numpadEnter ||
+                event.logicalKey == LogicalKeyboardKey.space ||
+                event.logicalKey == LogicalKeyboardKey.gameButtonA) {
+              if (onTap != null) onTap();
+              return KeyEventResult.handled;
+            }
+            if (event.logicalKey == LogicalKeyboardKey.arrowUp &&
+                upFocusNode != null) {
+              upFocusNode.requestFocus();
+              return KeyEventResult.handled;
+            }
+            if (event.logicalKey == LogicalKeyboardKey.arrowDown &&
+                downFocusNode != null) {
+              downFocusNode.requestFocus();
+              return KeyEventResult.handled;
+            }
+            return KeyEventResult.ignored;
+          },
+          child: Builder(
+            builder: (innerCtx) {
+              final isFocused = Focus.of(innerCtx).hasPrimaryFocus;
+              return GestureDetector(
+                onTap: onTap,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 11,
+                    vertical: 6,
+                  ),
+                  decoration: BoxDecoration(
+                    color: isFocused ? const Color(0xFF3E99EE) : bgColor,
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(
+                      color: isFocused
+                          ? const Color(0xFFFFE066)
+                          : Colors.white24,
+                      width: isFocused ? 2.2 : 1.0,
+                    ),
+                    boxShadow: isFocused
+                        ? const [
+                            BoxShadow(
+                              color: Color(0x883E99EE),
+                              blurRadius: 10,
+                            ),
+                          ]
+                        : null,
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        icon,
+                        size: 15,
+                        color: isFocused ? Colors.white : iconColor,
+                      ),
+                      const SizedBox(width: 5),
+                      Text(
+                        label,
+                        style: TextStyle(
+                          color: onTap == null ? Colors.white54 : Colors.white,
+                          fontSize: 12,
+                          fontWeight:
+                              isFocused ? FontWeight.w700 : FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildGalleryTvIconButton({
+    FocusNode? focusNode,
+    bool autofocus = false,
+    required IconData icon,
+    String? label,
+    required VoidCallback? onTap,
+    double iconSize = 20,
+    FocusNode? upFocusNode,
+    FocusNode? downFocusNode,
+  }) {
+    return StatefulBuilder(
+      builder: (btnCtx, setBtnState) {
+        return Focus(
+          focusNode: focusNode,
+          autofocus: autofocus,
+          onFocusChange: (_) => setBtnState(() {}),
+          onKeyEvent: (node, event) {
+            if (event is! KeyDownEvent) return KeyEventResult.ignored;
+            if (event.logicalKey == LogicalKeyboardKey.select ||
+                event.logicalKey == LogicalKeyboardKey.enter ||
+                event.logicalKey == LogicalKeyboardKey.numpadEnter ||
+                event.logicalKey == LogicalKeyboardKey.space ||
+                event.logicalKey == LogicalKeyboardKey.gameButtonA) {
+              if (onTap != null) onTap();
+              return KeyEventResult.handled;
+            }
+            if (event.logicalKey == LogicalKeyboardKey.arrowUp &&
+                upFocusNode != null) {
+              upFocusNode.requestFocus();
+              return KeyEventResult.handled;
+            }
+            if (event.logicalKey == LogicalKeyboardKey.arrowDown &&
+                downFocusNode != null) {
+              downFocusNode.requestFocus();
+              return KeyEventResult.handled;
+            }
+            return KeyEventResult.ignored;
+          },
+          child: Builder(
+            builder: (innerCtx) {
+              final isFocused = Focus.of(innerCtx).hasPrimaryFocus;
+              return GestureDetector(
+                onTap: onTap,
+                child: Container(
+                  padding: EdgeInsets.symmetric(
+                    horizontal: label != null ? 10 : 8,
+                    vertical: 6,
+                  ),
+                  decoration: BoxDecoration(
+                    color: isFocused
+                        ? const Color(0xFF3E99EE)
+                        : const Color(0x33FFFFFF),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(
+                      color: isFocused
+                          ? const Color(0xFFFFE066)
+                          : Colors.white24,
+                      width: isFocused ? 2.2 : 1.0,
+                    ),
+                    boxShadow: isFocused
+                        ? const [
+                            BoxShadow(
+                              color: Color(0x883E99EE),
+                              blurRadius: 10,
+                            ),
+                          ]
+                        : null,
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        icon,
+                        size: iconSize,
+                        color: Colors.white,
+                      ),
+                      if (label != null) ...[
+                        const SizedBox(width: 4),
+                        Text(
+                          label,
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 12,
+                            fontWeight:
+                                isFocused ? FontWeight.w700 : FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final list = _activeMessages;
@@ -14045,11 +14614,12 @@ class _TelegramPhotoGalleryDialogState
               bottom: isMobileDialog
                   ? 0
                   : (list.length > 1
-                      ? (isVideo ? 136 : 84)
-                      : (isVideo ? 68 : 16)),
+                      ? (isVideo ? 168 : 84)
+                      : (isVideo ? 104 : 16)),
               child: Focus(
                 focusNode: _focusNode,
-                autofocus: true,
+                autofocus: !isVideo,
+                canRequestFocus: !isVideo,
                 onFocusChange: (_) {
                   if (mounted) setState(() {});
                 },
@@ -14075,11 +14645,15 @@ class _TelegramPhotoGalleryDialogState
                       return KeyEventResult.handled;
                     } else if (event is KeyDownEvent &&
                         event.logicalKey == LogicalKeyboardKey.arrowUp) {
-                      node.focusInDirection(TraversalDirection.up);
+                      _topSaveFocusNode.requestFocus();
                       return KeyEventResult.handled;
                     } else if (event is KeyDownEvent &&
                         event.logicalKey == LogicalKeyboardKey.arrowDown) {
-                      node.focusInDirection(TraversalDirection.down);
+                      if (isVideo) {
+                        _playPauseFocusNode.requestFocus();
+                      } else {
+                        node.focusInDirection(TraversalDirection.down);
+                      }
                       return KeyEventResult.handled;
                     } else if (event is KeyDownEvent &&
                         (event.logicalKey == LogicalKeyboardKey.space ||
@@ -14436,142 +15010,108 @@ class _TelegramPhotoGalleryDialogState
                           ],
                           if (hasAlbumGroup) ...[
                             const SizedBox(width: 6),
-                            InkWell(
-                              borderRadius: BorderRadius.circular(16),
+                            _buildGalleryTvButton(
+                              icon: Icons.filter_none_rounded,
+                              label: _albumScopeOnly
+                                  ? '本组 (${widget.albumMessages!.length})'
+                                  : '全部 (${widget.photoMessages.length})',
+                              bgColor: _albumScopeOnly
+                                  ? const Color(0xFF2B5278)
+                                  : const Color(0xCC0F1720),
                               onTap: _toggleScopeMode,
-                              child: Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 10,
-                                  vertical: 6,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: _albumScopeOnly
-                                      ? const Color(0xFF3E99EE)
-                                      : const Color(0xCC0F1720),
-                                  borderRadius: BorderRadius.circular(16),
-                                  border: Border.all(color: Colors.white24),
-                                ),
-                                child: Text(
-                                  _albumScopeOnly
-                                      ? '本组 (${widget.albumMessages!.length})'
-                                      : '全部 (${widget.photoMessages.length})',
-                                  style: const TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 11.5,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                              ),
+                              downFocusNode:
+                                  isVideo ? _scrubberFocusNode : _focusNode,
                             ),
                           ],
                           if (isVideo && widget.onOpenMiniPlayer != null) ...[
                             const SizedBox(width: 6),
-                            FilledButton.tonalIcon(
-                              onPressed: () {
+                            _buildGalleryTvButton(
+                              icon: Icons.picture_in_picture_alt_rounded,
+                              label: '小窗',
+                              onTap: () {
                                 final posSec = _videoPosition.inSeconds;
                                 _videoPlayer?.pause();
                                 Navigator.of(context).pop();
                                 widget.onOpenMiniPlayer!(msg, posSec);
                               },
-                              icon: const Icon(
-                                Icons.picture_in_picture_alt_rounded,
-                                size: 15,
-                              ),
-                              label: const Text('小窗'),
+                              downFocusNode: _scrubberFocusNode,
                             ),
                           ],
                           if (hasAlbumGroup &&
                               widget.onQueueAlbumDownload != null) ...[
                             const SizedBox(width: 6),
-                            FilledButton.tonalIcon(
-                              style: FilledButton.styleFrom(
-                                backgroundColor: _queuedAlbum
-                                    ? const Color(0xFF1F6E43)
-                                    : const Color(0xCC1E2C3A),
-                                foregroundColor: Colors.white,
-                              ),
-                              onPressed: _queueingAlbum
+                            _buildGalleryTvButton(
+                              icon: _queuedAlbum
+                                  ? Icons.check_circle_rounded
+                                  : Icons.collections_bookmark_outlined,
+                              iconColor: _queuedAlbum
+                                  ? const Color(0xFF69F0AE)
+                                  : Colors.white,
+                              bgColor: _queuedAlbum
+                                  ? const Color(0xFF1F6E43)
+                                  : const Color(0xCC1E2C3A),
+                              label: _queueingAlbum
+                                  ? '转存中...'
+                                  : (_queuedAlbum
+                                      ? '已入队 ✓'
+                                      : '整组(${widget.albumMessages!.length})'),
+                              onTap: _queueingAlbum
                                   ? null
                                   : () =>
                                       _handleQueueAlbum(widget.albumMessages!),
-                              icon: Icon(
-                                _queuedAlbum
-                                    ? Icons.check_circle_rounded
-                                    : Icons.collections_bookmark_outlined,
-                                size: 15,
-                                color: _queuedAlbum
-                                    ? const Color(0xFF69F0AE)
-                                    : Colors.white,
-                              ),
-                              label: Text(
-                                _queueingAlbum
-                                    ? '转存中...'
-                                    : (_queuedAlbum
-                                        ? '已入队 ✓'
-                                        : '整组(${widget.albumMessages!.length})'),
-                              ),
+                              downFocusNode:
+                                  isVideo ? _scrubberFocusNode : _focusNode,
                             ),
                           ],
                           const SizedBox(width: 6),
-                          FilledButton.tonalIcon(
-                            style: FilledButton.styleFrom(
-                              backgroundColor: _savedLocalIds.contains(msg.id)
-                                  ? const Color(0xFF1F6E43)
-                                  : const Color(0xCC1E2C3A),
-                              foregroundColor: Colors.white,
-                            ),
-                            onPressed: _savingLocalIds.contains(msg.id)
+                          _buildGalleryTvButton(
+                            focusNode: _topSaveFocusNode,
+                            icon: _savedLocalIds.contains(msg.id)
+                                ? Icons.check_circle_rounded
+                                : Icons.download_rounded,
+                            iconColor: _savedLocalIds.contains(msg.id)
+                                ? const Color(0xFF69F0AE)
+                                : Colors.white,
+                            bgColor: _savedLocalIds.contains(msg.id)
+                                ? const Color(0xFF1F6E43)
+                                : const Color(0xCC1E2C3A),
+                            label: _savingLocalIds.contains(msg.id)
+                                ? '保存中...'
+                                : (_savedLocalIds.contains(msg.id)
+                                    ? '已存 ✓'
+                                    : '存本机'),
+                            onTap: _savingLocalIds.contains(msg.id)
                                 ? null
                                 : () => _handleSaveLocal(msg),
-                            icon: Icon(
-                              _savedLocalIds.contains(msg.id)
-                                  ? Icons.check_circle_rounded
-                                  : Icons.download_rounded,
-                              size: 15,
-                              color: _savedLocalIds.contains(msg.id)
-                                  ? const Color(0xFF69F0AE)
-                                  : Colors.white,
-                            ),
-                            label: Text(
-                              _savingLocalIds.contains(msg.id)
-                                  ? '保存中...'
-                                  : (_savedLocalIds.contains(msg.id)
-                                      ? '已存 ✓'
-                                      : '存本机'),
-                            ),
+                            downFocusNode:
+                                isVideo ? _scrubberFocusNode : _focusNode,
                           ),
                           if (att?.url.isNotEmpty ?? false) ...[
                             const SizedBox(width: 6),
-                            FilledButton.tonalIcon(
-                              style: FilledButton.styleFrom(
-                                backgroundColor: _queuedIds.contains(msg.id)
-                                    ? const Color(0xFF1F6E43)
-                                    : (_failedIds.contains(msg.id)
-                                        ? const Color(0xFF8B2635)
-                                        : const Color(0xFF2B5278)),
-                                foregroundColor: Colors.white,
-                              ),
-                              onPressed: _queueingIds.contains(msg.id)
+                            _buildGalleryTvButton(
+                              icon: _queuedIds.contains(msg.id)
+                                  ? Icons.check_circle_rounded
+                                  : (_failedIds.contains(msg.id)
+                                      ? Icons.error_outline_rounded
+                                      : Icons.cloud_download_outlined),
+                              iconColor: _queuedIds.contains(msg.id)
+                                  ? const Color(0xFF69F0AE)
+                                  : Colors.white,
+                              bgColor: _queuedIds.contains(msg.id)
+                                  ? const Color(0xFF1F6E43)
+                                  : (_failedIds.contains(msg.id)
+                                      ? const Color(0xFF8B2635)
+                                      : const Color(0xFF2B5278)),
+                              label: _queueingIds.contains(msg.id)
+                                  ? '添加中...'
+                                  : (_queuedIds.contains(msg.id)
+                                      ? '已入队 ✓'
+                                      : '转存'),
+                              onTap: _queueingIds.contains(msg.id)
                                   ? null
                                   : () => _handleQueueSingle(msg),
-                              icon: Icon(
-                                _queuedIds.contains(msg.id)
-                                    ? Icons.check_circle_rounded
-                                    : (_failedIds.contains(msg.id)
-                                        ? Icons.error_outline_rounded
-                                        : Icons.cloud_download_outlined),
-                                size: 15,
-                                color: _queuedIds.contains(msg.id)
-                                    ? const Color(0xFF69F0AE)
-                                    : Colors.white,
-                              ),
-                              label: Text(
-                                _queueingIds.contains(msg.id)
-                                    ? '添加中...'
-                                    : (_queuedIds.contains(msg.id)
-                                        ? '已入队 ✓'
-                                        : '转存'),
-                              ),
+                              downFocusNode:
+                                  isVideo ? _scrubberFocusNode : _focusNode,
                             ),
                           ],
                         ],
@@ -14579,9 +15119,13 @@ class _TelegramPhotoGalleryDialogState
                     ),
                   ),
                   const SizedBox(width: 6),
-                  IconButton.filledTonal(
-                    onPressed: () => Navigator.of(context).pop(),
-                    icon: const Icon(Icons.close, size: 18),
+                  _buildGalleryTvIconButton(
+                    focusNode: _topCloseFocusNode,
+                    icon: Icons.close_rounded,
+                    label: isMobileDialog ? null : '关闭',
+                    iconSize: 18,
+                    onTap: () => Navigator.of(context).pop(),
+                    downFocusNode: isVideo ? _scrubberFocusNode : _focusNode,
                   ),
                 ],
               ),
@@ -14678,16 +15222,22 @@ class _TelegramPhotoGalleryDialogState
             if (list.length > 1) ...[
               Positioned(
                 left: 12,
-                child: IconButton.filledTonal(
-                  onPressed: () => _step(-1),
-                  icon: const Icon(Icons.chevron_left_rounded, size: 30),
+                child: _buildGalleryTvIconButton(
+                  icon: Icons.chevron_left_rounded,
+                  iconSize: 28,
+                  onTap: () => _step(-1),
+                  upFocusNode: _topSaveFocusNode,
+                  downFocusNode: isVideo ? _playPauseFocusNode : null,
                 ),
               ),
               Positioned(
                 right: 12,
-                child: IconButton.filledTonal(
-                  onPressed: () => _step(1),
-                  icon: const Icon(Icons.chevron_right_rounded, size: 30),
+                child: _buildGalleryTvIconButton(
+                  icon: Icons.chevron_right_rounded,
+                  iconSize: 28,
+                  onTap: () => _step(1),
+                  upFocusNode: _topCloseFocusNode,
+                  downFocusNode: isVideo ? _playPauseFocusNode : null,
                 ),
               ),
             ],
@@ -14728,216 +15278,387 @@ class _TelegramPhotoGalleryDialogState
                       ),
                     ),
 
-                  // Official Telegram Video Scrubber & Controls Bar (shown when active item is a Video)
+                  // Official Telegram 2-Tier Video Scrubber & Controls Bar (shown when active item is a Video)
+                  // Row 1: Focusable Progress Scrubber Bar (Left/Right seeks -5s/+5s; Down switches to buttons)
+                  // Row 2: Focusable Control Buttons Row (Left/Right freely switches between all buttons!)
                   if (isVideo)
                     Container(
-                      constraints: const BoxConstraints(maxWidth: 820),
+                      constraints: const BoxConstraints(maxWidth: 880),
                       margin: const EdgeInsets.only(bottom: 8),
                       padding: const EdgeInsets.symmetric(
                         horizontal: 12,
-                        vertical: 4,
+                        vertical: 8,
                       ),
                       decoration: BoxDecoration(
-                        color: const Color(0xD90F1720),
+                        color: const Color(0xE60F1720),
                         borderRadius: BorderRadius.circular(14),
                         border: Border.all(color: Colors.white12),
                       ),
-                      child: Row(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
                         children: [
-                          IconButton(
-                            visualDensity: VisualDensity.compact,
-                            onPressed: () => _videoPlayer?.playOrPause(),
-                            icon: Icon(
-                              _isVideoPlaying
-                                  ? Icons.pause_rounded
-                                  : Icons.play_arrow_rounded,
-                              color: Colors.white,
-                              size: 24,
-                            ),
-                          ),
-                          IconButton(
-                            visualDensity: VisualDensity.compact,
-                            onPressed: () => _seekRelative(-5),
-                            icon: const Icon(
-                              Icons.replay_5_rounded,
-                              color: Colors.white70,
-                              size: 19,
-                            ),
-                          ),
-                          IconButton(
-                            visualDensity: VisualDensity.compact,
-                            onPressed: () => _seekRelative(5),
-                            icon: const Icon(
-                              Icons.forward_5_rounded,
-                              color: Colors.white70,
-                              size: 19,
-                            ),
-                          ),
-                          const SizedBox(width: 4),
-                          Text(
-                            _fmtClock(_videoPosition),
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 12,
-                              fontFeatures: [ui.FontFeature.tabularFigures()],
-                            ),
-                          ),
-                          Expanded(
-                            child: SliderTheme(
-                              data: SliderTheme.of(context).copyWith(
-                                trackHeight: 3.5,
-                                thumbShape: const RoundSliderThumbShape(
-                                  enabledThumbRadius: 6,
-                                ),
-                                overlayShape: const RoundSliderOverlayShape(
-                                  overlayRadius: 12,
-                                ),
-                                activeTrackColor: const Color(0xFF3E99EE),
-                                inactiveTrackColor: Colors.white24,
-                                thumbColor: Colors.white,
-                              ),
-                              child: Slider(
-                                value: posMs.toDouble(),
-                                min: 0,
-                                max: totalMs.toDouble(),
-                                onChanged: (val) {
-                                  _videoPlayer?.seek(
-                                    Duration(milliseconds: val.round()),
-                                  );
-                                },
-                              ),
-                            ),
-                          ),
-                          Text(
-                            _fmtClock(_videoDuration),
-                            style: const TextStyle(
-                              color: Colors.white70,
-                              fontSize: 12,
-                              fontFeatures: [ui.FontFeature.tabularFigures()],
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          InkWell(
-                            borderRadius: BorderRadius.circular(8),
-                            onFocusChange: (_) {
-                              if (mounted) setState(() {});
-                            },
-                            onTap: _cycleSpeed,
-                            child: Builder(
-                              builder: (spdCtx) {
-                                final isSpdFocused =
-                                    Focus.of(spdCtx).hasPrimaryFocus;
-                                return Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 7,
-                                    vertical: 3,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: isSpdFocused
-                                        ? const Color(0xFF3E99EE)
-                                        : Colors.white12,
-                                    borderRadius: BorderRadius.circular(8),
-                                    border: isSpdFocused
-                                        ? Border.all(
-                                            color: const Color(0xFFFFE066),
-                                            width: 1.8,
-                                          )
-                                        : null,
-                                  ),
-                                  child: Text(
-                                    '${_playbackSpeed}x',
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 11.5,
-                                      fontWeight: FontWeight.w600,
-                                    ),
-                                  ),
-                                );
-                              },
-                            ),
-                          ),
-                          if (_videoPlayer != null) ...[
-                            const SizedBox(width: 6),
-                            VideoProxyNodeSelector(
-                              proxyService: widget.appState.proxyService,
-                              scenario: RequestScenario.telegram,
-                              overlayStyle: true,
-                              compact: true,
-                              onProxyChanged: (statusMsg) {
-                                _showGalleryHud(statusMsg, state: 'success');
-                                final curSec = _videoPosition.inSeconds;
-                                _syncVideoPlayerForCurrentItem().then((_) {
-                                  if (curSec > 2) {
-                                    _pendingGalleryResumeSeconds = curSec;
+                          // Row 1: Dedicated TV Focusable Progress Scrubber
+                          StatefulBuilder(
+                            builder: (scrubCtx, setScrubState) {
+                              return Focus(
+                                focusNode: _scrubberFocusNode,
+                                onFocusChange: (_) => setScrubState(() {}),
+                                onKeyEvent: (node, event) {
+                                  if (event is! KeyDownEvent &&
+                                      event is! KeyRepeatEvent) {
+                                    return KeyEventResult.ignored;
                                   }
-                                });
-                              },
-                            ),
-                          ],
-                          const SizedBox(width: 4),
-                          Listener(
-                            onPointerSignal: (signal) {
-                              if (signal is PointerScrollEvent) {
-                                _stepVolume(signal.scrollDelta.dy < 0 ? 5 : -5);
-                              }
+                                  if (event.logicalKey ==
+                                      LogicalKeyboardKey.arrowLeft) {
+                                    _seekRelative(-5);
+                                    return KeyEventResult.handled;
+                                  }
+                                  if (event.logicalKey ==
+                                      LogicalKeyboardKey.arrowRight) {
+                                    _seekRelative(5);
+                                    return KeyEventResult.handled;
+                                  }
+                                  if (event is KeyDownEvent &&
+                                      event.logicalKey ==
+                                          LogicalKeyboardKey.arrowDown) {
+                                    _playPauseFocusNode.requestFocus();
+                                    return KeyEventResult.handled;
+                                  }
+                                  if (event is KeyDownEvent &&
+                                      event.logicalKey ==
+                                          LogicalKeyboardKey.arrowUp) {
+                                    _topSaveFocusNode.requestFocus();
+                                    return KeyEventResult.handled;
+                                  }
+                                  if (event is KeyDownEvent &&
+                                      (event.logicalKey ==
+                                              LogicalKeyboardKey.select ||
+                                          event.logicalKey ==
+                                              LogicalKeyboardKey.enter ||
+                                          event.logicalKey ==
+                                              LogicalKeyboardKey.numpadEnter ||
+                                          event.logicalKey ==
+                                              LogicalKeyboardKey.space ||
+                                          event.logicalKey ==
+                                              LogicalKeyboardKey.gameButtonA)) {
+                                    _videoPlayer?.playOrPause();
+                                    return KeyEventResult.handled;
+                                  }
+                                  return KeyEventResult.ignored;
+                                },
+                                child: Builder(
+                                  builder: (innerScrubCtx) {
+                                    final isScrubFocused =
+                                        Focus.of(innerScrubCtx).hasPrimaryFocus;
+                                    return Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 10,
+                                        vertical: 2,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: isScrubFocused
+                                            ? const Color(0x383E99EE)
+                                            : Colors.transparent,
+                                        borderRadius: BorderRadius.circular(10),
+                                        border: Border.all(
+                                          color: isScrubFocused
+                                              ? const Color(0xFFFFE066)
+                                              : Colors.transparent,
+                                          width: isScrubFocused ? 2.0 : 1.0,
+                                        ),
+                                      ),
+                                      child: Row(
+                                        children: [
+                                          Text(
+                                            _fmtClock(_videoPosition),
+                                            style: const TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 12,
+                                              fontWeight: FontWeight.w600,
+                                              fontFeatures: [
+                                                ui.FontFeature.tabularFigures(),
+                                              ],
+                                            ),
+                                          ),
+                                          Expanded(
+                                            child: ExcludeFocus(
+                                              child: SliderTheme(
+                                                data: SliderTheme.of(context)
+                                                    .copyWith(
+                                                  trackHeight:
+                                                      isScrubFocused ? 5.0 : 3.5,
+                                                  thumbShape:
+                                                      RoundSliderThumbShape(
+                                                    enabledThumbRadius:
+                                                        isScrubFocused
+                                                            ? 7.5
+                                                            : 6.0,
+                                                  ),
+                                                  overlayShape:
+                                                      const RoundSliderOverlayShape(
+                                                    overlayRadius: 12,
+                                                  ),
+                                                  activeTrackColor:
+                                                      isScrubFocused
+                                                          ? const Color(
+                                                              0xFFFFE066,
+                                                            )
+                                                          : const Color(
+                                                              0xFF3E99EE,
+                                                            ),
+                                                  inactiveTrackColor:
+                                                      Colors.white24,
+                                                  thumbColor: isScrubFocused
+                                                      ? const Color(0xFFFFE066)
+                                                      : Colors.white,
+                                                ),
+                                                child: Slider(
+                                                  value: posMs.toDouble(),
+                                                  min: 0,
+                                                  max: totalMs.toDouble(),
+                                                  onChanged: (val) {
+                                                    _videoPlayer?.seek(
+                                                      Duration(
+                                                        milliseconds:
+                                                            val.round(),
+                                                      ),
+                                                    );
+                                                  },
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                          Text(
+                                            _fmtClock(_videoDuration),
+                                            style: const TextStyle(
+                                              color: Colors.white70,
+                                              fontSize: 12,
+                                              fontFeatures: [
+                                                ui.FontFeature.tabularFigures(),
+                                              ],
+                                            ),
+                                          ),
+                                          if (isScrubFocused &&
+                                              !isMobileDialog) ...[
+                                            const SizedBox(width: 8),
+                                            Container(
+                                              padding:
+                                                  const EdgeInsets.symmetric(
+                                                horizontal: 7,
+                                                vertical: 2,
+                                              ),
+                                              decoration: BoxDecoration(
+                                                color: const Color(0xFF3E99EE),
+                                                borderRadius:
+                                                    BorderRadius.circular(6),
+                                              ),
+                                              child: const Text(
+                                                '◀▶ 调进度 · ▼ 切按钮',
+                                                style: TextStyle(
+                                                  color: Colors.white,
+                                                  fontSize: 10.5,
+                                                  fontWeight: FontWeight.w700,
+                                                ),
+                                              ),
+                                            ),
+                                          ],
+                                        ],
+                                      ),
+                                    );
+                                  },
+                                ),
+                              );
                             },
+                          ),
+                          const SizedBox(height: 6),
+                          // Row 2: Focusable Control Buttons Row (Left/Right freely switches focus among all buttons)
+                          SingleChildScrollView(
+                            scrollDirection: Axis.horizontal,
                             child: Row(
                               mainAxisSize: MainAxisSize.min,
                               children: [
-                            IconButton(
-                              visualDensity: VisualDensity.compact,
-                              onPressed: _toggleMute,
-                              icon: Icon(
-                                _isMuted || _volume <= 0
-                                    ? Icons.volume_off_rounded
-                                    : (_volume < 50
-                                        ? Icons.volume_down_rounded
-                                        : Icons.volume_up_rounded),
-                                color: Colors.white,
-                                size: 20,
-                              ),
-                            ),
-                            if (!isMobileDialog) ...[
-                              SizedBox(
-                                width: 88,
-                                child: SliderTheme(
-                                  data: SliderTheme.of(context).copyWith(
-                                    trackHeight: 3.0,
-                                    thumbShape: const RoundSliderThumbShape(
-                                      enabledThumbRadius: 5.5,
-                                    ),
-                                    overlayShape:
-                                        const RoundSliderOverlayShape(
-                                      overlayRadius: 10,
-                                    ),
-                                    activeTrackColor:
-                                        const Color(0xFF5EB5F7),
-                                    inactiveTrackColor: Colors.white24,
-                                    thumbColor: Colors.white,
-                                  ),
-                                  child: Slider(
-                                    value: (_isMuted ? 0.0 : _volume)
-                                        .clamp(0.0, 100.0),
-                                    min: 0,
-                                    max: 100,
-                                    onChanged: _setVolume,
-                                  ),
+                                _buildGalleryTvIconButton(
+                                  focusNode: _playPauseFocusNode,
+                                  autofocus: true,
+                                  icon: _isVideoPlaying
+                                      ? Icons.pause_rounded
+                                      : Icons.play_arrow_rounded,
+                                  label: _isVideoPlaying ? '暂停' : '播放',
+                                  onTap: () => _videoPlayer?.playOrPause(),
+                                  upFocusNode: _scrubberFocusNode,
                                 ),
-                              ),
-                              SizedBox(
-                                width: 34,
-                                child: Text(
-                                  '${(_isMuted ? 0 : _volume.round())}%',
-                                  style: const TextStyle(
-                                    color: Colors.white70,
-                                    fontSize: 11,
-                                    fontFeatures: [
-                                      ui.FontFeature.tabularFigures(),
+                                const SizedBox(width: 6),
+                                _buildGalleryTvIconButton(
+                                  icon: Icons.replay_5_rounded,
+                                  label: '快退5s',
+                                  onTap: () => _seekRelative(-5),
+                                  upFocusNode: _scrubberFocusNode,
+                                ),
+                                const SizedBox(width: 6),
+                                _buildGalleryTvIconButton(
+                                  icon: Icons.forward_5_rounded,
+                                  label: '快进5s',
+                                  onTap: () => _seekRelative(5),
+                                  upFocusNode: _scrubberFocusNode,
+                                ),
+                                if (list.length > 1) ...[
+                                  const SizedBox(width: 6),
+                                  _buildGalleryTvIconButton(
+                                    icon: Icons.skip_previous_rounded,
+                                    label: '上一项',
+                                    onTap: () => _step(-1),
+                                    upFocusNode: _scrubberFocusNode,
+                                  ),
+                                  const SizedBox(width: 6),
+                                  _buildGalleryTvIconButton(
+                                    icon: Icons.skip_next_rounded,
+                                    label: '下一项',
+                                    onTap: () => _step(1),
+                                    upFocusNode: _scrubberFocusNode,
+                                  ),
+                                ],
+                                const SizedBox(width: 6),
+                                _buildGalleryTvIconButton(
+                                  icon: Icons.speed_rounded,
+                                  label: '${_playbackSpeed}x',
+                                  onTap: _cycleSpeed,
+                                  upFocusNode: _scrubberFocusNode,
+                                ),
+                                if (_videoPlayer != null) ...[
+                                  const SizedBox(width: 6),
+                                  VideoProxyNodeSelector(
+                                    proxyService: widget.appState.proxyService,
+                                    scenario: RequestScenario.telegram,
+                                    overlayStyle: true,
+                                    compact: true,
+                                    onProxyChanged: (statusMsg) {
+                                      _showGalleryHud(
+                                        statusMsg,
+                                        state: 'success',
+                                      );
+                                      final curSec = _videoPosition.inSeconds;
+                                      _syncVideoPlayerForCurrentItem().then((_) {
+                                        if (curSec > 2) {
+                                          _pendingGalleryResumeSeconds = curSec;
+                                        }
+                                      });
+                                    },
+                                  ),
+                                ],
+                                const SizedBox(width: 6),
+                                Listener(
+                                  onPointerSignal: (signal) {
+                                    if (signal is PointerScrollEvent) {
+                                      _stepVolume(
+                                        signal.scrollDelta.dy < 0 ? 5 : -5,
+                                      );
+                                    }
+                                  },
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      _buildGalleryTvIconButton(
+                                        icon: _isMuted || _volume <= 0
+                                            ? Icons.volume_off_rounded
+                                            : (_volume < 50
+                                                ? Icons.volume_down_rounded
+                                                : Icons.volume_up_rounded),
+                                        label: _isMuted || _volume <= 0
+                                            ? '已静音'
+                                            : '静音',
+                                        onTap: _toggleMute,
+                                        upFocusNode: _scrubberFocusNode,
+                                      ),
+                                      if (!isMobileDialog) ...[
+                                        SizedBox(
+                                          width: 82,
+                                          child: ExcludeFocus(
+                                            child: SliderTheme(
+                                              data: SliderTheme.of(context)
+                                                  .copyWith(
+                                                trackHeight: 3.0,
+                                                thumbShape:
+                                                    const RoundSliderThumbShape(
+                                                  enabledThumbRadius: 5.5,
+                                                ),
+                                                overlayShape:
+                                                    const RoundSliderOverlayShape(
+                                                  overlayRadius: 10,
+                                                ),
+                                                activeTrackColor:
+                                                    const Color(0xFF5EB5F7),
+                                                inactiveTrackColor:
+                                                    Colors.white24,
+                                                thumbColor: Colors.white,
+                                              ),
+                                              child: Slider(
+                                                value: (_isMuted
+                                                        ? 0.0
+                                                        : _volume)
+                                                    .clamp(0.0, 100.0),
+                                                min: 0,
+                                                max: 100,
+                                                onChanged: _setVolume,
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                        SizedBox(
+                                          width: 34,
+                                          child: Text(
+                                            '${(_isMuted ? 0 : _volume.round())}%',
+                                            style: const TextStyle(
+                                              color: Colors.white70,
+                                              fontSize: 11,
+                                              fontFeatures: [
+                                                ui.FontFeature.tabularFigures(),
+                                              ],
+                                            ),
+                                          ),
+                                        ),
+                                      ],
                                     ],
                                   ),
                                 ),
-                              ),
-                            ],
+                                const SizedBox(width: 6),
+                                _buildGalleryTvIconButton(
+                                  icon: _savedLocalIds.contains(msg.id)
+                                      ? Icons.check_circle_rounded
+                                      : Icons.download_rounded,
+                                  label: _savingLocalIds.contains(msg.id)
+                                      ? '保存中'
+                                      : (_savedLocalIds.contains(msg.id)
+                                          ? '已存 ✓'
+                                          : '存本机'),
+                                  onTap: _savingLocalIds.contains(msg.id)
+                                      ? null
+                                      : () => _handleSaveLocal(msg),
+                                  upFocusNode: _scrubberFocusNode,
+                                ),
+                                if (att?.url.isNotEmpty ?? false) ...[
+                                  const SizedBox(width: 6),
+                                  _buildGalleryTvIconButton(
+                                    icon: _queuedIds.contains(msg.id)
+                                        ? Icons.check_circle_rounded
+                                        : Icons.cloud_download_outlined,
+                                    label: _queueingIds.contains(msg.id)
+                                        ? '添加中'
+                                        : (_queuedIds.contains(msg.id)
+                                            ? '已入队 ✓'
+                                            : '转存'),
+                                    onTap: _queueingIds.contains(msg.id)
+                                        ? null
+                                        : () => _handleQueueSingle(msg),
+                                    upFocusNode: _scrubberFocusNode,
+                                  ),
+                                ],
+                                const SizedBox(width: 6),
+                                _buildGalleryTvIconButton(
+                                  icon: Icons.close_rounded,
+                                  label: '退出全屏',
+                                  onTap: () => Navigator.of(context).pop(),
+                                  upFocusNode: _scrubberFocusNode,
+                                ),
                               ],
                             ),
                           ),
@@ -14975,82 +15696,138 @@ class _TelegramPhotoGalleryDialogState
                             peer: widget.chat.peer,
                             messageId: item.id,
                           );
-                          return GestureDetector(
-                            onTap: () => _selectIndex(idx),
-                            child: AnimatedContainer(
-                              duration: const Duration(milliseconds: 140),
-                              width: 54,
-                              height: 54,
-                              decoration: BoxDecoration(
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(
-                                  color: active
-                                      ? const Color(0xFF3E99EE)
-                                      : Colors.white24,
-                                  width: active ? 2.2 : 1.0,
-                                ),
-                              ),
-                              clipBehavior: Clip.antiAlias,
-                              child: Stack(
-                                fit: StackFit.expand,
-                                children: [
-                                  Image.network(
-                                    itemThumbUrl,
-                                    headers: widget.appState.api.authHeaders,
-                                    fit: BoxFit.cover,
-                                    errorBuilder: (_, __, ___) => Container(
-                                      color: const Color(0xFF141E2B),
-                                      alignment: Alignment.center,
-                                      child: Icon(
-                                        itemIsVideo
-                                            ? Icons.videocam_rounded
-                                            : Icons.image_outlined,
-                                        size: 18,
-                                        color: Colors.white54,
-                                      ),
-                                    ),
-                                  ),
-                                  if (itemIsVideo)
-                                    Container(
-                                      color: const Color(0x4D000000),
-                                      alignment: Alignment.center,
-                                      child: const Icon(
-                                        Icons.play_circle_fill_rounded,
-                                        size: 20,
-                                        color: Colors.white,
-                                      ),
-                                    ),
-                                  if (itemIsVideo &&
-                                      itemAtt != null &&
-                                      itemAtt.duration > 0)
-                                    Positioned(
-                                      bottom: 2,
-                                      right: 2,
+                          return StatefulBuilder(
+                            builder: (thumbCtx, setThumbState) {
+                              return Focus(
+                                onFocusChange: (_) => setThumbState(() {}),
+                                onKeyEvent: (node, event) {
+                                  if (event is! KeyDownEvent) {
+                                    return KeyEventResult.ignored;
+                                  }
+                                  if (event.logicalKey ==
+                                          LogicalKeyboardKey.select ||
+                                      event.logicalKey ==
+                                          LogicalKeyboardKey.enter ||
+                                      event.logicalKey ==
+                                          LogicalKeyboardKey.numpadEnter ||
+                                      event.logicalKey ==
+                                          LogicalKeyboardKey.space ||
+                                      event.logicalKey ==
+                                          LogicalKeyboardKey.gameButtonA) {
+                                    _selectIndex(idx);
+                                    return KeyEventResult.handled;
+                                  }
+                                  if (event.logicalKey ==
+                                      LogicalKeyboardKey.arrowUp) {
+                                    if (isVideo) {
+                                      _playPauseFocusNode.requestFocus();
+                                    } else {
+                                      _focusNode.requestFocus();
+                                    }
+                                    return KeyEventResult.handled;
+                                  }
+                                  return KeyEventResult.ignored;
+                                },
+                                child: Builder(
+                                  builder: (innerThumbCtx) {
+                                    final isThumbFocused =
+                                        Focus.of(innerThumbCtx).hasPrimaryFocus;
+                                    return GestureDetector(
+                                      onTap: () => _selectIndex(idx),
                                       child: Container(
-                                        padding: const EdgeInsets.symmetric(
-                                          horizontal: 3,
-                                          vertical: 0.5,
-                                        ),
+                                        width: 54,
+                                        height: 54,
                                         decoration: BoxDecoration(
-                                          color: const Color(0xB3000000),
                                           borderRadius:
-                                              BorderRadius.circular(4),
+                                              BorderRadius.circular(8),
+                                          border: Border.all(
+                                            color: isThumbFocused
+                                                ? const Color(0xFFFFE066)
+                                                : (active
+                                                    ? const Color(0xFF3E99EE)
+                                                    : Colors.white24),
+                                            width: isThumbFocused
+                                                ? 2.4
+                                                : (active ? 2.2 : 1.0),
+                                          ),
                                         ),
-                                        child: Text(
-                                          _fmtClock(
-                                            Duration(seconds: itemAtt.duration),
-                                          ),
-                                          style: const TextStyle(
-                                            color: Colors.white,
-                                            fontSize: 8.5,
-                                            fontWeight: FontWeight.w600,
-                                          ),
+                                        clipBehavior: Clip.antiAlias,
+                                        child: Stack(
+                                          fit: StackFit.expand,
+                                          children: [
+                                            Image.network(
+                                              itemThumbUrl,
+                                              headers: widget
+                                                  .appState.api.authHeaders,
+                                              fit: BoxFit.cover,
+                                              errorBuilder: (_, __, ___) =>
+                                                  Container(
+                                                color: const Color(0xFF141E2B),
+                                                alignment: Alignment.center,
+                                                child: Icon(
+                                                  itemIsVideo
+                                                      ? Icons.videocam_rounded
+                                                      : Icons.image_outlined,
+                                                  size: 18,
+                                                  color: Colors.white54,
+                                                ),
+                                              ),
+                                            ),
+                                            if (itemIsVideo)
+                                              Container(
+                                                color: const Color(0x4D000000),
+                                                alignment: Alignment.center,
+                                                child: const Icon(
+                                                  Icons
+                                                      .play_circle_fill_rounded,
+                                                  size: 20,
+                                                  color: Colors.white,
+                                                ),
+                                              ),
+                                            if (itemIsVideo &&
+                                                itemAtt != null &&
+                                                itemAtt.duration > 0)
+                                              Positioned(
+                                                bottom: 2,
+                                                right: 2,
+                                                child: Container(
+                                                  padding: const EdgeInsets
+                                                      .symmetric(
+                                                    horizontal: 3,
+                                                    vertical: 0.5,
+                                                  ),
+                                                  decoration: BoxDecoration(
+                                                    color:
+                                                        const Color(0xB3000000),
+                                                    borderRadius:
+                                                        BorderRadius.circular(
+                                                      4,
+                                                    ),
+                                                  ),
+                                                  child: Text(
+                                                    _fmtClock(
+                                                      Duration(
+                                                        seconds:
+                                                            itemAtt.duration,
+                                                      ),
+                                                    ),
+                                                    style: const TextStyle(
+                                                      color: Colors.white,
+                                                      fontSize: 8.5,
+                                                      fontWeight:
+                                                          FontWeight.w600,
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                          ],
                                         ),
                                       ),
-                                    ),
-                                ],
-                              ),
-                            ),
+                                    );
+                                  },
+                                ),
+                              );
+                            },
                           );
                         },
                       ),

@@ -7,15 +7,15 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Release tag version (e.g. v1.1.0)'
+        description: 'Release tag version (e.g. v1.1.1)'
         required: false
-        default: 'v1.1.0'
+        default: 'v1.1.1'
 
 permissions:
   contents: write
 
 env:
-  VERSION_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v1.1.0' }}
+  VERSION_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v1.1.1' }}
 
 jobs:
   build-android:
