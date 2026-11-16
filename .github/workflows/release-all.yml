@@ -87,6 +87,21 @@ jobs:
           codesign --force --sign - --timestamp=none "$IPA_STAGE/Payload/Runner.app"
           (cd "$IPA_STAGE" && zip -qry "$GITHUB_WORKSPACE/dist/LiuguangVideo-iOS-${VERSION_TAG}-unsigned.ipa" Payload)
           unzip -t "$GITHUB_WORKSPACE/dist/LiuguangVideo-iOS-${VERSION_TAG}-unsigned.ipa" >/dev/null
+      - name: Build Apple TV (tvOS) Unsigned IPA
+        run: |
+          BUILD_NAME="${VERSION_TAG#v}"
+          BUILD_NUM=$((100 + GITHUB_RUN_NUMBER))
+          xcodebuild -project tvos/Runner.xcodeproj -target Runner -sdk appletvos -configuration Release \
+            MARKETING_VERSION="$BUILD_NAME" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
+            SYMROOT="$GITHUB_WORKSPACE/build/tvos/Build/Products" \
+            OBJROOT="$GITHUB_WORKSPACE/build/tvos/Build/Intermediates.noindex" \
+            CODE_SIGNING_ALLOWED=NO build
+          IPA_STAGE="$(mktemp -d)"
+          mkdir -p "$IPA_STAGE/Payload"
+          cp -R "$GITHUB_WORKSPACE/build/tvos/Build/Products/Release-appletvos/Runner.app" "$IPA_STAGE/Payload/Runner.app"
+          codesign --force --sign - --timestamp=none "$IPA_STAGE/Payload/Runner.app"
+          (cd "$IPA_STAGE" && zip -qry "$GITHUB_WORKSPACE/dist/LiuguangVideo-tvOS-${VERSION_TAG}-unsigned.ipa" Payload)
+          unzip -t "$GITHUB_WORKSPACE/dist/LiuguangVideo-tvOS-${VERSION_TAG}-unsigned.ipa" >/dev/null
       - uses: actions/upload-artifact@v4
         with:
           name: apple-release
