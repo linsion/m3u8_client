@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -12,6 +13,7 @@ import '../../services/proxy_routing_service.dart';
 import '../../services/tv_platform_service.dart';
 import '../../state/app_state.dart';
 import '../theme.dart';
+import '../widgets/mobile_edge_swipe_back.dart';
 import '../widgets/video_download_speed_badge.dart';
 import '../widgets/video_proxy_node_selector.dart';
 
@@ -122,6 +124,15 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
   StreamSubscription<String>? _errorSub;
   StreamSubscription<bool>? _bufferingSub;
   StreamSubscription<int?>? _widthSub;
+  StreamSubscription<int?>? _heightSub;
+  StreamSubscription<VideoParams>? _videoParamsSub;
+  final GlobalKey _videoPlayerWidgetKey =
+      GlobalKey(debugLabel: 'VodMainVideoWidget');
+  int _videoWidth = 0;
+  int _videoHeight = 0;
+  bool? _fullscreenLandscapeOverride;
+  final Map<int, Offset> _stageTouchPointers = <int, Offset>{};
+  double? _initialPinchDistance;
   Timer? _startupWatchdogTimer;
   Timer? _bufferingLagTimer;
   bool _hasRenderedFirstFrame = false;
@@ -145,6 +156,92 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
   bool _isVerticalVolumeDragging = false;
   double _volumePercent = 100.0;
 
+  bool get _isPortraitVideo =>
+      _videoWidth > 0 && _videoHeight > 0 && _videoHeight > _videoWidth;
+
+  void _updateVideoDimensions({int? w, int? h, VideoParams? params}) {
+    if (!mounted) return;
+    final vp = params ?? _player.state.videoParams;
+    final rawW = vp.dw ?? vp.w ?? w ?? _player.state.width ?? 0;
+    final rawH = vp.dh ?? vp.h ?? h ?? _player.state.height ?? 0;
+    final rot = ((vp.rotate ?? 0) % 360 + 360) % 360;
+    int nextW = rawW;
+    int nextH = rawH;
+    if (rot == 90 || rot == 270) {
+      nextW = rawH;
+      nextH = rawW;
+    }
+    final firstFrame = nextW > 0 && !_hasRenderedFirstFrame;
+    final dimChanged = (nextW > 0 && nextH > 0) &&
+        (nextW != _videoWidth || nextH != _videoHeight);
+    if (firstFrame || dimChanged) {
+      final prevPortrait = _isPortraitVideo;
+      setState(() {
+        if (firstFrame) _hasRenderedFirstFrame = true;
+        if (nextW > 0 && nextH > 0) {
+          _videoWidth = nextW;
+          _videoHeight = nextH;
+        }
+      });
+      if (_isFullscreenMode &&
+          _fullscreenLandscapeOverride == null &&
+          _isPortraitVideo != prevPortrait) {
+        _applyFullscreenDeviceOrientation();
+      }
+    }
+  }
+
+  void _applyFullscreenDeviceOrientation() {
+    if (!(Platform.isAndroid || Platform.isIOS) || widget.appState.tvMode) {
+      return;
+    }
+    final useLandscape = _fullscreenLandscapeOverride ?? !_isPortraitVideo;
+    if (useLandscape) {
+      SystemChrome.setPreferredOrientations(const [
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+      ]);
+    } else {
+      SystemChrome.setPreferredOrientations(const [
+        DeviceOrientation.portraitUp,
+      ]);
+    }
+  }
+
+  void _toggleFullscreenOrientation() {
+    final mq = MediaQuery.maybeSizeOf(context);
+    final currentlyLandscape = _fullscreenLandscapeOverride ??
+        (mq != null ? mq.width > mq.height : !_isPortraitVideo);
+    final nextLandscape = !currentlyLandscape;
+    setState(() {
+      _fullscreenLandscapeOverride = nextLandscape;
+      if (!_isFullscreenMode) {
+        _isFullscreenMode = true;
+      }
+    });
+    if (Platform.isAndroid || Platform.isIOS) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+      if (!widget.appState.tvMode) {
+        _applyFullscreenDeviceOrientation();
+      }
+    }
+    _showAdToast(nextLandscape ? '已切换为：横屏全屏模式' : '已切换为：竖屏全屏模式');
+  }
+
+  void _cycleVideoAspectMode() {
+    const modes = ['fit', 'cover', '16:9', '4:3'];
+    final idx = modes.indexOf(_videoAspectMode);
+    final next = modes[(idx + 1) % modes.length];
+    setState(() => _videoAspectMode = next);
+    final label = switch (next) {
+      'cover' => '铺满裁剪 (去黑边)',
+      '16:9' => '强制 16:9',
+      '4:3' => '强制 4:3',
+      _ => '适应屏幕 (原始比例)',
+    };
+    _showAdToast('画面比例：$label');
+  }
+
   bool _isBackLogicalKey(LogicalKeyboardKey key) {
     return key == LogicalKeyboardKey.goBack ||
         key == LogicalKeyboardKey.escape ||
@@ -163,6 +260,24 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
 
     if (_isFullscreenMode) {
       _toggleFullscreenMode(forceValue: false);
+      return;
+    }
+    final mq = MediaQuery.maybeSizeOf(context);
+    final isPhoneLandscape = (Platform.isAndroid || Platform.isIOS) &&
+        !widget.appState.tvMode &&
+        mq != null &&
+        mq.shortestSide < 600 &&
+        mq.width > mq.height;
+    if (isPhoneLandscape) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+      SystemChrome.setPreferredOrientations(const [
+        DeviceOrientation.portraitUp,
+      ]);
+      Future<void>.delayed(const Duration(milliseconds: 900), () {
+        if (mounted && !_isFullscreenMode) {
+          SystemChrome.setPreferredOrientations(const []);
+        }
+      });
       return;
     }
     if (Navigator.of(context).canPop()) {
@@ -227,9 +342,13 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       }
     });
     _widthSub = _player.stream.width.listen((w) {
-      if ((w ?? 0) > 0 && !_hasRenderedFirstFrame && mounted) {
-        setState(() => _hasRenderedFirstFrame = true);
-      }
+      _updateVideoDimensions(w: w);
+    });
+    _heightSub = _player.stream.height.listen((h) {
+      _updateVideoDimensions(h: h);
+    });
+    _videoParamsSub = _player.stream.videoParams.listen((params) {
+      _updateVideoDimensions(params: params);
     });
     _bufferingSub = _player.stream.buffering.listen((isBuffering) {
       if (mounted) {
@@ -403,6 +522,9 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     _fullscreenControlsTimer?.cancel();
     setState(() {
       _isFullscreenMode = next;
+      if (!next) {
+        _fullscreenLandscapeOverride = null;
+      }
       // Hide bottom progress bar immediately upon entering fullscreen;
       // it only appears when the remote moves or screen is tapped.
       _fullscreenControlsVisible = false;
@@ -418,15 +540,19 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       if (next) {
         SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
         if (!widget.appState.tvMode) {
-          SystemChrome.setPreferredOrientations(const [
-            DeviceOrientation.landscapeLeft,
-            DeviceOrientation.landscapeRight,
-          ]);
+          _applyFullscreenDeviceOrientation();
         }
       } else {
         SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
         if (!widget.appState.tvMode) {
-          SystemChrome.setPreferredOrientations(const []);
+          SystemChrome.setPreferredOrientations(const [
+            DeviceOrientation.portraitUp,
+          ]);
+          Future<void>.delayed(const Duration(milliseconds: 800), () {
+            if (mounted && !_isFullscreenMode) {
+              SystemChrome.setPreferredOrientations(const []);
+            }
+          });
         }
       }
     }
@@ -470,6 +596,8 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     _errorSub?.cancel();
     _bufferingSub?.cancel();
     _widthSub?.cancel();
+    _heightSub?.cancel();
+    _videoParamsSub?.cancel();
     _player.dispose();
     super.dispose();
   }
@@ -719,6 +847,9 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       _currentEpisode = episode;
       _isResolvingPlay = true;
       _hasRenderedFirstFrame = false;
+      _videoWidth = 0;
+      _videoHeight = 0;
+      _fullscreenLandscapeOverride = null;
       _playError = null;
       _pendingSeekSeconds = effectiveSeek;
       _hasAppliedInitialSeek = false;
@@ -2236,6 +2367,12 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     final title = _detail?.vodName.isNotEmpty == true
         ? _detail!.vodName
         : (widget.initialTitle.isNotEmpty ? widget.initialTitle : '视频播放');
+    final mqSize = MediaQuery.sizeOf(context);
+    final isPhoneDevice = (Platform.isAndroid || Platform.isIOS) &&
+        !widget.appState.tvMode &&
+        mqSize.shortestSide < 600;
+    final isPhoneLandscape = isPhoneDevice && mqSize.width > mqSize.height;
+    final effectiveFullscreen = _isFullscreenMode || isPhoneLandscape;
 
     return PopScope(
       canPop: false,
@@ -2275,13 +2412,16 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
           const SingleActivator(LogicalKeyboardKey.pageDown): () =>
               _playNextEpisodeIfAvailable(),
         },
-        child: Scaffold(
+        child: MobileEdgeSwipeBack(
+          enabled: !widget.appState.tvMode,
+          onBack: _handleBackPress,
+          child: Scaffold(
           backgroundColor:
-              _isFullscreenMode ? Colors.black : VideoPlatformTheme.bgPrimary,
-          appBar: _isFullscreenMode
+              effectiveFullscreen ? Colors.black : VideoPlatformTheme.bgPrimary,
+          appBar: effectiveFullscreen
               ? null
               : AppBar(
-                  toolbarHeight: 50,
+                  toolbarHeight: isPhoneDevice ? 44 : 50,
                   titleSpacing: 4,
                   title: Row(
                     children: [
@@ -2404,7 +2544,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                     ),
                   ],
                 ),
-          body: _isFullscreenMode
+          body: effectiveFullscreen
               ? MediaQuery.removePadding(
                   context: context,
                   removeTop: true,
@@ -2499,7 +2639,8 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                         constraints.maxWidth >= 680) {
                       return _buildTvLeanbackDetailLayout(constraints);
                     }
-                    final isDesktopWide = constraints.maxWidth >= 860;
+                    final isDesktopWide =
+                        !isPhoneDevice && constraints.maxWidth >= 860;
                     if (isDesktopWide) {
                       return Stack(
                         children: [
@@ -2649,6 +2790,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                   },
                 ),
         ),
+        ),
       ),
       ),
     );
@@ -2689,7 +2831,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         children: [
           // 1. Top Hero Row: 16:9 Live Preview Player (left) + TV Metadata & Big D-Pad Action Bar (right)
           SizedBox(
-            height: 236,
+            height: (constraints.maxHeight * 0.42).clamp(256.0, 400.0),
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
@@ -3662,6 +3804,30 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                 ),
                               ],
                               const SizedBox(width: 8),
+                              _buildTvFocusableControlBtn(
+                                icon: _videoAspectMode == 'cover'
+                                    ? Icons.crop_free_rounded
+                                    : Icons.aspect_ratio_rounded,
+                                label: _videoAspectMode == 'fit'
+                                    ? '比例:适应'
+                                    : (_videoAspectMode == 'cover'
+                                        ? '比例:铺满'
+                                        : '比例:$_videoAspectMode'),
+                                tooltip: '切换画面比例 (适应/铺满去黑边/16:9/4:3)',
+                                isPrimary: _videoAspectMode != 'fit',
+                                onPressed: _cycleVideoAspectMode,
+                              ),
+                              if ((Platform.isAndroid || Platform.isIOS) &&
+                                  !widget.appState.tvMode) ...[
+                                const SizedBox(width: 8),
+                                _buildTvFocusableControlBtn(
+                                  icon: Icons.screen_rotation_rounded,
+                                  label: '横竖屏',
+                                  tooltip: '手动切换横屏全屏 / 竖屏全屏',
+                                  onPressed: _toggleFullscreenOrientation,
+                                ),
+                              ],
+                              const SizedBox(width: 8),
                               VideoProxyNodeSelector(
                                 proxyService: widget.appState.proxyService,
                                 scenario: RequestScenario.vodStream,
@@ -3675,17 +3841,23 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                       ),
                       const SizedBox(width: 8),
                       _buildTvFocusableControlBtn(
-                        icon: _isFullscreenMode
+                        icon: isFullscreen
                             ? Icons.fullscreen_exit_rounded
                             : Icons.fullscreen_rounded,
-                        label: _isFullscreenMode ? '退出全屏' : '全屏放大',
-                        tooltip: _isFullscreenMode
-                            ? '退出全屏 (按返回键也可退出)'
+                        label: isFullscreen ? '退出全屏' : '全屏放大',
+                        tooltip: isFullscreen
+                            ? '退出全屏 (按返回键或左边缘右滑也可退出)'
                             : '全屏放大播放',
                         isPrimary: true,
                         autofocus:
-                            widget.appState.tvMode && !_isFullscreenMode,
-                        onPressed: () => _toggleFullscreenMode(),
+                            widget.appState.tvMode && !isFullscreen,
+                        onPressed: () {
+                          if (isFullscreen && !_isFullscreenMode) {
+                            _handleBackPress();
+                          } else {
+                            _toggleFullscreenMode();
+                          }
+                        },
                       ),
                     ],
                   ),
@@ -3710,12 +3882,60 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
 
     final screenSize = MediaQuery.sizeOf(context);
     final isMobilePortrait =
-        screenSize.width < 680 ||
-        (screenSize.width < 860 && !widget.appState.tvMode);
-    final mobileStageHeight =
-        (screenSize.width * 9 / 16).clamp(205.0, 275.0);
+        screenSize.height >= screenSize.width &&
+        (screenSize.width < 680 ||
+            (screenSize.width < 860 && !widget.appState.tvMode));
+    // Larger video window on mobile portrait:
+    // - For portrait/vertical videos (9:16), expand up to 52% of screen height.
+    // - For standard/landscape videos, use at least 35% of screen height (or 16:9 width), up to 420px.
+    final double base16x9Height =
+        (screenSize.width * 9 / 16).clamp(235.0, 380.0);
+    final double mobileStageHeight = _isPortraitVideo
+        ? (screenSize.height * 0.52).clamp(320.0, 540.0)
+        : math.max(base16x9Height, screenSize.height * 0.35).clamp(256.0, 420.0);
 
-    final Widget stageContent = GestureDetector(
+    final Widget stageContent = Listener(
+      behavior: HitTestBehavior.translucent,
+      onPointerDown: (e) {
+        _stageTouchPointers[e.pointer] = e.position;
+        if (_stageTouchPointers.length == 2) {
+          final pts = _stageTouchPointers.values.toList();
+          _initialPinchDistance = (pts[0] - pts[1]).distance;
+        }
+      },
+      onPointerMove: (e) {
+        if (!_stageTouchPointers.containsKey(e.pointer)) return;
+        _stageTouchPointers[e.pointer] = e.position;
+        if (_stageTouchPointers.length == 2 && _initialPinchDistance != null) {
+          final pts = _stageTouchPointers.values.toList();
+          final dist = (pts[0] - pts[1]).distance;
+          if (_initialPinchDistance! > 16) {
+            final ratio = dist / _initialPinchDistance!;
+            if (ratio > 1.24 && _videoAspectMode != 'cover') {
+              _initialPinchDistance = dist;
+              setState(() => _videoAspectMode = 'cover');
+              _showAdToast('已双指放大为：铺满裁剪 (捏合恢复适应屏幕)');
+            } else if (ratio < 0.78 && _videoAspectMode != 'fit') {
+              _initialPinchDistance = dist;
+              setState(() => _videoAspectMode = 'fit');
+              _showAdToast('已恢复为：适应屏幕');
+            }
+          }
+        }
+      },
+      onPointerUp: (e) {
+        _stageTouchPointers.remove(e.pointer);
+        if (_stageTouchPointers.length < 2) {
+          _initialPinchDistance = null;
+        }
+      },
+      onPointerCancel: (e) {
+        _stageTouchPointers.remove(e.pointer);
+        if (_stageTouchPointers.length < 2) {
+          _initialPinchDistance = null;
+        }
+      },
+      child: GestureDetector(
         behavior: HitTestBehavior.translucent,
         onTap: isFullscreen
             ? null
@@ -3729,7 +3949,8 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                 }
               },
         onDoubleTap: () => _player.playOrPause(),
-        onVerticalDragStart: (_) {
+        onVerticalDragStart: (details) {
+          if (details.globalPosition.dx <= 40.0) return;
           if (_currentEpisode == null || _isResolvingPlay) return;
           setState(() => _isVerticalVolumeDragging = true);
         },
@@ -3747,7 +3968,9 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
           if (!_isVerticalVolumeDragging) return;
           setState(() => _isVerticalVolumeDragging = false);
         },
-        onHorizontalDragStart: (_) {
+        onHorizontalDragStart: (details) {
+          // Reserve left-edge swipe (dx <= 40) for mobile swipe-back gesture!
+          if (details.globalPosition.dx <= 40.0) return;
           if (_currentEpisode == null || _isResolvingPlay) return;
           final curSec = _player.state.position.inSeconds > 0
               ? _player.state.position.inSeconds.toDouble()
@@ -3807,16 +4030,25 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                 : Border.all(color: VideoPlatformTheme.borderSubtle),
           ),
           clipBehavior: Clip.antiAlias,
-          child: Stack(
-            fit: StackFit.expand,
-            children: [
-              Video(
-                controller: _videoController,
-                fill: Colors.black,
-                fit: videoFit,
-                aspectRatio: customAspectRatio,
-                controls: NoVideoControls,
-              ),
+          child: LayoutBuilder(
+            builder: (context, stageConstraints) {
+              final effectiveAspectRatio = customAspectRatio ??
+                  (_videoWidth > 0 && _videoHeight > 0
+                      ? _videoWidth / _videoHeight
+                      : null);
+              return Stack(
+                fit: StackFit.expand,
+                children: [
+                  Video(
+                    key: _videoPlayerWidgetKey,
+                    controller: _videoController,
+                    width: stageConstraints.maxWidth,
+                    height: stageConstraints.maxHeight,
+                    fill: Colors.black,
+                    fit: videoFit,
+                    aspectRatio: effectiveAspectRatio,
+                    controls: NoVideoControls,
+                  ),
               if (_isHorizontalSeeking)
                 Center(
                   child: IgnorePointer(
@@ -4369,9 +4601,12 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                   ],
                 ),
               ),
-          ],
+              ],
+            );
+          },
         ),
         ),
+      ),
     );
 
     final Widget focusableStage = Focus(
@@ -4668,6 +4903,44 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                           ),
                         ),
                         const Spacer(),
+                        // Aspect ratio / Fit-Cover quick toggle pill
+                        InkWell(
+                          borderRadius: BorderRadius.circular(12),
+                          onTap: _cycleVideoAspectMode,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 7,
+                              vertical: 4,
+                            ),
+                            decoration: BoxDecoration(
+                              color: _videoAspectMode != 'fit'
+                                  ? VideoPlatformTheme.accent
+                                      .withValues(alpha: 0.16)
+                                  : VideoPlatformTheme.bgCard,
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: _videoAspectMode != 'fit'
+                                    ? VideoPlatformTheme.accent
+                                    : VideoPlatformTheme.borderSubtle,
+                              ),
+                            ),
+                            child: Text(
+                              _videoAspectMode == 'fit'
+                                  ? '适应'
+                                  : (_videoAspectMode == 'cover'
+                                      ? '铺满'
+                                      : _videoAspectMode),
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                color: _videoAspectMode != 'fit'
+                                    ? VideoPlatformTheme.accent
+                                    : VideoPlatformTheme.textSecondary,
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 5),
                         // Speed selector pill
                         PopupMenuButton<double>(
                           tooltip: '倍速播放',

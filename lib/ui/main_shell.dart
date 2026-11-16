@@ -24,6 +24,7 @@ import 'screens/vod_detail_player_screen.dart';
 import 'screens/vod_home_screen.dart';
 import 'theme.dart';
 import 'widgets/app_brand_logo.dart';
+import 'widgets/mobile_edge_swipe_back.dart';
 import 'widgets/source_picker_sheet.dart';
 import 'widgets/video_download_speed_badge.dart';
 import 'widgets/video_proxy_node_selector.dart';
@@ -42,6 +43,7 @@ class MainShell extends StatefulWidget {
 
 class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   int _selectedIndex = 0;
+  final List<int> _tabHistory = <int>[0];
   bool _isSidebarCollapsed = false;
   bool _isMobileSidebarOpen = false;
   final TextEditingController _searchController = TextEditingController();
@@ -71,10 +73,17 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     });
   }
 
-  void _selectTab(int index) {
+  void _selectTab(int index, {bool recordHistory = true}) {
     final screenW = MediaQuery.maybeSizeOf(context)?.width ?? 1024;
     widget.appState.setImmersiveFullscreen(false);
     setState(() {
+      if (recordHistory && index != _selectedIndex) {
+        _tabHistory.remove(index);
+        _tabHistory.add(index);
+        if (_tabHistory.length > 12) {
+          _tabHistory.removeAt(0);
+        }
+      }
       _selectedIndex = index;
       _isMobileSidebarOpen = false;
       if (screenW < 860 && !widget.appState.tvMode) {
@@ -429,12 +438,12 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     }
   }
 
-  void _handleRootPop(AppState state) {
+  void _handleRootPop(AppState state, {bool fromEdgeSwipe = false}) {
     if (_isExitDialogShowing) return;
     final now = DateTime.now();
     if (_lastBackHandledAt != null &&
         now.difference(_lastBackHandledAt!) <
-            const Duration(milliseconds: 420)) {
+            const Duration(milliseconds: 320)) {
       return;
     }
     _lastBackHandledAt = now;
@@ -474,26 +483,39 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     // Step 5: On TV / Desktop layout, step focus back from Content Area -> Main Navigation Bar/Sidebar -> Tab 0 Focus
     final screenW = MediaQuery.maybeSizeOf(context)?.width ?? 1024;
     final isDesktopOrTv = screenW >= 860 || state.tvMode;
-    if (isDesktopOrTv) {
+    if (isDesktopOrTv && !fromEdgeSwipe) {
       if ((!state.tvMode && _isSidebarCollapsed) || !_isFocusInsideSidebar()) {
         _focusSidebarTab(_selectedIndex);
         return;
       }
       if (_selectedIndex != 0) {
-        _selectTab(0);
+        _tabHistory
+          ..clear()
+          ..add(0);
+        _selectTab(0, recordHistory: false);
         _focusSidebarTab(0);
         return;
       }
     } else {
-      // Mobile layout: step back to Home Tab 0 before prompting to exit
+      // Mobile layout (or edge swipe): step back through tab navigation history first
+      while (_tabHistory.isNotEmpty && _tabHistory.last == _selectedIndex) {
+        _tabHistory.removeLast();
+      }
+      if (_tabHistory.isNotEmpty) {
+        final prevTab = _tabHistory.removeLast();
+        _selectTab(prevTab, recordHistory: false);
+        return;
+      }
       if (_selectedIndex != 0) {
-        _selectTab(0);
+        _selectTab(0, recordHistory: false);
         return;
       }
     }
 
-    // Step 6: Already at the Main Focus (Tab 0 & Main Sidebar Focus) -> Ask confirmation to exit app
-    _showExitConfirmDialog();
+    // Step 6: Already at the root Home page (Tab 0) -> Ask confirmation to exit app (only for hardware/system back, not edge swipe)
+    if (!fromEdgeSwipe) {
+      _showExitConfirmDialog();
+    }
   }
 
   @override
@@ -544,7 +566,10 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
               const SingleActivator(LogicalKeyboardKey.keyK, control: true):
                   _openCommandPalette,
             },
-            child: Scaffold(
+            child: MobileEdgeSwipeBack(
+              enabled: !state.tvMode,
+              onBack: () => _handleRootPop(state, fromEdgeSwipe: true),
+              child: Scaffold(
               backgroundColor:
                   isImmersive ? Colors.black : VideoPlatformTheme.bgPrimary,
               body: SafeArea(
@@ -668,6 +693,9 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                                 ),
                               ),
                             );
+                          } else if (miniSession.streamUrl
+                              .contains('/api/telegram/')) {
+                            _selectTab(5);
                           }
                         },
                       ),
@@ -679,6 +707,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
               bottomNavigationBar: (isDesktop || isImmersive)
                   ? null
                   : _buildMobileBottomBar(state),
+            ),
             ),
           ),
         ),

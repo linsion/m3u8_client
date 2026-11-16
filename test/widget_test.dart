@@ -13,6 +13,7 @@ import 'package:m3u8_client/services/telegram_notification_service.dart';
 import 'package:m3u8_client/state/app_state.dart';
 import 'package:m3u8_client/ui/screens/proxy_server_screen.dart';
 import 'package:m3u8_client/ui/theme.dart';
+import 'package:m3u8_client/ui/widgets/mobile_edge_swipe_back.dart';
 import 'package:m3u8_client/ui/widgets/video_download_speed_badge.dart';
 import 'package:m3u8_client/ui/widgets/video_proxy_node_selector.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -1443,5 +1444,41 @@ proxies:
     expect(deadProbe.ok, isFalse);
 
     await originServer.close(force: true);
+  });
+
+  testWidgets('MobileEdgeSwipeBack triggers onBack when swiping right from left edge and ignores center swipes',
+      (WidgetTester tester) async {
+    int backCount = 0;
+    await tester.binding.setSurfaceSize(const Size(390, 844));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: MobileEdgeSwipeBack(
+          onBack: () => backCount++,
+          child: const Scaffold(
+            body: Center(child: Text('Test Content')),
+          ),
+        ),
+      ),
+    );
+
+    // 1. Swiping from center (x = 180) should NOT trigger back
+    await tester.timedDragFrom(
+      const Offset(180, 400),
+      const Offset(120, 0),
+      const Duration(milliseconds: 180),
+    );
+    await tester.pumpAndSettle();
+    expect(backCount, 0);
+
+    // 2. Swiping right from left edge (x = 12 -> +100px) SHOULD trigger back
+    await tester.timedDragFrom(
+      const Offset(12, 400),
+      const Offset(100, 0),
+      const Duration(milliseconds: 180),
+    );
+    await tester.pumpAndSettle();
+    expect(backCount, 1);
   });
 }

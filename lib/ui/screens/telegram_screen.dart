@@ -16,6 +16,7 @@ import '../../models/models.dart';
 import '../../services/proxy_routing_service.dart';
 import '../../state/app_state.dart';
 import '../theme.dart';
+import '../widgets/mobile_edge_swipe_back.dart';
 import '../widgets/video_download_speed_badge.dart';
 import '../widgets/video_proxy_node_selector.dart';
 
@@ -286,7 +287,6 @@ class _TelegramScreenState extends State<TelegramScreen> {
   bool _isLoadingChats = false;
   String _chatFilter = '';
   bool _isMobileChatSearchOpen = false;
-  double _mobileBackSwipeDx = 0.0;
 
   TelegramChat? _selectedChat;
   bool _userExitedChat = false;
@@ -4303,32 +4303,9 @@ class _TelegramScreenState extends State<TelegramScreen> {
           // Official Telegram Mobile (iOS / Android) Full-Screen Single-Page Stack Navigation:
           // Page 1: Full-screen Chat List -> Tap Chat -> Page 2: Full-screen Conversation -> Tap Header -> Page 3: Full-screen Chat Info
           if (_selectedChat != null) {
-            return GestureDetector(
-              behavior: HitTestBehavior.translucent,
-              onHorizontalDragStart: (details) {
-                _mobileBackSwipeDx = details.globalPosition.dx <= 42 ? 0.0 : -1.0;
-              },
-              onHorizontalDragUpdate: (details) {
-                if (_mobileBackSwipeDx >= 0) {
-                  _mobileBackSwipeDx += details.delta.dx;
-                }
-              },
-              onHorizontalDragEnd: (details) {
-                if (_mobileBackSwipeDx > 72 ||
-                    (_mobileBackSwipeDx >= 0 &&
-                        (details.primaryVelocity ?? 0) > 520)) {
-                  if (_showRightInfoPanel) {
-                    setState(() => _showRightInfoPanel = false);
-                  } else {
-                    _exitCurrentChatOnMobile();
-                  }
-                }
-                _mobileBackSwipeDx = -1.0;
-              },
-              child: _showRightInfoPanel
-                  ? _buildRightChatInfoPanel(tg, _selectedChat!)
-                  : _buildConversationPane(tg, isMobile: true),
-            );
+            return _showRightInfoPanel
+                ? _buildRightChatInfoPanel(tg, _selectedChat!)
+                : _buildConversationPane(tg, isMobile: true);
           }
           return _buildDialogsSidebar(tg, isMobile: true);
         },
@@ -8914,7 +8891,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
           }
 
           return Container(
-            height: isVideo ? 280 : 230,
+            height: isVideo ? 320 : 240,
             margin: const EdgeInsets.fromLTRB(4, 4, 4, 0),
             decoration: BoxDecoration(
               color: const Color(0xFF0A1017),
@@ -13861,7 +13838,8 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
           widget.onOpenGallery();
         },
         onHorizontalDragStart: (isVideo && _isInlineMode && _inlinePlayer != null)
-            ? (_) {
+            ? (details) {
+                if (details.globalPosition.dx <= 40.0) return;
                 setState(() {
                   _isInlineHorizontalSeeking = true;
                   _inlineSeekStartPos = _position;
@@ -14503,6 +14481,48 @@ class _TelegramPhotoGalleryDialogState
   bool _isGalleryHorizontalSeeking = false;
   Duration _gallerySeekStartPos = Duration.zero;
   Duration _gallerySeekPreviewPos = Duration.zero;
+  String _galleryAspectMode = 'fit'; // 'fit', 'cover'
+  bool? _galleryLandscapeOverride;
+  bool _galleryDidChangeOrientation = false;
+
+  void _cycleGalleryAspectMode() {
+    setState(() {
+      _galleryAspectMode = _galleryAspectMode == 'fit' ? 'cover' : 'fit';
+    });
+    _showGalleryHud(
+      _galleryAspectMode == 'cover' ? '画面比例：铺满裁剪 (去黑边)' : '画面比例：适应屏幕',
+      state: 'success',
+    );
+  }
+
+  void _toggleGalleryOrientation() {
+    if (!(Platform.isAndroid || Platform.isIOS) || widget.appState.tvMode) {
+      return;
+    }
+    final mq = MediaQuery.maybeSizeOf(context);
+    final isCurrentlyLandscape =
+        _galleryLandscapeOverride ?? (mq != null && mq.width > mq.height);
+    final nextLandscape = !isCurrentlyLandscape;
+    setState(() {
+      _galleryLandscapeOverride = nextLandscape;
+      _galleryDidChangeOrientation = true;
+    });
+    if (nextLandscape) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+      SystemChrome.setPreferredOrientations(const [
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+      ]);
+    } else {
+      SystemChrome.setPreferredOrientations(const [
+        DeviceOrientation.portraitUp,
+      ]);
+    }
+    _showGalleryHud(
+      nextLandscape ? '已切换为：横屏全屏模式' : '已切换为：竖屏全屏模式',
+      state: 'success',
+    );
+  }
 
   // Per-message download/save visual feedback inside the gallery lightbox
   final Set<int> _queueingIds = {};
@@ -14622,6 +14642,13 @@ class _TelegramPhotoGalleryDialogState
 
   @override
   void dispose() {
+    if (_galleryDidChangeOrientation &&
+        (Platform.isAndroid || Platform.isIOS)) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+      if (!widget.appState.tvMode) {
+        SystemChrome.setPreferredOrientations(const []);
+      }
+    }
     _dialogHudTimer?.cancel();
     _disposeVideoPlayer();
     _focusNode.dispose();
@@ -15226,7 +15253,8 @@ class _TelegramPhotoGalleryDialogState
     );
     final hasAlbumGroup =
         widget.albumMessages != null && widget.albumMessages!.length > 1;
-    final isMobileDialog = MediaQuery.sizeOf(context).width < 760;
+    final mqSize = MediaQuery.sizeOf(context);
+    final isMobileDialog = mqSize.shortestSide < 600 || mqSize.width < 760;
     final totalMs =
         _videoDuration.inMilliseconds > 0 ? _videoDuration.inMilliseconds : 1;
     final activePos =
@@ -15290,7 +15318,10 @@ class _TelegramPhotoGalleryDialogState
           }
           return KeyEventResult.ignored;
         },
-        child: Dialog(
+        child: MobileEdgeSwipeBack(
+          enabled: !widget.appState.tvMode,
+          onBack: () => Navigator.of(context).pop(),
+          child: Dialog(
         backgroundColor: isMobileDialog ? Colors.black : Colors.transparent,
         insetPadding:
             isMobileDialog ? EdgeInsets.zero : const EdgeInsets.all(14),
@@ -15299,12 +15330,6 @@ class _TelegramPhotoGalleryDialogState
           children: [
             // 1. Main Media Stage (Video Player OR Interactive Zoomable Photo)
             Positioned.fill(
-              top: isMobileDialog ? 0 : 56,
-              bottom: isMobileDialog
-                  ? 0
-                  : (list.length > 1
-                      ? (isVideo ? 168 : 84)
-                      : (isVideo ? 104 : 16)),
               child: Focus(
                 focusNode: _focusNode,
                 autofocus: !isVideo,
@@ -15375,7 +15400,8 @@ class _TelegramPhotoGalleryDialogState
                         behavior: HitTestBehavior.opaque,
                         onTap: () => _videoPlayer?.playOrPause(),
                         onDoubleTap: () => _videoPlayer?.playOrPause(),
-                        onHorizontalDragStart: (_) {
+                        onHorizontalDragStart: (details) {
+                          if (details.globalPosition.dx <= 40.0) return;
                           if (_videoPlayer == null) return;
                           setState(() {
                             _isGalleryHorizontalSeeking = true;
@@ -15428,12 +15454,35 @@ class _TelegramPhotoGalleryDialogState
                                 const SizedBox.shrink(),
                           ),
                           if (_videoController != null)
-                            Video(
-                              key: ValueKey('gallery_video_${msg.id}'),
-                              controller: _videoController!,
-                              fit: BoxFit.contain,
-                              fill: Colors.black,
-                              controls: NoVideoControls,
+                            LayoutBuilder(
+                              builder: (context, stageConstraints) {
+                                final vp = _videoPlayer?.state.videoParams;
+                                final rawW = vp?.dw ??
+                                    vp?.w ??
+                                    _videoPlayer?.state.width ??
+                                    0;
+                                final rawH = vp?.dh ??
+                                    vp?.h ??
+                                    _videoPlayer?.state.height ??
+                                    0;
+                                final rot = ((vp?.rotate ?? 0) % 360 + 360) % 360;
+                                final effW = (rot == 90 || rot == 270) ? rawH : rawW;
+                                final effH = (rot == 90 || rot == 270) ? rawW : rawH;
+                                return Video(
+                                  key: ValueKey('gallery_video_${msg.id}'),
+                                  controller: _videoController!,
+                                  width: stageConstraints.maxWidth,
+                                  height: stageConstraints.maxHeight,
+                                  fit: _galleryAspectMode == 'cover'
+                                      ? BoxFit.cover
+                                      : BoxFit.contain,
+                                  aspectRatio: (effW > 0 && effH > 0)
+                                      ? effW / effH
+                                      : null,
+                                  fill: Colors.black,
+                                  controls: NoVideoControls,
+                                );
+                              },
                             ),
                           if (_isGalleryHorizontalSeeking)
                             Container(
@@ -16380,6 +16429,27 @@ class _TelegramPhotoGalleryDialogState
                                     1,
                                   ),
                                 ),
+                                const SizedBox(width: 6),
+                                _buildGalleryTvIconButton(
+                                  icon: _galleryAspectMode == 'cover'
+                                      ? Icons.crop_free_rounded
+                                      : Icons.aspect_ratio_rounded,
+                                  label: _galleryAspectMode == 'cover'
+                                      ? '铺满'
+                                      : '适应',
+                                  onTap: _cycleGalleryAspectMode,
+                                  upFocusNode: _scrubberFocusNode,
+                                ),
+                                if ((Platform.isAndroid || Platform.isIOS) &&
+                                    !widget.appState.tvMode) ...[
+                                  const SizedBox(width: 6),
+                                  _buildGalleryTvIconButton(
+                                    icon: Icons.screen_rotation_rounded,
+                                    label: '横竖屏',
+                                    onTap: _toggleGalleryOrientation,
+                                    upFocusNode: _scrubberFocusNode,
+                                  ),
+                                ],
                                 if (_videoPlayer != null) ...[
                                   const SizedBox(width: 6),
                                   VideoProxyNodeSelector(
@@ -16752,6 +16822,7 @@ class _TelegramPhotoGalleryDialogState
             ),
           ],
         ),
+      ),
       ),
       ),
     );

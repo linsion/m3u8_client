@@ -36,19 +36,56 @@ class SourcePickerDialog extends StatefulWidget {
 }
 
 class _SourcePickerDialogState extends State<SourcePickerDialog> {
+  final ScrollController _scrollController = ScrollController();
   String _filter = '';
   int _tabIndex = 0; // 0: 全部, 1: 采集资源站, 2: TVBox 站点
+  bool _didInitialAutoFocus = false;
 
   @override
-  Widget build(BuildContext context) {
+  void initState() {
+    super.initState();
+    _scrollToSelectedSourceOnce();
+  }
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  List<VodSource> _computeFilteredSources() {
     final kw = _filter.trim().toLowerCase();
-    final filtered = widget.sources.where((s) {
+    return widget.sources.where((s) {
       if (_tabIndex == 1 && s.isTvBox) return false;
       if (_tabIndex == 2 && !s.isTvBox) return false;
       if (kw.isEmpty) return true;
       return s.name.toLowerCase().contains(kw) ||
           s.tvboxSourceName.toLowerCase().contains(kw);
     }).toList();
+  }
+
+  void _scrollToSelectedSourceOnce() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _didInitialAutoFocus = true;
+      if (!_scrollController.hasClients) return;
+      final selectedId = widget.selectedSource?.id;
+      if (selectedId == null || selectedId.isEmpty) return;
+      final filtered = _computeFilteredSources();
+      final idx = filtered.indexWhere((s) => s.id == selectedId);
+      if (idx <= 0) return;
+      const estimatedItemExtent = 56.0;
+      final pos = _scrollController.position;
+      final targetOffset =
+          (idx * estimatedItemExtent - pos.viewportDimension * 0.35)
+              .clamp(0.0, pos.maxScrollExtent);
+      _scrollController.jumpTo(targetOffset);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final filtered = _computeFilteredSources();
 
     final customCount = widget.sources.where((s) => !s.isTvBox).length;
     final tvboxCount = widget.sources.where((s) => s.isTvBox).length;
@@ -113,6 +150,7 @@ class _SourcePickerDialogState extends State<SourcePickerDialog> {
                         ),
                       )
                     : ListView.separated(
+                        controller: _scrollController,
                         itemCount: filtered.length,
                         separatorBuilder: (_, __) => const Divider(height: 1),
                         itemBuilder: (context, index) {
@@ -123,8 +161,10 @@ class _SourcePickerDialogState extends State<SourcePickerDialog> {
                             context,
                             src: src,
                             isSelected: isSelected,
-                            autofocus: isSelected ||
-                                (widget.selectedSource == null && index == 0),
+                            autofocus: !_didInitialAutoFocus &&
+                                (isSelected ||
+                                    (widget.selectedSource == null &&
+                                        index == 0)),
                           );
                         },
                       ),
@@ -257,96 +297,92 @@ class _SourcePickerDialogState extends State<SourcePickerDialog> {
     required bool isSelected,
     required bool autofocus,
   }) {
-    return InkWell(
-      autofocus: autofocus,
-      borderRadius: BorderRadius.circular(6),
-      onFocusChange: (_) {
-        if (mounted) setState(() {});
-      },
-      onTap: () {
-        Navigator.of(context).pop();
-        widget.onSelect(src);
-      },
-      child: Builder(
-        builder: (ctx) {
-          final isFocused = Focus.of(ctx).hasPrimaryFocus;
-          if (isFocused) {
-            WidgetsBinding.instance.addPostFrameCallback((_) {
-              if (ctx.mounted) {
-                Scrollable.ensureVisible(
-                  ctx,
-                  alignment: 0.4,
-                  duration: const Duration(milliseconds: 140),
-                );
-              }
-            });
-          }
-          return Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-            decoration: BoxDecoration(
-              color: isFocused
-                  ? VideoPlatformTheme.accent.withValues(alpha: 0.25)
-                  : (isSelected
-                      ? VideoPlatformTheme.accent.withValues(alpha: 0.12)
-                      : Colors.transparent),
-              borderRadius: BorderRadius.circular(6),
-              border: Border.all(
-                color: isFocused
-                    ? VideoPlatformTheme.accent
-                    : (isSelected
-                        ? VideoPlatformTheme.accent.withValues(alpha: 0.5)
-                        : Colors.transparent),
-                width: isFocused ? 2.0 : 1.0,
-              ),
-            ),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        src.name,
-                        style: TextStyle(
-                          color: (isSelected || isFocused)
-                              ? VideoPlatformTheme.accent
-                              : VideoPlatformTheme.textPrimary,
-                          fontSize: 13.5,
-                          fontWeight: (isSelected || isFocused)
-                              ? FontWeight.w700
-                              : FontWeight.w400,
-                        ),
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        src.groupLabel,
-                        style: TextStyle(
-                          color: VideoPlatformTheme.textMuted,
-                          fontSize: 11,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                if (isSelected)
-                  Icon(
-                    Icons.check_circle,
-                    color: VideoPlatformTheme.accent,
-                    size: 18,
-                  )
-                else
-                  Icon(
-                    Icons.chevron_right,
+    return StatefulBuilder(
+      builder: (tileCtx, setTileState) {
+        return InkWell(
+          autofocus: autofocus,
+          borderRadius: BorderRadius.circular(6),
+          onFocusChange: (focused) {
+            if (tileCtx.mounted) {
+              setTileState(() {});
+            }
+          },
+          onTap: () {
+            Navigator.of(context).pop();
+            widget.onSelect(src);
+          },
+          child: Builder(
+            builder: (ctx) {
+              final isFocused = Focus.of(ctx).hasPrimaryFocus;
+              return Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                decoration: BoxDecoration(
+                  color: isFocused
+                      ? VideoPlatformTheme.accent.withValues(alpha: 0.25)
+                      : (isSelected
+                          ? VideoPlatformTheme.accent.withValues(alpha: 0.12)
+                          : Colors.transparent),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(
                     color: isFocused
                         ? VideoPlatformTheme.accent
-                        : VideoPlatformTheme.textMuted,
-                    size: 18,
+                        : (isSelected
+                            ? VideoPlatformTheme.accent.withValues(alpha: 0.5)
+                            : Colors.transparent),
+                    width: isFocused ? 2.0 : 1.0,
                   ),
-              ],
-            ),
-          );
-        },
-      ),
+                ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            src.name,
+                            style: TextStyle(
+                              color: (isSelected || isFocused)
+                                  ? VideoPlatformTheme.accent
+                                  : VideoPlatformTheme.textPrimary,
+                              fontSize: 13.5,
+                              fontWeight: (isSelected || isFocused)
+                                  ? FontWeight.w700
+                                  : FontWeight.w400,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            src.groupLabel,
+                            style: TextStyle(
+                              color: VideoPlatformTheme.textMuted,
+                              fontSize: 11,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    if (isSelected)
+                      Icon(
+                        Icons.check_circle,
+                        color: VideoPlatformTheme.accent,
+                        size: 18,
+                      )
+                    else
+                      Icon(
+                        Icons.chevron_right,
+                        color: isFocused
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.textMuted,
+                        size: 18,
+                      ),
+                  ],
+                ),
+              );
+            },
+          ),
+        );
+      },
     );
   }
 

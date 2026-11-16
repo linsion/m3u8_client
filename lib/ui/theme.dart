@@ -1,3 +1,4 @@
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
 class AppThemePalette {
@@ -242,6 +243,13 @@ class VideoPlatformTheme {
       focusColor: p.accent.withValues(alpha: 0.36),
       splashFactory: NoSplash.splashFactory,
       highlightColor: Colors.transparent,
+      pageTransitionsTheme: const PageTransitionsTheme(
+        builders: {
+          TargetPlatform.iOS: CupertinoPageTransitionsBuilder(),
+          TargetPlatform.android: CupertinoPageTransitionsBuilder(),
+          TargetPlatform.macOS: CupertinoPageTransitionsBuilder(),
+        },
+      ),
       appBarTheme: AppBarTheme(
         backgroundColor: p.bgElevated,
         foregroundColor: p.textPrimary,

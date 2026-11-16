@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -35,7 +36,15 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
   StreamSubscription<String>? _errorSub;
   StreamSubscription<bool>? _completedSub;
   StreamSubscription<int?>? _widthSub;
+  StreamSubscription<int?>? _heightSub;
+  StreamSubscription<VideoParams>? _videoParamsSub;
   StreamSubscription<Duration>? _posSub;
+  final GlobalKey _liveVideoWidgetKey =
+      GlobalKey(debugLabel: 'LiveMainVideoWidget');
+  int _liveVideoWidth = 0;
+  int _liveVideoHeight = 0;
+  String _liveAspectMode = 'fit'; // 'fit', 'cover', '16:9'
+  bool? _liveLandscapeOverride;
   Timer? _startupTimer;
   Timer? _reconnectTimer;
 
@@ -100,6 +109,84 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     }
   }
 
+  bool get _isLivePortraitVideo =>
+      _liveVideoWidth > 0 &&
+      _liveVideoHeight > 0 &&
+      _liveVideoHeight > _liveVideoWidth;
+
+  void _updateLiveVideoDimensions({int? w, int? h, VideoParams? params}) {
+    if (!mounted) return;
+    final vp = params ?? _player.state.videoParams;
+    final rawW = vp.dw ?? vp.w ?? w ?? _player.state.width ?? 0;
+    final rawH = vp.dh ?? vp.h ?? h ?? _player.state.height ?? 0;
+    final rot = ((vp.rotate ?? 0) % 360 + 360) % 360;
+    int nextW = rawW;
+    int nextH = rawH;
+    if (rot == 90 || rot == 270) {
+      nextW = rawH;
+      nextH = rawW;
+    }
+    if (nextW > 0 &&
+        nextH > 0 &&
+        (nextW != _liveVideoWidth || nextH != _liveVideoHeight)) {
+      final prevPortrait = _isLivePortraitVideo;
+      setState(() {
+        _liveVideoWidth = nextW;
+        _liveVideoHeight = nextH;
+      });
+      if (_isLiveFullscreen &&
+          _liveLandscapeOverride == null &&
+          _isLivePortraitVideo != prevPortrait) {
+        _applyLiveFullscreenOrientation();
+      }
+    }
+  }
+
+  void _applyLiveFullscreenOrientation() {
+    if (!(Platform.isAndroid || Platform.isIOS) || widget.appState.tvMode) {
+      return;
+    }
+    final useLandscape = _liveLandscapeOverride ?? !_isLivePortraitVideo;
+    if (useLandscape) {
+      SystemChrome.setPreferredOrientations(const [
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+      ]);
+    } else {
+      SystemChrome.setPreferredOrientations(const [
+        DeviceOrientation.portraitUp,
+      ]);
+    }
+  }
+
+  void _toggleLiveOrientation() {
+    final mq = MediaQuery.maybeSizeOf(context);
+    final currentlyLandscape = _liveLandscapeOverride ??
+        (mq != null ? mq.width > mq.height : !_isLivePortraitVideo);
+    final nextLandscape = !currentlyLandscape;
+    setState(() {
+      _liveLandscapeOverride = nextLandscape;
+      if (!_isLiveFullscreen) {
+        _isLiveFullscreen = true;
+        _isSidebarCollapsed = true;
+      }
+    });
+    widget.appState.setImmersiveFullscreen(true);
+    if (Platform.isAndroid || Platform.isIOS) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+      if (!widget.appState.tvMode) {
+        _applyLiveFullscreenOrientation();
+      }
+    }
+  }
+
+  void _cycleLiveAspectMode() {
+    const modes = ['fit', 'cover', '16:9'];
+    final idx = modes.indexOf(_liveAspectMode);
+    final next = modes[(idx + 1) % modes.length];
+    setState(() => _liveAspectMode = next);
+  }
+
   void _toggleLiveFullscreen({bool? forceValue}) {
     final next = forceValue ?? !_isLiveFullscreen;
     if (next == _isLiveFullscreen &&
@@ -114,6 +201,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
       _liveOsdVisible = false;
       if (!next) {
         _showFullscreenChannelDrawer = false;
+        _liveLandscapeOverride = null;
       }
       if (next) {
         _isSidebarCollapsed = true;
@@ -123,8 +211,21 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     if (Platform.isAndroid || Platform.isIOS) {
       if (next) {
         SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+        if (!widget.appState.tvMode) {
+          _applyLiveFullscreenOrientation();
+        }
       } else {
         SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+        if (!widget.appState.tvMode) {
+          SystemChrome.setPreferredOrientations(const [
+            DeviceOrientation.portraitUp,
+          ]);
+          Future<void>.delayed(const Duration(milliseconds: 800), () {
+            if (mounted && !_isLiveFullscreen) {
+              SystemChrome.setPreferredOrientations(const []);
+            }
+          });
+        }
       }
     }
     if (next) {
@@ -174,6 +275,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     _configureLiveNativePlayer();
 
     _widthSub = _player.stream.width.listen((w) {
+      _updateLiveVideoDimensions(w: w);
       if ((w ?? 0) > 0 && mounted && !_isResolving) {
         final wasActive = _hasActivePlayback;
         _hasActivePlayback = true;
@@ -188,6 +290,12 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
           setState(() => _playError = null);
         }
       }
+    });
+    _heightSub = _player.stream.height.listen((h) {
+      _updateLiveVideoDimensions(h: h);
+    });
+    _videoParamsSub = _player.stream.videoParams.listen((params) {
+      _updateLiveVideoDimensions(params: params);
     });
 
     _posSub = _player.stream.position.listen((pos) {
@@ -600,6 +708,9 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     }
     if (_isLiveFullscreen && (Platform.isAndroid || Platform.isIOS)) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+      if (!widget.appState.tvMode) {
+        SystemChrome.setPreferredOrientations(const []);
+      }
     }
     _liveOsdTimer?.cancel();
     _startupTimer?.cancel();
@@ -609,6 +720,8 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     _errorSub?.cancel();
     _completedSub?.cancel();
     _widthSub?.cancel();
+    _heightSub?.cancel();
+    _videoParamsSub?.cancel();
     _posSub?.cancel();
     _groupScrollController.dispose();
     _playerFocusNode.dispose();
@@ -1297,8 +1410,18 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
             Expanded(
               child: LayoutBuilder(
                 builder: (context, constraints) {
-                  final isDesktop = constraints.maxWidth >= 860 ||
-                      (widget.appState.tvMode && constraints.maxWidth >= 680);
+                  final mqSize = MediaQuery.sizeOf(context);
+                  final isPhoneDevice =
+                      (Platform.isAndroid || Platform.isIOS) &&
+                      !widget.appState.tvMode &&
+                      mqSize.shortestSide < 600;
+                  final isPhoneLandscape =
+                      isPhoneDevice &&
+                      constraints.maxWidth > constraints.maxHeight;
+                  final isDesktop = !isPhoneDevice &&
+                      (constraints.maxWidth >= 860 ||
+                          (widget.appState.tvMode &&
+                              constraints.maxWidth >= 680));
                   if (isDesktop) {
                     return Row(
                       children: [
@@ -1445,9 +1568,16 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                       ],
                     );
                   }
+                  final double baseLive16x9Height =
+                      (constraints.maxWidth * 9 / 16).clamp(235.0, 380.0);
+                  final double mobileLiveStageHeight = _isLivePortraitVideo
+                      ? (constraints.maxHeight * 0.50).clamp(300.0, 500.0)
+                      : math
+                          .max(baseLive16x9Height, constraints.maxHeight * 0.36)
+                          .clamp(250.0, 410.0);
                   return Column(
                     children: [
-                      if (_isLiveFullscreen)
+                      if (_isLiveFullscreen || isPhoneLandscape)
                         Expanded(
                           child: _buildPlayerPanel(
                             compact: false,
@@ -1456,8 +1586,9 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                           ),
                         )
                       else ...[
-                        AspectRatio(
-                          aspectRatio: 16 / 9,
+                        SizedBox(
+                          width: double.infinity,
+                          height: mobileLiveStageHeight,
                           child: _buildPlayerPanel(
                             compact: true,
                             groups: groups.toList(),
@@ -1604,6 +1735,37 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
               ),
             ),
           ],
+          const SizedBox(width: 4),
+          InkWell(
+            borderRadius: BorderRadius.circular(14),
+            onTap: _cycleLiveAspectMode,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+              decoration: BoxDecoration(
+                color: _liveAspectMode != 'fit'
+                    ? VideoPlatformTheme.accent.withValues(alpha: 0.16)
+                    : VideoPlatformTheme.bgCard,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(
+                  color: _liveAspectMode != 'fit'
+                      ? VideoPlatformTheme.accent
+                      : VideoPlatformTheme.borderSubtle,
+                ),
+              ),
+              child: Text(
+                _liveAspectMode == 'fit'
+                    ? '适应'
+                    : (_liveAspectMode == 'cover' ? '铺满' : '16:9'),
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: _liveAspectMode != 'fit'
+                      ? VideoPlatformTheme.accent
+                      : VideoPlatformTheme.textSecondary,
+                ),
+              ),
+            ),
+          ),
           const SizedBox(width: 6),
           InkWell(
             borderRadius: BorderRadius.circular(14),
@@ -3077,10 +3239,28 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                       : Stack(
                           fit: StackFit.expand,
                           children: [
-                            Video(
-                              controller: _videoController,
-                              fill: Colors.black,
-                              controls: NoVideoControls,
+                            LayoutBuilder(
+                              builder: (context, stageConstraints) {
+                                final liveFit = _liveAspectMode == 'cover'
+                                    ? BoxFit.cover
+                                    : BoxFit.contain;
+                                final liveAspect = _liveAspectMode == '16:9'
+                                    ? 16 / 9
+                                    : (_liveVideoWidth > 0 &&
+                                            _liveVideoHeight > 0
+                                        ? _liveVideoWidth / _liveVideoHeight
+                                        : null);
+                                return Video(
+                                  key: _liveVideoWidgetKey,
+                                  controller: _videoController,
+                                  width: stageConstraints.maxWidth,
+                                  height: stageConstraints.maxHeight,
+                                  fit: liveFit,
+                                  aspectRatio: liveAspect,
+                                  fill: Colors.black,
+                                  controls: NoVideoControls,
+                                );
+                              },
                             ),
                             // Top-left OSD banner when switching channels via wheel/keys
                             if (_channelOsdText != null)
@@ -3176,6 +3356,81 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                                     ),
                                     const SizedBox(width: 8),
                                     VideoDownloadSpeedBadge(player: _player),
+                                    const SizedBox(width: 8),
+                                    InkWell(
+                                      borderRadius: BorderRadius.circular(18),
+                                      onTap: _cycleLiveAspectMode,
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 10,
+                                          vertical: 5,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: const Color(0xBB090E14),
+                                          borderRadius:
+                                              BorderRadius.circular(18),
+                                          border: Border.all(
+                                            color: _liveAspectMode != 'fit'
+                                                ? VideoPlatformTheme.accent
+                                                : Colors.white24,
+                                          ),
+                                        ),
+                                        child: Text(
+                                          _liveAspectMode == 'fit'
+                                              ? '比例:适应'
+                                              : (_liveAspectMode == 'cover'
+                                                  ? '比例:铺满'
+                                                  : '比例:16:9'),
+                                          style: const TextStyle(
+                                            color: Colors.white,
+                                            fontSize: 11.5,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                    if ((Platform.isAndroid ||
+                                            Platform.isIOS) &&
+                                        !widget.appState.tvMode) ...[
+                                      const SizedBox(width: 8),
+                                      InkWell(
+                                        borderRadius: BorderRadius.circular(18),
+                                        onTap: _toggleLiveOrientation,
+                                        child: Container(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 10,
+                                            vertical: 5,
+                                          ),
+                                          decoration: BoxDecoration(
+                                            color: const Color(0xBB090E14),
+                                            borderRadius:
+                                                BorderRadius.circular(18),
+                                            border: Border.all(
+                                              color: Colors.white24,
+                                            ),
+                                          ),
+                                          child: const Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              Icon(
+                                                Icons.screen_rotation_rounded,
+                                                size: 14,
+                                                color: Colors.white,
+                                              ),
+                                              SizedBox(width: 4),
+                                              Text(
+                                                '横竖屏',
+                                                style: TextStyle(
+                                                  color: Colors.white,
+                                                  fontSize: 11.5,
+                                                  fontWeight: FontWeight.w600,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    ],
                                     const SizedBox(width: 8),
                                     StatefulBuilder(
                                       builder: (fsBtnCtx, setFsBtnState) {

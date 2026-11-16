@@ -9,6 +9,7 @@ import 'package:media_kit_video/media_kit_video.dart';
 import '../../models/models.dart';
 import '../../state/app_state.dart';
 import '../theme.dart';
+import '../widgets/mobile_edge_swipe_back.dart';
 import '../widgets/video_download_speed_badge.dart';
 
 class DownloadsScreen extends StatefulWidget {
@@ -1276,6 +1277,9 @@ class _DirectVideoPlayerDialog extends StatefulWidget {
 class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
   late final Player _player;
   late final VideoController _controller;
+  String _fitMode = 'fit'; // 'fit', 'cover'
+  bool? _landscapeOverride;
+  bool _didChangeOrientation = false;
 
   @override
   void initState() {
@@ -1288,89 +1292,169 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
     );
   }
 
+  void _toggleOrientation() {
+    if (!(Platform.isAndroid || Platform.isIOS)) return;
+    final mq = MediaQuery.maybeSizeOf(context);
+    final isLandscape =
+        _landscapeOverride ?? (mq != null && mq.width > mq.height);
+    final nextLandscape = !isLandscape;
+    setState(() {
+      _landscapeOverride = nextLandscape;
+      _didChangeOrientation = true;
+    });
+    if (nextLandscape) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+      SystemChrome.setPreferredOrientations(const [
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+      ]);
+    } else {
+      SystemChrome.setPreferredOrientations(const [
+        DeviceOrientation.portraitUp,
+      ]);
+    }
+  }
+
   @override
   void dispose() {
+    if (_didChangeOrientation && (Platform.isAndroid || Platform.isIOS)) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+      SystemChrome.setPreferredOrientations(const []);
+    }
     _player.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return Dialog(
-      insetPadding: const EdgeInsets.all(24),
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 960, maxHeight: 620),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              height: 46,
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              decoration: BoxDecoration(
-                color: VideoPlatformTheme.bgElevated,
-                border: Border(
-                  bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
+    final mqSize = MediaQuery.sizeOf(context);
+    final isMobileDialog = mqSize.shortestSide < 600 || mqSize.width < 760;
+
+    return MobileEdgeSwipeBack(
+      onBack: () => Navigator.of(context).pop(),
+      child: Dialog(
+        backgroundColor: Colors.black,
+        insetPadding:
+            isMobileDialog ? EdgeInsets.zero : const EdgeInsets.all(14),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: isMobileDialog ? double.infinity : 1200,
+            maxHeight: isMobileDialog ? double.infinity : 820,
+          ),
+          child: Column(
+            children: [
+              Container(
+                height: 46,
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                decoration: BoxDecoration(
+                  color: VideoPlatformTheme.bgElevated,
+                  border: Border(
+                    bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
+                  ),
                 ),
-              ),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      widget.title,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ),
-                  VideoDownloadSpeedBadge(
-                    player: _player,
-                    compact: true,
-                    backgroundColor: VideoPlatformTheme.bgCard,
-                  ),
-                  const SizedBox(width: 8),
-                  if (widget.onEnterMiniPlayer != null)
-                    TextButton.icon(
-                      onPressed: () {
-                        final pos = _player.state.position.inSeconds;
-                        Navigator.of(context).pop();
-                        widget.onEnterMiniPlayer!(pos);
-                      },
-                      icon: const Icon(
-                        Icons.picture_in_picture_alt_rounded,
-                        size: 16,
-                      ),
-                      label: const Text('小窗播放'),
-                    ),
-                  IconButton(
-                    icon: const Icon(Icons.close, size: 18),
-                    onPressed: () => Navigator.of(context).pop(),
-                  ),
-                ],
-              ),
-            ),
-            Flexible(
-              child: AspectRatio(
-                aspectRatio: 16 / 9,
-                child: Stack(
-                  fit: StackFit.expand,
+                child: Row(
                   children: [
-                    Video(
-                      controller: _controller,
-                      fill: Colors.black,
+                    Expanded(
+                      child: Text(
+                        widget.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
                     ),
-                    Positioned(
-                      top: 12,
-                      right: 12,
-                      child: VideoDownloadSpeedBadge(player: _player),
+                    InkWell(
+                      borderRadius: BorderRadius.circular(12),
+                      onTap: () {
+                        setState(() {
+                          _fitMode = _fitMode == 'fit' ? 'cover' : 'fit';
+                        });
+                      },
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 4,
+                        ),
+                        child: Text(
+                          _fitMode == 'cover' ? '比例:铺满' : '比例:适应',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                            color: _fitMode == 'cover'
+                                ? VideoPlatformTheme.accent
+                                : VideoPlatformTheme.textSecondary,
+                          ),
+                        ),
+                      ),
+                    ),
+                    if (Platform.isAndroid || Platform.isIOS)
+                      IconButton(
+                        tooltip: '横竖屏切换',
+                        visualDensity: VisualDensity.compact,
+                        icon: const Icon(
+                          Icons.screen_rotation_rounded,
+                          size: 17,
+                        ),
+                        onPressed: _toggleOrientation,
+                      ),
+                    if (!isMobileDialog) ...[
+                      VideoDownloadSpeedBadge(
+                        player: _player,
+                        compact: true,
+                        backgroundColor: VideoPlatformTheme.bgCard,
+                      ),
+                      const SizedBox(width: 6),
+                    ],
+                    if (widget.onEnterMiniPlayer != null)
+                      TextButton.icon(
+                        onPressed: () {
+                          final pos = _player.state.position.inSeconds;
+                          Navigator.of(context).pop();
+                          widget.onEnterMiniPlayer!(pos);
+                        },
+                        icon: const Icon(
+                          Icons.picture_in_picture_alt_rounded,
+                          size: 16,
+                        ),
+                        label: const Text('小窗播放'),
+                      ),
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      icon: const Icon(Icons.close, size: 18),
+                      onPressed: () => Navigator.of(context).pop(),
                     ),
                   ],
                 ),
               ),
-            ),
-          ],
+              Expanded(
+                child: LayoutBuilder(
+                  builder: (context, stageConstraints) {
+                    return Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        Video(
+                          controller: _controller,
+                          width: stageConstraints.maxWidth,
+                          height: stageConstraints.maxHeight,
+                          fit: _fitMode == 'cover'
+                              ? BoxFit.cover
+                              : BoxFit.contain,
+                          fill: Colors.black,
+                        ),
+                        Positioned(
+                          top: 12,
+                          right: 12,
+                          child: VideoDownloadSpeedBadge(player: _player),
+                        ),
+                      ],
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );

@@ -11,6 +11,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../../models/models.dart';
 import '../../state/app_state.dart';
 import '../theme.dart';
+import '../widgets/mobile_edge_swipe_back.dart';
 import '../widgets/video_download_speed_badge.dart';
 
 class MediaLibraryScreen extends StatefulWidget {
@@ -1062,6 +1063,9 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
   late final Player _player;
   late final VideoController _controller;
   double _rate = 1.0;
+  String _fitMode = 'fit'; // 'fit', 'cover'
+  bool? _landscapeOverride;
+  bool _didChangeOrientation = false;
 
   @override
   void initState() {
@@ -1074,135 +1078,218 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
     );
   }
 
+  void _toggleOrientation() {
+    if (!(Platform.isAndroid || Platform.isIOS)) return;
+    final mq = MediaQuery.maybeSizeOf(context);
+    final isLandscape =
+        _landscapeOverride ?? (mq != null && mq.width > mq.height);
+    final nextLandscape = !isLandscape;
+    setState(() {
+      _landscapeOverride = nextLandscape;
+      _didChangeOrientation = true;
+    });
+    if (nextLandscape) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+      SystemChrome.setPreferredOrientations(const [
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+      ]);
+    } else {
+      SystemChrome.setPreferredOrientations(const [
+        DeviceOrientation.portraitUp,
+      ]);
+    }
+  }
+
   @override
   void dispose() {
+    if (_didChangeOrientation && (Platform.isAndroid || Platform.isIOS)) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+      SystemChrome.setPreferredOrientations(const []);
+    }
     _player.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return Dialog(
-      insetPadding: const EdgeInsets.all(24),
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 960, maxHeight: 620),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              height: 46,
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              decoration: BoxDecoration(
-                color: VideoPlatformTheme.bgElevated,
-                border: Border(
-                  bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
+    final mqSize = MediaQuery.sizeOf(context);
+    final isMobileDialog = mqSize.shortestSide < 600 || mqSize.width < 760;
+
+    return MobileEdgeSwipeBack(
+      onBack: () => Navigator.of(context).pop(),
+      child: Dialog(
+        backgroundColor: Colors.black,
+        insetPadding:
+            isMobileDialog ? EdgeInsets.zero : const EdgeInsets.all(14),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: isMobileDialog ? double.infinity : 1200,
+            maxHeight: isMobileDialog ? double.infinity : 820,
+          ),
+          child: Column(
+            children: [
+              Container(
+                height: 46,
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                decoration: BoxDecoration(
+                  color: VideoPlatformTheme.bgElevated,
+                  border: Border(
+                    bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
+                  ),
                 ),
-              ),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      widget.title,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ),
-                  IconButton(
-                    tooltip: '快退 10 秒',
-                    icon: const Icon(Icons.replay_10_rounded, size: 18),
-                    onPressed: () {
-                      final pos = _player.state.position;
-                      final target = pos - const Duration(seconds: 10);
-                      _player.seek(
-                        target < Duration.zero ? Duration.zero : target,
-                      );
-                    },
-                  ),
-                  IconButton(
-                    tooltip: '快进 10 秒',
-                    icon: const Icon(Icons.forward_10_rounded, size: 18),
-                    onPressed: () {
-                      final pos = _player.state.position;
-                      _player.seek(pos + const Duration(seconds: 10));
-                    },
-                  ),
-                  PopupMenuButton<double>(
-                    tooltip: '倍速播放',
-                    initialValue: _rate,
-                    onSelected: (r) {
-                      setState(() => _rate = r);
-                      _player.setRate(r);
-                    },
-                    itemBuilder: (_) => const [
-                      PopupMenuItem(value: 0.75, child: Text('0.75x')),
-                      PopupMenuItem(value: 1.0, child: Text('1.0x 正常')),
-                      PopupMenuItem(value: 1.25, child: Text('1.25x')),
-                      PopupMenuItem(value: 1.5, child: Text('1.5x')),
-                      PopupMenuItem(value: 2.0, child: Text('2.0x')),
-                      PopupMenuItem(value: 3.0, child: Text('3.0x')),
-                    ],
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                child: Row(
+                  children: [
+                    Expanded(
                       child: Text(
-                        '${_rate}x',
-                        style: TextStyle(
-                          fontSize: 12,
+                        widget.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 14,
                           fontWeight: FontWeight.w600,
-                          color: VideoPlatformTheme.accent,
                         ),
                       ),
                     ),
-                  ),
-                  VideoDownloadSpeedBadge(
-                    player: _player,
-                    compact: true,
-                    backgroundColor: VideoPlatformTheme.bgCard,
-                  ),
-                  const SizedBox(width: 6),
-                  if (widget.onEnterMiniPlayer != null)
                     IconButton(
-                      tooltip: '转入右下角小窗悬浮播放',
-                      icon: const Icon(
-                        Icons.picture_in_picture_alt_rounded,
-                        size: 18,
-                      ),
+                      tooltip: '快退 10 秒',
+                      visualDensity: VisualDensity.compact,
+                      icon: const Icon(Icons.replay_10_rounded, size: 18),
                       onPressed: () {
-                        final posSec = _player.state.position.inSeconds;
-                        Navigator.of(context).pop();
-                        widget.onEnterMiniPlayer!(posSec);
+                        final pos = _player.state.position;
+                        final target = pos - const Duration(seconds: 10);
+                        _player.seek(
+                          target < Duration.zero ? Duration.zero : target,
+                        );
                       },
                     ),
-                  IconButton(
-                    icon: const Icon(Icons.close, size: 18),
-                    onPressed: () => Navigator.of(context).pop(),
-                  ),
-                ],
-              ),
-            ),
-            Flexible(
-              child: AspectRatio(
-                aspectRatio: 16 / 9,
-                child: Stack(
-                  fit: StackFit.expand,
-                  children: [
-                    Video(
-                      controller: _controller,
-                      fill: Colors.black,
+                    IconButton(
+                      tooltip: '快进 10 秒',
+                      visualDensity: VisualDensity.compact,
+                      icon: const Icon(Icons.forward_10_rounded, size: 18),
+                      onPressed: () {
+                        final pos = _player.state.position;
+                        _player.seek(pos + const Duration(seconds: 10));
+                      },
                     ),
-                    Positioned(
-                      top: 12,
-                      right: 12,
-                      child: VideoDownloadSpeedBadge(player: _player),
+                    InkWell(
+                      borderRadius: BorderRadius.circular(12),
+                      onTap: () {
+                        setState(() {
+                          _fitMode = _fitMode == 'fit' ? 'cover' : 'fit';
+                        });
+                      },
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 6,
+                          vertical: 4,
+                        ),
+                        child: Text(
+                          _fitMode == 'cover' ? '铺满' : '适应',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                            color: _fitMode == 'cover'
+                                ? VideoPlatformTheme.accent
+                                : VideoPlatformTheme.textSecondary,
+                          ),
+                        ),
+                      ),
+                    ),
+                    if (Platform.isAndroid || Platform.isIOS)
+                      IconButton(
+                        tooltip: '横竖屏切换',
+                        visualDensity: VisualDensity.compact,
+                        icon: const Icon(
+                          Icons.screen_rotation_rounded,
+                          size: 17,
+                        ),
+                        onPressed: _toggleOrientation,
+                      ),
+                    PopupMenuButton<double>(
+                      tooltip: '倍速播放',
+                      initialValue: _rate,
+                      onSelected: (r) {
+                        setState(() => _rate = r);
+                        _player.setRate(r);
+                      },
+                      itemBuilder: (_) => const [
+                        PopupMenuItem(value: 0.75, child: Text('0.75x')),
+                        PopupMenuItem(value: 1.0, child: Text('1.0x 正常')),
+                        PopupMenuItem(value: 1.25, child: Text('1.25x')),
+                        PopupMenuItem(value: 1.5, child: Text('1.5x')),
+                        PopupMenuItem(value: 2.0, child: Text('2.0x')),
+                        PopupMenuItem(value: 3.0, child: Text('3.0x')),
+                      ],
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 6),
+                        child: Text(
+                          '${_rate}x',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                            color: VideoPlatformTheme.accent,
+                          ),
+                        ),
+                      ),
+                    ),
+                    if (!isMobileDialog) ...[
+                      VideoDownloadSpeedBadge(
+                        player: _player,
+                        compact: true,
+                        backgroundColor: VideoPlatformTheme.bgCard,
+                      ),
+                      const SizedBox(width: 4),
+                    ],
+                    if (widget.onEnterMiniPlayer != null)
+                      IconButton(
+                        tooltip: '转入右下角小窗悬浮播放',
+                        visualDensity: VisualDensity.compact,
+                        icon: const Icon(
+                          Icons.picture_in_picture_alt_rounded,
+                          size: 18,
+                        ),
+                        onPressed: () {
+                          final posSec = _player.state.position.inSeconds;
+                          Navigator.of(context).pop();
+                          widget.onEnterMiniPlayer!(posSec);
+                        },
+                      ),
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      icon: const Icon(Icons.close, size: 18),
+                      onPressed: () => Navigator.of(context).pop(),
                     ),
                   ],
                 ),
               ),
-            ),
-          ],
+              Expanded(
+                child: LayoutBuilder(
+                  builder: (context, stageConstraints) {
+                    return Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        Video(
+                          controller: _controller,
+                          width: stageConstraints.maxWidth,
+                          height: stageConstraints.maxHeight,
+                          fit: _fitMode == 'cover'
+                              ? BoxFit.cover
+                              : BoxFit.contain,
+                          fill: Colors.black,
+                        ),
+                        Positioned(
+                          top: 12,
+                          right: 12,
+                          child: VideoDownloadSpeedBadge(player: _player),
+                        ),
+                      ],
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -1222,11 +1309,19 @@ class _MediaImagePreviewDialog extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Dialog(
-      insetPadding: const EdgeInsets.all(24),
-      backgroundColor: VideoPlatformTheme.bgElevated,
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 920, maxHeight: 680),
+    final mqSize = MediaQuery.sizeOf(context);
+    final isMobileDialog = mqSize.shortestSide < 600 || mqSize.width < 760;
+    return MobileEdgeSwipeBack(
+      onBack: () => Navigator.of(context).pop(),
+      child: Dialog(
+        insetPadding:
+            isMobileDialog ? EdgeInsets.zero : const EdgeInsets.all(20),
+        backgroundColor: VideoPlatformTheme.bgElevated,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: isMobileDialog ? double.infinity : 1080,
+            maxHeight: isMobileDialog ? double.infinity : 780,
+          ),
         child: Column(
           children: [
             Container(
@@ -1269,6 +1364,7 @@ class _MediaImagePreviewDialog extends StatelessWidget {
             ),
           ],
         ),
+      ),
       ),
     );
   }

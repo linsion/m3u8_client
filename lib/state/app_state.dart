@@ -107,11 +107,11 @@ class VodPlaybackProgress {
 class AppState extends ChangeNotifier {
   static const String appVersionName = String.fromEnvironment(
     'FLUTTER_BUILD_NAME',
-    defaultValue: '1.1.5',
+    defaultValue: '1.1.6',
   );
   static const String appBuildNumber = String.fromEnvironment(
     'FLUTTER_BUILD_NUMBER',
-    defaultValue: '16',
+    defaultValue: '17',
   );
   static String get appShortVersion => 'v$appVersionName';
   static String get appFullVersion =>
