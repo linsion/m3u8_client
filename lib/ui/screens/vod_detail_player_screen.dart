@@ -301,7 +301,12 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         bufferSize: 128 * 1024 * 1024,
       ),
     );
-    _videoController = VideoController(_player);
+    _videoController = VideoController(
+      _player,
+      configuration: VideoControllerConfiguration(
+        hwdec: Platform.isAndroid ? 'mediacodec-copy' : null,
+      ),
+    );
     _configureVodNativePlayer();
 
     _positionSub = _player.stream.position.listen(_onPositionUpdate);
@@ -403,21 +408,25 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     try {
       final dynamic platform = _player.platform;
       final props = <String, String>{
+        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto-safe',
+        'hwdec-codecs': 'h264,hevc,vp8,vp9,av1',
+        'vd-lavc-check-hw-profile': 'yes',
+        'vd-lavc-software-fallback': 'yes',
         'cache': 'yes',
         'cache-on-disk': 'no',
-        'cache-secs': '90',
+        'cache-secs': '120',
         'cache-pause': 'yes',
-        'cache-pause-initial': 'yes',
-        'cache-pause-wait': '3.5',
+        'cache-pause-initial': 'no',
+        'cache-pause-wait': '0.8',
         'demuxer-thread': 'yes',
         'demuxer-max-bytes': '134217728',
         'demuxer-max-back-bytes': '33554432',
-        'demuxer-readahead-secs': '45',
-        'stream-buffer-size': '4194304',
+        'demuxer-readahead-secs': '60',
+        'stream-buffer-size': '524288',
         'vd-lavc-threads': '0',
         'ad-lavc-threads': '0',
-        'demuxer-lavf-probesize': '524288',
-        'demuxer-lavf-analyzeduration': '0',
+        'demuxer-lavf-probesize': '131072',
+        'demuxer-lavf-analyzeduration': '0.5',
         'network-timeout': '15',
         'tls-verify': 'no',
         'stream-lavf-o':
@@ -651,10 +660,12 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         _pendingSeekSeconds > 3 &&
         totalSec > 0) {
       _hasAppliedInitialSeek = true;
-      // Avoid seeking beyond video duration
+      // Avoid seeking beyond video duration or re-seeking if `Media(start: ...)` already landed there
       if (_pendingSeekSeconds < totalSec - 5) {
-        final target = Duration(seconds: _pendingSeekSeconds.round());
-        _player.seek(target);
+        if ((pos.inSeconds - _pendingSeekSeconds).abs() > 4) {
+          final target = Duration(seconds: _pendingSeekSeconds.round());
+          _player.seek(target);
+        }
         if (_isAutoIntroSkipPending) {
           _isAutoIntroSkipPending = false;
           _showAdToast('已自动跳过片头 (${_pendingSeekSeconds.round()}s)');
@@ -871,14 +882,22 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       }
     });
 
-    // Concurrently pre-probe alternate play lines in the background right from the start!
+    // Delay background alternate-line probing by 1.8s so 100% of network/proxy
+    // bandwidth is dedicated to the primary stream's initial handshake & first frame!
     if (resetTriedLines) {
-      unawaited(
-        _precheckAlternateLinesInParallel(
-          episode: episode,
-          attemptId: attemptId,
-        ),
-      );
+      Future<void>.delayed(const Duration(milliseconds: 1800), () {
+        if (!mounted ||
+            attemptId != _playAttemptSessionId ||
+            _hasRenderedFirstFrame) {
+          return;
+        }
+        unawaited(
+          _precheckAlternateLinesInParallel(
+            episode: episode,
+            attemptId: attemptId,
+          ),
+        );
+      });
     }
 
     try {
@@ -1038,10 +1057,14 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
 
     _activeStreamUrl = finalMediaTarget;
     _activeStreamHeaders = headers;
+    final startOffset = (!_hasAppliedInitialSeek && _pendingSeekSeconds > 3)
+        ? Duration(seconds: _pendingSeekSeconds.round())
+        : null;
     await _player.open(
       Media(
         finalMediaTarget,
         httpHeaders: usingLocalStreamRelay ? const {} : headers,
+        start: startOffset,
       ),
       play: true,
     );
@@ -1049,34 +1072,9 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       await _player.setRate(_playbackSpeed);
     }
 
-    // 1. Concurrent fast playability probe on direct streams (when not already
-    // handled by LocalProxyTunnelBridge relay, to avoid competing proxy handshakes).
-    if (!forceProxy && !usingLocalStreamRelay && playUrl.startsWith('http')) {
-      unawaited(
-        widget.appState.api
-            .probeVodStreamPlayableFast(
-          playUrl,
-          headers,
-          timeout: const Duration(milliseconds: 2500),
-        )
-            .then((probe) {
-          if (!mounted || activeAttemptId != _playAttemptSessionId) return;
-          if (!probe.ok) {
-            final hasStarted = _player.state.duration > Duration.zero ||
-                _player.state.position > Duration.zero ||
-                (_player.state.width ?? 0) > 0 ||
-                LocalProxyTunnelBridge.recentDownstreamBytesPerSecond > 512;
-            if (!hasStarted) {
-              _triggerFastStartupFallback(reason: '主线路探测不可达');
-            }
-          }
-        }),
-      );
-    }
-
-    // 2. Startup watchdog: give proxy tunnels adequate time for TLS + first segment
+    // Startup watchdog: give proxy tunnels adequate time for TLS + first segment
     // and never abort while downstream bytes are actively flowing!
-    final watchdogMs = _usingClientProxy ? 6800 : 4200;
+    final watchdogMs = _usingClientProxy ? 6800 : 4800;
     _startupWatchdogTimer = Timer(Duration(milliseconds: watchdogMs), () {
       if (!mounted || activeAttemptId != _playAttemptSessionId) return;
       final hasStarted = _player.state.duration > Duration.zero ||

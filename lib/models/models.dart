@@ -1172,6 +1172,7 @@ class TelegramChat {
   final bool readOnly;
   final bool broadcast;
   final bool self;
+  final bool contact;
   final bool muted;
   final int topMessageId;
   final int readOutboxMaxId;
@@ -1189,6 +1190,7 @@ class TelegramChat {
     this.readOnly = false,
     this.broadcast = false,
     this.self = false,
+    this.contact = false,
     this.muted = false,
     this.topMessageId = 0,
     this.readOutboxMaxId = 0,
@@ -1198,6 +1200,31 @@ class TelegramChat {
       _positiveIntRegex.hasMatch(avatarPhotoId) &&
       avatarDcId > 0 &&
       avatarDcId <= 10;
+
+  /// Action type supported for `/api/telegram/conversation-action` (`'leave'` or `'delete_contact'`).
+  String get conversationActionType {
+    if (peer.startsWith('channel:') || peer.startsWith('chat:')) {
+      return 'leave';
+    }
+    if (peer.startsWith('user:') && !self) {
+      return 'delete_contact';
+    }
+    return '';
+  }
+
+  /// Human-readable label for the conversation action (`退出频道` / `退出超级群` / `退出群组` / `删除好友`).
+  String get conversationActionLabel {
+    if (peer.startsWith('channel:')) {
+      return (broadcast || kind.contains('频道')) ? '退出频道' : '退出超级群';
+    }
+    if (peer.startsWith('chat:')) {
+      return '退出群组';
+    }
+    if (peer.startsWith('user:') && !self) {
+      return '删除好友';
+    }
+    return '';
+  }
 
   TelegramChat copyWith({
     String? peer,
@@ -1212,6 +1239,7 @@ class TelegramChat {
     bool? readOnly,
     bool? broadcast,
     bool? self,
+    bool? contact,
     bool? muted,
     int? topMessageId,
     int? readOutboxMaxId,
@@ -1229,6 +1257,7 @@ class TelegramChat {
       readOnly: readOnly ?? this.readOnly,
       broadcast: broadcast ?? this.broadcast,
       self: self ?? this.self,
+      contact: contact ?? this.contact,
       muted: muted ?? this.muted,
       topMessageId: topMessageId ?? this.topMessageId,
       readOutboxMaxId: readOutboxMaxId ?? this.readOutboxMaxId,
@@ -1255,6 +1284,7 @@ class TelegramChat {
       readOnly: json['read_only'] == true,
       broadcast: json['broadcast'] == true,
       self: json['self'] == true,
+      contact: json['contact'] == true,
       muted: json['muted'] == true ||
           json['notification_muted'] == true ||
           json['silent'] == true,

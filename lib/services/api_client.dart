@@ -719,12 +719,23 @@ class ApiClient {
       return cached.data;
     }
 
-    if (_canDirectQueryCms(source)) {
+    final canDirectDetail = _canDirectQueryCms(source) ||
+        (_config.preferDirectPlayback &&
+            source.isTvBox &&
+            source.tvboxType == 1 &&
+            _isStandardHttpCmsApi(source.api) &&
+            _proxyService?.resolveEffectiveRoute(
+                  RequestScenario.vodApi,
+                  targetUri: Uri.tryParse(source.api.trim()),
+                ) !=
+                ScenarioRouteMode.serverRelay);
+
+    if (canDirectDetail) {
       try {
         final json = await _fetchDirectCmsJson(
           source.api,
           {'ac': 'detail', 'ids': vodId},
-          timeout: const Duration(seconds: 5),
+          timeout: const Duration(milliseconds: 3500),
         );
         if (json != null) {
           final list = json['list'];
@@ -733,11 +744,20 @@ class ApiClient {
               list.first is Map<String, dynamic>) {
             final detail =
                 VodDetail.fromJson(list.first as Map<String, dynamic>);
-            _vodDetailCache[cacheKey] = (
-              data: detail,
-              expiresAt: now.add(const Duration(minutes: 5)),
-            );
-            return detail;
+            final hasDirectEpisodes = detail.playGroups.isNotEmpty &&
+                detail.playGroups.any(
+                  (g) =>
+                      g.episodes.isNotEmpty &&
+                      (!source.isTvBox ||
+                          _isDirectPlayableVodUrl(g.episodes.first.rawUrl)),
+                );
+            if (hasDirectEpisodes) {
+              _vodDetailCache[cacheKey] = (
+                data: detail,
+                expiresAt: now.add(const Duration(minutes: 5)),
+              );
+              return detail;
+            }
           }
         }
       } catch (_) {}
@@ -2957,6 +2977,24 @@ class ApiClient {
         'ids': messageIds,
         'revoke': revoke,
       },
+    );
+  }
+
+  /// Leave a Telegram channel/supergroup/group (`action = 'leave'`) or
+  /// delete a Telegram contact (`action = 'delete_contact'`).
+  Future<void> performTelegramConversationAction({
+    required String accountId,
+    required String peer,
+    required String action,
+  }) async {
+    await _postJson(
+      '/api/telegram/conversation-action',
+      query: {'account_id': accountId},
+      body: {
+        'peer': peer,
+        'action': action,
+      },
+      timeout: const Duration(seconds: 30),
     );
   }
 

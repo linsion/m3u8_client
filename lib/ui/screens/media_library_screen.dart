@@ -1070,12 +1070,44 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
   @override
   void initState() {
     super.initState();
-    _player = Player();
-    _controller = VideoController(_player);
+    _player = Player(
+      configuration: const PlayerConfiguration(
+        bufferSize: 128 * 1024 * 1024,
+      ),
+    );
+    _controller = VideoController(
+      _player,
+      configuration: VideoControllerConfiguration(
+        hwdec: Platform.isAndroid ? 'mediacodec-copy' : null,
+      ),
+    );
+    _configureMediaPlayer();
     _player.open(
       Media(widget.streamUrl, httpHeaders: widget.headers),
       play: true,
     );
+  }
+
+  Future<void> _configureMediaPlayer() async {
+    try {
+      final dynamic platform = _player.platform;
+      final props = <String, String>{
+        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto-safe',
+        'hwdec-codecs': 'h264,hevc,vp8,vp9,av1',
+        'vd-lavc-software-fallback': 'yes',
+        'cache': 'yes',
+        'cache-secs': '120',
+        'cache-pause-initial': 'no',
+        'cache-pause-wait': '0.8',
+        'demuxer-max-bytes': '134217728',
+        'demuxer-readahead-secs': '60',
+        'stream-buffer-size': '524288',
+        'tls-verify': 'no',
+      };
+      for (final entry in props.entries) {
+        await platform.setProperty(entry.key, entry.value);
+      }
+    } catch (_) {}
   }
 
   void _toggleOrientation() {

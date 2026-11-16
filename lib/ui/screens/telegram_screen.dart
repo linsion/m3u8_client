@@ -4978,12 +4978,247 @@ class _TelegramScreenState extends State<TelegramScreen> {
     );
   }
 
+  Future<void> _confirmAndPerformConversationAction(
+    _TgPalette tg,
+    TelegramChat chat,
+  ) async {
+    final action = chat.conversationActionType;
+    final label = chat.conversationActionLabel;
+    if (action.isEmpty || label.isEmpty) return;
+
+    final isDeleteContact = action == 'delete_contact';
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dlgCtx) => AlertDialog(
+        backgroundColor: tg.sidebarBg,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        title: Row(
+          children: [
+            Icon(
+              isDeleteContact
+                  ? Icons.person_remove_outlined
+                  : Icons.logout_rounded,
+              color: const Color(0xFFE54D42),
+              size: 22,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                label,
+                style: TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w700,
+                  color: tg.textPrimary,
+                ),
+              ),
+            ),
+          ],
+        ),
+        content: Text(
+          isDeleteContact
+              ? '确定删除好友「${chat.title}」？\n删除后将从您的联系人列表中移除（历史聊天记录仍会保留）。'
+              : '确定$label「${chat.title}」？\n退出后将从会话列表中移除，且无法继续接收新消息（重新加入可能需要邀请链接）。',
+          style: TextStyle(
+            fontSize: 13.5,
+            height: 1.5,
+            color: tg.textSecondary,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dlgCtx).pop(false),
+            child: Text('取消', style: TextStyle(color: tg.textSecondary)),
+          ),
+          FilledButton.icon(
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFFE54D42),
+            ),
+            onPressed: () => Navigator.of(dlgCtx).pop(true),
+            icon: Icon(
+              isDeleteContact
+                  ? Icons.person_remove_outlined
+                  : Icons.logout_rounded,
+              size: 16,
+            ),
+            label: Text('确认$label'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true || !mounted) return;
+
+    _showDownloadHud('正在执行$label「${chat.title}」...', state: 'loading');
+    try {
+      await widget.appState.api.performTelegramConversationAction(
+        accountId: _activeAccountId,
+        peer: chat.peer,
+        action: action,
+      );
+      if (!mounted) return;
+
+      setState(() {
+        _chats.removeWhere((c) => c.peer == chat.peer);
+        if (_selectedChat?.peer == chat.peer) {
+          _selectedChat = _chats.isNotEmpty && !_isMobileLayout
+              ? _chats.first
+              : null;
+          _showRightInfoPanel = false;
+          _selectionMode = false;
+          _selectedMessageIds.clear();
+          if (_selectedChat == null) {
+            _messages = [];
+          }
+        }
+      });
+      _cachedChatsByAccountFolder['$_activeAccountId:$_selectedFolderKey'] = (
+        chats: List<TelegramChat>.from(_chats),
+        nextCursor: _nextChatCursor,
+      );
+      _cachedMessagesByPeer.remove('$_activeAccountId:${chat.peer}');
+      if (_selectedChat != null) {
+        _loadMessages(loadOlder: false);
+      }
+      _showDownloadHud('已成功$label：${chat.title}', state: 'success');
+    } catch (e) {
+      if (!mounted) return;
+      _showDownloadHud('$label失败：$e', state: 'error');
+    }
+  }
+
+  Future<void> _showDesktopChatRowContextMenu(
+    _TgPalette tg,
+    TelegramChat chat,
+    Offset globalPosition,
+  ) async {
+    final overlay =
+        Overlay.of(context).context.findRenderObject() as RenderBox?;
+    if (overlay == null) return;
+    final isMuted = chat.muted ||
+        widget.appState.telegramNotifications.isPeerMuted(
+          _activeAccountId,
+          chat.peer,
+        );
+    final actionLabel = chat.conversationActionLabel;
+    final isDeleteContact = chat.conversationActionType == 'delete_contact';
+
+    final selected = await showMenu<String>(
+      context: context,
+      color: tg.sidebarBg,
+      position: RelativeRect.fromRect(
+        Rect.fromLTWH(globalPosition.dx, globalPosition.dy, 1, 1),
+        Offset.zero & overlay.size,
+      ),
+      items: [
+        if (chat.unread > 0)
+          PopupMenuItem(
+            value: 'read',
+            child: Row(
+              children: [
+                Icon(
+                  Icons.mark_chat_read_outlined,
+                  size: 18,
+                  color: tg.tgBlueBright,
+                ),
+                const SizedBox(width: 10),
+                Text('标记为已读', style: TextStyle(color: tg.textPrimary)),
+              ],
+            ),
+          ),
+        PopupMenuItem(
+          value: 'mute',
+          child: Row(
+            children: [
+              Icon(
+                isMuted
+                    ? Icons.notifications_active_outlined
+                    : Icons.notifications_off_outlined,
+                size: 18,
+                color: tg.textSecondary,
+              ),
+              const SizedBox(width: 10),
+              Text(
+                isMuted ? '开启此会话新消息通知' : '静音此会话通知',
+                style: TextStyle(color: tg.textPrimary),
+              ),
+            ],
+          ),
+        ),
+        PopupMenuItem(
+          value: 'info',
+          child: Row(
+            children: [
+              Icon(
+                Icons.info_outline_rounded,
+                size: 18,
+                color: tg.textSecondary,
+              ),
+              const SizedBox(width: 10),
+              Text(
+                '查看共享媒体与会话资料',
+                style: TextStyle(color: tg.textPrimary),
+              ),
+            ],
+          ),
+        ),
+        if (actionLabel.isNotEmpty) ...[
+          const PopupMenuDivider(),
+          PopupMenuItem(
+            value: 'leave_or_delete',
+            child: Row(
+              children: [
+                Icon(
+                  isDeleteContact
+                      ? Icons.person_remove_outlined
+                      : Icons.logout_rounded,
+                  size: 18,
+                  color: const Color(0xFFE54D42),
+                ),
+                const SizedBox(width: 10),
+                Text(
+                  actionLabel,
+                  style: const TextStyle(
+                    color: Color(0xFFE54D42),
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ],
+    );
+
+    if (!mounted || selected == null) return;
+    switch (selected) {
+      case 'read':
+        _markChatAsRead(chat);
+        break;
+      case 'mute':
+        await widget.appState.telegramNotifications.toggleLocalPeerMute(
+          _activeAccountId,
+          chat.peer,
+        );
+        if (mounted) setState(() {});
+        break;
+      case 'info':
+        await _selectChat(chat);
+        if (mounted) setState(() => _showRightInfoPanel = true);
+        break;
+      case 'leave_or_delete':
+        await _confirmAndPerformConversationAction(tg, chat);
+        break;
+    }
+  }
+
   void _showMobileChatRowContextSheet(_TgPalette tg, TelegramChat chat) {
     final isMuted = chat.muted ||
         widget.appState.telegramNotifications.isPeerMuted(
           _activeAccountId,
           chat.peer,
         );
+    final actionLabel = chat.conversationActionLabel;
+    final isDeleteContact = chat.conversationActionType == 'delete_contact';
     showModalBottomSheet<void>(
       context: context,
       backgroundColor: tg.sidebarBg,
@@ -5076,6 +5311,28 @@ class _TelegramScreenState extends State<TelegramScreen> {
                     }
                   },
                 ),
+                if (actionLabel.isNotEmpty) ...[
+                  Divider(height: 1, color: tg.borderLine),
+                  ListTile(
+                    leading: Icon(
+                      isDeleteContact
+                          ? Icons.person_remove_outlined
+                          : Icons.logout_rounded,
+                      color: const Color(0xFFE54D42),
+                    ),
+                    title: Text(
+                      actionLabel,
+                      style: const TextStyle(
+                        color: Color(0xFFE54D42),
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    onTap: () {
+                      Navigator.of(sheetCtx).pop();
+                      _confirmAndPerformConversationAction(tg, chat);
+                    },
+                  ),
+                ],
               ],
             ),
           ),
@@ -5512,23 +5769,29 @@ class _TelegramScreenState extends State<TelegramScreen> {
                                   : Colors.transparent,
                               child: StatefulBuilder(
                                 builder: (rowStateCtx, setRowState) {
-                                  return InkWell(
-                                    hoverColor: isSelected
-                                        ? tg.sidebarSelected
-                                        : tg.sidebarHover,
-                                    onFocusChange: (_) {
-                                      if (rowStateCtx.mounted) {
-                                        setRowState(() {});
-                                      }
-                                    },
-                                    onTap: () => _selectChat(chat),
-                                    onLongPress: isMobile
-                                        ? () => _showMobileChatRowContextSheet(
-                                            tg,
-                                            chat,
-                                          )
-                                        : null,
-                                    child: Builder(
+                                  return GestureDetector(
+                                    onSecondaryTapDown: (details) =>
+                                        _showDesktopChatRowContextMenu(
+                                      tg,
+                                      chat,
+                                      details.globalPosition,
+                                    ),
+                                    child: InkWell(
+                                      hoverColor: isSelected
+                                          ? tg.sidebarSelected
+                                          : tg.sidebarHover,
+                                      onFocusChange: (_) {
+                                        if (rowStateCtx.mounted) {
+                                          setRowState(() {});
+                                        }
+                                      },
+                                      onTap: () => _selectChat(chat),
+                                      onLongPress: () =>
+                                          _showMobileChatRowContextSheet(
+                                        tg,
+                                        chat,
+                                      ),
+                                      child: Builder(
                                       builder: (itemCtx) {
                                         final isFocused =
                                             Focus.of(itemCtx).hasPrimaryFocus;
@@ -5789,18 +6052,19 @@ class _TelegramScreenState extends State<TelegramScreen> {
                               );
                             },
                           ),
-                        );
-                      },
-                    ),
-                  );
-                },
-              ),
-                    ),
+                        ),
+                      );
+                    },
                   ),
-                ),
+                );
+              },
+            ),
+          ),
+        ),
       ),
-    ],
-  ),
+    ),
+  ],
+),
 );
   }
 
@@ -6051,6 +6315,12 @@ class _TelegramScreenState extends State<TelegramScreen> {
                               case 'export_json':
                                 _exportCurrentChatHistory(chat, asJson: true);
                                 break;
+                              case 'leave_or_delete':
+                                await _confirmAndPerformConversationAction(
+                                  tg,
+                                  chat,
+                                );
+                                break;
                             }
                           },
                           itemBuilder: (_) => [
@@ -6181,6 +6451,33 @@ class _TelegramScreenState extends State<TelegramScreen> {
                                 ],
                               ),
                             ),
+                            if (chat.conversationActionLabel.isNotEmpty) ...[
+                              const PopupMenuDivider(),
+                              PopupMenuItem(
+                                value: 'leave_or_delete',
+                                child: Row(
+                                  children: [
+                                    Icon(
+                                      chat.conversationActionType ==
+                                              'delete_contact'
+                                          ? Icons.person_remove_outlined
+                                          : Icons.logout_rounded,
+                                      size: 18,
+                                      color: const Color(0xFFE54D42),
+                                    ),
+                                    const SizedBox(width: 10),
+                                    Text(
+                                      chat.conversationActionLabel,
+                                      style: const TextStyle(
+                                        fontSize: 13.5,
+                                        fontWeight: FontWeight.w600,
+                                        color: Color(0xFFE54D42),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
                           ],
                         );
                       },
@@ -6366,6 +6663,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
                         ),
                         IconButton(
                           visualDensity: VisualDensity.compact,
+                          tooltip: '刷新最新消息',
                           icon: Icon(
                             Icons.refresh_rounded,
                             size: 19,
@@ -6373,6 +6671,20 @@ class _TelegramScreenState extends State<TelegramScreen> {
                           ),
                           onPressed: () => _loadMessages(loadOlder: false),
                         ),
+                        if (chat.conversationActionLabel.isNotEmpty)
+                          IconButton(
+                            visualDensity: VisualDensity.compact,
+                            tooltip: chat.conversationActionLabel,
+                            icon: Icon(
+                              chat.conversationActionType == 'delete_contact'
+                                  ? Icons.person_remove_outlined
+                                  : Icons.logout_rounded,
+                              size: 18,
+                              color: const Color(0xFFE54D42),
+                            ),
+                            onPressed: () =>
+                                _confirmAndPerformConversationAction(tg, chat),
+                          ),
                       ],
                     ),
                   ),
@@ -11245,6 +11557,30 @@ class _TelegramScreenState extends State<TelegramScreen> {
                   '${chat.kind.isNotEmpty ? chat.kind : "Telegram 会话"} · ID: ${chat.peer}',
                   style: TextStyle(fontSize: 11.5, color: tg.textSecondary),
                 ),
+                if (chat.conversationActionLabel.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: const Color(0xFFE54D42),
+                        side: const BorderSide(
+                          color: Color(0x99E54D42),
+                          width: 1.2,
+                        ),
+                      ),
+                      onPressed: () =>
+                          _confirmAndPerformConversationAction(tg, chat),
+                      icon: Icon(
+                        chat.conversationActionType == 'delete_contact'
+                            ? Icons.person_remove_outlined
+                            : Icons.logout_rounded,
+                        size: 16,
+                      ),
+                      label: Text(chat.conversationActionLabel),
+                    ),
+                  ),
+                ],
                 if (mediaMessages.isNotEmpty) ...[
                   const SizedBox(height: 14),
                   SizedBox(
@@ -14485,6 +14821,50 @@ class _TelegramPhotoGalleryDialogState
   bool? _galleryLandscapeOverride;
   bool _galleryDidChangeOrientation = false;
 
+  // Draggable & hideable state for Progress/Controls Bar and Video Title/Caption Windows
+  Offset _controlsDragOffset = Offset.zero;
+  bool _controlsHidden = false;
+  Offset _captionDragOffset = Offset.zero;
+  bool _captionHidden = false;
+  Offset _topTitleDragOffset = Offset.zero;
+  bool _topTitleHidden = false;
+  Offset _restorePillDragOffset = Offset.zero;
+  final ScrollController _thumbStripScrollController = ScrollController();
+
+  void _scrollActiveThumbnailIntoView({bool animated = true}) {
+    void performScroll(bool useAnimation) {
+      if (!mounted || !_thumbStripScrollController.hasClients) return;
+      final pos = _thumbStripScrollController.position;
+      if (!pos.hasViewportDimension || !pos.hasContentDimensions) return;
+      const itemWidth = 54.0;
+      const separatorWidth = 6.0;
+      const horizontalPadding = 8.0;
+      final itemCenter = horizontalPadding +
+          _currentIndex * (itemWidth + separatorWidth) +
+          itemWidth / 2.0;
+      final targetOffset = (itemCenter - pos.viewportDimension / 2.0)
+          .clamp(0.0, pos.maxScrollExtent);
+      if (useAnimation && (pos.pixels - targetOffset).abs() > 2.0) {
+        _thumbStripScrollController.animateTo(
+          targetOffset,
+          duration: const Duration(milliseconds: 240),
+          curve: Curves.easeOutCubic,
+        );
+      } else {
+        _thumbStripScrollController.jumpTo(targetOffset);
+      }
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      performScroll(animated);
+      if (_currentIndex > 0) {
+        Future<void>.delayed(const Duration(milliseconds: 90), () {
+          performScroll(animated);
+        });
+      }
+    });
+  }
+
   void _cycleGalleryAspectMode() {
     setState(() {
       _galleryAspectMode = _galleryAspectMode == 'fit' ? 'cover' : 'fit';
@@ -14638,6 +15018,7 @@ class _TelegramPhotoGalleryDialogState
     final idx = list.indexWhere((m) => m.id == widget.initialMessageId);
     _currentIndex = idx >= 0 ? idx : 0;
     _syncVideoPlayerForCurrentItem();
+    _scrollActiveThumbnailIntoView(animated: false);
   }
 
   @override
@@ -14651,6 +15032,7 @@ class _TelegramPhotoGalleryDialogState
     }
     _dialogHudTimer?.cancel();
     _disposeVideoPlayer();
+    _thumbStripScrollController.dispose();
     _focusNode.dispose();
     _scrubberFocusNode.dispose();
     _prevItemFocusNode.dispose();
@@ -14698,18 +15080,23 @@ class _TelegramPhotoGalleryDialogState
     try {
       final dynamic platform = p.platform;
       final props = <String, String>{
+        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto-safe',
+        'hwdec-codecs': 'h264,hevc,vp8,vp9,av1',
+        'vd-lavc-check-hw-profile': 'yes',
+        'vd-lavc-software-fallback': 'yes',
         'cache': 'yes',
         'cache-on-disk': 'no',
         'cache-secs': '120',
         'cache-pause': 'yes',
-        'cache-pause-initial': 'yes',
-        'cache-pause-wait': '3.5',
+        'cache-pause-initial': 'no',
+        'cache-pause-wait': '0.8',
         'demuxer-thread': 'yes',
         'demuxer-max-bytes': '134217728',
         'demuxer-max-back-bytes': '33554432',
         'demuxer-readahead-secs': '60',
-        'stream-buffer-size': '4194304',
-        'demuxer-lavf-probesize': '524288',
+        'stream-buffer-size': '524288',
+        'demuxer-lavf-probesize': '131072',
+        'demuxer-lavf-analyzeduration': '0.5',
         'vd-lavc-threads': '0',
         'ad-lavc-threads': '0',
         'network-timeout': '20',
@@ -14883,11 +15270,15 @@ class _TelegramPhotoGalleryDialogState
     final list = _activeMessages;
     if (list.isEmpty) return;
     final clamped = (newIndex + list.length) % list.length;
-    if (clamped == _currentIndex && _videoPlayer != null) return;
+    if (clamped == _currentIndex && _videoPlayer != null) {
+      _scrollActiveThumbnailIntoView(animated: true);
+      return;
+    }
     setState(() {
       _currentIndex = clamped;
     });
     _syncVideoPlayerForCurrentItem();
+    _scrollActiveThumbnailIntoView(animated: true);
   }
 
   void _step(int delta) {
@@ -14907,6 +15298,7 @@ class _TelegramPhotoGalleryDialogState
       final idx = newList.indexWhere((m) => m.id == currentMsgId);
       _currentIndex = idx >= 0 ? idx : 0;
     });
+    _scrollActiveThumbnailIntoView(animated: true);
   }
 
   void _cycleSpeed() {
@@ -15398,7 +15790,14 @@ class _TelegramPhotoGalleryDialogState
                       },
                       child: GestureDetector(
                         behavior: HitTestBehavior.opaque,
-                        onTap: () => _videoPlayer?.playOrPause(),
+                        onTap: () {
+                          if (_controlsHidden) {
+                            setState(() => _controlsHidden = false);
+                            _scrollActiveThumbnailIntoView(animated: false);
+                          } else {
+                            _videoPlayer?.playOrPause();
+                          }
+                        },
                         onDoubleTap: () => _videoPlayer?.playOrPause(),
                         onHorizontalDragStart: (details) {
                           if (details.globalPosition.dx <= 40.0) return;
@@ -15678,52 +16077,94 @@ class _TelegramPhotoGalleryDialogState
                       child: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 10,
-                              vertical: 6,
-                            ),
-                            decoration: BoxDecoration(
-                              color: const Color(0xCC0F1720),
-                              borderRadius: BorderRadius.circular(18),
-                              border: Border.all(color: Colors.white12),
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(
-                                  isVideo
-                                      ? Icons.videocam_rounded
-                                      : Icons.photo_outlined,
-                                  size: 15,
-                                  color: const Color(0xFF5EB5F7),
-                                ),
-                                const SizedBox(width: 6),
-                                ConstrainedBox(
-                                  constraints: BoxConstraints(
-                                    maxWidth: isMobileDialog ? 150 : 320,
+                          if (!_topTitleHidden)
+                            Transform.translate(
+                              offset: _topTitleDragOffset,
+                              child: GestureDetector(
+                                onPanUpdate: (details) {
+                                  setState(() {
+                                    _topTitleDragOffset += details.delta;
+                                  });
+                                },
+                                onDoubleTap: () {
+                                  setState(() {
+                                    _topTitleDragOffset = Offset.zero;
+                                  });
+                                },
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 10,
+                                    vertical: 6,
                                   ),
-                                  child: Text(
-                                    [
-                                      '${_currentIndex + 1} / ${list.length}',
-                                      att?.displayName ??
-                                          (isVideo ? '视频' : '图片'),
-                                      if (att != null &&
-                                          att.formattedSize.isNotEmpty)
-                                        att.formattedSize,
-                                    ].join(' · '),
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 12.0,
-                                      fontWeight: FontWeight.w600,
-                                    ),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xCC0F1720),
+                                    borderRadius: BorderRadius.circular(18),
+                                    border: Border.all(color: Colors.white12),
+                                  ),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      const Icon(
+                                        Icons.drag_indicator_rounded,
+                                        size: 14,
+                                        color: Colors.white54,
+                                      ),
+                                      const SizedBox(width: 4),
+                                      Icon(
+                                        isVideo
+                                            ? Icons.videocam_rounded
+                                            : Icons.photo_outlined,
+                                        size: 15,
+                                        color: const Color(0xFF5EB5F7),
+                                      ),
+                                      const SizedBox(width: 6),
+                                      ConstrainedBox(
+                                        constraints: BoxConstraints(
+                                          maxWidth: isMobileDialog ? 140 : 300,
+                                        ),
+                                        child: Text(
+                                          [
+                                            '${_currentIndex + 1} / ${list.length}',
+                                            att?.displayName ??
+                                                (isVideo ? '视频' : '图片'),
+                                            if (att != null &&
+                                                att.formattedSize.isNotEmpty)
+                                              att.formattedSize,
+                                          ].join(' · '),
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: const TextStyle(
+                                            color: Colors.white,
+                                            fontSize: 12.0,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 6),
+                                      InkWell(
+                                        onTap: () => setState(
+                                          () => _topTitleHidden = true,
+                                        ),
+                                        child: const Icon(
+                                          Icons.close_rounded,
+                                          size: 14,
+                                          color: Colors.white60,
+                                        ),
+                                      ),
+                                    ],
                                   ),
                                 ),
-                              ],
+                              ),
+                            )
+                          else
+                            _buildGalleryTvButton(
+                              icon: Icons.title_rounded,
+                              label: '显示文件名',
+                              onTap: () => setState(() {
+                                _topTitleHidden = false;
+                                _topTitleDragOffset = Offset.zero;
+                              }),
                             ),
-                          ),
                           if (isVideo && _videoPlayer != null) ...[
                             const SizedBox(width: 6),
                             VideoProxyNodeSelector(
@@ -16071,62 +16512,258 @@ class _TelegramPhotoGalleryDialogState
               ),
             ],
 
-            // 4. Bottom Controls Stack: Caption + Video Playback Controls + Album Thumbnail Strip
-            Positioned(
-              left: 16,
-              right: 16,
-              bottom: 6,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  // Optional message caption
-                  if (msg.text.trim().isNotEmpty)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: Container(
-                        constraints: const BoxConstraints(maxWidth: 720),
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 14,
-                          vertical: 6,
-                        ),
-                        decoration: BoxDecoration(
-                          color: const Color(0xCC0B121A),
-                          borderRadius: BorderRadius.circular(10),
-                          border: Border.all(color: Colors.white12),
-                        ),
-                        child: Text(
-                          msg.text.trim(),
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          textAlign: TextAlign.center,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 12.5,
+            // 4a. Draggable & Hideable Video Title / Caption Small Window (`视频标题/简介小窗`)
+            if (msg.text.trim().isNotEmpty && !_captionHidden)
+              Positioned(
+                bottom: isVideo ? (list.length > 1 ? 182 : 112) : 82,
+                child: Transform.translate(
+                  offset: _captionDragOffset,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onPanUpdate: (details) {
+                      setState(() {
+                        _captionDragOffset += details.delta;
+                      });
+                    },
+                    onDoubleTap: () {
+                      setState(() {
+                        _captionDragOffset = Offset.zero;
+                      });
+                    },
+                    child: Container(
+                      constraints: BoxConstraints(
+                        maxWidth: isMobileDialog ? 330 : 680,
+                      ),
+                      padding: const EdgeInsets.fromLTRB(12, 6, 8, 7),
+                      decoration: BoxDecoration(
+                        color: const Color(0xCC0B121A),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: Colors.white24),
+                        boxShadow: const [
+                          BoxShadow(
+                            color: Colors.black45,
+                            blurRadius: 8,
+                            offset: Offset(0, 2),
                           ),
-                        ),
+                        ],
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Padding(
+                            padding: EdgeInsets.only(top: 2, right: 6),
+                            child: Icon(
+                              Icons.drag_indicator_rounded,
+                              size: 15,
+                              color: Colors.white54,
+                            ),
+                          ),
+                          Flexible(
+                            child: Text(
+                              msg.text.trim(),
+                              maxLines: 3,
+                              overflow: TextOverflow.ellipsis,
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 12.5,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          if (_captionDragOffset != Offset.zero)
+                            Padding(
+                              padding: const EdgeInsets.only(right: 4),
+                              child: InkWell(
+                                onTap: () => setState(
+                                  () => _captionDragOffset = Offset.zero,
+                                ),
+                                child: const Icon(
+                                  Icons.restart_alt_rounded,
+                                  size: 15,
+                                  color: Color(0xFF5EB5F7),
+                                ),
+                              ),
+                            ),
+                          InkWell(
+                            onTap: () => setState(() => _captionHidden = true),
+                            child: const Icon(
+                              Icons.close_rounded,
+                              size: 16,
+                              color: Colors.white70,
+                            ),
+                          ),
+                        ],
                       ),
                     ),
+                  ),
+                ),
+              ),
 
-                  // Official Telegram 2-Tier Video Scrubber & Controls Bar (shown when active item is a Video)
-                  // Row 1: Focusable Progress Scrubber Bar (Left/Right seeks -5s/+5s; Down switches to buttons)
-                  // Row 2: Focusable Control Buttons Row (Left/Right freely switches between all buttons!)
-                  if (isVideo)
-                    Container(
-                      constraints: const BoxConstraints(maxWidth: 880),
-                      margin: const EdgeInsets.only(bottom: 8),
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 8,
-                      ),
-                      decoration: BoxDecoration(
-                        color: const Color(0xE60F1720),
-                        borderRadius: BorderRadius.circular(14),
-                        border: Border.all(color: Colors.white12),
-                      ),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          // Row 1: Dedicated TV Focusable Progress Scrubber
+            // 4b. Draggable & Hideable Bottom Controls Stack: Video Playback Progress Bar + Album Strip
+            if (!_controlsHidden)
+              Positioned(
+                left: 16,
+                right: 16,
+                bottom: 6,
+                child: Transform.translate(
+                  offset: _controlsDragOffset,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // Official Telegram 2-Tier Video Scrubber & Controls Bar (shown when active item is a Video)
+                      if (isVideo)
+                        GestureDetector(
+                          behavior: HitTestBehavior.translucent,
+                          onPanUpdate: (details) {
+                            setState(() {
+                              _controlsDragOffset += details.delta;
+                            });
+                          },
+                          child: Container(
+                            constraints: const BoxConstraints(maxWidth: 920),
+                            margin: const EdgeInsets.only(bottom: 8),
+                            padding: const EdgeInsets.fromLTRB(12, 5, 12, 8),
+                            decoration: BoxDecoration(
+                              color: const Color(0xE60F1720),
+                              borderRadius: BorderRadius.circular(14),
+                              border: Border.all(color: Colors.white12),
+                              boxShadow: const [
+                                BoxShadow(
+                                  color: Colors.black54,
+                                  blurRadius: 12,
+                                  offset: Offset(0, 4),
+                                ),
+                              ],
+                            ),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                // Top Drag Handle & Quick Hide/Title Bar
+                                Row(
+                                  children: [
+                                    const Icon(
+                                      Icons.drag_indicator_rounded,
+                                      size: 14,
+                                      color: Colors.white54,
+                                    ),
+                                    const SizedBox(width: 4),
+                                    const Text(
+                                      '按住可任意拖动进度条位置',
+                                      style: TextStyle(
+                                        color: Colors.white54,
+                                        fontSize: 10.5,
+                                      ),
+                                    ),
+                                    const Spacer(),
+                                    if (msg.text.trim().isNotEmpty)
+                                      InkWell(
+                                        borderRadius: BorderRadius.circular(6),
+                                        onTap: () => setState(
+                                          () => _captionHidden = !_captionHidden,
+                                        ),
+                                        child: Padding(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 6,
+                                            vertical: 2,
+                                          ),
+                                          child: Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              Icon(
+                                                _captionHidden
+                                                    ? Icons.subtitles_outlined
+                                                    : Icons
+                                                        .subtitles_off_outlined,
+                                                size: 13,
+                                                color: const Color(0xFF5EB5F7),
+                                              ),
+                                              const SizedBox(width: 3),
+                                              Text(
+                                                _captionHidden
+                                                    ? '显示标题窗'
+                                                    : '隐藏标题窗',
+                                                style: const TextStyle(
+                                                  color: Color(0xFF5EB5F7),
+                                                  fontSize: 11,
+                                                  fontWeight: FontWeight.w600,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    if (_controlsDragOffset != Offset.zero) ...[
+                                      const SizedBox(width: 6),
+                                      InkWell(
+                                        borderRadius: BorderRadius.circular(6),
+                                        onTap: () => setState(
+                                          () =>
+                                              _controlsDragOffset = Offset.zero,
+                                        ),
+                                        child: const Padding(
+                                          padding: EdgeInsets.symmetric(
+                                            horizontal: 6,
+                                            vertical: 2,
+                                          ),
+                                          child: Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              Icon(
+                                                Icons.restart_alt_rounded,
+                                                size: 13,
+                                                color: Colors.white70,
+                                              ),
+                                              SizedBox(width: 3),
+                                              Text(
+                                                '归位',
+                                                style: TextStyle(
+                                                  color: Colors.white70,
+                                                  fontSize: 11,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                    const SizedBox(width: 6),
+                                    InkWell(
+                                      borderRadius: BorderRadius.circular(6),
+                                      onTap: () => setState(
+                                        () => _controlsHidden = true,
+                                      ),
+                                      child: const Padding(
+                                        padding: EdgeInsets.symmetric(
+                                          horizontal: 6,
+                                          vertical: 2,
+                                        ),
+                                        child: Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            Icon(
+                                              Icons.visibility_off_outlined,
+                                              size: 13,
+                                              color: Color(0xFFFFB74D),
+                                            ),
+                                            SizedBox(width: 3),
+                                            Text(
+                                              '隐藏进度条',
+                                              style: TextStyle(
+                                                color: Color(0xFFFFB74D),
+                                                fontSize: 11,
+                                                fontWeight: FontWeight.w600,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 2),
+                                // Row 1: Dedicated TV Focusable Progress Scrubber
                           StatefulBuilder(
                             builder: (scrubCtx, setScrubState) {
                               return Focus(
@@ -16650,6 +17287,7 @@ class _TelegramPhotoGalleryDialogState
                         ],
                       ),
                     ),
+                  ),
 
                   // Official Telegram Bottom Album / Gallery Thumbnail Strip (`photo` + `video`)
                   if (list.length > 1)
@@ -16666,6 +17304,7 @@ class _TelegramPhotoGalleryDialogState
                         border: Border.all(color: Colors.white12),
                       ),
                       child: ListView.separated(
+                        controller: _thumbStripScrollController,
                         scrollDirection: Axis.horizontal,
                         shrinkWrap: true,
                         itemCount: list.length,
@@ -16729,12 +17368,20 @@ class _TelegramPhotoGalleryDialogState
                                             color: isThumbFocused
                                                 ? const Color(0xFFFFE066)
                                                 : (active
-                                                    ? const Color(0xFF3E99EE)
+                                                    ? const Color(0xFF00E5FF)
                                                     : Colors.white24),
                                             width: isThumbFocused
-                                                ? 2.4
-                                                : (active ? 2.2 : 1.0),
+                                                ? 2.6
+                                                : (active ? 2.5 : 1.0),
                                           ),
+                                          boxShadow: active
+                                              ? const [
+                                                  BoxShadow(
+                                                    color: Color(0x8000E5FF),
+                                                    blurRadius: 8,
+                                                  ),
+                                                ]
+                                              : null,
                                         ),
                                         clipBehavior: Clip.antiAlias,
                                         child: Stack(
@@ -16760,15 +17407,54 @@ class _TelegramPhotoGalleryDialogState
                                             ),
                                             if (itemIsVideo)
                                               Container(
-                                                color: const Color(0x4D000000),
+                                                color: active
+                                                    ? const Color(0x2600E5FF)
+                                                    : const Color(0x4D000000),
                                                 alignment: Alignment.center,
-                                                child: const Icon(
-                                                  Icons
-                                                      .play_circle_fill_rounded,
+                                                child: Icon(
+                                                  active
+                                                      ? Icons.equalizer_rounded
+                                                      : Icons
+                                                          .play_circle_fill_rounded,
                                                   size: 20,
-                                                  color: Colors.white,
+                                                  color: active
+                                                      ? const Color(0xFFFFE066)
+                                                      : Colors.white,
                                                 ),
                                               ),
+                                            // Top-left sequence number / active indicator badge
+                                            Positioned(
+                                              top: 2,
+                                              left: 2,
+                                              child: Container(
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                  horizontal: 3.5,
+                                                  vertical: 0.5,
+                                                ),
+                                                decoration: BoxDecoration(
+                                                  color: active
+                                                      ? const Color(0xEE0088CC)
+                                                      : const Color(0xB3000000),
+                                                  borderRadius:
+                                                      BorderRadius.circular(4),
+                                                ),
+                                                child: Text(
+                                                  active
+                                                      ? '${idx + 1}·播'
+                                                      : '${idx + 1}',
+                                                  style: TextStyle(
+                                                    color: active
+                                                        ? const Color(
+                                                            0xFFFFE066,
+                                                          )
+                                                        : Colors.white70,
+                                                    fontSize: 8.5,
+                                                    fontWeight: FontWeight.w700,
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
                                             if (itemIsVideo &&
                                                 itemAtt != null &&
                                                 itemAtt.duration > 0)
@@ -16820,6 +17506,65 @@ class _TelegramPhotoGalleryDialogState
                 ],
               ),
             ),
+          )
+        else
+          Positioned(
+            right: 16,
+            bottom: 14,
+            child: Transform.translate(
+              offset: _restorePillDragOffset,
+              child: GestureDetector(
+                onPanUpdate: (details) {
+                  setState(() {
+                    _restorePillDragOffset += details.delta;
+                  });
+                },
+                onTap: () {
+                  setState(() {
+                    _controlsHidden = false;
+                  });
+                  _scrollActiveThumbnailIntoView(animated: false);
+                },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 7,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xCC0F1720),
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(color: Colors.white24),
+                    boxShadow: const [
+                      BoxShadow(
+                        color: Colors.black54,
+                        blurRadius: 8,
+                        offset: Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                  child: const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.visibility_outlined,
+                        size: 15,
+                        color: Color(0xFF5EB5F7),
+                      ),
+                      SizedBox(width: 6),
+                      Text(
+                        '显示进度条',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
           ],
         ),
       ),

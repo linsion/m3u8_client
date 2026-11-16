@@ -607,8 +607,8 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
         'stream-buffer-size': '1048576',
         'vd-lavc-threads': '0',
         'ad-lavc-threads': '0',
-        'demuxer-lavf-probesize': '524288',
-        'demuxer-lavf-analyzeduration': '0',
+        'demuxer-lavf-probesize': '131072',
+        'demuxer-lavf-analyzeduration': '0.5',
         'network-timeout': '12',
         'tls-verify': 'no',
         // Never set force-seekable=yes or loop-file=inf on live streams:

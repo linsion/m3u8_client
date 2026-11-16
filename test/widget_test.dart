@@ -1481,4 +1481,50 @@ proxies:
     await tester.pumpAndSettle();
     expect(backCount, 1);
   });
+
+  test('TelegramChat computes conversationActionType and conversationActionLabel accurately',
+      () {
+    final channelChat = TelegramChat.fromJson(const {
+      'peer': 'channel:100123',
+      'title': '测试频道',
+      'kind': '频道',
+      'broadcast': true,
+    });
+    expect(channelChat.conversationActionType, 'leave');
+    expect(channelChat.conversationActionLabel, '退出频道');
+
+    final supergroupChat = TelegramChat.fromJson(const {
+      'peer': 'channel:100456',
+      'title': '测试超级群',
+      'kind': '超级群',
+      'broadcast': false,
+    });
+    expect(supergroupChat.conversationActionType, 'leave');
+    expect(supergroupChat.conversationActionLabel, '退出超级群');
+
+    final groupChat = TelegramChat.fromJson(const {
+      'peer': 'chat:789',
+      'title': '普通群组',
+      'kind': '群组',
+    });
+    expect(groupChat.conversationActionType, 'leave');
+    expect(groupChat.conversationActionLabel, '退出群组');
+
+    final friendChat = TelegramChat.fromJson(const {
+      'peer': 'user:42',
+      'title': '好友A',
+      'contact': true,
+      'self': false,
+    });
+    expect(friendChat.conversationActionType, 'delete_contact');
+    expect(friendChat.conversationActionLabel, '删除好友');
+
+    final selfChat = TelegramChat.fromJson(const {
+      'peer': 'user:1',
+      'title': '收藏夹',
+      'self': true,
+    });
+    expect(selfChat.conversationActionType, '');
+    expect(selfChat.conversationActionLabel, '');
+  });
 }

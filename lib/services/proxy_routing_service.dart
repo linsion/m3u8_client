@@ -2224,11 +2224,9 @@ class LocalProxyTunnelBridge {
 
   /// Multi-connection concurrent HLS segment prefetching & parallel chunk state.
   static const int maxConcurrentPrefetchWorkers = 4;
-  static const int prefetchLookaheadCount = 4;
-  static const int _maxPrefetchCacheSegments = 20;
-  static const int _maxPrefetchCacheBytes = 40 * 1024 * 1024;
-  static const int _parallelRangeChunkConnections = 3;
-  static const int _parallelRangeThresholdBytes = 1536 * 1024;
+  static const int prefetchLookaheadCount = 6;
+  static const int _maxPrefetchCacheSegments = 24;
+  static const int _maxPrefetchCacheBytes = 48 * 1024 * 1024;
 
   List<String> _playlistSegmentUrls = <String>[];
   final Map<String, int> _playlistSegmentIndexMap = <String, int>{};
@@ -2247,6 +2245,7 @@ class LocalProxyTunnelBridge {
         List<ProxyNode> candidateNodes,
       })> _pendingPrefetchQueue = Queue();
   int _activePrefetchWorkers = 0;
+  Timer? _initialPrefetchTimer;
 
   int get prefetchedSegmentCount => _prefetchedSegmentCache.length;
   int get activePrefetchWorkerCount => _activePrefetchWorkers;
@@ -2367,6 +2366,8 @@ class LocalProxyTunnelBridge {
   Future<void> stop() async {
     final s = _serverSocket;
     _serverSocket = null;
+    _initialPrefetchTimer?.cancel();
+    _initialPrefetchTimer = null;
     _pendingPrefetchQueue.clear();
     _inFlightSegmentFetches.clear();
     _prefetchedSegmentCache.clear();
@@ -2654,20 +2655,23 @@ class LocalProxyTunnelBridge {
         return;
       }
 
-      // 1. If this request is for a known playlist segment in direct mode,
-      // trigger multi-connection concurrent prefetching immediately.
-      // In proxy mode (!forceDirect), we defer lookahead prefetch until after
-      // the current segment opens/streams so seg[0] gets 100% exclusive proxy
-      // bandwidth for instant first-frame rendering!
+      // 1. Purge any stale queued prefetch tasks outside the active playback window
+      // (e.g. after the user seeks or resumes at a different timestamp).
+      // Defer scheduling lookahead prefetch (`segIndex + 1..N`) until either a cache hit
+      // or after the active segment has streamed its initial keyframe bytes (>= 128KB),
+      // so the segment currently needed by `libmpv` gets 100% exclusive bandwidth!
       final segIndex = _playlistSegmentIndexMap[targetUrl];
-      if (segIndex != null && forceDirect) {
-        _scheduleLookaheadPrefetch(
-          fromIndex: segIndex + 1,
-          count: prefetchLookaheadCount,
-          customHeaders: customHeaders,
-          forceDirect: forceDirect,
-          candidateNodes: candidateNodes,
-        );
+      if (segIndex != null) {
+        _initialPrefetchTimer?.cancel();
+        _initialPrefetchTimer = null;
+        if (_pendingPrefetchQueue.isNotEmpty) {
+          _pendingPrefetchQueue.removeWhere((task) {
+            final idx = _playlistSegmentIndexMap[task.url];
+            return idx == null ||
+                idx <= segIndex ||
+                idx > segIndex + prefetchLookaheadCount;
+          });
+        }
       }
 
       // 2. Check if this segment was already prefetched into memory by our
@@ -2675,10 +2679,10 @@ class LocalProxyTunnelBridge {
       if (rangeHeader == null || rangeHeader.isEmpty) {
         final cached = _prefetchedSegmentCache[targetUrl];
         if (cached != null) {
-          if (segIndex != null && !forceDirect) {
+          if (segIndex != null) {
             _scheduleLookaheadPrefetch(
               fromIndex: segIndex + 1,
-              count: 4,
+              count: forceDirect ? prefetchLookaheadCount : 4,
               customHeaders: customHeaders,
               forceDirect: forceDirect,
               candidateNodes: candidateNodes,
@@ -2701,10 +2705,10 @@ class LocalProxyTunnelBridge {
         if (inFlight != null) {
           final awaited = await inFlight;
           if (awaited != null) {
-            if (segIndex != null && !forceDirect) {
+            if (segIndex != null) {
               _scheduleLookaheadPrefetch(
                 fromIndex: segIndex + 1,
-                count: 2,
+                count: forceDirect ? 4 : 2,
                 customHeaders: customHeaders,
                 forceDirect: forceDirect,
                 candidateNodes: candidateNodes,
@@ -3121,16 +3125,15 @@ class LocalProxyTunnelBridge {
             segmentAccumulator.length + chunk.length <= 8 * 1024 * 1024) {
           segmentAccumulator.add(chunk);
         }
-        if (!forceDirect &&
-            segIndex != null &&
+        if (segIndex != null &&
             !lookaheadTriggeredForProxySeg &&
-            (streamedBytes >= 192 * 1024 ||
+            (streamedBytes >= 256 * 1024 ||
                 (resp.contentLength > 0 &&
                     streamedBytes * 2 >= resp.contentLength))) {
           lookaheadTriggeredForProxySeg = true;
           _scheduleLookaheadPrefetch(
             fromIndex: segIndex + 1,
-            count: 4,
+            count: forceDirect ? 3 : 2,
             customHeaders: customHeaders,
             forceDirect: forceDirect,
             candidateNodes: candidateNodes,
@@ -3168,12 +3171,11 @@ class LocalProxyTunnelBridge {
         }
       }
       if (!clientClosed &&
-          !forceDirect &&
           segIndex != null &&
           !lookaheadTriggeredForProxySeg) {
         _scheduleLookaheadPrefetch(
           fromIndex: segIndex + 1,
-          count: 2,
+          count: forceDirect ? 4 : 2,
           customHeaders: customHeaders,
           forceDirect: forceDirect,
           candidateNodes: candidateNodes,
@@ -3382,54 +3384,6 @@ class LocalProxyTunnelBridge {
       if (resp == null) return null;
       final contentType = resp.headers.value('content-type') ?? 'video/mp2t';
       final totalLen = resp.contentLength;
-      final acceptRanges =
-          resp.headers.value('accept-ranges')?.toLowerCase() ?? '';
-
-      // If segment is large (>= 1.5MB) and server advertises byte-range support,
-      // split the remaining bytes across multiple concurrent Range connections!
-      if (totalLen >= _parallelRangeThresholdBytes &&
-          totalLen <= 10 * 1024 * 1024 &&
-          acceptRanges.contains('bytes')) {
-        await resp.drain<void>().timeout(
-              const Duration(milliseconds: 300),
-              onTimeout: () {},
-            );
-        final chunkSize =
-            (totalLen / _parallelRangeChunkConnections).ceil();
-        final futures = <Future<Uint8List?>>[];
-        for (var part = 0; part < _parallelRangeChunkConnections; part++) {
-          final start = part * chunkSize;
-          if (start >= totalLen) break;
-          final end = min(totalLen - 1, start + chunkSize - 1);
-          futures.add(() async {
-            final partResp = await openPrefetchRequest(
-              byteRange: 'bytes=$start-$end',
-            );
-            if (partResp == null || partResp.statusCode != 206) return null;
-            final bb = BytesBuilder(copy: false);
-            await for (final chunk
-                in partResp.timeout(const Duration(seconds: 12))) {
-              if (chunk.isNotEmpty) {
-                recordDownstreamBytes(chunk.length);
-                bb.add(chunk);
-              }
-            }
-            return bb.takeBytes();
-          }());
-        }
-        final parts = await Future.wait(futures);
-        if (parts.every((p) => p != null)) {
-          final combined = BytesBuilder(copy: false);
-          for (final p in parts) {
-            combined.add(p!);
-          }
-          final bytes = combined.takeBytes();
-          if (bytes.length == totalLen) {
-            _storePrefetchedSegment(url, bytes, contentType);
-            return (bytes: bytes, contentType: contentType);
-          }
-        }
-      }
 
       if (totalLen > 10 * 1024 * 1024) {
         await resp.drain<void>().timeout(
@@ -3509,20 +3463,26 @@ class LocalProxyTunnelBridge {
 
     if (discoveredSegments.isNotEmpty) {
       _registerPlaylistSegments(discoveredSegments);
+      _initialPrefetchTimer?.cancel();
       if (forceDirect) {
-        // In direct mode, immediately launch multi-connection concurrent prefetching
-        // for the initial segments so the player gets instant zero-wait segment hits.
-        _scheduleLookaheadPrefetch(
-          fromIndex: 0,
-          count: prefetchLookaheadCount,
-          customHeaders: headers,
-          forceDirect: forceDirect,
-          candidateNodes: candidateNodes,
-        );
+        // Defer initial segment prefetch by 50ms:
+        // - In real playback, `libmpv` requests `seg[0]` (or `seg[seek]`) within 2-5ms,
+        //   which cancels this timer so `seg[0]` streams chunk-by-chunk directly to `libmpv`
+        //   with 100% exclusive bandwidth (rendering the first keyframe after ~128KB instead
+        //   of waiting for the entire `.ts` file to buffer in `_inFlightSegmentFetches`).
+        // - When pre-warming a playlist without an immediate segment request, this timer
+        //   fires after 50ms and prefetches `seg[0..N]` in parallel.
+        _initialPrefetchTimer = Timer(const Duration(milliseconds: 50), () {
+          _initialPrefetchTimer = null;
+          _scheduleLookaheadPrefetch(
+            fromIndex: 0,
+            count: prefetchLookaheadCount,
+            customHeaders: headers,
+            forceDirect: forceDirect,
+            candidateNodes: candidateNodes,
+          );
+        });
       }
-      // In proxy mode (!forceDirect), do NOT pre-occupy seg[0] in _inFlightSegmentFetches
-      // before libmpv requests seg[0]; let libmpv stream seg[0] chunk-by-chunk directly
-      // with 100% exclusive proxy bandwidth so the first video frame renders immediately!
     }
 
     return sb.toString();

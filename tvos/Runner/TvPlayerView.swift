@@ -117,6 +117,7 @@ struct TvAVPlayerContainer: UIViewControllerRepresentable {
       }
       let asset = AVURLAsset(url: url, options: options)
       let item = AVPlayerItem(asset: asset)
+      item.preferredForwardBufferDuration = request.isLive ? 10 : 45
 
       let titleMeta = AVMutableMetadataItem()
       titleMeta.identifier = .commonIdentifierTitle
@@ -137,6 +138,7 @@ struct TvAVPlayerContainer: UIViewControllerRepresentable {
         avPlayer = AVPlayer(playerItem: item)
         controller.player = avPlayer
       }
+      avPlayer.automaticallyWaitsToMinimizeStalling = false
       self.player = avPlayer
 
       statusObservation = item.observe(\.status, options: [.new]) { [weak self, weak avPlayer, weak controller] observedItem, _ in
