@@ -807,6 +807,7 @@ struct TvVodSectionView: View {
                 TvVodPosterCard(
                   item: item,
                   index: idx,
+                  themeId: appState.themeId,
                   action: {
                     appState.selectedDetailItem = item
                   },
@@ -1243,11 +1244,12 @@ struct TvVodExpandedCategoryDrawerView: View {
 
 /// Apple TV+ Style Featured Hero Showcase Banner (Zero Offscreen Blur Pass)
 struct TvVodHeroBanner: View {
+  @EnvironmentObject var appState: TvAppState
   let item: TvVodItem
   let onOpenDetail: () -> Void
 
   var body: some View {
-    let palette = TvThemePalette.current
+    let palette = appState.activeTheme
     ZStack(alignment: .bottomLeading) {
       LinearGradient(
         colors: [
@@ -1272,18 +1274,24 @@ struct TvVodHeroBanner: View {
           HStack(spacing: 10) {
             Text("今日焦点推荐")
               .font(.system(size: 15, weight: .bold))
+              .foregroundColor(.white)
               .padding(.horizontal, 12)
               .padding(.vertical, 5)
-              .background(Color(red: 0.20, green: 0.60, blue: 0.96))
+              .background(palette.accent)
               .clipShape(Capsule())
 
             if !item.vodRemarks.isEmpty {
               Text(item.vodRemarks)
-                .font(.system(size: 15, weight: .semibold))
+                .font(.system(size: 15, weight: .bold))
+                .foregroundColor(palette.accentHover)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 5)
-                .background(Color.white.opacity(0.16))
+                .background(Color(red: 0.06, green: 0.07, blue: 0.10).opacity(0.88))
                 .clipShape(Capsule())
+                .overlay(
+                  Capsule()
+                    .stroke(palette.accent.opacity(0.55), lineWidth: 1)
+                )
             }
 
             if !item.typeName.isEmpty {
@@ -1331,15 +1339,17 @@ struct TvVodHeroBanner: View {
   }
 }
 
-/// Native Apple TV .card Poster Item (Decoupled from @EnvironmentObject so focus navigation triggers zero global rebuilds!)
+/// Native Apple TV .card Poster Item (Decoupled from @EnvironmentObject so focus navigation triggers zero global rebuilds, while reacting to themeId changes!)
 struct TvVodPosterCard: View {
   @Environment(\.isFocused) private var isFocused
   let item: TvVodItem
   let index: Int
+  var themeId: String = TvThemePalette.current.id
   let action: () -> Void
   let onFocusedAtIndex: (Int) -> Void
 
   var body: some View {
+    let palette = TvThemePalette.palette(for: themeId)
     Button(action: action) {
       VStack(alignment: .leading, spacing: 10) {
         ZStack(alignment: .bottomLeading) {
@@ -1357,13 +1367,17 @@ struct TvVodPosterCard: View {
           HStack {
             if !item.vodRemarks.isEmpty {
               Text(item.vodRemarks)
-                .font(.caption2)
-                .fontWeight(.semibold)
-                .foregroundColor(.white)
-                .padding(.horizontal, 9)
+                .font(.system(size: 14, weight: .bold))
+                .foregroundColor(palette.accentHover)
+                .lineLimit(1)
+                .padding(.horizontal, 10)
                 .padding(.vertical, 4)
-                .background(Color.black.opacity(0.75))
+                .background(Color(red: 0.06, green: 0.07, blue: 0.10).opacity(0.88))
                 .clipShape(Capsule())
+                .overlay(
+                  Capsule()
+                    .stroke(palette.accent.opacity(0.55), lineWidth: 1)
+                )
             }
             Spacer()
             if !item.vodYear.isEmpty {
@@ -1608,23 +1622,21 @@ struct TvVodDetailSheetView: View {
                     .lineLimit(2)
                     .shadow(color: .black.opacity(0.6), radius: 12, y: 4)
 
-                  // 网易爆米花 Metadata Badges Row (Amber Score/Remark + 4K/M3U8 Tag + Year/Area/Genre)
+                  // 网易爆米花 Metadata Badges Row (Theme-Colored Remark + 4K/M3U8 Tag + Year/Area/Genre)
                   HStack(spacing: 12) {
                     if !d.vodRemarks.isEmpty {
                       Text(d.vodRemarks)
                         .font(.system(size: 16, weight: .bold))
-                        .foregroundColor(Color(red: 0.08, green: 0.06, blue: 0.02))
+                        .foregroundColor(appState.activeTheme.accentHover)
                         .padding(.horizontal, 14)
                         .padding(.vertical, 6)
                         .background(
                           Capsule()
-                            .fill(
-                              LinearGradient(
-                                colors: [Color(red: 1.0, green: 0.80, blue: 0.28), Color(red: 0.96, green: 0.62, blue: 0.12)],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                              )
-                            )
+                            .fill(Color(red: 0.06, green: 0.07, blue: 0.10).opacity(0.88))
+                        )
+                        .overlay(
+                          Capsule()
+                            .stroke(appState.activeTheme.accent.opacity(0.60), lineWidth: 1.2)
                         )
                     }
 
@@ -1830,11 +1842,11 @@ struct TvVodDetailSheetView: View {
                                 .foregroundColor(.white)
                                 .lineLimit(1)
                               Text(alt.vodRemarks.isEmpty ? "正片" : alt.vodRemarks)
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundColor(.white.opacity(0.72))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.white.opacity(0.10))
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundColor(appState.activeTheme.accentHover)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2.5)
+                                .background(appState.activeTheme.accent.opacity(0.16))
                                 .clipShape(Capsule())
                                 .lineLimit(1)
                             }
@@ -5949,19 +5961,50 @@ struct TvFavoritesHistorySectionView: View {
                     )
                   }
                 } label: {
+                  let remarkLabel = lib.episode.isEmpty ? lib.remark : lib.episode
                   VStack(alignment: .leading, spacing: 8) {
-                    TvRemoteImage(rawUrl: lib.poster, placeholderIcon: "film", contentMode: .fill)
-                      .frame(width: 245, height: 348)
-                      .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    ZStack(alignment: .bottomLeading) {
+                      TvRemoteImage(rawUrl: lib.poster, placeholderIcon: "film", contentMode: .fill)
+                        .frame(width: 245, height: 348)
+                        .clipped()
+
+                      LinearGradient(
+                        colors: [.clear, Color.black.opacity(0.84)],
+                        startPoint: .center,
+                        endPoint: .bottom
+                      )
+                      .frame(height: 96)
+
+                      if !remarkLabel.isEmpty {
+                        HStack {
+                          Text(remarkLabel)
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundColor(appState.activeTheme.accentHover)
+                            .lineLimit(1)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 4)
+                            .background(Color(red: 0.06, green: 0.07, blue: 0.10).opacity(0.88))
+                            .clipShape(Capsule())
+                            .overlay(
+                              Capsule()
+                                .stroke(appState.activeTheme.accent.opacity(0.55), lineWidth: 1)
+                            )
+                          Spacer()
+                        }
+                        .padding(12)
+                      }
+                    }
+                    .frame(width: 245, height: 348)
+                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
 
                     Text(lib.title)
                       .font(.headline)
                       .foregroundColor(.white)
                       .lineLimit(1)
 
-                    Text("\(lib.sourceName) · \(lib.episode.isEmpty ? lib.remark : lib.episode)")
+                    Text("\(lib.sourceName) · \(remarkLabel)")
                       .font(.caption)
-                      .foregroundColor(.white.opacity(0.62))
+                      .foregroundColor(appState.activeTheme.accentHover.opacity(0.88))
                       .lineLimit(1)
                   }
                   .frame(width: 245)
