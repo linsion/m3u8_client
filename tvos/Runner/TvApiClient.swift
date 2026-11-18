@@ -174,10 +174,6 @@ final class TvFlvToTsRemuxer {
 
   func feedFlvTag(tagType: UInt8, dtsMs: Int64, body: Data, onSegmentReady: (Data, Double) -> Void) {
     guard body.count >= 2 else { return }
-    if baseDts90k < 0 {
-      baseDts90k = dtsMs * 90
-    }
-    let relDts90k = max(0, dtsMs * 90 - baseDts90k) + 90_000
 
     if tagType == 8 {
       let soundFmt = (body[0] >> 4) & 0x0F
@@ -191,7 +187,8 @@ final class TvFlvToTsRemuxer {
         if adtsChanCfg == 0 { adtsChanCfg = 2 }
         adtsProfile = (objType == 5 || objType == 29) ? 1 : max(0, min(3, objType - 1))
         hasAudioConfig = true
-      } else if pktType == 1, hasAudioConfig, body.count > 2, currentSegmentStartDts >= 0 {
+      } else if pktType == 1, hasAudioConfig, body.count > 2, currentSegmentStartDts >= 0, baseDts90k >= 0 {
+        let relDts90k = max(currentSegmentStartDts, dtsMs * 90 - baseDts90k + 90_000)
         let rawAac = body.subdata(in: 2..<body.count)
         let frameLen = rawAac.count + 7
         var adts = Data(count: 7)
@@ -214,7 +211,6 @@ final class TvFlvToTsRemuxer {
       let pktType = body[1]
       var cts = (Int(body[2]) << 16) | (Int(body[3]) << 8) | Int(body[4])
       if (cts & 0x800000) != 0 { cts -= 0x1000000 }
-      let relPts90k = max(0, relDts90k + Int64(cts) * 90)
 
       if pktType == 0, body.count >= 11 {
         nalLengthSize = Int(body[9] & 0x03) + 1
@@ -249,21 +245,32 @@ final class TvFlvToTsRemuxer {
         }
       } else if pktType == 1, body.count > 5, !spsPpsAnnexB.isEmpty {
         let isKeyframe = (frameType == 1)
-        if isKeyframe {
-          if currentSegmentStartDts >= 0 {
-            let durSec = Double(relDts90k - currentSegmentStartDts) / 90_000.0
-            if durSec >= 1.5 && !currentSegment.isEmpty {
-              onSegmentReady(currentSegment, durSec)
-              resetSegment(atDts: relDts90k)
-            }
-          } else {
+        let rawDts90k = dtsMs * 90
+        // Initialize baseDts90k ONLY on the first real video keyframe (sequence headers often have dtsMs=0 while live frames start at 46,000,000+ ms)
+        if baseDts90k < 0 {
+          guard isKeyframe else { return }
+          baseDts90k = rawDts90k
+        } else if rawDts90k < baseDts90k {
+          baseDts90k = rawDts90k
+        }
+        let relDts90k = max(0, rawDts90k - baseDts90k) + 90_000
+        let relPts90k = max(0, relDts90k + Int64(cts) * 90)
+
+        if currentSegmentStartDts < 0 {
+          guard isKeyframe else { return }
+          resetSegment(atDts: relDts90k)
+        } else {
+          let durSec = Double(relDts90k - currentSegmentStartDts) / 90_000.0
+          // Emit ~2.0s TS segments even when Douyu/Huya Together-Watch uses 8s–10s GOPs so AVPlayer starts playback in ~1.5s without timing out
+          if ((isKeyframe && durSec >= 1.2) || durSec >= 2.0) && !currentSegment.isEmpty {
+            onSegmentReady(currentSegment, durSec)
             resetSegment(atDts: relDts90k)
           }
         }
         guard currentSegmentStartDts >= 0 else { return }
 
         var annexB = Data([0x00, 0x00, 0x00, 0x01, 0x09, 0xF0]) // H.264 AUD
-        if isKeyframe {
+        if isKeyframe || currentSegment.count <= 376 {
           annexB.append(spsPpsAnnexB)
         }
         var pos = 5
@@ -459,28 +466,76 @@ final class TvLiveFlvSession: NSObject, URLSessionDataDelegate, @unchecked Senda
   private var buffer = Data()
   private var cursor = 0
   private var headerSkipped = false
-  private let remuxer = TvFlvToTsRemuxer()
+  private var remuxer = TvFlvToTsRemuxer()
   private var segments: [(seq: Int, dur: Double, data: Data)] = []
   private var nextSeq = 1
   private var task: URLSessionDataTask?
   private var session: URLSession?
   private var isStopped = false
+  private var initialUrl: URL?
+  private var initialHeaders: [String: String] = [:]
+  private var fallbackUrl: URL?
+  private var fallbackHeaders: [String: String] = [:]
+  private var retryCount = 0
 
-  func start(url: URL, headers: [String: String]) {
+  func start(
+    url: URL,
+    headers: [String: String],
+    fallbackUrl: URL? = nil,
+    fallbackHeaders: [String: String] = [:]
+  ) {
+    lock.lock()
+    self.initialUrl = url
+    self.initialHeaders = headers
+    self.fallbackUrl = fallbackUrl
+    self.fallbackHeaders = fallbackHeaders
+    self.retryCount = 0
+    lock.unlock()
+    launchRequest(url: url, headers: headers)
+  }
+
+  private func launchRequest(url: URL, headers: [String: String]) {
     let cfg = URLSessionConfiguration.ephemeral
     cfg.timeoutIntervalForRequest = 14
     cfg.timeoutIntervalForResource = 7200
     cfg.httpShouldSetCookies = true
     let sess = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
-    self.session = sess
     var req = URLRequest(url: url)
     req.httpMethod = "GET"
     for (k, v) in headers where !v.isEmpty {
       req.setValue(v, forHTTPHeaderField: k)
     }
     let t = sess.dataTask(with: req)
+    lock.lock()
+    guard !isStopped else {
+      lock.unlock()
+      sess.invalidateAndCancel()
+      return
+    }
+    let oldTask = self.task
+    let oldSess = self.session
+    self.buffer.removeAll(keepingCapacity: true)
+    self.cursor = 0
+    self.headerSkipped = false
     self.task = t
+    self.session = sess
+    lock.unlock()
+    oldTask?.cancel()
+    oldSess?.invalidateAndCancel()
     t.resume()
+  }
+
+  private func scheduleRetryLocked() {
+    guard !isStopped, retryCount < 2 else { return }
+    retryCount += 1
+    let attempt = retryCount
+    let useFallback = (attempt >= 2 && fallbackUrl != nil && fallbackUrl != initialUrl)
+    guard let nextUrl = useFallback ? fallbackUrl : initialUrl else { return }
+    let nextHeaders = useFallback ? fallbackHeaders : initialHeaders
+    DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.15) { [weak self] in
+      guard let self else { return }
+      self.launchRequest(url: nextUrl, headers: nextHeaders)
+    }
   }
 
   func stop() {
@@ -522,17 +577,61 @@ final class TvLiveFlvSession: NSObject, URLSessionDataDelegate, @unchecked Senda
     }
   }
 
+  func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    willPerformHTTPRedirection response: HTTPURLResponse,
+    newRequest request: URLRequest,
+    completionHandler: @escaping (URLRequest?) -> Void
+  ) {
+    var req = request
+    lock.lock()
+    let ua = initialHeaders["User-Agent"] ?? initialHeaders["user-agent"] ?? ""
+    lock.unlock()
+    if !ua.isEmpty {
+      req.setValue(ua, forHTTPHeaderField: "User-Agent")
+    }
+    completionHandler(req)
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    dataTask: URLSessionDataTask,
+    didReceive response: URLResponse,
+    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+  ) {
+    if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
+      completionHandler(.cancel)
+      lock.lock()
+      if dataTask === self.task {
+        scheduleRetryLocked()
+      }
+      lock.unlock()
+      return
+    }
+    completionHandler(.allow)
+  }
+
+  func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+    guard error != nil else { return }
+    lock.lock()
+    if task === self.task, segments.isEmpty {
+      scheduleRetryLocked()
+    }
+    lock.unlock()
+  }
+
   func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
     TvNetworkSpeedMonitor.shared.recordDownstreamBytes(data.count)
     lock.lock()
     defer { lock.unlock() }
-    guard !isStopped else { return }
+    guard !isStopped, dataTask === self.task else { return }
     buffer.append(data)
     if !headerSkipped {
       if buffer.count - cursor >= 13 {
         guard buffer[cursor] == 0x46, buffer[cursor + 1] == 0x4C, buffer[cursor + 2] == 0x56 else {
-          isStopped = true
           dataTask.cancel()
+          scheduleRetryLocked()
           return
         }
         let h0 = Int(buffer[cursor + 5]) << 24
@@ -561,8 +660,8 @@ final class TvLiveFlvSession: NSObject, URLSessionDataDelegate, @unchecked Senda
         let seq = self.nextSeq
         self.nextSeq += 1
         self.segments.append((seq: seq, dur: dur, data: segData))
-        if self.segments.count > 6 {
-          self.segments.removeFirst(self.segments.count - 6)
+        if self.segments.count > 8 {
+          self.segments.removeFirst(self.segments.count - 8)
         }
       }
     }
@@ -660,14 +759,20 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     return "http://127.0.0.1:\(port)/live.m3u8?gen=\(gen)"
   }
 
-  func prepareFlvProxyPlaylistUrl(targetUrl: String, headers: [String: String]) async -> String? {
+  func prepareFlvProxyPlaylistUrl(
+    targetUrl: String,
+    headers: [String: String],
+    fallbackUrl: String = "",
+    fallbackHeaders: [String: String] = [:]
+  ) async -> String? {
     startListenerIfNeeded()
     for _ in 0..<25 {
       if port > 0 { break }
       try? await Task.sleep(nanoseconds: 10_000_000)
     }
     guard port > 0, let u = URL(string: targetUrl) else { return nil }
-    let gen = startNewFlvSession(url: u, headers: headers)
+    let fbUrl = fallbackUrl.isEmpty ? nil : URL(string: fallbackUrl)
+    let gen = startNewFlvSession(url: u, headers: headers, fallbackUrl: fbUrl, fallbackHeaders: fallbackHeaders)
     return "http://127.0.0.1:\(port)/flv_live.m3u8?gen=\(gen)"
   }
 
@@ -724,7 +829,12 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     tgVideoMetaCache[targetUrl] = resolved
   }
 
-  private func startNewFlvSession(url: URL, headers: [String: String]) -> Int {
+  private func startNewFlvSession(
+    url: URL,
+    headers: [String: String],
+    fallbackUrl: URL? = nil,
+    fallbackHeaders: [String: String] = [:]
+  ) -> Int {
     flvLock.lock()
     let old = activeFlvSession
     activeFlvGeneration &+= 1
@@ -733,7 +843,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     activeFlvSession = flvSess
     flvLock.unlock()
     old?.stop()
-    flvSess.start(url: url, headers: headers)
+    flvSess.start(url: url, headers: headers, fallbackUrl: fallbackUrl, fallbackHeaders: fallbackHeaders)
     return gen
   }
 
@@ -794,7 +904,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
         sendResponse(conn: conn, status: "404 Not Found", contentType: "text/plain", body: Data(), isHead: method == "HEAD")
         return
       }
-      for _ in 0..<75 {
+      for _ in 0..<120 {
         if !flvSession.snapshotSegments().isEmpty { break }
         try? await Task.sleep(nanoseconds: 100_000_000)
       }
@@ -2675,8 +2785,12 @@ final class TvApiClient {
     var chosenRawUrl = channel.urls.isEmpty ? "" : channel.urls[safeIdx]
     var split = Self.splitUrlAndInlineHeaders(chosenRawUrl)
 
-    func buildHeaders(for inlineHeaders: [String: String]) -> [String: String] {
-      var h: [String: String] = ["User-Agent": "okhttp/3.15"]
+    func buildHeaders(for inlineHeaders: [String: String], urlHint: String) -> [String: String] {
+      let lowerUrl = urlHint.lowercased()
+      let defaultUa = (lowerUrl.contains("ottiptv.cc") || lowerUrl.contains("/douyu/") || lowerUrl.contains("/huya/") || lowerUrl.contains("/yy/"))
+        ? "okHttp/Mod-1.5.0.0"
+        : "okhttp/3.15"
+      var h: [String: String] = ["User-Agent": defaultUa]
       if let src = source {
         for (k, v) in src.defaultHeaders where !v.isEmpty { h[k] = v }
       }
@@ -2685,7 +2799,7 @@ final class TvApiClient {
       return h
     }
 
-    var mergedHeaders = buildHeaders(for: split.headers)
+    var mergedHeaders = buildHeaders(for: split.headers, urlHint: split.cleanUrl)
     var directCleanUrl = split.cleanUrl
     let lowerInitial = directCleanUrl.lowercased()
     let isKnownFlvGateway = lowerInitial.contains("/douyu/")
@@ -2705,7 +2819,7 @@ final class TvApiClient {
           let cRaw = channel.urls[cIdx]
           let cSplit = Self.splitUrlAndInlineHeaders(cRaw)
           if cSplit.cleanUrl.lowercased().contains(".m3u8") && !cSplit.cleanUrl.contains("://[") {
-            candidates.append((cIdx, cSplit.cleanUrl, buildHeaders(for: cSplit.headers), cRaw))
+            candidates.append((cIdx, cSplit.cleanUrl, buildHeaders(for: cSplit.headers, urlHint: cSplit.cleanUrl), cRaw))
             if candidates.count >= 3 { break }
           }
         }
@@ -2758,15 +2872,16 @@ final class TvApiClient {
     }
 
     let lowerPath = (URL(string: directCleanUrl)?.path ?? "").lowercased()
-    let isAlreadyMediaStream = lowerPath.hasSuffix(".m3u8")
+    let isAlreadyMediaStream = isKnownFlvGateway
+      || lowerPath.hasSuffix(".m3u8")
       || lowerPath.hasSuffix(".ts")
       || lowerPath.hasSuffix(".flv")
       || lowerPath.contains(".m3u8/")
       || lowerPath.contains("/pltv/")
       || directCleanUrl.contains("://[")
 
-    // If it's a non-media gateway URL (e.g. .php?id=..., /douyu/..., /huya/...) or forceServerRelay is requested, check /api/tvbox/live/play
-    if (!isAlreadyMediaStream || forceServerRelay), let src = source, !src.isCustom {
+    // If it's a non-media gateway URL (e.g. .php?id=...) or forceServerRelay is requested for non-FLV streams, check /api/tvbox/live/play
+    if !isKnownFlvGateway && (!isAlreadyMediaStream || forceServerRelay), let src = source, !src.isCustom {
       let query = [
         URLQueryItem(name: "tvbox_source", value: String(src.sourceIndex)),
         URLQueryItem(name: "tvbox_live", value: String(src.liveIndex)),
@@ -2793,18 +2908,23 @@ final class TvApiClient {
     let isFlvStream = isKnownFlvGateway || directCleanUrl.lowercased().contains(".flv")
 
     if isFlvStream {
-      let flvTarget = forceServerRelay ? proxyUrl : split.cleanUrl
-      let flvHeaders = forceServerRelay ? authHeaders : mergedHeaders
+      let preferDirectFlv = !forceServerRelay
+      let flvTarget = preferDirectFlv ? split.cleanUrl : proxyUrl
+      let flvHeaders = preferDirectFlv ? mergedHeaders : authHeaders
+      let flvFallback = preferDirectFlv ? proxyUrl : split.cleanUrl
+      let flvFallbackHeaders = preferDirectFlv ? authHeaders : mergedHeaders
       if let localFlvHlsUrl = await TvLocalHlsProxyServer.shared.prepareFlvProxyPlaylistUrl(
         targetUrl: flvTarget,
-        headers: flvHeaders
+        headers: flvHeaders,
+        fallbackUrl: flvFallback,
+        fallbackHeaders: flvFallbackHeaders
       ) {
         return TvResolvedPlayback(
           directUrl: localFlvHlsUrl,
-          serverProxyUrl: proxyUrl,
+          serverProxyUrl: localFlvHlsUrl,
           headers: mergedHeaders,
-          parseVia: forceServerRelay ? "服务端代理+FLV转封装" : "本地FLV实时转封装",
-          backendProxyPlayback: forceServerRelay
+          parseVia: preferDirectFlv ? "本地FLV实时转封装" : "服务端代理+FLV转封装",
+          backendProxyPlayback: !preferDirectFlv
         )
       }
     }

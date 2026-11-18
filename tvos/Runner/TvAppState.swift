@@ -2994,7 +2994,7 @@ final class TvAppState: ObservableObject {
 
   /// Returns true ONLY when the scenario explicitly requests Server Relay (`/api/vod/proxy`)
   func shouldUseServerRelay(for scenario: TvRequestScenario) -> Bool {
-    resolveEffectiveRoute(for: scenario) == .serverRelay
+    rule(for: scenario).mode == .serverRelay
   }
 
   /// Builds the concise status badge text for video player proxy selector buttons (matching `VideoProxyNodeSelector._buildTriggerContent`)

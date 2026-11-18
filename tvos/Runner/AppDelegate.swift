@@ -2225,8 +2225,9 @@ final class TvLiveStreamController: ObservableObject {
       )
       guard currentSession == self.sessionId else { return }
 
-      let targetUrl = usingProxyFallback ? resolved.serverProxyUrl : resolved.directUrl
-      let headers: [String: String] = usingProxyFallback
+      let targetUrl = resolved.directUrl.isEmpty ? resolved.serverProxyUrl : resolved.directUrl
+      let isLocalHlsProxy = targetUrl.contains("127.0.0.1:")
+      let headers: [String: String] = (usingProxyFallback && !isLocalHlsProxy)
         ? appState.api.authHeaders
         : resolved.headers
 
@@ -2276,7 +2277,8 @@ final class TvLiveStreamController: ObservableObject {
     attemptStartedAt = Date()
     didAdvanceCurrentAttempt = false
 
-    let assetHeaders = isProxyAttempt ? appState.api.authHeaders : headers
+    let isLocalProxy = trimmedUrl.contains("127.0.0.1:")
+    let assetHeaders = (isProxyAttempt && !isLocalProxy) ? appState.api.authHeaders : headers
     let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": assetHeaders])
     let item = AVPlayerItem(asset: asset)
     item.preferredForwardBufferDuration = 1.5
