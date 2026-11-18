@@ -5236,7 +5236,6 @@ class ProxyRoutingService extends ChangeNotifier {
         .where((n) => n.enabled && n.isSupportedByClientTunnel && n.isReachable)
         .toList()
       ..sort((a, b) => a.effectiveScore.compareTo(b.effectiveScore));
-    if (reachable.length >= 6) return reachable;
     final untested = _nodes
         .where(
           (n) =>
@@ -5245,9 +5244,16 @@ class ProxyRoutingService extends ChangeNotifier {
               !n.isReachable &&
               !n.isTimeout,
         )
-        .take(6)
         .toList();
-    return [...reachable, ...untested];
+    final timedOut = _nodes
+        .where(
+          (n) =>
+              !n.isInfoNode &&
+              !n.isReachable &&
+              n.isTimeout,
+        )
+        .toList();
+    return [...reachable, ...untested, ...timedOut];
   }
 
   /// Returns true if [node] is currently reachable and not failing consecutively.
@@ -5267,13 +5273,28 @@ class ProxyRoutingService extends ChangeNotifier {
   }
 
   void _ensureAutoSelectedNodeLocked() {
-    final supportedEnabled = _nodes
+    final allSelectable = _nodes.where((n) => !n.isInfoNode).toList();
+    if (allSelectable.isEmpty) return;
+
+    if (_selectionMode == ProxySelectionMode.manual) {
+      if (_selectedNodeId != null &&
+          _selectedNodeId!.isNotEmpty &&
+          allSelectable.any((n) => n.id == _selectedNodeId)) {
+        return;
+      }
+      final supported = allSelectable
+          .where((n) => n.enabled && n.isSupportedByClientTunnel)
+          .toList();
+      final fallbackList = supported.isNotEmpty ? supported : allSelectable;
+      _selectedNodeId = (fastestNode ?? fallbackList.first).id;
+      return;
+    }
+
+    final supportedEnabled = allSelectable
         .where((n) => n.enabled && n.isSupportedByClientTunnel)
         .toList();
-    final enabledNodes = supportedEnabled.isNotEmpty
-        ? supportedEnabled
-        : _nodes.where((n) => n.enabled && !n.isInfoNode).toList();
-    if (enabledNodes.isEmpty) return;
+    final enabledNodes =
+        supportedEnabled.isNotEmpty ? supportedEnabled : allSelectable;
 
     ProxyNode? currentSelected;
     if (_selectedNodeId != null && _selectedNodeId!.isNotEmpty) {
@@ -5284,19 +5305,14 @@ class ProxyRoutingService extends ChangeNotifier {
         }
       }
     }
-    if (_selectionMode == ProxySelectionMode.manual) {
-      if (currentSelected == null) {
-        _selectedNodeId = (fastestNode ?? enabledNodes.first).id;
-      }
-      return;
-    }
     if (currentSelected != null && isNodeHealthyAndSmooth(currentSelected)) {
       return;
     }
     final fastest = fastestNode;
     if (fastest != null) {
       _selectedNodeId = fastest.id;
-    } else if (currentSelected == null || !currentSelected.isSupportedByClientTunnel) {
+    } else if (currentSelected == null ||
+        !currentSelected.isSupportedByClientTunnel) {
       _selectedNodeId = enabledNodes.first.id;
     }
   }
@@ -5609,14 +5625,24 @@ class ProxyRoutingService extends ChangeNotifier {
     }
 
     if (isProxy) {
-      // Probe strictly through the proxy tunnel (never falling back to local direct network!)
-      final candidates = <ProxyNode>[
-        if (node.isSupportedByClientTunnel) node,
-        ..._resolveCandidateFallbackNodes().where(
-          (n) => n.id != node.id,
-        ),
-      ];
+      final rule = _scenarioRules[scenario];
+      final isManualLock = _selectionMode == ProxySelectionMode.manual ||
+          (rule?.specificNodeId != null && rule!.specificNodeId!.isNotEmpty);
+
+      // In manual mode (or when a specific node is locked to this scenario),
+      // probe ONLY the user-selected node and never auto-switch back to another node!
+      final candidates = isManualLock
+          ? <ProxyNode>[node]
+          : <ProxyNode>[
+              if (node.isSupportedByClientTunnel) node,
+              ..._resolveCandidateFallbackNodes().where(
+                (n) => n.id != node.id,
+              ),
+            ];
       for (final candidate in candidates.take(4)) {
+        if (!candidate.isSupportedByClientTunnel) {
+          continue;
+        }
         await _ensureBridgeForNode(candidate);
         final proxyHc = _localBridge._getOrCreateStreamRelayHttpClient(
           candidate,
@@ -5628,15 +5654,14 @@ class ProxyRoutingService extends ChangeNotifier {
             success: true,
             rttMs: rttMs,
           );
-          if (candidate.id != effectiveNode!.id) {
+          if (!isManualLock && candidate.id != effectiveNode!.id) {
             effectiveNode = candidate;
             final resolvedHost =
                 await LocalProxyTunnelBridge.resolveRealEntryIp(
               candidate.server,
             );
             entryIp = '$resolvedHost:${candidate.port}';
-            if (_selectionMode == ProxySelectionMode.autoFastest ||
-                !node.isSupportedByClientTunnel) {
+            if (_selectionMode == ProxySelectionMode.autoFastest) {
               _selectedNodeId = candidate.id;
               notifyListeners();
             }
@@ -5721,15 +5746,30 @@ class ProxyRoutingService extends ChangeNotifier {
   /// as long as it is healthy and smooth (`isNodeHealthyAndSmooth`), and only switches
   /// to [fastestNode] when the current node is unset, lagging, or unreachable.
   ProxyNode? get activeNode {
-    final supportedEnabled = _nodes
+    final allSelectable = _nodes.where((n) => !n.isInfoNode).toList();
+    if (allSelectable.isEmpty) {
+      return _nodes.isEmpty ? null : _nodes.first;
+    }
+
+    // In manual mode: always respect the exact node the user selected (even if it previously timed out)
+    if (_selectionMode == ProxySelectionMode.manual &&
+        _selectedNodeId != null &&
+        _selectedNodeId!.isNotEmpty) {
+      for (final n in allSelectable) {
+        if (n.id == _selectedNodeId) {
+          return n;
+        }
+      }
+    }
+
+    final supportedEnabled = allSelectable
         .where((n) => n.enabled && n.isSupportedByClientTunnel)
         .toList();
     final enabledNodes = supportedEnabled.isNotEmpty
         ? supportedEnabled
-        : _nodes.where((n) => n.enabled && !n.isInfoNode).toList();
+        : allSelectable.where((n) => n.enabled).toList();
     if (enabledNodes.isEmpty) {
-      final fallbackAll = _nodes.where((n) => n.enabled).toList();
-      return fallbackAll.isEmpty ? null : fallbackAll.first;
+      return allSelectable.first;
     }
 
     ProxyNode? currentSelected;
@@ -5764,7 +5804,7 @@ class ProxyRoutingService extends ChangeNotifier {
     final rule = _scenarioRules[scenario];
     if (rule?.specificNodeId != null && rule!.specificNodeId!.isNotEmpty) {
       for (final n in _nodes) {
-        if (n.id == rule.specificNodeId && n.enabled) {
+        if (n.id == rule.specificNodeId && !n.isInfoNode) {
           return n;
         }
       }
@@ -6205,6 +6245,27 @@ class ProxyRoutingService extends ChangeNotifier {
     bool switchToManual = true,
   }) async {
     _selectedNodeId = nodeId;
+    _nodeFailureStreaks[nodeId] = 0;
+
+    // Ensure the manually selected node is enabled
+    final idx = _nodes.indexWhere((n) => n.id == nodeId);
+    if (idx >= 0 && !_nodes[idx].enabled) {
+      _nodes[idx] = _nodes[idx].copyWith(enabled: true);
+    }
+
+    // Synchronize any scenario rules that had an older specificNodeId pinned
+    var rulesUpdated = false;
+    for (final s in RequestScenario.values) {
+      final r = _scenarioRules[s];
+      if (r != null &&
+          r.specificNodeId != null &&
+          r.specificNodeId!.isNotEmpty &&
+          r.specificNodeId != nodeId) {
+        _scenarioRules[s] = r.copyWith(specificNodeId: nodeId);
+        rulesUpdated = true;
+      }
+    }
+
     _resetAllBridgeSessionCaches();
     if (switchToManual) {
       _selectionMode = ProxySelectionMode.manual;
@@ -6222,11 +6283,14 @@ class ProxyRoutingService extends ChangeNotifier {
         ? '已切换代理节点：${node.displayTitle} (${node.protocolBadge}$speedSuffix)'
         : '已更新选中节点';
     notifyListeners();
-    // Verify real tunnel connectivity & throughput in background if untested
+    // Verify real tunnel connectivity & throughput in background if untested or previously timed out
     if (node != null && (node.latencyMs == null || node.latencyMs! <= 0)) {
       unawaited(testSingleNodeLatency(node.id));
     }
     try {
+      if (rulesUpdated) {
+        await _persistScenarioRules();
+      }
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString(_prefSelectedNodeIdKey, nodeId);
       if (switchToManual) {

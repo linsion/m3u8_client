@@ -1565,7 +1565,7 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
       borderRadius: BorderRadius.circular(8),
       onTap: () => _proxySvc.selectNode(
         node.id,
-        switchToManual: _proxySvc.selectionMode == ProxySelectionMode.manual,
+        switchToManual: true,
       ),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 160),

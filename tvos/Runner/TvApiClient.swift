@@ -179,7 +179,7 @@ final class TvLocalProxyTunnelServer: @unchecked Sendable {
 
   func configure(node: TvSubscriptionNode?, enabled: Bool) {
     startListenerIfNeeded()
-    let parsed = (node?.isSupportedByClientTunnel == true) ? node.map { Self.parseCredentials(from: $0) } : nil
+    let parsed = node.map { Self.parseCredentials(from: $0) }
     lock.lock()
     self.activeNode = node
     self.activeCreds = parsed

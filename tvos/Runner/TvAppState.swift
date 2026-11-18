@@ -2525,11 +2525,15 @@ final class TvAppState: ObservableObject {
   /// Currently active global proxy node (respecting `autoFastest` vs `manual`)
   var activeProxyNode: TvSubscriptionNode? {
     let pool = activePoolNodes
-    guard !pool.isEmpty else { return nil }
+    guard !pool.isEmpty else { return subscriptionNodes.first }
     if proxySelectionMode == .manual,
-       !selectedProxyNodeId.isEmpty,
-       let matched = pool.first(where: { $0.id == selectedProxyNodeId && $0.isSupportedByClientTunnel }) {
-      return matched
+       !selectedProxyNodeId.isEmpty {
+      if let matched = pool.first(where: { $0.id == selectedProxyNodeId }) {
+        return matched
+      }
+      if let anyMatched = subscriptionNodes.first(where: { $0.id == selectedProxyNodeId }) {
+        return anyMatched
+      }
     }
     if let fastest = fastestProxyNode {
       return fastest
@@ -2562,37 +2566,45 @@ final class TvAppState: ObservableObject {
     }
   }
 
-  func selectManualNode(_ nodeId: String) {
-    guard let node = subscriptionNodes.first(where: { $0.id == nodeId }) else { return }
+  private func syncManualNodeSelectionAcrossRules(_ node: TvSubscriptionNode) {
     selectedProxyNodeId = node.id
     proxySelectionMode = .manual
     proxyEnabled = true
+    if let subIdx = subscriptions.firstIndex(where: { $0.id == node.subscriptionId }), !subscriptions[subIdx].enabled {
+      subscriptions[subIdx].enabled = true
+    }
+    for sc in TvRequestScenario.allCases {
+      if var r = scenarioRules[sc], let spec = r.specificNodeId, !spec.isEmpty, spec != node.id {
+        r.specificNodeId = node.id
+        scenarioRules[sc] = r
+      }
+    }
+    TvLocalProxyTunnelServer.shared.configure(node: node, enabled: true)
     persistProxyState()
+  }
+
+  func selectManualNode(_ nodeId: String) {
+    guard let node = subscriptionNodes.first(where: { $0.id == nodeId }) else { return }
+    syncManualNodeSelectionAcrossRules(node)
     Task {
-      let ms = node.isSupportedByClientTunnel
-        ? await Self.tcpPing(host: node.host, port: node.port)
-        : 9999
+      let ms = await Self.tcpPing(host: node.host, port: node.port)
       if let idx = subscriptionNodes.firstIndex(where: { $0.id == node.id }) {
         subscriptionNodes[idx].latencyMs = ms
         persistProxyState()
       }
-      let latStr = ms >= 9999 ? (node.isSupportedByClientTunnel ? "超时" : "协议暂不支持") : "\(ms) ms"
+      let latStr = ms >= 9999 ? "超时" : "\(ms) ms"
       showToast("🎯 已锁定代理节点：\(node.displayTitle) (\(latStr))")
     }
   }
 
   func selectAndTestProxyNode(_ node: TvSubscriptionNode) async {
-    selectedProxyNodeId = node.id
-    proxySelectionMode = .manual
-    proxyEnabled = true
-    let ms = node.isSupportedByClientTunnel
-      ? await Self.tcpPing(host: node.host, port: node.port)
-      : 9999
+    syncManualNodeSelectionAcrossRules(node)
+    let ms = await Self.tcpPing(host: node.host, port: node.port)
     if let idx = subscriptionNodes.firstIndex(where: { $0.id == node.id }) {
       subscriptionNodes[idx].latencyMs = ms
     }
     persistProxyState()
-    let latStr = ms >= 9999 ? (node.isSupportedByClientTunnel ? "超时" : "协议暂不支持") : "\(ms) ms"
+    let latStr = ms >= 9999 ? "超时" : "\(ms) ms"
     showToast("🎯 已锁定代理节点：\(node.displayTitle) (\(latStr))")
   }
 
@@ -3101,6 +3113,15 @@ final class TvAppState: ObservableObject {
       activateScenarioProxyTunnel(for: scenario)
       if let node = subscriptionNodes.first(where: { $0.id == nodeId }) {
         showToast("🎯 「\(scenario.label)」已切换至节点：\(node.displayTitle) (\(node.formattedLatency))")
+        if (node.latencyMs ?? 9999) >= 9999 {
+          Task {
+            let ms = await Self.tcpPing(host: node.host, port: node.port)
+            if let idx = subscriptionNodes.firstIndex(where: { $0.id == nodeId }) {
+              subscriptionNodes[idx].latencyMs = ms
+              persistProxyState()
+            }
+          }
+        }
       }
     }
   }
