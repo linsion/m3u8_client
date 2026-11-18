@@ -4,10 +4,46 @@ import FlutterMacOS
 import GameController
 import UserNotifications
 
-class MainFlutterWindow: NSWindow, NSWindowDelegate, UNUserNotificationCenterDelegate {
+/// Transparent AppKit drag-destination overlay view placed over FlutterView.
+/// `hitTest` returns `nil` so normal mouse clicks/scrolls/hovers go straight to FlutterView,
+/// while AppKit's internal `_hitTest:dragTypes:` routes drag-and-drop events here.
+final class MacFileDropOverlayView: NSView {
+  weak var hostWindow: MainFlutterWindow?
+
+  override func hitTest(_ point: NSPoint) -> NSView? {
+    return nil
+  }
+
+  override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+    return hostWindow?.draggingEntered(sender) ?? []
+  }
+
+  override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+    return hostWindow?.draggingUpdated(sender) ?? []
+  }
+
+  override func draggingExited(_ sender: NSDraggingInfo?) {
+    hostWindow?.draggingExited(sender)
+  }
+
+  override func draggingEnded(_ sender: NSDraggingInfo) {
+    hostWindow?.draggingEnded(sender)
+  }
+
+  override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+    return hostWindow?.prepareForDragOperation(sender) ?? false
+  }
+
+  override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+    return hostWindow?.performDragOperation(sender) ?? false
+  }
+}
+
+class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUserNotificationCenterDelegate {
   private let channelName = "com.linsion.m3u8_client/tv_platform"
   private var notificationsChannel: FlutterMethodChannel?
   private var utilsChannel: FlutterMethodChannel?
+  private var dropOverlayView: MacFileDropOverlayView?
 
   override func awakeFromNib() {
     let flutterViewController = FlutterViewController()
@@ -69,13 +105,22 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, UNUserNotificationCenterDel
 
     let dragTypes: [NSPasteboard.PasteboardType] = [
       .fileURL,
+      .URL,
       .png,
       .tiff,
       NSPasteboard.PasteboardType("public.file-url"),
+      NSPasteboard.PasteboardType("public.url"),
+      NSPasteboard.PasteboardType("public.jpeg"),
+      NSPasteboard.PasteboardType("public.heic"),
       NSPasteboard.PasteboardType("NSFilenamesPboardType"),
     ]
     self.registerForDraggedTypes(dragTypes)
-    flutterViewController.view.unregisterDraggedTypes()
+    let overlay = MacFileDropOverlayView(frame: flutterViewController.view.bounds)
+    overlay.autoresizingMask = [.width, .height]
+    overlay.hostWindow = self
+    overlay.registerForDraggedTypes(dragTypes)
+    flutterViewController.view.addSubview(overlay, positioned: .above, relativeTo: nil)
+    self.dropOverlayView = overlay
 
     let notifChannel = FlutterMethodChannel(
       name: "com.linsion.m3u8_client/notifications",
@@ -122,34 +167,118 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, UNUserNotificationCenterDel
   }
 
   private static func buildFilePayloadItem(for url: URL) -> [String: Any]? {
-    guard url.isFileURL else { return nil }
+    let resolved = (url as NSURL).filePathURL ?? url
+    guard resolved.isFileURL else { return nil }
     var isDir: ObjCBool = false
-    guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue else {
+    guard FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDir), !isDir.boolValue else {
       return nil
     }
-    let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+    let attrs = try? FileManager.default.attributesOfItem(atPath: resolved.path)
     let fileSize = (attrs?[.size] as? NSNumber)?.intValue ?? 0
     guard fileSize > 0 else { return nil }
-    if fileSize <= 25 * 1024 * 1024, let data = try? Data(contentsOf: url), !data.isEmpty {
+    if fileSize <= 8 * 1024 * 1024, let data = try? Data(contentsOf: resolved), !data.isEmpty {
       return [
-        "name": url.lastPathComponent,
-        "path": url.path,
+        "name": resolved.lastPathComponent,
+        "path": resolved.path,
         "size": fileSize,
         "bytes": FlutterStandardTypedData(bytes: data)
       ]
     }
     return [
-      "name": url.lastPathComponent,
-      "path": url.path,
+      "name": resolved.lastPathComponent,
+      "path": resolved.path,
       "size": fileSize,
       "bytes": FlutterStandardTypedData(bytes: Data())
     ]
   }
 
+  private static func buildFilePayloadItems(for url: URL, limit: Int = 10) -> [[String: Any]] {
+    let resolved = (url as NSURL).filePathURL ?? url
+    guard resolved.isFileURL else { return [] }
+    var isDir: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDir) else {
+      return []
+    }
+    if !isDir.boolValue {
+      if let item = buildFilePayloadItem(for: resolved) {
+        return [item]
+      }
+      return []
+    }
+    var results: [[String: Any]] = []
+    if let children = try? FileManager.default.contentsOfDirectory(
+      at: resolved,
+      includingPropertiesForKeys: [.isRegularFileKey],
+      options: [.skipsHiddenFiles]
+    ) {
+      for child in children {
+        if results.count >= limit { break }
+        if let item = buildFilePayloadItem(for: child) {
+          results.append(item)
+        }
+      }
+    }
+    return results
+  }
+
+  private static func extractFileURLs(from pb: NSPasteboard) -> [URL] {
+    var result: [URL] = []
+    var seenPaths = Set<String>()
+
+    func appendResolved(_ url: URL) {
+      let resolved = (url as NSURL).filePathURL ?? url
+      guard resolved.isFileURL else { return }
+      let path = resolved.path
+      guard !path.isEmpty, !seenPaths.contains(path) else { return }
+      seenPaths.insert(path)
+      result.append(resolved)
+    }
+
+    if let urls = pb.readObjects(
+      forClasses: [NSURL.self],
+      options: [.urlReadingFileURLsOnly: true]
+    ) as? [URL] {
+      for u in urls {
+        appendResolved(u)
+      }
+    }
+
+    if result.isEmpty,
+       let urls = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] {
+      for u in urls {
+        appendResolved(u)
+      }
+    }
+
+    if result.isEmpty,
+       let filenames = pb.propertyList(
+         forType: NSPasteboard.PasteboardType("NSFilenamesPboardType")
+       ) as? [String] {
+      for path in filenames where !path.isEmpty {
+        appendResolved(URL(fileURLWithPath: path))
+      }
+    }
+
+    if result.isEmpty, let items = pb.pasteboardItems {
+      for item in items {
+        if let str = item.string(forType: .fileURL)
+            ?? item.string(forType: NSPasteboard.PasteboardType("public.file-url")),
+           let u = URL(string: str) {
+          appendResolved(u)
+        } else if let data = item.data(forType: .fileURL)
+            ?? item.data(forType: NSPasteboard.PasteboardType("public.file-url")),
+                  let u = URL(dataRepresentation: data, relativeTo: nil) {
+          appendResolved(u)
+        }
+      }
+    }
+
+    return result
+  }
+
   private func hasValidDragContent(_ sender: NSDraggingInfo) -> Bool {
     let pb = sender.draggingPasteboard
-    if let urls = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL],
-       urls.contains(where: { $0.isFileURL }) {
+    if !Self.extractFileURLs(from: pb).isEmpty {
       return true
     }
     if NSImage.canInit(with: pb) {
@@ -158,7 +287,7 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, UNUserNotificationCenterDel
     return false
   }
 
-  func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+  @objc func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
     guard hasValidDragContent(sender) else { return [] }
     DispatchQueue.main.async { [weak self] in
       self?.utilsChannel?.invokeMethod("onFileDragUpdated", arguments: ["active": true])
@@ -166,31 +295,35 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, UNUserNotificationCenterDel
     return .copy
   }
 
-  func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-    hasValidDragContent(sender) ? .copy : []
+  @objc func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+    guard hasValidDragContent(sender) else { return [] }
+    return .copy
   }
 
-  func draggingExited(_ sender: NSDraggingInfo?) {
+  @objc func draggingExited(_ sender: NSDraggingInfo?) {
     DispatchQueue.main.async { [weak self] in
       self?.utilsChannel?.invokeMethod("onFileDragUpdated", arguments: ["active": false])
     }
   }
 
-  func draggingEnded(_ sender: NSDraggingInfo) {
+  @objc func draggingEnded(_ sender: NSDraggingInfo) {
     DispatchQueue.main.async { [weak self] in
       self?.utilsChannel?.invokeMethod("onFileDragUpdated", arguments: ["active": false])
     }
   }
 
-  func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+  @objc func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+    return hasValidDragContent(sender)
+  }
+
+  @objc func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
     let pb = sender.draggingPasteboard
     var items: [[String: Any]] = []
-    if let urls = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] {
-      for url in urls.prefix(10) {
-        if let item = Self.buildFilePayloadItem(for: url) {
-          items.append(item)
-        }
-      }
+    let urls = Self.extractFileURLs(from: pb)
+    for url in urls {
+      if items.count >= 10 { break }
+      let extracted = Self.buildFilePayloadItems(for: url, limit: 10 - items.count)
+      items.append(contentsOf: extracted)
     }
     if items.isEmpty,
        let image = NSImage(pasteboard: pb),

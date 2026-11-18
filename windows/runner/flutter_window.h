@@ -2,9 +2,14 @@
 #define RUNNER_FLUTTER_WINDOW_H_
 
 #include <flutter/dart_project.h>
+#include <flutter/encodable_value.h>
 #include <flutter/flutter_view_controller.h>
+#include <flutter/method_channel.h>
+#include <ole2.h>
 
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "win32_window.h"
 
@@ -14,6 +19,9 @@ class FlutterWindow : public Win32Window {
   // Creates a new FlutterWindow hosting a Flutter view running |project|.
   explicit FlutterWindow(const flutter::DartProject& project);
   virtual ~FlutterWindow();
+
+  void NotifyFileDragUpdated(bool active);
+  void NotifyFilesDropped(const std::vector<std::wstring>& paths);
 
  protected:
   // Win32Window:
@@ -28,6 +36,12 @@ class FlutterWindow : public Win32Window {
 
   // The Flutter instance hosted by this window.
   std::unique_ptr<flutter::FlutterViewController> flutter_controller_;
+
+  // Native utility method channel (file drag-and-drop & file picker).
+  std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> utils_channel_;
+
+  // OLE drag-and-drop target registered on the window.
+  IDropTarget* drop_target_ = nullptr;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

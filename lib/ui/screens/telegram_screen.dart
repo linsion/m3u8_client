@@ -455,9 +455,8 @@ class _TelegramScreenState extends State<TelegramScreen> {
     if (!mounted) return null;
     if (call.method == 'onFileDragUpdated') {
       final args = call.arguments;
-      final active = (args is Map && args['active'] == true) &&
-          _selectedChat != null &&
-          !_selectedChat!.readOnly;
+      final active =
+          (args is Map && args['active'] == true) && _selectedChat != null;
       if (_isDraggingFilesOverChat != active) {
         setState(() => _isDraggingFilesOverChat = active);
       }
@@ -480,12 +479,28 @@ class _TelegramScreenState extends State<TelegramScreen> {
         for (final item in rawList) {
           if (item is Map) {
             final name = (item['name'] ?? '附件').toString();
-            final bytes = item['bytes'] is Uint8List
+            Uint8List bytes = item['bytes'] is Uint8List
                 ? item['bytes'] as Uint8List
                 : Uint8List(0);
             final path = item['path']?.toString();
-            final size = (item['size'] as num?)?.toInt() ?? bytes.length;
-            if (size > 0 && (bytes.isNotEmpty || (path != null && path.isNotEmpty))) {
+            int size = (item['size'] as num?)?.toInt() ?? bytes.length;
+            if (path != null && path.isNotEmpty) {
+              try {
+                final fileObj = File(path);
+                if (await fileObj.exists()) {
+                  if (size <= 0) {
+                    size = await fileObj.length();
+                  }
+                  if (bytes.isEmpty &&
+                      size > 0 &&
+                      size <= 25 * 1024 * 1024) {
+                    bytes = await fileObj.readAsBytes();
+                  }
+                }
+              } catch (_) {}
+            }
+            if (size > 0 &&
+                (bytes.isNotEmpty || (path != null && path.isNotEmpty))) {
               droppedFiles.add(
                 TelegramOutgoingFile(
                   name: name,
@@ -2785,8 +2800,8 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
     final pickedFiles = <TelegramOutgoingFile>[];
 
-    // 1. Try native MethodChannel NSOpenPanel on macOS
-    if (Platform.isMacOS) {
+    // 1. Try native MethodChannel file picker on macOS & Windows
+    if (Platform.isMacOS || Platform.isWindows) {
       try {
         final rawList = await _nativeUtilsChannel.invokeMethod<dynamic>(
           'pickFiles',
@@ -2796,11 +2811,26 @@ class _TelegramScreenState extends State<TelegramScreen> {
           for (final item in rawList) {
             if (item is Map) {
               final name = (item['name'] ?? '附件').toString();
-              final bytes = item['bytes'] is Uint8List
+              Uint8List bytes = item['bytes'] is Uint8List
                   ? item['bytes'] as Uint8List
                   : Uint8List(0);
               final path = item['path']?.toString();
-              final size = (item['size'] as num?)?.toInt() ?? bytes.length;
+              int size = (item['size'] as num?)?.toInt() ?? bytes.length;
+              if (path != null && path.isNotEmpty) {
+                try {
+                  final fileObj = File(path);
+                  if (await fileObj.exists()) {
+                    if (size <= 0) {
+                      size = await fileObj.length();
+                    }
+                    if (bytes.isEmpty &&
+                        size > 0 &&
+                        size <= 25 * 1024 * 1024) {
+                      bytes = await fileObj.readAsBytes();
+                    }
+                  }
+                } catch (_) {}
+              }
               if (size > 0 &&
                   (bytes.isNotEmpty || (path != null && path.isNotEmpty))) {
                 pickedFiles.add(
