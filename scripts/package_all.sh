@@ -24,7 +24,7 @@ echo "========================================================"
 if [[ "$(uname -s)" == "Darwin" ]]; then
   echo "▶ [1/5] 正在打包 macOS 桌面版 (Release)..."
   rm -rf build/macos/Build/Intermediates.noindex/SwiftExplicitPrecompiledModules build/macos/ModuleCache.noindex
-  flutter build macos --release --dart-define=FLUTTER_BUILD_NAME="${VERSION}" --dart-define=FLUTTER_BUILD_NUMBER="${BUILD_NUM}"
+  flutter build macos --release
 
   MACOS_APP_PATH="$(find build/macos/Build/Products/Release -maxdepth 1 -name "*.app" | head -n 1)"
   if [[ -n "$MACOS_APP_PATH" && -d "$MACOS_APP_PATH" ]]; then
@@ -45,7 +45,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 
   # 2. iOS Release (.app + .ipa)
   echo "▶ [2/5] 正在打包 iOS / iPadOS 版 (Release --no-codesign)..."
-  if flutter build ios --release --no-codesign --dart-define=FLUTTER_BUILD_NAME="${VERSION}" --dart-define=FLUTTER_BUILD_NUMBER="${BUILD_NUM}"; then
+  if flutter build ios --release --no-codesign; then
     IOS_APP_PATH="build/ios/iphoneos/Runner.app"
     if [[ -d "$IOS_APP_PATH" ]]; then
       IOS_IPA="${DIST_DIR}/${APP_SLUG}-iOS-v${VERSION}-unsigned.ipa"
@@ -106,7 +106,7 @@ fi
 
 # 3. Android & Android TV Release (.apk Universal + Split ABI + .aab)
 echo "▶ [3/5] 正在打包 Android 手机 / 平板 / Android TV 通用版 (Release APK & AAB)..."
-flutter build apk --release --dart-define=FLUTTER_BUILD_NAME="${VERSION}" --dart-define=FLUTTER_BUILD_NUMBER="${BUILD_NUM}"
+flutter build apk --release
 if [[ -f "build/app/outputs/flutter-apk/app-release.apk" ]]; then
   cp "build/app/outputs/flutter-apk/app-release.apk" \
      "${DIST_DIR}/${APP_SLUG}-Android-Universal-v${VERSION}.apk"
@@ -116,7 +116,7 @@ if [[ -f "build/app/outputs/flutter-apk/app-release.apk" ]]; then
   echo "  ✓ Android TV Universal APK: ${DIST_DIR}/${APP_SLUG}-AndroidTV-Universal-v${VERSION}.apk"
 fi
 
-flutter build apk --split-per-abi --release --dart-define=FLUTTER_BUILD_NAME="${VERSION}" --dart-define=FLUTTER_BUILD_NUMBER="${BUILD_NUM}"
+flutter build apk --split-per-abi --release
 for abi in arm64-v8a armeabi-v7a x86_64; do
   ABI_APK="build/app/outputs/flutter-apk/app-${abi}-release.apk"
   if [[ -f "$ABI_APK" ]]; then
@@ -125,7 +125,7 @@ for abi in arm64-v8a armeabi-v7a x86_64; do
   fi
 done
 
-flutter build appbundle --release --dart-define=FLUTTER_BUILD_NAME="${VERSION}" --dart-define=FLUTTER_BUILD_NUMBER="${BUILD_NUM}"
+flutter build appbundle --release
 if [[ -f "build/app/outputs/bundle/release/app-release.aab" ]]; then
   cp "build/app/outputs/bundle/release/app-release.aab" \
      "${DIST_DIR}/${APP_SLUG}-Android-Release-v${VERSION}.aab"
