@@ -35,9 +35,9 @@ jobs:
           BUILD_NAME="${VERSION_TAG#v}"
           BUILD_NUM=$((100 + GITHUB_RUN_NUMBER))
           flutter pub get
-          flutter build apk --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM"
-          flutter build apk --split-per-abi --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM"
-          flutter build appbundle --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM"
+          flutter build apk --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM" --dart-define=FLUTTER_BUILD_NAME="$BUILD_NAME" --dart-define=FLUTTER_BUILD_NUMBER="$BUILD_NUM"
+          flutter build apk --split-per-abi --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM" --dart-define=FLUTTER_BUILD_NAME="$BUILD_NAME" --dart-define=FLUTTER_BUILD_NUMBER="$BUILD_NUM"
+          flutter build appbundle --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM" --dart-define=FLUTTER_BUILD_NAME="$BUILD_NAME" --dart-define=FLUTTER_BUILD_NUMBER="$BUILD_NUM"
           mkdir -p dist
           cp build/app/outputs/flutter-apk/app-release.apk "dist/LiuguangVideo-Android-Universal-${VERSION_TAG}.apk"
           cp build/app/outputs/flutter-apk/app-release.apk "dist/LiuguangVideo-AndroidTV-Universal-${VERSION_TAG}.apk"
@@ -65,7 +65,7 @@ jobs:
           BUILD_NAME="${VERSION_TAG#v}"
           BUILD_NUM=$((100 + GITHUB_RUN_NUMBER))
           flutter pub get
-          flutter build macos --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM"
+          flutter build macos --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM" --dart-define=FLUTTER_BUILD_NAME="$BUILD_NAME" --dart-define=FLUTTER_BUILD_NUMBER="$BUILD_NUM"
           mkdir -p dist
           APP_PATH="$(find build/macos/Build/Products/Release -maxdepth 1 -name "*.app" | head -n 1)"
           ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "dist/LiuguangVideo-macOS-universal-${VERSION_TAG}.zip"
@@ -77,7 +77,7 @@ jobs:
         run: |
           BUILD_NAME="${VERSION_TAG#v}"
           BUILD_NUM=$((100 + GITHUB_RUN_NUMBER))
-          flutter build ios --release --no-codesign --build-name="$BUILD_NAME" --build-number="$BUILD_NUM"
+          flutter build ios --release --no-codesign --build-name="$BUILD_NAME" --build-number="$BUILD_NUM" --dart-define=FLUTTER_BUILD_NAME="$BUILD_NAME" --dart-define=FLUTTER_BUILD_NUMBER="$BUILD_NUM"
           IPA_STAGE="$(mktemp -d)"
           mkdir -p "$IPA_STAGE/Payload"
           cp -R build/ios/iphoneos/Runner.app "$IPA_STAGE/Payload/Runner.app"
@@ -124,7 +124,7 @@ jobs:
           BUILD_NAME="${VERSION_TAG#v}"
           BUILD_NUM=$((100 + GITHUB_RUN_NUMBER))
           flutter pub get
-          flutter build windows --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM"
+          flutter build windows --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM" --dart-define=FLUTTER_BUILD_NAME="$BUILD_NAME" --dart-define=FLUTTER_BUILD_NUMBER="$BUILD_NUM"
           mkdir -p dist
           (cd build/windows/x64/runner/Release && 7z a -tzip "$GITHUB_WORKSPACE/dist/LiuguangVideo-Windows-x64-${VERSION_TAG}.zip" .)
       - uses: actions/upload-artifact@v4
@@ -149,7 +149,7 @@ jobs:
           BUILD_NAME="${VERSION_TAG#v}"
           BUILD_NUM=$((100 + GITHUB_RUN_NUMBER))
           flutter pub get
-          flutter build linux --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM"
+          flutter build linux --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM" --dart-define=FLUTTER_BUILD_NAME="$BUILD_NAME" --dart-define=FLUTTER_BUILD_NUMBER="$BUILD_NUM"
           mkdir -p dist
           tar -czf "dist/LiuguangVideo-Linux-x64-${VERSION_TAG}.tar.gz" -C build/linux/x64/release/bundle .
       - uses: actions/upload-artifact@v4

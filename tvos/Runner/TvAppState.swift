@@ -85,6 +85,22 @@ final class TvAppState: ObservableObject {
     TvThemePalette.palette(for: themeId)
   }
 
+  var appVersion: String {
+    let raw = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return (raw.isEmpty || raw.contains("$(")) ? "1.2.0" : raw
+  }
+
+  var appBuildNumber: String {
+    let raw = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return (raw.isEmpty || raw.contains("$(")) ? "32" : raw
+  }
+
+  var appFullVersion: String {
+    "v\(appVersion) (Build \(appBuildNumber))"
+  }
+
   func setTheme(_ id: String) {
     let palette = TvThemePalette.palette(for: id)
     TvThemePalette.current = palette

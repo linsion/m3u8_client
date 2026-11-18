@@ -461,6 +461,17 @@ struct TvAppleTopNavigationBar: View {
         Text("流光视频")
           .font(.system(size: 22, weight: .bold, design: .rounded))
           .foregroundColor(.white)
+        Text("v\(appState.appVersion)")
+          .font(.system(size: 13, weight: .bold, design: .monospaced))
+          .foregroundColor(theme.accentHover)
+          .padding(.horizontal, 9)
+          .padding(.vertical, 3)
+          .background(theme.accent.opacity(0.18))
+          .clipShape(Capsule(style: .continuous))
+          .overlay(
+            Capsule(style: .continuous)
+              .stroke(theme.accentHover.opacity(0.45), lineWidth: 1)
+          )
       }
       .padding(.leading, 8)
 
@@ -555,9 +566,18 @@ struct TvLoginView: View {
       }
 
       VStack(spacing: 8) {
-        Text("流光视频 · Apple TV")
-          .font(.system(size: 42, weight: .bold, design: .rounded))
-          .foregroundColor(.white)
+        HStack(spacing: 12) {
+          Text("流光视频 · Apple TV")
+            .font(.system(size: 42, weight: .bold, design: .rounded))
+            .foregroundColor(.white)
+          Text(appState.appFullVersion)
+            .font(.system(size: 16, weight: .bold, design: .monospaced))
+            .foregroundColor(appState.activeTheme.accentHover)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .background(appState.activeTheme.accent.opacity(0.2))
+            .clipShape(Capsule(style: .continuous))
+        }
         Text("连接您的流光视频服务端，畅享影视点播、电视直播、Telegram 频道画廊与 115 网盘")
           .font(.system(size: 20))
           .foregroundColor(.white.opacity(0.68))
@@ -7650,6 +7670,17 @@ struct TvSettingsSectionView: View {
               Label("外观与主题配色（原应用 5 款经典影院主题）", systemImage: "paintpalette.fill")
                 .font(.title3.bold())
               Spacer()
+              Text("当前版本：\(appState.appFullVersion)")
+                .font(.system(size: 15, weight: .bold, design: .monospaced))
+                .foregroundColor(.white.opacity(0.92))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 5)
+                .background(appState.activeTheme.accent.opacity(0.22))
+                .clipShape(Capsule(style: .continuous))
+                .overlay(
+                  Capsule(style: .continuous)
+                    .stroke(appState.activeTheme.accentHover.opacity(0.5), lineWidth: 1)
+                )
               Text("当前：\(appState.activeTheme.name) · \(appState.activeTheme.subtitle)")
                 .font(.callout)
                 .foregroundColor(appState.activeTheme.accentHover)
@@ -7818,6 +7849,28 @@ struct TvSettingsSectionView: View {
           .background(.ultraThinMaterial)
           .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
           .focusSection()
+
+          // 4. App Version & Runtime Info Card
+          HStack(spacing: 20) {
+            Label("流光视频 Apple TV 原生客户端", systemImage: "appletv.fill")
+              .font(.headline)
+              .foregroundColor(.white)
+            Text(appState.appFullVersion)
+              .font(.system(size: 16, weight: .bold, design: .monospaced))
+              .foregroundColor(appState.activeTheme.accentHover)
+              .padding(.horizontal, 12)
+              .padding(.vertical, 5)
+              .background(appState.activeTheme.accent.opacity(0.2))
+              .clipShape(Capsule(style: .continuous))
+            Spacer()
+            Text("tvOS \(UIDevice.current.systemVersion) · 本地代理端口 127.0.0.1:\(TvLocalProxyTunnelServer.shared.port) · HLS 加速端口 127.0.0.1:\(TvLocalHlsProxyServer.shared.port)")
+              .font(.caption.monospaced())
+              .foregroundColor(.white.opacity(0.68))
+          }
+          .padding(.horizontal, 28)
+          .padding(.vertical, 20)
+          .background(.ultraThinMaterial)
+          .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
         }
         .padding(.horizontal, 56)
         .padding(.vertical, 24)
