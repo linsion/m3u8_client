@@ -290,6 +290,7 @@ final class TvAppState: ObservableObject {
   @Published var isRefreshingSubscription: Bool = false
   @Published var backendProxyServices: [TvProxyServiceConfig] = []
   @Published var backendProxyStatuses: [TvProxyRuntimeStatus] = []
+  @Published var showProxyStatsOverlay: Bool = false
 
   // 8. 115 Cloud Drive & Backend Settings + In-Player 115 Cloud Acceleration Pipeline
   @Published var is115LoggedIn: Bool = false
@@ -1061,14 +1062,16 @@ final class TvAppState: ObservableObject {
     isResolvingPlay = true
     defer { isResolvingPlay = false }
 
-    let forceRelay = shouldUseServerRelay(for: .vodStream) || !preferDirectPlayback
+    activateScenarioProxyTunnel(for: .vodStream)
+    let effRoute = resolveEffectiveRoute(for: .vodStream)
+    let forceRelay = (effRoute == .serverRelay) || !preferDirectPlayback
     let resolved = await api.resolvePlayback(
       source: source,
       playFrom: group.name,
       rawUrl: ep.rawUrl,
       forceServerRelay: forceRelay
     )
-    let finalStream = await api.prepareAdFilteredStreamIfPossible(
+    var finalStream = await api.prepareAdFilteredStreamIfPossible(
       streamUrl: resolved.directUrl,
       headers: resolved.headers,
       enableAdFilter: enableAdFilter
@@ -1077,15 +1080,34 @@ final class TvAppState: ObservableObject {
     if mergedHeaders["Cookie"] == nil && !api.cookieHeaderValue.isEmpty {
       mergedHeaders["Cookie"] = api.cookieHeaderValue
     }
+    if effRoute == .proxyNode && !finalStream.contains("127.0.0.1:") {
+      if finalStream.lowercased().contains(".m3u8") {
+        if let proxiedHls = await TvLocalHlsProxyServer.shared.prepareProxyPlaylistUrl(
+          gatewayUrl: finalStream,
+          resolvedUrl: finalStream,
+          headers: mergedHeaders
+        ) {
+          finalStream = proxiedHls
+        }
+      } else if finalStream.hasPrefix("http") {
+        finalStream = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
+          remoteUrl: finalStream,
+          headers: mergedHeaders
+        )
+      }
+    }
 
     let savedSec = savedPosition(vodId: detail.vodId, episodeTitle: ep.title)
     let resumeSec = savedSec > 5 ? savedSec : Double(skipIntroSeconds)
+    let viaBadge = (effRoute == .proxyNode)
+      ? "代理: \(resolveNode(for: .vodStream)?.displayTitle ?? resolved.parseVia)"
+      : resolved.parseVia
 
     self.playerControlsVisible = true
     self.playerShowEpisodeDrawer = false
     self.activePlayback = TvPlaybackRequest(
       title: detail.vodName,
-      subtitle: "\(group.name) · \(ep.title) (\(resolved.parseVia))",
+      subtitle: "\(group.name) · \(ep.title) (\(viaBadge))",
       streamUrl: finalStream,
       backupProxyUrl: resolved.serverProxyUrl,
       headers: mergedHeaders,
@@ -1464,6 +1486,7 @@ final class TvAppState: ObservableObject {
     let idx = min(max(0, resolvedIndex), channel.urls.count - 1)
     recordLiveChannelSelection(channel: channel, urlIndex: idx)
     Task {
+      activateScenarioProxyTunnel(for: .liveStream)
       let useRelay = shouldUseServerRelay(for: .liveStream)
       let resolved = await api.resolveLivePlayback(
         source: selectedLiveSource,
@@ -3019,10 +3042,21 @@ final class TvAppState: ObservableObject {
     }
   }
 
+  /// Configures `TvLocalProxyTunnelServer.shared` for the given scenario's effective route & node
+  func activateScenarioProxyTunnel(for scenario: TvRequestScenario) {
+    let eff = resolveEffectiveRoute(for: scenario)
+    if eff == .proxyNode, let node = resolveNode(for: scenario) {
+      TvLocalProxyTunnelServer.shared.configure(node: node, enabled: true)
+    } else {
+      TvLocalProxyTunnelServer.shared.configure(node: nil, enabled: false)
+    }
+  }
+
   /// Handles selection from `TvVideoProxyNodeSelectorSheet` (matching `_onSelected` in `lib/ui/widgets/video_proxy_node_selector.dart`)
   func applyInPlayerProxyChoice(scenario: TvRequestScenario, choice: String) {
     if choice == "direct" {
       updateScenarioRule(scenario, mode: .direct, clearSpecificNode: true)
+      activateScenarioProxyTunnel(for: scenario)
       showToast("🚫 「\(scenario.label)」已切换为直连播放")
     } else if choice == "auto_fastest" {
       proxyEnabled = true
@@ -3031,16 +3065,20 @@ final class TvAppState: ObservableObject {
         selectedProxyNodeId = best.id
       }
       updateScenarioRule(scenario, mode: .proxyNode, clearSpecificNode: true)
+      activateScenarioProxyTunnel(for: scenario)
       let bestLabel = fastestProxyNode.map { "\($0.displayTitle) (\($0.formattedLatency))" } ?? "自动最快"
       showToast("⚡ 「\(scenario.label)」已切换为自动择优：\(bestLabel)")
     } else if choice == "server_relay" {
       updateScenarioRule(scenario, mode: .serverRelay, clearSpecificNode: true)
+      activateScenarioProxyTunnel(for: scenario)
       showToast("🛡️ 「\(scenario.label)」已切换为服务端代理中转")
     } else if choice.hasPrefix("node:") {
       let nodeId = String(choice.dropFirst(5))
       proxyEnabled = true
+      proxySelectionMode = .manual
       selectedProxyNodeId = nodeId
       updateScenarioRule(scenario, mode: .proxyNode, specificNodeId: nodeId)
+      activateScenarioProxyTunnel(for: scenario)
       if let node = subscriptionNodes.first(where: { $0.id == nodeId }) {
         showToast("🎯 「\(scenario.label)」已切换至节点：\(node.displayTitle) (\(node.formattedLatency))")
       }

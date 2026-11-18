@@ -2263,15 +2263,41 @@ class LocalProxyTunnelBridge {
   bool get isRunning => _serverSocket != null;
 
   static final List<({int timestampMs, int bytes})> _downstreamSamples = [];
+  static final List<({int timestampMs, int bytes})> _upstreamSamples = [];
+  static int totalDownstreamBytes = 0;
+  static int totalUpstreamBytes = 0;
+  static int activeTunnelConnections = 0;
+  static int totalTunnelRequests = 0;
+  static ProxyNode? lastActiveTunnelNode;
 
   static void recordDownstreamBytes(int bytes) {
     if (bytes <= 0) return;
+    totalDownstreamBytes += bytes;
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     _downstreamSamples.add((timestampMs: nowMs, bytes: bytes));
     if (_downstreamSamples.length > 512) {
       final cutoff = nowMs - 2000;
       _downstreamSamples.removeWhere((s) => s.timestampMs < cutoff);
     }
+  }
+
+  static void recordUpstreamBytes(int bytes) {
+    if (bytes <= 0) return;
+    totalUpstreamBytes += bytes;
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    _upstreamSamples.add((timestampMs: nowMs, bytes: bytes));
+    if (_upstreamSamples.length > 512) {
+      final cutoff = nowMs - 2000;
+      _upstreamSamples.removeWhere((s) => s.timestampMs < cutoff);
+    }
+  }
+
+  static void resetTrafficCounters() {
+    totalDownstreamBytes = 0;
+    totalUpstreamBytes = 0;
+    totalTunnelRequests = 0;
+    _downstreamSamples.clear();
+    _upstreamSamples.clear();
   }
 
   /// Returns the real-time downstream transfer speed (in bytes/sec) across
@@ -2286,6 +2312,29 @@ class LocalProxyTunnelBridge {
       totalBytes += s.bytes;
     }
     return totalBytes / 1.5;
+  }
+
+  /// Returns the real-time upstream transfer speed (in bytes/sec) over the last 1.5s.
+  static double get recentUpstreamBytesPerSecond {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final cutoff = nowMs - 1500;
+    _upstreamSamples.removeWhere((s) => s.timestampMs < cutoff);
+    if (_upstreamSamples.isEmpty) return 0.0;
+    var totalBytes = 0;
+    for (final s in _upstreamSamples) {
+      totalBytes += s.bytes;
+    }
+    return totalBytes / 1.5;
+  }
+
+  void resetSessionState() {
+    winningNodeForSession = null;
+    _initialPrefetchTimer?.cancel();
+    _initialPrefetchTimer = null;
+    _pendingPrefetchQueue.clear();
+    _inFlightSegmentFetches.clear();
+    _prefetchedSegmentCache.clear();
+    _prefetchedCacheTotalBytes = 0;
   }
 
   static String _stripAdsInBackgroundIsolate(Map<String, String> payload) {
@@ -2306,6 +2355,7 @@ class LocalProxyTunnelBridge {
     Map<String, String> headers = const {},
     bool cleanM3u8Ads = false,
     bool forceDirect = false,
+    String? preferredNodeId,
   }) {
     final p = port;
     if (p <= 0) return targetUrl;
@@ -2340,6 +2390,8 @@ class LocalProxyTunnelBridge {
     }
     if (forceDirect) {
       qp.write('&direct=1');
+    } else if (preferredNodeId != null && preferredNodeId.isNotEmpty) {
+      qp.write('&nid=${Uri.encodeQueryComponent(preferredNodeId)}');
     }
     return 'http://127.0.0.1:$p/__m3u8_proxy__/$suffix?${qp.toString()}';
   }
@@ -2441,111 +2493,10 @@ class LocalProxyTunnelBridge {
     required bool isHttps,
     required Duration timeout,
   }) async {
-    final proto = node.protocol.toLowerCase();
-    if (proto == 'trojan' && node.network.toLowerCase() != 'ws') {
-      final rawSocket = await Socket.connect(
-        node.server,
-        node.port,
-        timeout: timeout,
-      );
-      try {
-        rawSocket.setOption(SocketOption.tcpNoDelay, true);
-      } catch (_) {}
-      final sni = node.sni.isNotEmpty
-          ? node.sni
-          : (node.wsHost.isNotEmpty ? node.wsHost : node.server);
-      final tlsSocket = await SecureSocket.secure(
-        rawSocket,
-        host: sni,
-        onBadCertificate: (_) => true,
-      ).timeout(timeout);
-
-      final hashHex = _Sha224.hexDigest(node.password);
-      final hostBytes = utf8.encode(targetHost);
-      final trojanHeader = <int>[
-        ...latin1.encode(hashHex),
-        0x0d,
-        0x0a,
-        0x01,
-        0x03,
-        hostBytes.length,
-        ...hostBytes,
-        (targetPort >> 8) & 0xff,
-        targetPort & 0xff,
-        0x0d,
-        0x0a,
-      ];
-      tlsSocket.add(trojanHeader);
-      if (isHttps) {
-        return SecureSocket.secure(
-          tlsSocket,
-          host: targetHost,
-          onBadCertificate: (_) => true,
-        ).timeout(timeout);
-      }
-      return tlsSocket;
-    }
-
-    final tunnel = await _openUpstreamTunnel(
-      node: node,
-      targetHost: targetHost,
-      targetPort: targetPort,
-      isConnect: true,
-      rawHttpHeaderLines: const [],
-      initialBodyBytes: const [],
-      timeout: timeout,
-    );
-    if (tunnel == null) {
-      throw SocketException('Failed to open proxy tunnel via ${node.name}');
-    }
-
+    lastActiveTunnelNode = node;
+    totalTunnelRequests++;
     final pairServer = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
-    unawaited(
-      pairServer.first.then((srvSide) {
-        try {
-          srvSide.setOption(SocketOption.tcpNoDelay, true);
-        } catch (_) {}
-        srvSide.listen(
-          (d) => tunnel.send(d),
-          onDone: () {
-            tunnel.close();
-            try {
-              pairServer.close();
-            } catch (_) {}
-          },
-          onError: (_) {
-            tunnel.close();
-            try {
-              pairServer.close();
-            } catch (_) {}
-          },
-        );
-        tunnel.stream.listen(
-          (d) {
-            try {
-              srvSide.add(d);
-            } catch (_) {}
-          },
-          onDone: () {
-            try {
-              srvSide.destroy();
-            } catch (_) {}
-            try {
-              pairServer.close();
-            } catch (_) {}
-          },
-          onError: (_) {
-            try {
-              srvSide.destroy();
-            } catch (_) {}
-            try {
-              pairServer.close();
-            } catch (_) {}
-          },
-        );
-      }),
-    );
-
+    final srvFuture = pairServer.first;
     final clientSide = await Socket.connect(
       InternetAddress.loopbackIPv4,
       pairServer.port,
@@ -2554,6 +2505,94 @@ class LocalProxyTunnelBridge {
     try {
       clientSide.setOption(SocketOption.tcpNoDelay, true);
     } catch (_) {}
+
+    final srvSide = await srvFuture.timeout(timeout);
+    try {
+      srvSide.setOption(SocketOption.tcpNoDelay, true);
+    } catch (_) {}
+
+    activeTunnelConnections++;
+    var connectionClosed = false;
+    _UpstreamTunnel? activeTunnel;
+    var tunnelOpening = false;
+    final pendingClientChunks = <Uint8List>[];
+
+    void closeAll() {
+      if (connectionClosed) return;
+      connectionClosed = true;
+      if (activeTunnelConnections > 0) {
+        activeTunnelConnections--;
+      }
+      activeTunnel?.close();
+      try {
+        srvSide.destroy();
+      } catch (_) {}
+      try {
+        pairServer.close();
+      } catch (_) {}
+    }
+
+    srvSide.listen(
+      (chunk) {
+        if (chunk.isEmpty || connectionClosed) return;
+        recordUpstreamBytes(chunk.length);
+        if (activeTunnel != null) {
+          try {
+            activeTunnel!.send(chunk);
+          } catch (_) {
+            closeAll();
+          }
+          return;
+        }
+        if (tunnelOpening) {
+          pendingClientChunks.add(Uint8List.fromList(chunk));
+          return;
+        }
+        tunnelOpening = true;
+        final firstPayload = Uint8List.fromList(chunk);
+        unawaited(() async {
+          try {
+            final opened = await _openUpstreamTunnel(
+              node: node,
+              targetHost: targetHost,
+              targetPort: targetPort,
+              isConnect: true,
+              rawHttpHeaderLines: const [],
+              initialBodyBytes: firstPayload,
+              timeout: timeout,
+            );
+            if (opened == null || connectionClosed) {
+              opened?.close();
+              closeAll();
+              return;
+            }
+            activeTunnel = opened;
+            for (final queued in pendingClientChunks) {
+              opened.send(queued);
+            }
+            pendingClientChunks.clear();
+            opened.stream.listen(
+              (rx) {
+                if (rx.isEmpty || connectionClosed) return;
+                recordDownstreamBytes(rx.length);
+                try {
+                  srvSide.add(rx);
+                } catch (_) {
+                  closeAll();
+                }
+              },
+              onDone: closeAll,
+              onError: (_) => closeAll(),
+            );
+          } catch (_) {
+            closeAll();
+          }
+        }());
+      },
+      onDone: closeAll,
+      onError: (_) => closeAll(),
+    );
+
     if (isHttps) {
       return SecureSocket.secure(
         clientSide,
@@ -2626,13 +2665,22 @@ class LocalProxyTunnelBridge {
 
       final cleanAds = reqUri?.queryParameters['clean'] == '1';
       final forceDirect = reqUri?.queryParameters['direct'] == '1';
+      final explicitNodeId = reqUri?.queryParameters['nid']?.trim() ?? '';
       final candidateNodes = <ProxyNode>[];
       if (!forceDirect) {
+        final fallbacks = _resolveFallbackNodes?.call() ?? const <ProxyNode>[];
+        if (explicitNodeId.isNotEmpty) {
+          for (final fb in fallbacks) {
+            if (fb.id == explicitNodeId) {
+              candidateNodes.add(fb);
+              break;
+            }
+          }
+        }
         final primary = _resolveDefaultNode();
-        if (primary != null) {
+        if (primary != null && !candidateNodes.any((n) => n.id == primary.id)) {
           candidateNodes.add(primary);
         }
-        final fallbacks = _resolveFallbackNodes?.call() ?? const <ProxyNode>[];
         for (final fb in fallbacks) {
           if (!candidateNodes.any((n) => n.id == fb.id)) {
             candidateNodes.add(fb);
@@ -3426,6 +3474,8 @@ class LocalProxyTunnelBridge {
     final discoveredSegments = <String>[];
     final isMediaPlaylist = content.contains('#EXTINF');
 
+    final preferredNodeId =
+        (!forceDirect && candidateNodes.isNotEmpty) ? candidateNodes.first.id : null;
     for (final rawLine in lines) {
       final line = rawLine.trim();
       if (line.isEmpty) continue;
@@ -3439,6 +3489,7 @@ class LocalProxyTunnelBridge {
               targetUrl: abs,
               headers: headers,
               forceDirect: forceDirect,
+              preferredNodeId: preferredNodeId,
             );
             return 'URI="$relayed"';
           });
@@ -3456,6 +3507,7 @@ class LocalProxyTunnelBridge {
           headers: headers,
           cleanM3u8Ads: cleanAds,
           forceDirect: forceDirect,
+          preferredNodeId: preferredNodeId,
         );
         sb.writeln(relayed);
       }
@@ -3513,6 +3565,7 @@ class LocalProxyTunnelBridge {
     clientSub = client.listen(
       (chunk) {
         if (chunk.isEmpty) return;
+        recordUpstreamBytes(chunk.length);
         if (tunnelReady && activeUpstream != null) {
           try {
             activeUpstream!.send(chunk);
@@ -5206,6 +5259,215 @@ class ProxyRoutingService extends ChangeNotifier {
   bool get lastStatusIsError => _lastStatusIsError;
   int get autoCheckIntervalMinutes => _autoCheckIntervalMinutes;
   int get localBridgePort => _localBridge.port;
+  int get totalInboundBytes => LocalProxyTunnelBridge.totalDownstreamBytes;
+  int get totalOutboundBytes => LocalProxyTunnelBridge.totalUpstreamBytes;
+  double get currentInboundBytesPerSecond =>
+      LocalProxyTunnelBridge.recentDownstreamBytesPerSecond;
+  double get currentOutboundBytesPerSecond =>
+      LocalProxyTunnelBridge.recentUpstreamBytesPerSecond;
+  int get activeTunnelConnections =>
+      LocalProxyTunnelBridge.activeTunnelConnections;
+  int get totalTunnelRequests => LocalProxyTunnelBridge.totalTunnelRequests;
+
+  void resetTrafficCounters() {
+    LocalProxyTunnelBridge.resetTrafficCounters();
+    notifyListeners();
+  }
+
+  void _resetAllBridgeSessionCaches() {
+    _localBridge.resetSessionState();
+    for (final b in _nodeBridges.values) {
+      b.resetSessionState();
+    }
+  }
+
+  final Map<String, ({
+    String entryIp,
+    String exitIp,
+    String location,
+    String isp,
+    int rttMs,
+    int updatedAtMs,
+  })> _ipProbeCache = {};
+
+  /// Probes and returns the real-time Entry Server IP and Exit Public IP / Geo / ISP
+  /// for the given [scenario] (through the active proxy tunnel if routed via proxyNode,
+  /// or direct if routed directly).
+  Future<({
+    String routeLabel,
+    bool isUsingProxy,
+    String nodeName,
+    String protocolBadge,
+    String entryHostPort,
+    String entryResolvedIp,
+    String exitPublicIp,
+    String exitLocation,
+    String exitIsp,
+    int rttMs,
+  })> probeScenarioRealTimeIpInfo(
+    RequestScenario scenario, {
+    bool forceRefresh = false,
+  }) async {
+    final effective = resolveEffectiveRoute(scenario);
+    final node = resolveNodeForScenario(scenario);
+    final isProxy = effective == ScenarioRouteMode.proxyNode && node != null;
+    final isRelay = effective == ScenarioRouteMode.serverRelay;
+    final cacheKey = isProxy
+        ? 'node:${node.id}'
+        : (isRelay ? 'relay' : 'direct');
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final cached = _ipProbeCache[cacheKey];
+    if (!forceRefresh &&
+        cached != null &&
+        nowMs - cached.updatedAtMs < 25000 &&
+        cached.exitIp.isNotEmpty) {
+      return (
+        routeLabel: isProxy
+            ? (selectionMode == ProxySelectionMode.autoFastest
+                ? '代理加速 · 自动择优'
+                : '代理加速 · 手动锁定')
+            : (isRelay ? '服务端代理中转' : '客户端直连模式'),
+        isUsingProxy: isProxy || isRelay,
+        nodeName: isProxy
+            ? node.displayTitle
+            : (isRelay ? '主服务端中转 (/api/vod/proxy)' : '本机网络直连 (Direct)'),
+        protocolBadge: isProxy
+            ? node.protocolBadge
+            : (isRelay ? 'HTTP-RELAY' : 'DIRECT'),
+        entryHostPort: isProxy ? '${node.server}:${node.port}' : '本机网卡直出',
+        entryResolvedIp: cached.entryIp,
+        exitPublicIp: cached.exitIp,
+        exitLocation: cached.location,
+        exitIsp: cached.isp,
+        rttMs: cached.rttMs,
+      );
+    }
+
+    String entryIp = isProxy ? node.server : '本机直连';
+    if (isProxy) {
+      try {
+        final addrs = await InternetAddress.lookup(node.server)
+            .timeout(const Duration(milliseconds: 1800));
+        if (addrs.isNotEmpty) {
+          entryIp = '${addrs.first.address}:${node.port}';
+        }
+      } catch (_) {
+        entryIp = '${node.server}:${node.port}';
+      }
+    }
+
+    String exitIp = '';
+    String location = '';
+    String isp = '';
+    int rttMs = isProxy ? (node.latencyMs ?? 0) : 0;
+
+    final hc = HttpClient()
+      ..connectionTimeout = const Duration(milliseconds: 4500)
+      ..badCertificateCallback = (cert, host, port) => true;
+
+    try {
+      if (isProxy) {
+        final p = await _ensureBridgeForNode(node);
+        if (p > 0) {
+          hc.findProxy = (_) => 'PROXY 127.0.0.1:$p';
+        }
+      } else {
+        hc.findProxy = (_) => 'DIRECT';
+      }
+
+      // 1. Fast JSON GeoIP lookup via ip-api.com (supports Chinese region/ISP names)
+      final sw = Stopwatch()..start();
+      try {
+        final req = await hc
+            .getUrl(Uri.parse(
+                'http://ip-api.com/json/?lang=zh-CN&fields=status,country,regionName,city,isp,org,query'))
+            .timeout(const Duration(milliseconds: 4200));
+        req.headers.set('User-Agent', 'Mozilla/5.0');
+        final resp = await req.close().timeout(const Duration(milliseconds: 4200));
+        if (resp.statusCode == 200) {
+          final body = await resp.transform(utf8.decoder).join();
+          sw.stop();
+          rttMs = sw.elapsedMilliseconds.clamp(1, 9999);
+          final map = jsonDecode(body);
+          if (map is Map && map['status'] == 'success') {
+            exitIp = (map['query'] ?? '').toString().trim();
+            final country = (map['country'] ?? '').toString().trim();
+            final region = (map['regionName'] ?? '').toString().trim();
+            final city = (map['city'] ?? '').toString().trim();
+            final locParts = <String>[
+              if (country.isNotEmpty) country,
+              if (region.isNotEmpty && region != country) region,
+              if (city.isNotEmpty && city != region) city,
+            ];
+            location = locParts.join(' · ');
+            isp = (map['isp'] ?? map['org'] ?? '').toString().trim();
+          }
+        }
+      } catch (_) {}
+
+      // 2. Fallback to Cloudflare cdn-cgi/trace if ip-api was blocked or timed out
+      if (exitIp.isEmpty) {
+        final sw2 = Stopwatch()..start();
+        try {
+          final req = await hc
+              .getUrl(Uri.parse('https://www.cloudflare.com/cdn-cgi/trace'))
+              .timeout(const Duration(milliseconds: 4200));
+          final resp =
+              await req.close().timeout(const Duration(milliseconds: 4200));
+          if (resp.statusCode == 200) {
+            final text = await resp.transform(utf8.decoder).join();
+            sw2.stop();
+            rttMs = sw2.elapsedMilliseconds.clamp(1, 9999);
+            for (final line in text.split('\n')) {
+              if (line.startsWith('ip=')) {
+                exitIp = line.substring(3).trim();
+              } else if (line.startsWith('loc=')) {
+                location = line.substring(4).trim();
+              } else if (line.startsWith('colo=')) {
+                isp = 'Cloudflare ${line.substring(5).trim()}';
+              }
+            }
+          }
+        } catch (_) {}
+      }
+    } finally {
+      hc.close(force: true);
+    }
+
+    if (exitIp.isNotEmpty) {
+      _ipProbeCache[cacheKey] = (
+        entryIp: entryIp,
+        exitIp: exitIp,
+        location: location.isEmpty ? '未知地区' : location,
+        isp: isp,
+        rttMs: rttMs,
+        updatedAtMs: nowMs,
+      );
+    }
+
+    return (
+      routeLabel: isProxy
+          ? (selectionMode == ProxySelectionMode.autoFastest
+              ? '代理加速 · 自动择优'
+              : '代理加速 · 手动锁定')
+          : (isRelay ? '服务端代理中转' : '客户端直连模式'),
+      isUsingProxy: isProxy || isRelay,
+      nodeName: isProxy
+          ? node.displayTitle
+          : (isRelay ? '主服务端中转 (/api/vod/proxy)' : '本机网络直连 (Direct)'),
+      protocolBadge: isProxy
+          ? node.protocolBadge
+          : (isRelay ? 'HTTP-RELAY' : 'DIRECT'),
+      entryHostPort: isProxy ? '${node.server}:${node.port}' : '本机网卡直出',
+      entryResolvedIp: entryIp,
+      exitPublicIp: exitIp.isEmpty ? (isProxy ? node.server : '探测超时') : exitIp,
+      exitLocation: location.isEmpty
+          ? (isProxy ? node.regionCategory : '本地网络')
+          : location,
+      exitIsp: isp,
+      rttMs: rttMs,
+    );
+  }
 
   /// Returns the fastest reachable enabled node ranked by real tunnel
   /// `effectiveScore` (combining real HTTP tunnel TTFB and transfer throughput).
@@ -5280,6 +5542,14 @@ class ProxyRoutingService extends ChangeNotifier {
 
     if (rule.mode == ScenarioRouteMode.serverRelay) {
       return ScenarioRouteMode.serverRelay;
+    }
+    if (rule.mode == ScenarioRouteMode.direct) {
+      return ScenarioRouteMode.direct;
+    }
+    if (rule.mode == ScenarioRouteMode.proxyNode) {
+      return resolveNodeForScenario(scenario) != null
+          ? ScenarioRouteMode.proxyNode
+          : ScenarioRouteMode.direct;
     }
     if (!_proxyEnabled) {
       return ScenarioRouteMode.direct;
@@ -5403,16 +5673,17 @@ class ProxyRoutingService extends ChangeNotifier {
     final node = resolveNodeForScenario(scenario);
     if (node == null) return trimmed;
 
+    final port = await _ensureBridgeForNode(node);
+    if (port <= 0) return trimmed;
     final bridge = (node.id == activeNode?.id)
         ? _localBridge
         : (_nodeBridges[node.id] ?? _localBridge);
-    final port = await _ensureBridgeForNode(node);
-    if (port <= 0) return trimmed;
 
     return bridge.buildStreamRelayUrl(
       targetUrl: trimmed,
       headers: headers,
       cleanM3u8Ads: cleanM3u8Ads,
+      preferredNodeId: node.id,
     );
   }
 
@@ -5574,6 +5845,7 @@ class ProxyRoutingService extends ChangeNotifier {
   /// Enable or disable the global proxy master switch.
   Future<void> setProxyEnabled(bool enabled) async {
     _proxyEnabled = enabled;
+    _resetAllBridgeSessionCaches();
     if (enabled) {
       await _localBridge.ensureStarted();
       _configureAutoFastestTimer();
@@ -5601,6 +5873,7 @@ class ProxyRoutingService extends ChangeNotifier {
   /// Switch between `manual` and `autoFastest` proxy selection modes.
   Future<void> setSelectionMode(ProxySelectionMode mode) async {
     _selectionMode = mode;
+    _resetAllBridgeSessionCaches();
     _configureAutoFastestTimer();
     if (mode == ProxySelectionMode.autoFastest) {
       final fastest = fastestNode;
@@ -5635,12 +5908,16 @@ class ProxyRoutingService extends ChangeNotifier {
     bool switchToManual = true,
   }) async {
     _selectedNodeId = nodeId;
+    _resetAllBridgeSessionCaches();
     if (switchToManual) {
       _selectionMode = ProxySelectionMode.manual;
       _configureAutoFastestTimer();
     }
     await _localBridge.ensureStarted();
     final node = activeNode;
+    if (node != null) {
+      await _ensureBridgeForNode(node);
+    }
     _lastStatusIsError = false;
     final speedSuffix =
         (node != null && node.speedLabel.isNotEmpty) ? ' · ${node.speedLabel}' : '';
@@ -5679,6 +5956,7 @@ class ProxyRoutingService extends ChangeNotifier {
       clearSpecificNode: clearSpecificNode,
     );
     _scenarioRules[scenario] = updated;
+    _resetAllBridgeSessionCaches();
     if (updated.mode == ScenarioRouteMode.proxyNode ||
         updated.mode == ScenarioRouteMode.smartAuto ||
         updated.mode == ScenarioRouteMode.followGlobal) {

@@ -2213,6 +2213,7 @@ final class TvLiveStreamController: ObservableObject {
     isBuffering = true
     errorText = nil
     didAdvanceCurrentAttempt = true
+    appState.activateScenarioProxyTunnel(for: .liveStream)
     usingProxyFallback = forceProxy || appState.shouldUseServerRelay(for: .liveStream)
     routeStatusText = "正在连接信号 \(safeIdx + 1)/\(channel.urls.count)..."
 
@@ -2494,6 +2495,28 @@ struct TvLiveSectionView: View {
         }
         .padding(.horizontal, 42)
         .padding(.vertical, 16)
+      }
+
+      if appState.showProxyStatsOverlay {
+        VStack {
+          HStack {
+            Spacer()
+            TvVideoProxyStatsOverlayCard(
+              scenario: .liveStream,
+              onOpenSelector: {
+                showLiveProxySelectorSheet = true
+              },
+              onClose: {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                  appState.showProxyStatsOverlay = false
+                }
+              }
+            )
+            .padding(.trailing, 54)
+            .padding(.top, 36)
+          }
+          Spacer()
+        }
       }
     }
     .onChange(of: appState.liveScrollToTopTrigger) { _ in
@@ -2818,6 +2841,17 @@ struct TvLiveSectionView: View {
             .fixedSize(horizontal: true, vertical: false)
 
             Button {
+              withAnimation(.easeInOut(duration: 0.2)) {
+                appState.showProxyStatsOverlay.toggle()
+              }
+            } label: {
+              Label(appState.showProxyStatsOverlay ? "隐藏监控" : "代理监控", systemImage: "waveform.path.ecg.rectangle")
+                .lineLimit(1)
+            }
+            .buttonStyle(TvApplePillButtonStyle(isSelected: appState.showProxyStatsOverlay, compact: true))
+            .fixedSize(horizontal: true, vertical: false)
+
+            Button {
               appState.toggleLiveChannelFavorite(ch)
             } label: {
               Label(isFav ? "已收藏" : "收藏", systemImage: isFav ? "star.fill" : "star")
@@ -3012,6 +3046,18 @@ struct TvLiveSectionView: View {
                 .lineLimit(1)
             }
             .buttonStyle(TvApplePillButtonStyle(isSelected: liveController.usingProxyFallback || appState.shouldUseProxyOrRelay(for: .liveStream), compact: true))
+            .fixedSize(horizontal: true, vertical: false)
+
+            Button {
+              lastInteractionAt = Date()
+              withAnimation(.easeInOut(duration: 0.2)) {
+                appState.showProxyStatsOverlay.toggle()
+              }
+            } label: {
+              Label(appState.showProxyStatsOverlay ? "隐藏监控" : "代理监控", systemImage: "waveform.path.ecg.rectangle")
+                .lineLimit(1)
+            }
+            .buttonStyle(TvApplePillButtonStyle(isSelected: appState.showProxyStatsOverlay, compact: true))
             .fixedSize(horizontal: true, vertical: false)
 
             Button {
@@ -4199,7 +4245,13 @@ struct TvTelegramConversationPaneView: View {
                         TvTelegramAlbumBubbleView(
                           chat: chat,
                           albumMessages: group.messages,
-                          onForward: { onRequestForward(group.messages) }
+                          onForward: { onRequestForward(group.messages) },
+                          onCopyText: { copied in
+                            if !chat.readOnly {
+                              composeText = copied
+                            }
+                            appState.showToast(chat.readOnly ? "已复制相册说明文本" : "已复制文本并填入输入框")
+                          }
                         )
                       } else if group.isDocGroup {
                         TvTelegramDocGroupBubbleView(
@@ -4211,7 +4263,13 @@ struct TvTelegramConversationPaneView: View {
                         TvTelegramMessageBubbleView(
                           chat: chat,
                           message: group.first,
-                          onForward: { onRequestForward([group.first]) }
+                          onForward: { onRequestForward([group.first]) },
+                          onCopyText: { copied in
+                            if !chat.readOnly {
+                              composeText = copied
+                            }
+                            appState.showToast(chat.readOnly ? "已复制消息文本" : "已复制消息文本并填入输入框")
+                          }
                         )
                       }
                     }
@@ -4410,6 +4468,7 @@ struct TvTelegramAlbumBubbleView: View {
   let chat: TvTelegramChat
   let albumMessages: [TvTelegramMessage]
   let onForward: () -> Void
+  var onCopyText: ((String) -> Void)? = nil
 
   var body: some View {
     let first = albumMessages[0]
@@ -4541,6 +4600,15 @@ struct TvTelegramAlbumBubbleView: View {
           }
           .buttonStyle(TvApplePillButtonStyle(compact: true))
 
+          if !captionMsg.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            Button {
+              onCopyText?(captionMsg.text)
+            } label: {
+              Label("复制文本", systemImage: "doc.on.doc")
+            }
+            .buttonStyle(TvApplePillButtonStyle(compact: true))
+          }
+
           Button(action: onForward) {
             Label("转发", systemImage: "arrowshape.turn.up.right")
           }
@@ -4668,6 +4736,7 @@ struct TvTelegramMessageBubbleView: View {
   let chat: TvTelegramChat
   let message: TvTelegramMessage
   let onForward: () -> Void
+  var onCopyText: ((String) -> Void)? = nil
 
   var body: some View {
     let isOutgoing = message.outgoing && !chat.broadcast
@@ -4794,6 +4863,15 @@ struct TvTelegramMessageBubbleView: View {
                 appState.telegramReplyingTo = message
               } label: {
                 Label("回复", systemImage: "arrowshape.turn.up.left")
+              }
+              .buttonStyle(TvApplePillButtonStyle(compact: true))
+            }
+
+            if !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+              Button {
+                onCopyText?(message.text)
+              } label: {
+                Label("复制", systemImage: "doc.on.doc")
               }
               .buttonStyle(TvApplePillButtonStyle(compact: true))
             }

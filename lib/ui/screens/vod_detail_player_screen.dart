@@ -17,6 +17,7 @@ import '../widgets/mobile_edge_swipe_back.dart';
 import '../widgets/video_115_accelerate_button.dart';
 import '../widgets/video_download_speed_badge.dart';
 import '../widgets/video_proxy_node_selector.dart';
+import '../widgets/video_proxy_stats_overlay.dart';
 import '../../services/local_115_direct_service.dart';
 
 class VodDetailPlayerScreen extends StatefulWidget {
@@ -140,6 +141,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
   Timer? _bufferingLagTimer;
   bool _hasRenderedFirstFrame = false;
   bool _usingClientProxy = false;
+  bool _showProxyStatsOverlay = false;
   int _clientProxyRetryCountForEpisode = 0;
   bool _bypassClientProxyForCurrentEpisode = false;
   bool _didTryServerResolveForEpisode = false;
@@ -1441,8 +1443,11 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       _pendingSeekSeconds = curPosSec;
       _hasAppliedInitialSeek = false;
     }
+    final isRelayMode = widget.appState.proxyService
+            .resolveEffectiveRoute(RequestScenario.vodStream) ==
+        ScenarioRouteMode.serverRelay;
     setState(() {
-      _useServerProxy = false;
+      _useServerProxy = isRelayMode;
       _bypassClientProxyForCurrentEpisode = false;
       _clientProxyRetryCountForEpisode = 0;
       _hasRenderedFirstFrame = false;
@@ -1452,8 +1457,9 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     if (resolved != null) {
       _openResolvedStream(
         resolved,
-        forceProxy: resolved.backendProxyPlayback && resolved.directUrl.isEmpty,
-        bypassClientProxy: false,
+        forceProxy: isRelayMode ||
+            (resolved.backendProxyPlayback && resolved.directUrl.isEmpty),
+        bypassClientProxy: isRelayMode,
       );
     } else if (_currentEpisode != null) {
       _selectAndPlayEpisode(_currentEpisode!, resumeSeconds: curPosSec);
@@ -2569,6 +2575,24 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                 ),
                               ),
                             ),
+                            Center(
+                              child: Padding(
+                                padding: const EdgeInsets.only(right: 4),
+                                child: VideoProxyStatsButton(
+                                  proxyService: widget.appState.proxyService,
+                                  scenario: RequestScenario.vodStream,
+                                  isShowingStats: _showProxyStatsOverlay,
+                                  overlayStyle: false,
+                                  compact: isNarrow,
+                                  onToggle: () {
+                                    setState(() {
+                                      _showProxyStatsOverlay =
+                                          !_showProxyStatsOverlay;
+                                    });
+                                  },
+                                ),
+                              ),
+                            ),
                             TextButton.icon(
                               style: TextButton.styleFrom(
                                 visualDensity: VisualDensity.compact,
@@ -3107,6 +3131,20 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                               overlayStyle: false,
                               compact: false,
                               onProxyChanged: _onProxyNodeSwitched,
+                            ),
+                            const SizedBox(width: 8),
+                            VideoProxyStatsButton(
+                              proxyService: widget.appState.proxyService,
+                              scenario: RequestScenario.vodStream,
+                              isShowingStats: _showProxyStatsOverlay,
+                              overlayStyle: false,
+                              compact: false,
+                              onToggle: () {
+                                setState(() {
+                                  _showProxyStatsOverlay =
+                                      !_showProxyStatsOverlay;
+                                });
+                              },
                             ),
                           ],
                         ),
@@ -3944,6 +3982,20 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                 compact: true,
                                 onProxyChanged: _onProxyNodeSwitched,
                               ),
+                              const SizedBox(width: 8),
+                              VideoProxyStatsButton(
+                                proxyService: widget.appState.proxyService,
+                                scenario: RequestScenario.vodStream,
+                                isShowingStats: _showProxyStatsOverlay,
+                                overlayStyle: isFullscreen,
+                                compact: true,
+                                onToggle: () {
+                                  setState(() {
+                                    _showProxyStatsOverlay =
+                                        !_showProxyStatsOverlay;
+                                  });
+                                },
+                              ),
                             ],
                           ),
                         ),
@@ -4445,6 +4497,20 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                               onProxyChanged: _onProxyNodeSwitched,
                             ),
                             const SizedBox(width: 6),
+                            VideoProxyStatsButton(
+                              proxyService: widget.appState.proxyService,
+                              scenario: RequestScenario.vodStream,
+                              isShowingStats: _showProxyStatsOverlay,
+                              overlayStyle: true,
+                              compact: screenSize.width < 520,
+                              onToggle: () {
+                                setState(() {
+                                  _showProxyStatsOverlay =
+                                      !_showProxyStatsOverlay;
+                                });
+                              },
+                            ),
+                            const SizedBox(width: 6),
                             VideoDownloadSpeedBadge(player: _player),
                             if (_playError == null &&
                                 !_isResolvingPlay &&
@@ -4720,6 +4786,16 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                     ),
                   ],
                 ),
+              ),
+            if (_showProxyStatsOverlay)
+              VideoProxyStatsDetailPanel(
+                proxyService: widget.appState.proxyService,
+                scenario: RequestScenario.vodStream,
+                onClose: () {
+                  if (mounted) {
+                    setState(() => _showProxyStatsOverlay = false);
+                  }
+                },
               ),
               ],
             );

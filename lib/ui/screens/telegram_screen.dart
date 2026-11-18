@@ -20,6 +20,7 @@ import '../widgets/mobile_edge_swipe_back.dart';
 import '../widgets/video_115_accelerate_button.dart';
 import '../widgets/video_download_speed_badge.dart';
 import '../widgets/video_proxy_node_selector.dart';
+import '../widgets/video_proxy_stats_overlay.dart';
 import '../../services/local_115_direct_service.dart';
 
 class _TelegramDraft {
@@ -375,6 +376,8 @@ class _TelegramScreenState extends State<TelegramScreen> {
   bool _sendAsFile = false;
   int _uploadPercent = 0;
   String _uploadStatusText = '';
+  bool _isDraggingFilesOverChat = false;
+  String _activeSelectedBubbleText = '';
 
   // Official Telegram Emoji Panel & Formatting State
   bool _showEmojiPanel = false;
@@ -436,6 +439,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
     super.initState();
     _messageScrollController.addListener(_onMessageScroll);
     widget.appState.addListener(_onAppStateChanged);
+    _nativeUtilsChannel.setMethodCallHandler(_handleNativeUtilsMethodCall);
     _notifEventSub = widget.appState.telegramNotifications.eventStream.listen(
       _onRealtimeNotificationEvent,
     );
@@ -445,6 +449,70 @@ class _TelegramScreenState extends State<TelegramScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _checkPendingNotificationJump();
     });
+  }
+
+  Future<dynamic> _handleNativeUtilsMethodCall(MethodCall call) async {
+    if (!mounted) return null;
+    if (call.method == 'onFileDragUpdated') {
+      final args = call.arguments;
+      final active = (args is Map && args['active'] == true) &&
+          _selectedChat != null &&
+          !_selectedChat!.readOnly;
+      if (_isDraggingFilesOverChat != active) {
+        setState(() => _isDraggingFilesOverChat = active);
+      }
+      return null;
+    }
+    if (call.method == 'onFilesDropped') {
+      if (_isDraggingFilesOverChat) {
+        setState(() => _isDraggingFilesOverChat = false);
+      }
+      final chat = _selectedChat;
+      if (chat == null || chat.readOnly) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('请先打开一个可发言的 Telegram 会话再拖拽发送文件')),
+        );
+        return null;
+      }
+      final rawList = call.arguments;
+      if (rawList is List) {
+        final droppedFiles = <TelegramOutgoingFile>[];
+        for (final item in rawList) {
+          if (item is Map) {
+            final name = (item['name'] ?? '附件').toString();
+            final bytes = item['bytes'] is Uint8List
+                ? item['bytes'] as Uint8List
+                : Uint8List(0);
+            final path = item['path']?.toString();
+            final size = (item['size'] as num?)?.toInt() ?? bytes.length;
+            if (size > 0 && (bytes.isNotEmpty || (path != null && path.isNotEmpty))) {
+              droppedFiles.add(
+                TelegramOutgoingFile(
+                  name: name,
+                  bytes: bytes,
+                  mimeType: _guessMimeType(name),
+                  filePath: path,
+                  fileSize: size,
+                ),
+              );
+            }
+          }
+        }
+        if (droppedFiles.isNotEmpty && mounted) {
+          final allImages = droppedFiles.every((f) => f.isImage);
+          _stageOrPreviewOutgoingFiles(
+            droppedFiles,
+            asFile: !allImages,
+            openPreviewDialog: true,
+            dialogTitle: allImages
+                ? '拖拽发送图片 (${droppedFiles.length})'
+                : '拖拽发送文件 (${droppedFiles.length})',
+          );
+        }
+      }
+      return null;
+    }
+    return null;
   }
 
   void _onAppStateChanged() {
@@ -2728,15 +2796,20 @@ class _TelegramScreenState extends State<TelegramScreen> {
           for (final item in rawList) {
             if (item is Map) {
               final name = (item['name'] ?? '附件').toString();
-              final bytes = item['bytes'];
+              final bytes = item['bytes'] is Uint8List
+                  ? item['bytes'] as Uint8List
+                  : Uint8List(0);
               final path = item['path']?.toString();
-              if (bytes is Uint8List && bytes.isNotEmpty) {
+              final size = (item['size'] as num?)?.toInt() ?? bytes.length;
+              if (size > 0 &&
+                  (bytes.isNotEmpty || (path != null && path.isNotEmpty))) {
                 pickedFiles.add(
                   TelegramOutgoingFile(
                     name: name,
                     bytes: bytes,
                     mimeType: _guessMimeType(name),
                     filePath: path,
+                    fileSize: size,
                   ),
                 );
               }
@@ -2805,19 +2878,26 @@ class _TelegramScreenState extends State<TelegramScreen> {
         );
         if (res is Map) {
           final name = (res['name'] ?? '粘贴图片.png').toString();
-          final bytes = res['bytes'];
-          if (bytes is Uint8List && bytes.isNotEmpty && mounted) {
+          final bytes = res['bytes'] is Uint8List
+              ? res['bytes'] as Uint8List
+              : Uint8List(0);
+          final path = res['path']?.toString();
+          final size = (res['size'] as num?)?.toInt() ?? bytes.length;
+          if (size > 0 &&
+              (bytes.isNotEmpty || (path != null && path.isNotEmpty)) &&
+              mounted) {
+            final file = TelegramOutgoingFile(
+              name: name,
+              bytes: bytes,
+              mimeType: _guessMimeType(name),
+              filePath: path,
+              fileSize: size,
+            );
             _stageOrPreviewOutgoingFiles(
-              [
-                TelegramOutgoingFile(
-                  name: name,
-                  bytes: bytes,
-                  mimeType: _guessMimeType(name),
-                ),
-              ],
-              asFile: false,
+              [file],
+              asFile: !file.isImage,
               openPreviewDialog: true,
-              dialogTitle: '发送剪贴板图片',
+              dialogTitle: file.isImage ? '发送剪贴板图片' : '发送剪贴板文件',
             );
             return true;
           }
@@ -7297,6 +7377,85 @@ class _TelegramScreenState extends State<TelegramScreen> {
                   ),
                 ),
               ),
+
+              // 5. Drag-and-Drop File Sending Overlay (Desktop / macOS)
+              if (_isDraggingFilesOverChat)
+                Positioned.fill(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () => setState(() => _isDraggingFilesOverChat = false),
+                    child: Container(
+                      margin: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: tg.isDark
+                            ? const Color(0xDA0E1621)
+                            : const Color(0xE6F4F9FF),
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(
+                          color: chat.readOnly
+                              ? const Color(0xFFE54D42)
+                              : tg.tgBlueBright,
+                          width: 2.2,
+                        ),
+                        boxShadow: const [
+                          BoxShadow(
+                            color: Color(0x55000000),
+                            blurRadius: 24,
+                            offset: Offset(0, 8),
+                          ),
+                        ],
+                      ),
+                      alignment: Alignment.center,
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Container(
+                            width: 72,
+                            height: 72,
+                            decoration: BoxDecoration(
+                              color: (chat.readOnly
+                                      ? const Color(0xFFE54D42)
+                                      : tg.tgBlueBright)
+                                  .withValues(alpha: 0.16),
+                              shape: BoxShape.circle,
+                            ),
+                            alignment: Alignment.center,
+                            child: Icon(
+                              chat.readOnly
+                                  ? Icons.block_rounded
+                                  : Icons.cloud_upload_rounded,
+                              size: 38,
+                              color: chat.readOnly
+                                  ? const Color(0xFFE54D42)
+                                  : tg.tgBlueBright,
+                            ),
+                          ),
+                          const SizedBox(height: 14),
+                          Text(
+                            chat.readOnly
+                                ? '当前频道「${chat.title}」为只读，无法拖拽发送文件'
+                                : '释放鼠标以发送文件至「${chat.title}」',
+                            style: TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w700,
+                              color: tg.textPrimary,
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            chat.readOnly
+                                ? '请切换到私聊、群组或收藏夹 (Saved Messages) 会话'
+                                : '支持图片、视频、音频及任意文档 (单文件最高 2GB · 可选无损原文件或压缩媒体)',
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              color: tg.textSecondary,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
             ],
           ),
         ),
@@ -7694,13 +7853,12 @@ class _TelegramScreenState extends State<TelegramScreen> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 if (captionMsg.text.trim().isNotEmpty) ...[
-                  Text(
-                    captionMsg.text,
-                    style: TextStyle(
-                      fontSize: 13.5,
-                      height: 1.4,
-                      color: tg.textPrimary,
-                    ),
+                  _buildInteractiveMessageText(
+                    tg,
+                    chat,
+                    captionMsg,
+                    fontSize: 13.5,
+                    height: 1.4,
                   ),
                   const SizedBox(height: 4),
                 ],
@@ -7824,6 +7982,22 @@ class _TelegramScreenState extends State<TelegramScreen> {
                       },
                     ),
                     const Spacer(),
+                    if (captionMsg.text.trim().isNotEmpty)
+                      InkWell(
+                        onTap: () {
+                          Clipboard.setData(
+                            ClipboardData(text: captionMsg.text),
+                          );
+                          _showDownloadHud('已复制消息文本', state: 'success');
+                        },
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 5),
+                          child: Text(
+                            '复制',
+                            style: TextStyle(fontSize: 11, color: tg.textMuted),
+                          ),
+                        ),
+                      ),
                     InkWell(
                       onTap: () => _showForwardMessagesDialog(albumMessages),
                       child: Padding(
@@ -8460,13 +8634,12 @@ class _TelegramScreenState extends State<TelegramScreen> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 if (captionMsg.text.trim().isNotEmpty) ...[
-                  Text(
-                    captionMsg.text,
-                    style: TextStyle(
-                      fontSize: 13.5,
-                      height: 1.4,
-                      color: tg.textPrimary,
-                    ),
+                  _buildInteractiveMessageText(
+                    tg,
+                    chat,
+                    captionMsg,
+                    fontSize: 13.5,
+                    height: 1.4,
                   ),
                   const SizedBox(height: 4),
                 ],
@@ -8735,13 +8908,12 @@ class _TelegramScreenState extends State<TelegramScreen> {
                                       ),
                                     )
                                   : null,
-                              child: Text(
-                                msg.text,
-                                style: TextStyle(
-                                  fontSize: isGiantEmoji ? 36 : 13.5,
-                                  height: isGiantEmoji ? 1.15 : 1.42,
-                                  color: tg.textPrimary,
-                                ),
+                              child: _buildInteractiveMessageText(
+                                tg,
+                                chat,
+                                msg,
+                                fontSize: isGiantEmoji ? 36 : 13.5,
+                                height: isGiantEmoji ? 1.15 : 1.42,
                               ),
                             );
                           },
@@ -8750,13 +8922,12 @@ class _TelegramScreenState extends State<TelegramScreen> {
                     },
                   )
                 else
-                  Text(
-                    msg.text,
-                    style: TextStyle(
-                      fontSize: 13.5,
-                      height: 1.42,
-                      color: tg.textPrimary,
-                    ),
+                  _buildInteractiveMessageText(
+                    tg,
+                    chat,
+                    msg,
+                    fontSize: 13.5,
+                    height: 1.42,
                   ),
                 const SizedBox(height: 3),
               ],
@@ -8778,6 +8949,32 @@ class _TelegramScreenState extends State<TelegramScreen> {
                           padding: const EdgeInsets.symmetric(horizontal: 4),
                           child: Text(
                             '回复',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: tg.textMuted,
+                            ),
+                          ),
+                        ),
+                      ),
+                    if (msg.text.trim().isNotEmpty)
+                      InkWell(
+                        onTap: () {
+                          final selectedText = _activeSelectedBubbleText.trim();
+                          final textToCopy = selectedText.isNotEmpty
+                              ? selectedText
+                              : msg.text;
+                          Clipboard.setData(ClipboardData(text: textToCopy));
+                          _showDownloadHud(
+                            selectedText.isNotEmpty
+                                ? '已复制选中内容'
+                                : '已复制消息文本',
+                            state: 'success',
+                          );
+                        },
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 4),
+                          child: Text(
+                            '复制',
                             style: TextStyle(
                               fontSize: 11,
                               color: tg.textMuted,
@@ -8970,6 +9167,132 @@ class _TelegramScreenState extends State<TelegramScreen> {
           Flexible(child: bubbleContent),
         ],
       ),
+    );
+  }
+
+  /// Interactive selectable message text inside a Telegram bubble supporting
+  /// partial mouse/touch selection, Cmd+C copy, and a rich text context menu.
+  Widget _buildInteractiveMessageText(
+    _TgPalette tg,
+    TelegramChat chat,
+    TelegramMessage msg, {
+    required double fontSize,
+    required double height,
+  }) {
+    return SelectableText(
+      msg.text,
+      style: TextStyle(
+        fontSize: fontSize,
+        height: height,
+        color: tg.textPrimary,
+      ),
+      onSelectionChanged: (selection, cause) {
+        if (!selection.isValid || selection.isCollapsed) {
+          _activeSelectedBubbleText = '';
+          return;
+        }
+        final start = selection.start.clamp(0, msg.text.length);
+        final end = selection.end.clamp(0, msg.text.length);
+        if (end > start) {
+          _activeSelectedBubbleText = msg.text.substring(start, end);
+        } else {
+          _activeSelectedBubbleText = '';
+        }
+      },
+      contextMenuBuilder: (ctx, editableTextState) {
+        final val = editableTextState.textEditingValue;
+        final sel = val.selection;
+        final hasSelection =
+            sel.isValid && !sel.isCollapsed && sel.end > sel.start;
+        final selectedSubstr = hasSelection
+            ? val.text.substring(
+                sel.start.clamp(0, val.text.length),
+                sel.end.clamp(0, val.text.length),
+              )
+            : '';
+
+        final buttonItems = <ContextMenuButtonItem>[
+          if (hasSelection)
+            ContextMenuButtonItem(
+              label: '复制选中文字',
+              onPressed: () {
+                editableTextState.copySelection(SelectionChangedCause.toolbar);
+                ContextMenuController.removeAny();
+                _showDownloadHud('已复制选中文字', state: 'success');
+              },
+            ),
+          ContextMenuButtonItem(
+            label: '复制整条消息',
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: msg.text));
+              ContextMenuController.removeAny();
+              _showDownloadHud('已复制整条消息文本', state: 'success');
+            },
+          ),
+          ContextMenuButtonItem(
+            label: '全选文字',
+            onPressed: () {
+              editableTextState.selectAll(SelectionChangedCause.toolbar);
+            },
+          ),
+          if (!chat.readOnly)
+            ContextMenuButtonItem(
+              label: hasSelection ? '引用选中内容回复' : '回复此消息',
+              onPressed: () {
+                ContextMenuController.removeAny();
+                setState(() => _replyingToMessage = msg);
+                if (hasSelection && selectedSubstr.trim().isNotEmpty) {
+                  final existing = _composeController.text;
+                  final quoteLine = '> ${selectedSubstr.trim()}\n';
+                  if (!existing.startsWith(quoteLine)) {
+                    _composeController.text = '$quoteLine$existing';
+                    _composeController.selection = TextSelection.fromPosition(
+                      TextPosition(offset: _composeController.text.length),
+                    );
+                  }
+                }
+                _saveCurrentDraft();
+                _composeFocusNode.requestFocus();
+              },
+            ),
+          if (!chat.readOnly)
+            ContextMenuButtonItem(
+              label: '填入输入框编辑',
+              onPressed: () {
+                ContextMenuController.removeAny();
+                final textToInsert =
+                    hasSelection && selectedSubstr.trim().isNotEmpty
+                        ? selectedSubstr
+                        : msg.text;
+                _composeController.text = textToInsert;
+                _composeController.selection = TextSelection.fromPosition(
+                  TextPosition(offset: _composeController.text.length),
+                );
+                _saveCurrentDraft();
+                _composeFocusNode.requestFocus();
+              },
+            ),
+          ContextMenuButtonItem(
+            label: '转发消息...',
+            onPressed: () {
+              ContextMenuController.removeAny();
+              _showForwardMessagesDialog([msg]);
+            },
+          ),
+          ContextMenuButtonItem(
+            label: '保存到收藏夹',
+            onPressed: () {
+              ContextMenuController.removeAny();
+              _saveMessageToSavedMessages(msg);
+            },
+          ),
+        ];
+
+        return AdaptiveTextSelectionToolbar.buttonItems(
+          anchors: editableTextState.contextMenuAnchors,
+          buttonItems: buttonItems,
+        );
+      },
     );
   }
 
@@ -10167,6 +10490,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
     if (overlay == null) return;
 
     final att = msg.attachment;
+    final activeSelection = _activeSelectedBubbleText.trim();
     final selected = await showMenu<String>(
       context: context,
       color: tg.sidebarBg,
@@ -10175,6 +10499,55 @@ class _TelegramScreenState extends State<TelegramScreen> {
         Offset.zero & overlay.size,
       ),
       items: [
+        if (activeSelection.isNotEmpty)
+          PopupMenuItem(
+            value: 'copy_selected',
+            child: Row(
+              children: [
+                Icon(Icons.content_copy_rounded, size: 17, color: tg.tgBlueBright),
+                const SizedBox(width: 10),
+                Text('复制选中文字', style: TextStyle(color: tg.textPrimary)),
+              ],
+            ),
+          ),
+        if (msg.text.isNotEmpty)
+          PopupMenuItem(
+            value: 'copy',
+            child: Row(
+              children: [
+                Icon(Icons.copy_rounded, size: 17, color: tg.textSecondary),
+                const SizedBox(width: 10),
+                Text('复制整条消息文本', style: TextStyle(color: tg.textPrimary)),
+              ],
+            ),
+          ),
+        if (msg.links.isNotEmpty)
+          PopupMenuItem(
+            value: 'copy_links',
+            child: Row(
+              children: [
+                Icon(Icons.link_rounded, size: 18, color: tg.tgBlueBright),
+                const SizedBox(width: 10),
+                Text(
+                  msg.links.length > 1
+                      ? '复制消息内全部链接 (${msg.links.length})'
+                      : '复制消息内链接',
+                  style: TextStyle(color: tg.textPrimary),
+                ),
+              ],
+            ),
+          ),
+        if (!chat.readOnly && msg.text.trim().isNotEmpty)
+          PopupMenuItem(
+            value: 'insert_compose',
+            child: Row(
+              children: [
+                Icon(Icons.edit_note_rounded, size: 18, color: tg.textSecondary),
+                const SizedBox(width: 10),
+                Text('填入输入框编辑', style: TextStyle(color: tg.textPrimary)),
+              ],
+            ),
+          ),
         if (!chat.readOnly)
           PopupMenuItem(
             value: 'reply',
@@ -10275,17 +10648,6 @@ class _TelegramScreenState extends State<TelegramScreen> {
               ],
             ),
           ),
-        if (msg.text.isNotEmpty)
-          PopupMenuItem(
-            value: 'copy',
-            child: Row(
-              children: [
-                Icon(Icons.copy_rounded, size: 17, color: tg.textSecondary),
-                const SizedBox(width: 10),
-                Text('复制消息文本', style: TextStyle(color: tg.textPrimary)),
-              ],
-            ),
-          ),
         PopupMenuItem(
           value: 'select',
           child: Row(
@@ -10322,6 +10684,37 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
     if (!mounted || selected == null) return;
     switch (selected) {
+      case 'copy_selected':
+        if (activeSelection.isNotEmpty) {
+          Clipboard.setData(ClipboardData(text: activeSelection));
+          _showDownloadHud('已复制选中文字', state: 'success');
+        }
+        break;
+      case 'copy':
+        Clipboard.setData(ClipboardData(text: msg.text));
+        _showDownloadHud('已复制整条消息文本', state: 'success');
+        break;
+      case 'copy_links':
+        if (msg.links.isNotEmpty) {
+          Clipboard.setData(ClipboardData(text: msg.links.join('\n')));
+          _showDownloadHud(
+            msg.links.length > 1
+                ? '已复制 ${msg.links.length} 条链接'
+                : '已复制消息内链接',
+            state: 'success',
+          );
+        }
+        break;
+      case 'insert_compose':
+        final textToInsert =
+            activeSelection.isNotEmpty ? activeSelection : msg.text;
+        _composeController.text = textToInsert;
+        _composeController.selection = TextSelection.fromPosition(
+          TextPosition(offset: _composeController.text.length),
+        );
+        _saveCurrentDraft();
+        _composeFocusNode.requestFocus();
+        break;
       case 'reply':
         setState(() => _replyingToMessage = msg);
         _saveCurrentDraft();
@@ -10346,12 +10739,6 @@ class _TelegramScreenState extends State<TelegramScreen> {
         if (att != null && att.url.isNotEmpty) {
           _queueTelegramDownload(url: att.url, name: att.displayName);
         }
-        break;
-      case 'copy':
-        Clipboard.setData(ClipboardData(text: msg.text));
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('已复制消息文本')),
-        );
         break;
       case 'select':
         setState(() {
@@ -11433,7 +11820,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        if (f.isImage)
+                        if (f.isImage && f.bytes.isNotEmpty)
                           ClipRRect(
                             borderRadius: BorderRadius.circular(5),
                             child: Image.memory(
@@ -12863,7 +13250,7 @@ class _TelegramSendPreviewDialogState
                       border: Border.all(color: tg.borderLine),
                     ),
                     clipBehavior: Clip.antiAlias,
-                    child: currentFile.isImage
+                    child: currentFile.isImage && currentFile.bytes.isNotEmpty
                         ? Stack(
                             fit: StackFit.expand,
                             children: [
@@ -12979,7 +13366,7 @@ class _TelegramSendPreviewDialogState
                           child: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              if (f.isImage)
+                              if (f.isImage && f.bytes.isNotEmpty)
                                 ClipRRect(
                                   borderRadius: BorderRadius.circular(4),
                                   child: Image.memory(
@@ -15213,6 +15600,7 @@ class _TelegramPhotoGalleryDialogState
   int _galleryVideoOpenSeq = 0;
   String _activeGalleryStreamUrl = '';
   bool _activeGalleryUsingLocalRelay = false;
+  bool _showProxyStatsOverlay = false;
   Timer? _galleryAutoHideTimer;
   final ScrollController _thumbStripScrollController = ScrollController();
 
@@ -16809,6 +17197,20 @@ class _TelegramPhotoGalleryDialogState
                               },
                             ),
                             const SizedBox(width: 6),
+                            VideoProxyStatsButton(
+                              proxyService: widget.appState.proxyService,
+                              scenario: RequestScenario.telegram,
+                              isShowingStats: _showProxyStatsOverlay,
+                              overlayStyle: true,
+                              compact: isMobileDialog,
+                              onToggle: () {
+                                setState(() {
+                                  _showProxyStatsOverlay =
+                                      !_showProxyStatsOverlay;
+                                });
+                              },
+                            ),
+                            const SizedBox(width: 6),
                             VideoDownloadSpeedBadge(
                               player: _videoPlayer!,
                               compact: isMobileDialog,
@@ -17805,6 +18207,20 @@ class _TelegramPhotoGalleryDialogState
                                       });
                                     },
                                   ),
+                                  const SizedBox(width: 6),
+                                  VideoProxyStatsButton(
+                                    proxyService: widget.appState.proxyService,
+                                    scenario: RequestScenario.telegram,
+                                    isShowingStats: _showProxyStatsOverlay,
+                                    overlayStyle: true,
+                                    compact: true,
+                                    onToggle: () {
+                                      setState(() {
+                                        _showProxyStatsOverlay =
+                                            !_showProxyStatsOverlay;
+                                      });
+                                    },
+                                  ),
                                 ],
                                 const SizedBox(width: 6),
                                 Listener(
@@ -18247,6 +18663,16 @@ class _TelegramPhotoGalleryDialogState
               },
               child: const SizedBox(width: 1, height: 1),
             ),
+          ),
+        if (_showProxyStatsOverlay)
+          VideoProxyStatsDetailPanel(
+            proxyService: widget.appState.proxyService,
+            scenario: RequestScenario.telegram,
+            onClose: () {
+              if (mounted) {
+                setState(() => _showProxyStatsOverlay = false);
+              }
+            },
           ),
           ],
         ),

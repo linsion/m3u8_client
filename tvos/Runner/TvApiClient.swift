@@ -1,21 +1,92 @@
+import CommonCrypto
+import CryptoKit
 import Foundation
 import Network
+import Security
 
-// MARK: - Real-Time Downstream Network Speed Monitor (1:1 Match with LocalProxyTunnelBridge + VideoDownloadSpeedBadge)
+// MARK: - Real-Time Network Traffic & Proxy Telemetry Monitor (1:1 Match with LocalProxyTunnelBridge + VideoProxyStatsDetailPanel)
 
 final class TvNetworkSpeedMonitor: @unchecked Sendable {
   static let shared = TvNetworkSpeedMonitor()
   private let lock = NSLock()
-  private var samples: [(timestampMs: Int64, bytes: Int)] = []
+  private var downstreamSamples: [(timestampMs: Int64, bytes: Int)] = []
+  private var upstreamSamples: [(timestampMs: Int64, bytes: Int)] = []
+  private var _totalDownstreamBytes: Int64 = 0
+  private var _totalUpstreamBytes: Int64 = 0
+  private var _activeTunnelConnections: Int = 0
+  private var _totalTunnelRequests: Int = 0
+
+  var totalDownstreamBytes: Int64 {
+    lock.lock()
+    defer { lock.unlock() }
+    return _totalDownstreamBytes
+  }
+
+  var totalUpstreamBytes: Int64 {
+    lock.lock()
+    defer { lock.unlock() }
+    return _totalUpstreamBytes
+  }
+
+  var activeTunnelConnections: Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return _activeTunnelConnections
+  }
+
+  var totalTunnelRequests: Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return _totalTunnelRequests
+  }
+
+  func incrementTunnelConnection() {
+    lock.lock()
+    _activeTunnelConnections += 1
+    _totalTunnelRequests += 1
+    lock.unlock()
+  }
+
+  func decrementTunnelConnection() {
+    lock.lock()
+    if _activeTunnelConnections > 0 {
+      _activeTunnelConnections -= 1
+    }
+    lock.unlock()
+  }
+
+  func resetCounters() {
+    lock.lock()
+    _totalDownstreamBytes = 0
+    _totalUpstreamBytes = 0
+    _totalTunnelRequests = 0
+    downstreamSamples.removeAll()
+    upstreamSamples.removeAll()
+    lock.unlock()
+  }
 
   func recordDownstreamBytes(_ count: Int) {
     guard count > 0 else { return }
     let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
     lock.lock()
-    samples.append((nowMs, count))
-    if samples.count > 96 {
+    _totalDownstreamBytes += Int64(count)
+    downstreamSamples.append((nowMs, count))
+    if downstreamSamples.count > 128 {
       let cutoff = nowMs - 2500
-      samples.removeAll { $0.timestampMs < cutoff }
+      downstreamSamples.removeAll { $0.timestampMs < cutoff }
+    }
+    lock.unlock()
+  }
+
+  func recordUpstreamBytes(_ count: Int) {
+    guard count > 0 else { return }
+    let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+    lock.lock()
+    _totalUpstreamBytes += Int64(count)
+    upstreamSamples.append((nowMs, count))
+    if upstreamSamples.count > 128 {
+      let cutoff = nowMs - 2500
+      upstreamSamples.removeAll { $0.timestampMs < cutoff }
     }
     lock.unlock()
   }
@@ -24,10 +95,10 @@ final class TvNetworkSpeedMonitor: @unchecked Sendable {
     let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
     let cutoff = nowMs - 1800
     lock.lock()
-    samples.removeAll { $0.timestampMs < cutoff }
+    downstreamSamples.removeAll { $0.timestampMs < cutoff }
     var totalBytes = 0
     var earliestMs = nowMs
-    for s in samples {
+    for s in downstreamSamples {
       totalBytes += s.bytes
       if s.timestampMs < earliestMs {
         earliestMs = s.timestampMs
@@ -37,6 +108,1200 @@ final class TvNetworkSpeedMonitor: @unchecked Sendable {
     guard totalBytes > 0 else { return 0.0 }
     let spanSec = max(0.45, Double(nowMs - earliestMs) / 1000.0)
     return Double(totalBytes) / spanSec
+  }
+
+  var recentUpstreamBytesPerSecond: Double {
+    let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+    let cutoff = nowMs - 1800
+    lock.lock()
+    upstreamSamples.removeAll { $0.timestampMs < cutoff }
+    var totalBytes = 0
+    var earliestMs = nowMs
+    for s in upstreamSamples {
+      totalBytes += s.bytes
+      if s.timestampMs < earliestMs {
+        earliestMs = s.timestampMs
+      }
+    }
+    lock.unlock()
+    guard totalBytes > 0 else { return 0.0 }
+    let spanSec = max(0.45, Double(nowMs - earliestMs) / 1000.0)
+    return Double(totalBytes) / spanSec
+  }
+}
+
+// MARK: - Local Client Proxy Tunnel Bridge for tvOS (Trojan / VLESS / Shadowsocks AEAD / SOCKS5 / HTTP + Real-Time Exit IP Probe)
+
+struct TvParsedProxyNodeCredentials: Sendable {
+  let id: String
+  let name: String
+  let proto: String
+  let host: String
+  let port: Int
+  var username: String = ""
+  var password: String = ""
+  var cipher: String = "aes-256-gcm"
+  var sni: String = ""
+  var tls: Bool = false
+  var network: String = "tcp"
+  var wsHost: String = ""
+  var wsPath: String = "/"
+}
+
+struct TvRealTimeProxyIpSnapshot: Sendable {
+  let routeLabel: String
+  let isUsingProxy: Bool
+  let nodeName: String
+  let protocolBadge: String
+  let entryHostPort: String
+  let entryResolvedIp: String
+  let exitPublicIp: String
+  let exitLocation: String
+  let exitIsp: String
+  let rttMs: Int
+}
+
+final class TvLocalProxyTunnelServer: @unchecked Sendable {
+  static let shared = TvLocalProxyTunnelServer()
+
+  private let lock = NSLock()
+  private var listener: NWListener?
+  private(set) var port: UInt16 = 0
+  private let queue = DispatchQueue(label: "tv.liuguang.proxy.tunnel", qos: .userInitiated, attributes: .concurrent)
+  private var activeNode: TvSubscriptionNode?
+  private var activeCreds: TvParsedProxyNodeCredentials?
+  private var proxyEnabled: Bool = false
+  private var ipCache: [String: (snapshot: TvRealTimeProxyIpSnapshot, timestampMs: Int64)] = [:]
+
+  private init() {
+    startListenerIfNeeded()
+  }
+
+  func configure(node: TvSubscriptionNode?, enabled: Bool) {
+    startListenerIfNeeded()
+    let parsed = node.map { Self.parseCredentials(from: $0) }
+    lock.lock()
+    self.activeNode = node
+    self.activeCreds = parsed
+    self.proxyEnabled = enabled && (parsed != nil)
+    lock.unlock()
+  }
+
+  var currentActiveNode: TvSubscriptionNode? {
+    lock.lock()
+    defer { lock.unlock() }
+    return proxyEnabled ? activeNode : nil
+  }
+
+  var isProxyActive: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return proxyEnabled && activeCreds != nil && port > 0
+  }
+
+  func proxyConnectionDictionary() -> [AnyHashable: Any]? {
+    lock.lock()
+    let active = proxyEnabled && activeCreds != nil
+    let p = Int(port)
+    lock.unlock()
+    guard active, p > 0 else { return nil }
+    return [
+      kCFNetworkProxiesHTTPEnable as String: 1,
+      kCFNetworkProxiesHTTPProxy as String: "127.0.0.1",
+      kCFNetworkProxiesHTTPPort as String: p,
+      "HTTPSEnable": 1,
+      "HTTPSProxy": "127.0.0.1",
+      "HTTPSPort": p,
+    ]
+  }
+
+  func makeProxiedUrlSession(timeoutRequest: TimeInterval = 12, timeoutResource: TimeInterval = 30) -> URLSession {
+    let cfg = URLSessionConfiguration.ephemeral
+    cfg.timeoutIntervalForRequest = timeoutRequest
+    cfg.timeoutIntervalForResource = timeoutResource
+    cfg.httpMaximumConnectionsPerHost = 24
+    cfg.httpShouldSetCookies = true
+    cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+    if let dict = proxyConnectionDictionary() {
+      cfg.connectionProxyDictionary = dict
+    }
+    return URLSession(configuration: cfg, delegate: InsecureSessionDelegate(), delegateQueue: nil)
+  }
+
+  func startListenerIfNeeded() {
+    lock.lock()
+    if listener != nil && port > 0 {
+      lock.unlock()
+      return
+    }
+    lock.unlock()
+    do {
+      let params = NWParameters.tcp
+      params.allowLocalEndpointReuse = true
+      let nwListener = try NWListener(using: params, on: .any)
+      nwListener.stateUpdateHandler = { [weak self] state in
+        guard let self else { return }
+        if case .ready = state, let p = nwListener.port?.rawValue, p > 0 {
+          self.lock.lock()
+          self.port = p
+          self.lock.unlock()
+        }
+      }
+      nwListener.newConnectionHandler = { [weak self] conn in
+        self?.handleClientConnection(conn)
+      }
+      nwListener.start(queue: queue)
+      lock.lock()
+      self.listener = nwListener
+      lock.unlock()
+    } catch {}
+  }
+
+  private func handleClientConnection(_ client: NWConnection) {
+    client.start(queue: queue)
+    client.receive(minimumIncompleteLength: 1, maximumLength: 32768) { [weak self] data, _, _, err in
+      guard let self, err == nil, let data, !data.isEmpty,
+            let headerStr = String(data: data, encoding: .isoLatin1) else {
+        client.cancel()
+        return
+      }
+      let lines = headerStr.components(separatedBy: "\r\n")
+      guard let firstLine = lines.first else {
+        client.cancel()
+        return
+      }
+      let parts = firstLine.components(separatedBy: " ")
+      guard parts.count >= 2 else {
+        client.cancel()
+        return
+      }
+      let method = parts[0].uppercased()
+      let target = parts[1]
+      let isConnect = (method == "CONNECT")
+      var targetHost = ""
+      var targetPort = isConnect ? 443 : 80
+
+      if isConnect {
+        let hp = target.components(separatedBy: ":")
+        targetHost = hp.first ?? ""
+        if hp.count >= 2, let p = Int(hp.last ?? ""), p > 0 {
+          targetPort = p
+        }
+      } else if let u = URL(string: target), let h = u.host, !h.isEmpty {
+        targetHost = h
+        targetPort = u.port ?? (u.scheme?.lowercased() == "https" ? 443 : 80)
+      } else {
+        for line in lines.dropFirst() where line.lowercased().hasPrefix("host:") {
+          let hVal = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+          let hp = hVal.components(separatedBy: ":")
+          targetHost = hp.first ?? ""
+          if hp.count >= 2, let p = Int(hp.last ?? ""), p > 0 {
+            targetPort = p
+          }
+          break
+        }
+      }
+
+      guard !targetHost.isEmpty else {
+        client.cancel()
+        return
+      }
+
+      self.lock.lock()
+      let creds = self.proxyEnabled ? self.activeCreds : nil
+      self.lock.unlock()
+
+      if isConnect {
+        let established = Data("HTTP/1.1 200 Connection Established\r\n\r\n".utf8)
+        client.send(content: established, completion: .contentProcessed { sendErr in
+          guard sendErr == nil else {
+            client.cancel()
+            return
+          }
+          client.receive(minimumIncompleteLength: 1, maximumLength: 65536) { firstPayload, _, _, rxErr in
+            guard rxErr == nil, let firstPayload, !firstPayload.isEmpty else {
+              client.cancel()
+              return
+            }
+            TvNetworkSpeedMonitor.shared.recordUpstreamBytes(firstPayload.count)
+            self.openTunnelAndBridge(
+              client: client,
+              creds: creds,
+              targetHost: targetHost,
+              targetPort: targetPort,
+              initialPayload: firstPayload
+            )
+          }
+        })
+      } else {
+        let rewritten = Self.rewriteOriginFormHttpRequest(lines: lines, rawData: data)
+        TvNetworkSpeedMonitor.shared.recordUpstreamBytes(rewritten.count)
+        self.openTunnelAndBridge(
+          client: client,
+          creds: creds,
+          targetHost: targetHost,
+          targetPort: targetPort,
+          initialPayload: rewritten
+        )
+      }
+    }
+  }
+
+  private static func rewriteOriginFormHttpRequest(lines: [String], rawData: Data) -> Data {
+    guard !lines.isEmpty else { return rawData }
+    var out = ""
+    let parts = lines[0].components(separatedBy: " ")
+    if parts.count >= 3, let u = URL(string: parts[1]), u.host != nil {
+      let path = u.path.isEmpty ? "/" : u.path
+      let query = (u.query != nil && !u.query!.isEmpty) ? "?\(u.query!)" : ""
+      out += "\(parts[0]) \(path)\(query) \(parts[2])\r\n"
+    } else {
+      out += "\(lines[0])\r\n"
+    }
+    for l in lines.dropFirst() {
+      if l.isEmpty { break }
+      if l.lowercased().hasPrefix("proxy-connection:") { continue }
+      out += "\(l)\r\n"
+    }
+    out += "\r\n"
+    return Data(out.utf8)
+  }
+
+  private func openTunnelAndBridge(
+    client: NWConnection,
+    creds: TvParsedProxyNodeCredentials?,
+    targetHost: String,
+    targetPort: Int,
+    initialPayload: Data
+  ) {
+    guard let creds else {
+      openDirectBridge(client: client, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
+      return
+    }
+
+    let proto = creds.proto.lowercased()
+    if proto == "trojan" {
+      openTrojanBridge(client: client, creds: creds, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
+    } else if proto == "vless" {
+      openVlessBridge(client: client, creds: creds, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
+    } else if proto == "ss" || proto == "shadowsocks" {
+      openShadowsocksBridge(client: client, creds: creds, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
+    } else if proto == "socks5" || proto == "socks" {
+      openSocks5Bridge(client: client, creds: creds, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
+    } else if proto == "http" || proto == "https" {
+      openHttpProxyBridge(client: client, creds: creds, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
+    } else {
+      openDirectBridge(client: client, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
+    }
+  }
+
+  private func makeUpstreamConnection(host: String, port: Int, useTls: Bool, sni: String) -> NWConnection {
+    let nwHost = NWEndpoint.Host(host)
+    let nwPort = NWEndpoint.Port(rawValue: UInt16(clamping: port)) ?? .https
+    if useTls {
+      let tlsOptions = NWProtocolTLS.Options()
+      let serverName = sni.isEmpty ? host : sni
+      sec_protocol_options_set_tls_server_name(tlsOptions.securityProtocolOptions, serverName)
+      sec_protocol_options_set_verify_block(
+        tlsOptions.securityProtocolOptions,
+        { _, _, completionHandler in completionHandler(true) },
+        queue
+      )
+      let params = NWParameters(tls: tlsOptions, tcp: NWProtocolTCP.Options())
+      return NWConnection(host: nwHost, port: nwPort, using: params)
+    } else {
+      return NWConnection(host: nwHost, port: nwPort, using: .tcp)
+    }
+  }
+
+  private func openDirectBridge(
+    client: NWConnection,
+    targetHost: String,
+    targetPort: Int,
+    initialPayload: Data
+  ) {
+    let upstream = makeUpstreamConnection(host: targetHost, port: targetPort, useTls: false, sni: "")
+    TvNetworkSpeedMonitor.shared.incrementTunnelConnection()
+    upstream.stateUpdateHandler = { [weak self] state in
+      switch state {
+      case .ready:
+        upstream.send(content: initialPayload, completion: .contentProcessed { err in
+          if err != nil {
+            self?.closePair(client: client, upstream: upstream)
+            return
+          }
+          self?.pipeRawBidirectional(client: client, upstream: upstream, stripVlessHeader: false)
+        })
+      case .failed, .cancelled:
+        self?.closePair(client: client, upstream: upstream)
+      default:
+        break
+      }
+    }
+    upstream.start(queue: queue)
+  }
+
+  private func openTrojanBridge(
+    client: NWConnection,
+    creds: TvParsedProxyNodeCredentials,
+    targetHost: String,
+    targetPort: Int,
+    initialPayload: Data
+  ) {
+    let sni = creds.sni.isEmpty ? (creds.wsHost.isEmpty ? creds.host : creds.wsHost) : creds.sni
+    let upstream = makeUpstreamConnection(host: creds.host, port: creds.port, useTls: true, sni: sni)
+    TvNetworkSpeedMonitor.shared.incrementTunnelConnection()
+
+    let passHash = Self.sha224Hex(creds.password)
+    let hostBytes = Array(targetHost.utf8)
+    var packet = Data()
+    packet.append(contentsOf: passHash.utf8)
+    packet.append(contentsOf: [0x0D, 0x0A, 0x01, 0x03, UInt8(hostBytes.count)])
+    packet.append(contentsOf: hostBytes)
+    packet.append(contentsOf: [UInt8((targetPort >> 8) & 0xFF), UInt8(targetPort & 0xFF), 0x0D, 0x0A])
+    packet.append(initialPayload)
+
+    upstream.stateUpdateHandler = { [weak self] state in
+      switch state {
+      case .ready:
+        upstream.send(content: packet, completion: .contentProcessed { err in
+          if err != nil {
+            self?.closePair(client: client, upstream: upstream)
+            return
+          }
+          self?.pipeRawBidirectional(client: client, upstream: upstream, stripVlessHeader: false)
+        })
+      case .failed:
+        self?.closePair(client: client, upstream: upstream, countDecrementOnly: true)
+        self?.openDirectBridge(client: client, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
+      case .cancelled:
+        self?.closePair(client: client, upstream: upstream)
+      default:
+        break
+      }
+    }
+    upstream.start(queue: queue)
+  }
+
+  private func openVlessBridge(
+    client: NWConnection,
+    creds: TvParsedProxyNodeCredentials,
+    targetHost: String,
+    targetPort: Int,
+    initialPayload: Data
+  ) {
+    guard let uuidBytes = Self.parseUuidBytes(creds.password) else {
+      openDirectBridge(client: client, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
+      return
+    }
+    let sni = creds.sni.isEmpty ? (creds.wsHost.isEmpty ? creds.host : creds.wsHost) : creds.sni
+    let upstream = makeUpstreamConnection(host: creds.host, port: creds.port, useTls: creds.tls, sni: sni)
+    TvNetworkSpeedMonitor.shared.incrementTunnelConnection()
+
+    let hostBytes = Array(targetHost.utf8)
+    var packet = Data([0x00])
+    packet.append(uuidBytes)
+    packet.append(contentsOf: [
+      0x00, // addon len 0
+      0x01, // TCP
+      UInt8((targetPort >> 8) & 0xFF),
+      UInt8(targetPort & 0xFF),
+      0x02, // Domain
+      UInt8(hostBytes.count),
+    ])
+    packet.append(contentsOf: hostBytes)
+    packet.append(initialPayload)
+
+    upstream.stateUpdateHandler = { [weak self] state in
+      switch state {
+      case .ready:
+        upstream.send(content: packet, completion: .contentProcessed { err in
+          if err != nil {
+            self?.closePair(client: client, upstream: upstream)
+            return
+          }
+          self?.pipeRawBidirectional(client: client, upstream: upstream, stripVlessHeader: true)
+        })
+      case .failed:
+        self?.closePair(client: client, upstream: upstream, countDecrementOnly: true)
+        self?.openDirectBridge(client: client, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
+      case .cancelled:
+        self?.closePair(client: client, upstream: upstream)
+      default:
+        break
+      }
+    }
+    upstream.start(queue: queue)
+  }
+
+  private func openSocks5Bridge(
+    client: NWConnection,
+    creds: TvParsedProxyNodeCredentials,
+    targetHost: String,
+    targetPort: Int,
+    initialPayload: Data
+  ) {
+    let upstream = makeUpstreamConnection(host: creds.host, port: creds.port, useTls: creds.tls, sni: creds.sni)
+    TvNetworkSpeedMonitor.shared.incrementTunnelConnection()
+    upstream.stateUpdateHandler = { [weak self] state in
+      guard let self else { return }
+      switch state {
+      case .ready:
+        let greet = Data([0x05, 0x01, 0x00])
+        upstream.send(content: greet, completion: .contentProcessed { err in
+          guard err == nil else {
+            self.closePair(client: client, upstream: upstream)
+            return
+          }
+          upstream.receive(minimumIncompleteLength: 2, maximumLength: 16) { resp, _, _, rErr in
+            guard rErr == nil, let resp, resp.count >= 2, resp[0] == 0x05 else {
+              self.closePair(client: client, upstream: upstream)
+              return
+            }
+            let hostBytes = Array(targetHost.utf8)
+            var connReq = Data([0x05, 0x01, 0x00, 0x03, UInt8(hostBytes.count)])
+            connReq.append(contentsOf: hostBytes)
+            connReq.append(contentsOf: [UInt8((targetPort >> 8) & 0xFF), UInt8(targetPort & 0xFF)])
+            upstream.send(content: connReq, completion: .contentProcessed { cErr in
+              guard cErr == nil else {
+                self.closePair(client: client, upstream: upstream)
+                return
+              }
+              upstream.receive(minimumIncompleteLength: 4, maximumLength: 64) { cResp, _, _, crErr in
+                guard crErr == nil, let cResp, cResp.count >= 4, cResp[1] == 0x00 else {
+                  self.closePair(client: client, upstream: upstream)
+                  return
+                }
+                upstream.send(content: initialPayload, completion: .contentProcessed { pErr in
+                  guard pErr == nil else {
+                    self.closePair(client: client, upstream: upstream)
+                    return
+                  }
+                  self.pipeRawBidirectional(client: client, upstream: upstream, stripVlessHeader: false)
+                })
+              }
+            })
+          }
+        })
+      case .failed:
+        self.closePair(client: client, upstream: upstream, countDecrementOnly: true)
+        self.openDirectBridge(client: client, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
+      case .cancelled:
+        self.closePair(client: client, upstream: upstream)
+      default:
+        break
+      }
+    }
+    upstream.start(queue: queue)
+  }
+
+  private func openHttpProxyBridge(
+    client: NWConnection,
+    creds: TvParsedProxyNodeCredentials,
+    targetHost: String,
+    targetPort: Int,
+    initialPayload: Data
+  ) {
+    let upstream = makeUpstreamConnection(host: creds.host, port: creds.port, useTls: creds.tls || creds.proto.lowercased() == "https", sni: creds.sni)
+    TvNetworkSpeedMonitor.shared.incrementTunnelConnection()
+    upstream.stateUpdateHandler = { [weak self] state in
+      guard let self else { return }
+      switch state {
+      case .ready:
+        var connectHeader = "CONNECT \(targetHost):\(targetPort) HTTP/1.1\r\nHost: \(targetHost):\(targetPort)\r\n"
+        if !creds.username.isEmpty || !creds.password.isEmpty {
+          let rawAuth = "\(creds.username):\(creds.password)"
+          let b64 = Data(rawAuth.utf8).base64EncodedString()
+          connectHeader += "Proxy-Authorization: Basic \(b64)\r\n"
+        }
+        connectHeader += "\r\n"
+        upstream.send(content: Data(connectHeader.utf8), completion: .contentProcessed { err in
+          guard err == nil else {
+            self.closePair(client: client, upstream: upstream)
+            return
+          }
+          upstream.receive(minimumIncompleteLength: 12, maximumLength: 4096) { resp, _, _, rErr in
+            guard rErr == nil, let resp, let str = String(data: resp, encoding: .isoLatin1), str.contains(" 200 ") else {
+              self.closePair(client: client, upstream: upstream)
+              return
+            }
+            upstream.send(content: initialPayload, completion: .contentProcessed { pErr in
+              guard pErr == nil else {
+                self.closePair(client: client, upstream: upstream)
+                return
+              }
+              self.pipeRawBidirectional(client: client, upstream: upstream, stripVlessHeader: false)
+            })
+          }
+        })
+      case .failed:
+        self.closePair(client: client, upstream: upstream, countDecrementOnly: true)
+        self.openDirectBridge(client: client, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
+      case .cancelled:
+        self.closePair(client: client, upstream: upstream)
+      default:
+        break
+      }
+    }
+    upstream.start(queue: queue)
+  }
+
+  private func openShadowsocksBridge(
+    client: NWConnection,
+    creds: TvParsedProxyNodeCredentials,
+    targetHost: String,
+    targetPort: Int,
+    initialPayload: Data
+  ) {
+    let c = creds.cipher.lowercased()
+    let isChaCha = c.contains("chacha20")
+    let keyLen = isChaCha ? 32 : (c.contains("128") ? 16 : 32)
+    let saltLen = keyLen
+    let masterKey = Self.evpBytesToKey(password: creds.password, keyLen: keyLen)
+    var clientSalt = Data(count: saltLen)
+    for i in 0..<saltLen { clientSalt[i] = UInt8.random(in: 0...255) }
+    let clientSubkey = Self.hkdfSha1(ikm: masterKey, salt: clientSalt, info: Data("ss-subkey".utf8), outLen: keyLen)
+
+    let hostBytes = Array(targetHost.utf8)
+    var plain = Data([0x03, UInt8(hostBytes.count)])
+    plain.append(contentsOf: hostBytes)
+    plain.append(contentsOf: [UInt8((targetPort >> 8) & 0xFF), UInt8(targetPort & 0xFF)])
+    plain.append(initialPayload)
+
+    var clientNonce: UInt64 = 0
+    guard let firstEnc = Self.ssAeadPack(plain: plain, subkey: clientSubkey, isChaCha: isChaCha, nonceCounter: &clientNonce) else {
+      openDirectBridge(client: client, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
+      return
+    }
+    var firstPacket = clientSalt
+    firstPacket.append(firstEnc)
+
+    let upstream = makeUpstreamConnection(host: creds.host, port: creds.port, useTls: false, sni: "")
+    TvNetworkSpeedMonitor.shared.incrementTunnelConnection()
+    upstream.stateUpdateHandler = { [weak self] state in
+      guard let self else { return }
+      switch state {
+      case .ready:
+        upstream.send(content: firstPacket, completion: .contentProcessed { err in
+          guard err == nil else {
+            self.closePair(client: client, upstream: upstream)
+            return
+          }
+          self.pipeShadowsocksBidirectional(
+            client: client,
+            upstream: upstream,
+            masterKey: masterKey,
+            clientSubkey: clientSubkey,
+            initialClientNonce: clientNonce,
+            saltLen: saltLen,
+            keyLen: keyLen,
+            isChaCha: isChaCha
+          )
+        })
+      case .failed:
+        self.closePair(client: client, upstream: upstream, countDecrementOnly: true)
+        self.openDirectBridge(client: client, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
+      case .cancelled:
+        self.closePair(client: client, upstream: upstream)
+      default:
+        break
+      }
+    }
+    upstream.start(queue: queue)
+  }
+
+  private func pipeShadowsocksBidirectional(
+    client: NWConnection,
+    upstream: NWConnection,
+    masterKey: Data,
+    clientSubkey: Data,
+    initialClientNonce: UInt64,
+    saltLen: Int,
+    keyLen: Int,
+    isChaCha: Bool
+  ) {
+    let stateLock = NSLock()
+    var clientNonce = initialClientNonce
+    var serverNonce: UInt64 = 0
+    var serverSubkey: Data? = nil
+    var rxBuf = Data()
+    var pendingLen: Int? = nil
+
+    func pumpClientToUpstream() {
+      client.receive(minimumIncompleteLength: 1, maximumLength: 32768) { [weak self] data, _, isComplete, err in
+        guard let self else { return }
+        if let data, !data.isEmpty {
+          TvNetworkSpeedMonitor.shared.recordUpstreamBytes(data.count)
+          stateLock.lock()
+          let packed = Self.ssAeadPack(plain: data, subkey: clientSubkey, isChaCha: isChaCha, nonceCounter: &clientNonce)
+          stateLock.unlock()
+          if let packed {
+            upstream.send(content: packed, completion: .contentProcessed { sErr in
+              if sErr != nil || isComplete {
+                self.closePair(client: client, upstream: upstream)
+              } else {
+                pumpClientToUpstream()
+              }
+            })
+            return
+          }
+        }
+        if err != nil || isComplete {
+          self.closePair(client: client, upstream: upstream)
+        }
+      }
+    }
+
+    func pumpUpstreamToClient() {
+      upstream.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, err in
+        guard let self else { return }
+        if let data, !data.isEmpty {
+          TvNetworkSpeedMonitor.shared.recordDownstreamBytes(data.count)
+          var outPlain = Data()
+          var failed = false
+          stateLock.lock()
+          rxBuf.append(data)
+          if serverSubkey == nil, rxBuf.count >= saltLen {
+            let srvSalt = rxBuf.subdata(in: 0..<saltLen)
+            rxBuf.removeSubrange(0..<saltLen)
+            serverSubkey = Self.hkdfSha1(ikm: masterKey, salt: srvSalt, info: Data("ss-subkey".utf8), outLen: keyLen)
+          }
+          if let sKey = serverSubkey {
+            while true {
+              if pendingLen == nil {
+                guard rxBuf.count >= 18 else { break }
+                let encLen = rxBuf.subdata(in: 0..<18)
+                guard let decLen = Self.ssAeadOpen(cipherWithTag: encLen, subkey: sKey, isChaCha: isChaCha, nonce: serverNonce) else {
+                  failed = true
+                  break
+                }
+                serverNonce += 1
+                rxBuf.removeSubrange(0..<18)
+                pendingLen = ((Int(decLen[0]) << 8) | Int(decLen[1])) & 0x3FFF
+              }
+              if let pLen = pendingLen {
+                let need = pLen + 16
+                guard rxBuf.count >= need else { break }
+                let encPayload = rxBuf.subdata(in: 0..<need)
+                guard let decPayload = Self.ssAeadOpen(cipherWithTag: encPayload, subkey: sKey, isChaCha: isChaCha, nonce: serverNonce) else {
+                  failed = true
+                  break
+                }
+                serverNonce += 1
+                rxBuf.removeSubrange(0..<need)
+                pendingLen = nil
+                outPlain.append(decPayload)
+              }
+            }
+          }
+          stateLock.unlock()
+
+          if failed {
+            self.closePair(client: client, upstream: upstream)
+            return
+          }
+          if !outPlain.isEmpty {
+            client.send(content: outPlain, completion: .contentProcessed { sErr in
+              if sErr != nil || isComplete {
+                self.closePair(client: client, upstream: upstream)
+              } else {
+                pumpUpstreamToClient()
+              }
+            })
+            return
+          }
+          if !isComplete && err == nil {
+            pumpUpstreamToClient()
+            return
+          }
+        }
+        if err != nil || isComplete {
+          self.closePair(client: client, upstream: upstream)
+        }
+      }
+    }
+
+    pumpClientToUpstream()
+    pumpUpstreamToClient()
+  }
+
+  private func pipeRawBidirectional(
+    client: NWConnection,
+    upstream: NWConnection,
+    stripVlessHeader: Bool
+  ) {
+    let vlessLock = NSLock()
+    var vlessParsed = !stripVlessHeader
+    var vlessBuf = Data()
+
+    func pumpClientToUpstream() {
+      client.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, err in
+        guard let self else { return }
+        if let data, !data.isEmpty {
+          TvNetworkSpeedMonitor.shared.recordUpstreamBytes(data.count)
+          upstream.send(content: data, completion: .contentProcessed { sErr in
+            if sErr != nil || isComplete {
+              self.closePair(client: client, upstream: upstream)
+            } else {
+              pumpClientToUpstream()
+            }
+          })
+          return
+        }
+        if err != nil || isComplete {
+          self.closePair(client: client, upstream: upstream)
+        }
+      }
+    }
+
+    func pumpUpstreamToClient() {
+      upstream.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, err in
+        guard let self else { return }
+        if let data, !data.isEmpty {
+          TvNetworkSpeedMonitor.shared.recordDownstreamBytes(data.count)
+          var forwardData = data
+          vlessLock.lock()
+          if !vlessParsed {
+            vlessBuf.append(data)
+            if vlessBuf.count >= 2 {
+              let addonLen = Int(vlessBuf[1])
+              if vlessBuf.count >= 2 + addonLen {
+                vlessParsed = true
+                forwardData = vlessBuf.subdata(in: (2 + addonLen)..<vlessBuf.count)
+                vlessBuf.removeAll()
+              } else {
+                forwardData = Data()
+              }
+            } else {
+              forwardData = Data()
+            }
+          }
+          vlessLock.unlock()
+
+          if !forwardData.isEmpty {
+            client.send(content: forwardData, completion: .contentProcessed { sErr in
+              if sErr != nil || isComplete {
+                self.closePair(client: client, upstream: upstream)
+              } else {
+                pumpUpstreamToClient()
+              }
+            })
+            return
+          } else if !isComplete && err == nil {
+            pumpUpstreamToClient()
+            return
+          }
+        }
+        if err != nil || isComplete {
+          self.closePair(client: client, upstream: upstream)
+        }
+      }
+    }
+
+    pumpClientToUpstream()
+    pumpUpstreamToClient()
+  }
+
+  private func closePair(client: NWConnection, upstream: NWConnection, countDecrementOnly: Bool = false) {
+    TvNetworkSpeedMonitor.shared.decrementTunnelConnection()
+    upstream.stateUpdateHandler = nil
+    upstream.cancel()
+    if !countDecrementOnly {
+      client.cancel()
+    }
+  }
+
+  // MARK: - Crypto & Node Credential Parser Helpers
+
+  private static func sha224Hex(_ input: String) -> String {
+    let data = Data(input.utf8)
+    var digest = [UInt8](repeating: 0, count: Int(CC_SHA224_DIGEST_LENGTH))
+    data.withUnsafeBytes { ptr in
+      _ = CC_SHA224(ptr.baseAddress, CC_LONG(data.count), &digest)
+    }
+    return digest.map { String(format: "%02x", $0) }.joined()
+  }
+
+  private static func parseUuidBytes(_ uuidStr: String) -> Data? {
+    let hex = uuidStr.replacingOccurrences(of: "-", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+    guard hex.count == 32 else { return nil }
+    var out = Data(capacity: 16)
+    var idx = hex.startIndex
+    for _ in 0..<16 {
+      let next = hex.index(idx, offsetBy: 2)
+      guard let b = UInt8(hex[idx..<next], radix: 16) else { return nil }
+      out.append(b)
+      idx = next
+    }
+    return out
+  }
+
+  private static func evpBytesToKey(password: String, keyLen: Int) -> Data {
+    let passBytes = Data(password.utf8)
+    var result = Data()
+    var prev = Data()
+    while result.count < keyLen {
+      var input = prev
+      input.append(passBytes)
+      var md5 = [UInt8](repeating: 0, count: Int(CC_MD5_DIGEST_LENGTH))
+      input.withUnsafeBytes { ptr in
+        _ = CC_MD5(ptr.baseAddress, CC_LONG(input.count), &md5)
+      }
+      prev = Data(md5)
+      result.append(prev)
+    }
+    return result.prefix(keyLen)
+  }
+
+  private static func hkdfSha1(ikm: Data, salt: Data, info: Data, outLen: Int) -> Data {
+    var prk = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
+    salt.withUnsafeBytes { saltPtr in
+      ikm.withUnsafeBytes { ikmPtr in
+        CCHmac(CCHmacAlgorithm(kCCHmacAlgSHA1), saltPtr.baseAddress, salt.count, ikmPtr.baseAddress, ikm.count, &prk)
+      }
+    }
+    var okm = Data()
+    var t = Data()
+    var counter: UInt8 = 1
+    while okm.count < outLen {
+      var msg = t
+      msg.append(info)
+      msg.append(counter)
+      var block = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
+      msg.withUnsafeBytes { msgPtr in
+        CCHmac(CCHmacAlgorithm(kCCHmacAlgSHA1), prk, prk.count, msgPtr.baseAddress, msg.count, &block)
+      }
+      t = Data(block)
+      okm.append(t)
+      counter &+= 1
+    }
+    return okm.prefix(outLen)
+  }
+
+  private static func makeSsNonce(_ counter: UInt64) -> Data {
+    var n = Data(repeating: 0, count: 12)
+    var le = counter.littleEndian
+    withUnsafeBytes(of: &le) { ptr in
+      for i in 0..<8 { n[i] = ptr[i] }
+    }
+    return n
+  }
+
+  private static func ssAeadEncrypt(plain: Data, subkey: Data, isChaCha: Bool, nonce: UInt64) -> Data? {
+    let nonceData = makeSsNonce(nonce)
+    let key = SymmetricKey(data: subkey)
+    do {
+      if isChaCha {
+        let chachaNonce = try ChaChaPoly.Nonce(data: nonceData)
+        let sealed = try ChaChaPoly.seal(plain, using: key, nonce: chachaNonce)
+        var out = Data(sealed.ciphertext)
+        out.append(sealed.tag)
+        return out
+      } else {
+        let aesNonce = try AES.GCM.Nonce(data: nonceData)
+        let sealed = try AES.GCM.seal(plain, using: key, nonce: aesNonce)
+        var out = Data(sealed.ciphertext)
+        out.append(sealed.tag)
+        return out
+      }
+    } catch {
+      return nil
+    }
+  }
+
+  private static func ssAeadOpen(cipherWithTag: Data, subkey: Data, isChaCha: Bool, nonce: UInt64) -> Data? {
+    guard cipherWithTag.count >= 16 else { return nil }
+    let nonceData = makeSsNonce(nonce)
+    let key = SymmetricKey(data: subkey)
+    let ct = cipherWithTag.prefix(cipherWithTag.count - 16)
+    let tag = cipherWithTag.suffix(16)
+    do {
+      if isChaCha {
+        let chachaNonce = try ChaChaPoly.Nonce(data: nonceData)
+        let box = try ChaChaPoly.SealedBox(nonce: chachaNonce, ciphertext: ct, tag: tag)
+        return try ChaChaPoly.open(box, using: key)
+      } else {
+        let aesNonce = try AES.GCM.Nonce(data: nonceData)
+        let box = try AES.GCM.SealedBox(nonce: aesNonce, ciphertext: ct, tag: tag)
+        return try AES.GCM.open(box, using: key)
+      }
+    } catch {
+      return nil
+    }
+  }
+
+  private static func ssAeadPack(plain: Data, subkey: Data, isChaCha: Bool, nonceCounter: inout UInt64) -> Data? {
+    var out = Data()
+    var offset = 0
+    while offset < plain.count {
+      let end = min(offset + 0x3FFF, plain.count)
+      let slice = plain.subdata(in: offset..<end)
+      let lenData = Data([UInt8((slice.count >> 8) & 0xFF), UInt8(slice.count & 0xFF)])
+      guard let encLen = ssAeadEncrypt(plain: lenData, subkey: subkey, isChaCha: isChaCha, nonce: nonceCounter) else { return nil }
+      nonceCounter += 1
+      guard let encPayload = ssAeadEncrypt(plain: slice, subkey: subkey, isChaCha: isChaCha, nonce: nonceCounter) else { return nil }
+      nonceCounter += 1
+      out.append(encLen)
+      out.append(encPayload)
+      offset = end
+    }
+    return out
+  }
+
+  static func parseCredentials(from node: TvSubscriptionNode) -> TvParsedProxyNodeCredentials {
+    let raw = node.rawUri.trimmingCharacters(in: .whitespacesAndNewlines)
+    var creds = TvParsedProxyNodeCredentials(
+      id: node.id,
+      name: node.displayTitle,
+      proto: node.type.lowercased(),
+      host: node.host,
+      port: node.port
+    )
+
+    if raw.contains("server:") && raw.contains("port:") {
+      // Clash YAML line
+      func yamlVal(_ k: String) -> String {
+        guard let r = raw.range(of: "\(k):") else { return "" }
+        var s = String(raw[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+        if let c = s.firstIndex(of: ",") { s = String(s[..<c]) }
+        if let b = s.firstIndex(of: "}") { s = String(s[..<b]) }
+        return s.trimmingCharacters(in: CharacterSet(charactersIn: " \"'"))
+      }
+      let pw = yamlVal("password")
+      let uuid = yamlVal("uuid")
+      creds.password = !pw.isEmpty ? pw : uuid
+      creds.username = yamlVal("username")
+      let cipher = yamlVal("cipher")
+      if !cipher.isEmpty { creds.cipher = cipher }
+      let sni = yamlVal("sni")
+      let servername = yamlVal("servername")
+      creds.sni = !sni.isEmpty ? sni : servername
+      let tlsStr = yamlVal("tls").lowercased()
+      creds.tls = (tlsStr == "true" || tlsStr == "1" || creds.proto == "trojan")
+      let net = yamlVal("network")
+      if !net.isEmpty { creds.network = net.lowercased() }
+      return creds
+    }
+
+    guard let schemeRange = raw.range(of: "://") else { return creds }
+    let proto = String(raw[..<schemeRange.lowerBound]).lowercased()
+    var body = String(raw[schemeRange.upperBound...])
+    if let hashIdx = body.firstIndex(of: "#") {
+      body = String(body[..<hashIdx])
+    }
+
+    if proto == "ss" || proto == "shadowsocks" {
+      var queryPart = ""
+      if let qIdx = body.firstIndex(of: "?") {
+        queryPart = String(body[body.index(after: qIdx)...])
+        body = String(body[..<qIdx])
+      }
+      if !body.contains("@"), let dec = decodeBase64(body), dec.contains("@") {
+        body = dec
+      }
+      if let atIdx = body.lastIndex(of: "@") {
+        var userInfo = String(body[..<atIdx])
+        if !userInfo.contains(":"), let decUser = decodeBase64(userInfo), decUser.contains(":") {
+          userInfo = decUser
+        }
+        if let colon = userInfo.firstIndex(of: ":") {
+          creds.cipher = String(userInfo[..<colon])
+          creds.password = String(userInfo[userInfo.index(after: colon)...]).removingPercentEncoding
+            ?? String(userInfo[userInfo.index(after: colon)...])
+        }
+      }
+      if !queryPart.isEmpty {
+        // Optional plugin params
+        _ = queryPart
+      }
+      return creds
+    }
+
+    if let comp = URLComponents(string: raw) {
+      let user = (comp.user ?? "").removingPercentEncoding ?? (comp.user ?? "")
+      let pass = (comp.password ?? "").removingPercentEncoding ?? (comp.password ?? "")
+      if proto == "trojan" || proto == "vless" {
+        creds.password = !pass.isEmpty ? pass : user
+        creds.tls = (proto == "trojan")
+      } else {
+        creds.username = user
+        creds.password = pass
+      }
+      for item in comp.queryItems ?? [] {
+        let k = item.name.lowercased()
+        let v = item.value ?? ""
+        switch k {
+        case "sni", "peer":
+          if !v.isEmpty { creds.sni = v }
+        case "security":
+          if v.lowercased() == "tls" || v.lowercased() == "reality" || v.lowercased() == "xtls" {
+            creds.tls = true
+          }
+        case "type", "net":
+          if !v.isEmpty { creds.network = v.lowercased() }
+        case "host":
+          if !v.isEmpty { creds.wsHost = v }
+        case "path":
+          if !v.isEmpty { creds.wsPath = v }
+        default:
+          break
+        }
+      }
+    }
+    return creds
+  }
+
+  private static func decodeBase64(_ raw: String) -> String? {
+    var padded = raw
+      .replacingOccurrences(of: "-", with: "+")
+      .replacingOccurrences(of: "_", with: "/")
+      .components(separatedBy: .whitespacesAndNewlines)
+      .joined()
+    guard !padded.isEmpty else { return nil }
+    while padded.count % 4 != 0 { padded.append("=") }
+    guard let data = Data(base64Encoded: padded, options: .ignoreUnknownCharacters) else { return nil }
+    return String(data: data, encoding: .utf8)
+  }
+
+  private static func resolveHostToIp(_ host: String) -> String {
+    var hints = addrinfo()
+    hints.ai_socktype = SOCK_STREAM
+    hints.ai_family = AF_UNSPEC
+    var res: UnsafeMutablePointer<addrinfo>? = nil
+    let err = getaddrinfo(host, nil, &hints, &res)
+    guard err == 0, let first = res else { return host }
+    defer { freeaddrinfo(res) }
+    var hostBuf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+    if getnameinfo(first.pointee.ai_addr, first.pointee.ai_addrlen, &hostBuf, socklen_t(hostBuf.count), nil, 0, NI_NUMERICHOST) == 0 {
+      let ip = String(cString: hostBuf)
+      if !ip.isEmpty { return ip }
+    }
+    return host
+  }
+
+  private func cachedIpSnapshot(key: String, nowMs: Int64) -> TvRealTimeProxyIpSnapshot? {
+    lock.lock()
+    defer { lock.unlock() }
+    guard let hit = ipCache[key], nowMs - hit.timestampMs < 25_000 else { return nil }
+    return hit.snapshot
+  }
+
+  private func storeIpSnapshot(_ snapshot: TvRealTimeProxyIpSnapshot, forKey key: String, nowMs: Int64) {
+    lock.lock()
+    ipCache[key] = (snapshot, nowMs)
+    lock.unlock()
+  }
+
+  func probeRealTimeIpInfo(
+    node: TvSubscriptionNode?,
+    routeMode: TvScenarioRouteMode,
+    selectionMode: TvProxySelectionMode,
+    forceRefresh: Bool = false
+  ) async -> TvRealTimeProxyIpSnapshot {
+    let isProxy = (routeMode == .proxyNode && node != nil)
+    let isRelay = (routeMode == .serverRelay)
+    let cacheKey = isProxy ? "node:\(node!.id)" : (isRelay ? "relay" : "direct")
+    let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+
+    if !forceRefresh, let cached = cachedIpSnapshot(key: cacheKey, nowMs: nowMs) {
+      return cached
+    }
+
+    let routeLabel: String = {
+      if isProxy {
+        return selectionMode == .autoFastest ? "代理加速 · 自动择优" : "代理加速 · 手动锁定"
+      }
+      if isRelay {
+        return "服务端代理中转"
+      }
+      return "客户端直连模式"
+    }()
+    let nodeName = isProxy
+      ? node!.displayTitle
+      : (isRelay ? "主服务端中转 (/api/vod/proxy)" : "本机网络直连 (Direct)")
+    let protoBadge = isProxy
+      ? node!.type.uppercased()
+      : (isRelay ? "HTTP-RELAY" : "DIRECT")
+    let entryHostPort = isProxy ? "\(node!.host):\(node!.port)" : "本机网卡直出"
+    let entryIp = isProxy ? "\(Self.resolveHostToIp(node!.host)):\(node!.port)" : "本机直连"
+
+    if isProxy {
+      configure(node: node, enabled: true)
+    }
+
+    let probeSession = isProxy
+      ? makeProxiedUrlSession(timeoutRequest: 5, timeoutResource: 6)
+      : {
+          let cfg = URLSessionConfiguration.ephemeral
+          cfg.timeoutIntervalForRequest = 4.5
+          cfg.timeoutIntervalForResource = 5.5
+          return URLSession(configuration: cfg, delegate: InsecureSessionDelegate(), delegateQueue: nil)
+        }()
+    defer { probeSession.finishTasksAndInvalidate() }
+
+    var exitIp = ""
+    var exitLoc = ""
+    var exitIsp = ""
+    var rttMs = isProxy ? (node?.latencyMs ?? 0) : 0
+
+    // 1. Probe ip-api.com (Chinese location & ISP)
+    if let u1 = URL(string: "http://ip-api.com/json/?lang=zh-CN&fields=status,country,regionName,city,isp,org,query") {
+      let t0 = Date()
+      var req = URLRequest(url: u1)
+      req.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+      if let (data, resp) = try? await probeSession.data(for: req),
+         let http = resp as? HTTPURLResponse, http.statusCode == 200,
+         let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+         (dict["status"] as? String) == "success" {
+        rttMs = max(1, Int(Date().timeIntervalSince(t0) * 1000))
+        exitIp = (dict["query"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let country = (dict["country"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let region = (dict["regionName"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let city = (dict["city"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        var parts: [String] = []
+        if !country.isEmpty { parts.append(country) }
+        if !region.isEmpty && region != country { parts.append(region) }
+        if !city.isEmpty && city != region { parts.append(city) }
+        exitLoc = parts.joined(separator: " · ")
+        exitIsp = (dict["isp"] as? String ?? dict["org"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+      }
+    }
+
+    // 2. Fallback to Cloudflare cdn-cgi/trace
+    if exitIp.isEmpty, let u2 = URL(string: "https://www.cloudflare.com/cdn-cgi/trace") {
+      let t0 = Date()
+      if let (data, resp) = try? await probeSession.data(from: u2),
+         let http = resp as? HTTPURLResponse, http.statusCode == 200,
+         let text = String(data: data, encoding: .utf8) {
+        rttMs = max(1, Int(Date().timeIntervalSince(t0) * 1000))
+        for line in text.components(separatedBy: "\n") {
+          if line.hasPrefix("ip=") {
+            exitIp = String(line.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
+          } else if line.hasPrefix("loc=") {
+            exitLoc = String(line.dropFirst(4)).trimmingCharacters(in: .whitespacesAndNewlines)
+          } else if line.hasPrefix("colo=") {
+            exitIsp = "Cloudflare \(String(line.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines))"
+          }
+        }
+      }
+    }
+
+    let snapshot = TvRealTimeProxyIpSnapshot(
+      routeLabel: routeLabel,
+      isUsingProxy: isProxy || isRelay,
+      nodeName: nodeName,
+      protocolBadge: protoBadge,
+      entryHostPort: entryHostPort,
+      entryResolvedIp: entryIp,
+      exitPublicIp: exitIp.isEmpty ? (isProxy ? node!.host : "探测超时") : exitIp,
+      exitLocation: exitLoc.isEmpty ? (isProxy ? node!.regionCategory : "本地网络") : exitLoc,
+      exitIsp: exitIsp,
+      rttMs: rttMs
+    )
+    if !exitIp.isEmpty {
+      storeIpSnapshot(snapshot, forKey: cacheKey, nowMs: nowMs)
+    }
+    return snapshot
   }
 }
 
@@ -499,6 +1764,9 @@ final class TvLiveFlvSession: NSObject, URLSessionDataDelegate, @unchecked Senda
     cfg.timeoutIntervalForRequest = 14
     cfg.timeoutIntervalForResource = 7200
     cfg.httpShouldSetCookies = true
+    if let proxyDict = TvLocalProxyTunnelServer.shared.proxyConnectionDictionary() {
+      cfg.connectionProxyDictionary = proxyDict
+    }
     let sess = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
     var req = URLRequest(url: url)
     req.httpMethod = "GET"
@@ -679,7 +1947,10 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
   private(set) var port: UInt16 = 0
   private let queue = DispatchQueue(label: "tv.liuguang.hls.proxy", qos: .userInitiated, attributes: .concurrent)
   private let store = TvHlsSegmentCacheActor()
-  private let urlSession: URLSession
+  private let directUrlSession: URLSession
+  private var cachedProxyUrlSession: URLSession? = nil
+  private var cachedProxyPort: UInt16 = 0
+  private let sessionLock = NSLock()
   private let flvLock = NSLock()
   private var activeFlvSession: TvLiveFlvSession? = nil
   private var activeFlvGeneration: Int = 0
@@ -689,6 +1960,23 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
   private var tgVideoMetaCache: [String: (totalSize: Int64, contentType: String, headerChunk: Data)] = [:]
   private var tgMetaOrder: [String] = []
 
+  private var urlSession: URLSession {
+    guard TvLocalProxyTunnelServer.shared.isProxyActive else {
+      return directUrlSession
+    }
+    let curPort = TvLocalProxyTunnelServer.shared.port
+    sessionLock.lock()
+    defer { sessionLock.unlock() }
+    if let existing = cachedProxyUrlSession, cachedProxyPort == curPort {
+      return existing
+    }
+    cachedProxyUrlSession?.finishTasksAndInvalidate()
+    let fresh = TvLocalProxyTunnelServer.shared.makeProxiedUrlSession(timeoutRequest: 10, timeoutResource: 22)
+    cachedProxyUrlSession = fresh
+    cachedProxyPort = curPort
+    return fresh
+  }
+
   private init() {
     let cfg = URLSessionConfiguration.ephemeral
     cfg.timeoutIntervalForRequest = 10
@@ -696,7 +1984,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     cfg.httpMaximumConnectionsPerHost = 32
     cfg.httpShouldSetCookies = true
     cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
-    self.urlSession = URLSession(configuration: cfg, delegate: InsecureSessionDelegate(), delegateQueue: nil)
+    self.directUrlSession = URLSession(configuration: cfg, delegate: InsecureSessionDelegate(), delegateQueue: nil)
     startListenerIfNeeded()
   }
 

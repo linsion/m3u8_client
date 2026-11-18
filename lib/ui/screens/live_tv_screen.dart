@@ -16,6 +16,7 @@ import '../../state/app_state.dart';
 import '../theme.dart';
 import '../widgets/video_download_speed_badge.dart';
 import '../widgets/video_proxy_node_selector.dart';
+import '../widgets/video_proxy_stats_overlay.dart';
 
 class LiveTvScreen extends StatefulWidget {
   final AppState appState;
@@ -77,6 +78,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
   // Collapsible & resizable channel list state
   bool _isSidebarCollapsed = false;
   bool _isLiveFullscreen = false;
+  bool _showProxyStatsOverlay = false;
   bool _liveOsdVisible = false;
   bool _showFullscreenChannelDrawer = false;
   Timer? _liveOsdTimer;
@@ -1920,6 +1922,19 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
               },
             ),
             const SizedBox(width: 4),
+            VideoProxyStatsButton(
+              proxyService: state.proxyService,
+              scenario: RequestScenario.liveStream,
+              isShowingStats: _showProxyStatsOverlay,
+              overlayStyle: false,
+              compact: true,
+              onToggle: () {
+                setState(() {
+                  _showProxyStatsOverlay = !_showProxyStatsOverlay;
+                });
+              },
+            ),
+            const SizedBox(width: 4),
             PopupMenuButton<String>(
               tooltip: '更多直播工具',
               icon: const Icon(Icons.more_vert_rounded, size: 20),
@@ -2167,6 +2182,18 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                           isAutoReconnect: true,
                         );
                       }
+                    },
+                  ),
+                  const SizedBox(width: 6),
+                  VideoProxyStatsButton(
+                    proxyService: state.proxyService,
+                    scenario: RequestScenario.liveStream,
+                    isShowingStats: _showProxyStatsOverlay,
+                    overlayStyle: false,
+                    onToggle: () {
+                      setState(() {
+                        _showProxyStatsOverlay = !_showProxyStatsOverlay;
+                      });
                     },
                   ),
                   const SizedBox(width: 8),
@@ -3345,7 +3372,12 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                                         _channelOsdTimer?.cancel();
                                         setState(() {
                                           _channelOsdText = msg;
-                                          _useServerProxy = false;
+                                          _useServerProxy = widget.appState
+                                                  .proxyService
+                                                  .resolveEffectiveRoute(
+                                                      RequestScenario
+                                                          .liveStream) ==
+                                              ScenarioRouteMode.serverRelay;
                                           _playError = null;
                                         });
                                         _channelOsdTimer = Timer(
@@ -3364,6 +3396,20 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                                           resetTried: false,
                                           isAutoReconnect: false,
                                         );
+                                      },
+                                    ),
+                                    const SizedBox(width: 8),
+                                    VideoProxyStatsButton(
+                                      proxyService:
+                                          widget.appState.proxyService,
+                                      scenario: RequestScenario.liveStream,
+                                      isShowingStats: _showProxyStatsOverlay,
+                                      overlayStyle: true,
+                                      onToggle: () {
+                                        setState(() {
+                                          _showProxyStatsOverlay =
+                                              !_showProxyStatsOverlay;
+                                        });
                                       },
                                     ),
                                     const SizedBox(width: 8),
@@ -3775,6 +3821,18 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                                   activeList,
                                   overlayMode: true,
                                 ),
+                              ),
+                            if (_showProxyStatsOverlay)
+                              VideoProxyStatsDetailPanel(
+                                proxyService: widget.appState.proxyService,
+                                scenario: RequestScenario.liveStream,
+                                onClose: () {
+                                  if (mounted) {
+                                    setState(
+                                      () => _showProxyStatsOverlay = false,
+                                    );
+                                  }
+                                },
                               ),
                           ],
                         ),
@@ -4493,6 +4551,20 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                           resetTried: false,
                           isAutoReconnect: true,
                         );
+                      },
+                    ),
+                    const SizedBox(width: 6),
+                    VideoProxyStatsButton(
+                      proxyService: widget.appState.proxyService,
+                      scenario: RequestScenario.liveStream,
+                      isShowingStats: _showProxyStatsOverlay,
+                      overlayStyle: overlayMode,
+                      compact: true,
+                      onToggle: () {
+                        if (overlayMode) _pokeLiveOsd();
+                        setState(() {
+                          _showProxyStatsOverlay = !_showProxyStatsOverlay;
+                        });
                       },
                     ),
                     const SizedBox(width: 6),

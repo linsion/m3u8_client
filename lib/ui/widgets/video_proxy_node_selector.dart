@@ -44,6 +44,7 @@ class VideoProxyNodeSelector extends StatefulWidget {
 class _VideoProxyNodeSelectorState extends State<VideoProxyNodeSelector> {
   static const String _kModeDirect = '__mode_direct__';
   static const String _kModeAuto = '__mode_auto__';
+  static const String _kModeServerRelay = '__mode_server_relay__';
   static const String _kActionRetest = '__action_retest__';
 
   final GlobalKey<PopupMenuButtonState<String>> _menuKey =
@@ -56,13 +57,25 @@ class _VideoProxyNodeSelectorState extends State<VideoProxyNodeSelector> {
   bool get compact => widget.compact;
   bool get overlayStyle => widget.overlayStyle;
 
-  bool _isDirectActive() {
-    if (!proxyService.proxyEnabled) return true;
+  bool _isServerRelayActive() {
     final rule = proxyService.scenarioRules[scenario];
+    return rule?.mode == ScenarioRouteMode.serverRelay;
+  }
+
+  bool _isDirectActive() {
+    final rule = proxyService.scenarioRules[scenario];
+    if (rule?.mode == ScenarioRouteMode.serverRelay ||
+        rule?.mode == ScenarioRouteMode.proxyNode) {
+      return false;
+    }
+    if (!proxyService.proxyEnabled) return true;
     return rule?.mode == ScenarioRouteMode.direct;
   }
 
   String _buildCurrentLabel() {
+    if (_isServerRelayActive()) {
+      return compact ? '🛡️中转' : '代理: 服务端中转';
+    }
     if (_isDirectActive()) {
       return compact ? '直连' : '代理: 直连';
     }
@@ -136,6 +149,16 @@ class _VideoProxyNodeSelectorState extends State<VideoProxyNodeSelector> {
       return;
     }
 
+    if (value == _kModeServerRelay) {
+      await proxyService.updateScenarioRule(
+        scenario,
+        mode: ScenarioRouteMode.serverRelay,
+        clearSpecificNode: true,
+      );
+      onProxyChanged?.call('🛡️ 已切换为服务端代理中转播放');
+      return;
+    }
+
     // Specific proxy node selected
     if (!proxyService.proxyEnabled) {
       await proxyService.setProxyEnabled(true);
@@ -143,10 +166,11 @@ class _VideoProxyNodeSelectorState extends State<VideoProxyNodeSelector> {
     await proxyService.updateScenarioRule(
       scenario,
       mode: ScenarioRouteMode.proxyNode,
-      clearSpecificNode: true,
+      specificNodeId: value,
     );
     await proxyService.selectNode(value, switchToManual: true);
-    final selected = proxyService.activeNode;
+    final selected = proxyService.resolveNodeForScenario(scenario) ??
+        proxyService.activeNode;
     onProxyChanged?.call(
       selected != null
           ? '已切换代理节点：${selected.displayTitle}'
@@ -160,8 +184,10 @@ class _VideoProxyNodeSelectorState extends State<VideoProxyNodeSelector> {
       listenable: proxyService,
       builder: (context, _) {
         final isDirect = _isDirectActive();
+        final isServerRelay = _isServerRelayActive();
         final activeNode = proxyService.resolveNodeForScenario(scenario);
         final isAuto = !isDirect &&
+            !isServerRelay &&
             proxyService.selectionMode == ProxySelectionMode.autoFastest &&
             (proxyService.scenarioRules[scenario]?.specificNodeId == null ||
                 proxyService.scenarioRules[scenario]!.specificNodeId!.isEmpty);
@@ -299,6 +325,33 @@ class _VideoProxyNodeSelectorState extends State<VideoProxyNodeSelector> {
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              PopupMenuItem<String>(
+                value: _kModeServerRelay,
+                height: 38,
+                child: Row(
+                  children: [
+                    Icon(
+                      isServerRelay
+                          ? Icons.radio_button_checked_rounded
+                          : Icons.radio_button_unchecked_rounded,
+                      size: 16,
+                      color: isServerRelay
+                          ? VideoPlatformTheme.accent
+                          : VideoPlatformTheme.textMuted,
+                    ),
+                    const SizedBox(width: 8),
+                    const Expanded(
+                      child: Text(
+                        '🛡️ 服务端代理中转 (/api/vod/proxy)',
+                        style: TextStyle(
                           fontSize: 12.5,
                           fontWeight: FontWeight.w600,
                         ),

@@ -942,6 +942,303 @@ struct TvVideoDownloadSpeedBadge: View {
   }
 }
 
+// MARK: - Real-Time Proxy IP & Inbound/Outbound Traffic Statistics Overlay Card (1:1 Match with VideoProxyStatsDetailPanel)
+
+struct TvVideoProxyStatsOverlayCard: View {
+  @EnvironmentObject var appState: TvAppState
+  let scenario: TvRequestScenario
+  let onOpenSelector: () -> Void
+  let onClose: () -> Void
+
+  @State private var isProbingIp: Bool = false
+  @State private var snapshot = TvRealTimeProxyIpSnapshot(
+    routeLabel: "检测中...",
+    isUsingProxy: false,
+    nodeName: "-",
+    protocolBadge: "-",
+    entryHostPort: "-",
+    entryResolvedIp: "解析中...",
+    exitPublicIp: "探测中...",
+    exitLocation: "",
+    exitIsp: "",
+    rttMs: 0
+  )
+  @State private var inSpeed: Double = 0
+  @State private var outSpeed: Double = 0
+  @State private var totalIn: Int64 = 0
+  @State private var totalOut: Int64 = 0
+  @State private var activeConns: Int = 0
+  @State private var totalReqs: Int = 0
+  private let tickTimer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
+
+  private static func formatSpeed(_ bytesPerSec: Double) -> String {
+    guard bytesPerSec.isFinite, bytesPerSec > 0 else { return "0 B/s" }
+    let kb = 1024.0
+    let mb = kb * 1024.0
+    if bytesPerSec >= mb {
+      return String(format: "%.2f MB/s", bytesPerSec / mb)
+    }
+    if bytesPerSec >= kb {
+      return String(format: "%.1f KB/s", bytesPerSec / kb)
+    }
+    return String(format: "%.0f B/s", bytesPerSec)
+  }
+
+  private static func formatBytes(_ bytes: Int64) -> String {
+    if bytes <= 0 { return "0 B" }
+    let kb = 1024.0
+    let mb = kb * 1024.0
+    let gb = mb * 1024.0
+    let d = Double(bytes)
+    if d >= gb {
+      return String(format: "%.2f GB", d / gb)
+    }
+    if d >= mb {
+      return String(format: "%.2f MB", d / mb)
+    }
+    if d >= kb {
+      return String(format: "%.1f KB", d / kb)
+    }
+    return "\(bytes) B"
+  }
+
+  var body: some View {
+    let statusColor = snapshot.isUsingProxy
+      ? Color(red: 0.20, green: 0.83, blue: 0.60)
+      : Color(red: 0.98, green: 0.75, blue: 0.14)
+
+    VStack(alignment: .leading, spacing: 10) {
+      HStack(spacing: 10) {
+        Circle()
+          .fill(statusColor)
+          .frame(width: 10, height: 10)
+          .shadow(color: statusColor.opacity(0.75), radius: 6)
+
+        Text("代理实时 IP 与流量监控")
+          .font(.system(size: 18, weight: .bold))
+          .foregroundColor(.white)
+
+        Spacer()
+
+        Button {
+          Task { await refreshTelemetry(force: true) }
+        } label: {
+          HStack(spacing: 5) {
+            if isProbingIp {
+              ProgressView()
+                .scaleEffect(0.6)
+            } else {
+              Image(systemName: "arrow.clockwise")
+                .font(.system(size: 13, weight: .bold))
+            }
+            Text("刷新IP")
+              .font(.system(size: 13, weight: .semibold))
+          }
+        }
+        .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+        Button {
+          onOpenSelector()
+        } label: {
+          Label("切换节点", systemImage: "network")
+            .font(.system(size: 13, weight: .semibold))
+        }
+        .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+        Button {
+          onClose()
+        } label: {
+          Image(systemName: "xmark")
+            .font(.system(size: 14, weight: .bold))
+        }
+        .buttonStyle(TvApplePillButtonStyle(isDestructive: true, compact: true))
+      }
+
+      Divider()
+        .background(Color.white.opacity(0.14))
+
+      VStack(alignment: .leading, spacing: 6) {
+        infoRow(
+          label: "当前模式",
+          value: snapshot.routeLabel,
+          color: statusColor,
+          badge: snapshot.protocolBadge
+        )
+        infoRow(
+          label: "生效节点",
+          value: snapshot.nodeName,
+          color: .white,
+          badge: snapshot.rttMs > 0 ? "\(snapshot.rttMs)ms" : nil
+        )
+        infoRow(
+          label: "入口节点IP",
+          value: snapshot.entryResolvedIp,
+          color: .white.opacity(0.82),
+          monospaced: true
+        )
+        infoRow(
+          label: "实时出口IP",
+          value: snapshot.exitPublicIp,
+          color: Color(red: 0.22, green: 0.74, blue: 0.97),
+          monospaced: true
+        )
+        if !snapshot.exitLocation.isEmpty || !snapshot.exitIsp.isEmpty {
+          let locText = [snapshot.exitLocation, snapshot.exitIsp]
+            .filter { !$0.isEmpty }
+            .joined(separator: " · ")
+          infoRow(
+            label: "IP 归属地",
+            value: locText,
+            color: .white.opacity(0.78)
+          )
+        }
+      }
+
+      VStack(spacing: 8) {
+        HStack(spacing: 14) {
+          metricBox(
+            title: "↓ 实时入站速率",
+            value: Self.formatSpeed(inSpeed),
+            color: Color(red: 0.20, green: 0.83, blue: 0.60)
+          )
+          Divider()
+            .frame(height: 36)
+            .background(Color.white.opacity(0.14))
+          metricBox(
+            title: "↑ 实时出站速率",
+            value: Self.formatSpeed(outSpeed),
+            color: Color(red: 0.38, green: 0.65, blue: 0.98)
+          )
+        }
+        Divider()
+          .background(Color.white.opacity(0.12))
+        HStack(spacing: 14) {
+          metricBox(
+            title: "⬇️ 累计入站流量",
+            value: Self.formatBytes(totalIn),
+            color: .white
+          )
+          Divider()
+            .frame(height: 36)
+            .background(Color.white.opacity(0.14))
+          metricBox(
+            title: "⬆️ 累计出站流量",
+            value: Self.formatBytes(totalOut),
+            color: .white
+          )
+        }
+      }
+      .padding(12)
+      .background(
+        RoundedRectangle(cornerRadius: 14, style: .continuous)
+          .fill(Color.white.opacity(0.06))
+      )
+      .overlay(
+        RoundedRectangle(cornerRadius: 14, style: .continuous)
+          .stroke(Color.white.opacity(0.10), lineWidth: 1)
+      )
+
+      HStack {
+        Text("活跃隧道: \(activeConns) · 累计请求: \(totalReqs)")
+          .font(.system(size: 13, weight: .medium))
+          .foregroundColor(.white.opacity(0.60))
+        Spacer()
+        Button("清零统计") {
+          TvNetworkSpeedMonitor.shared.resetCounters()
+          sampleTrafficCounters()
+        }
+        .buttonStyle(TvApplePillButtonStyle(compact: true))
+      }
+    }
+    .padding(18)
+    .frame(width: 520)
+    .background(
+      RoundedRectangle(cornerRadius: 22, style: .continuous)
+        .fill(Color(red: 0.05, green: 0.08, blue: 0.13).opacity(0.94))
+    )
+    .overlay(
+      RoundedRectangle(cornerRadius: 22, style: .continuous)
+        .stroke(statusColor.opacity(0.55), lineWidth: 1.5)
+    )
+    .shadow(color: .black.opacity(0.65), radius: 22, y: 10)
+    .focusSection()
+    .task(id: "\(appState.proxyEnabled)|\(appState.selectedProxyNodeId)|\(appState.rule(for: scenario).mode.rawValue)|\(appState.rule(for: scenario).specificNodeId ?? "")") {
+      sampleTrafficCounters()
+      await refreshTelemetry(force: false)
+    }
+    .onReceive(tickTimer) { _ in
+      sampleTrafficCounters()
+    }
+  }
+
+  private func sampleTrafficCounters() {
+    let mon = TvNetworkSpeedMonitor.shared
+    inSpeed = mon.recentDownstreamBytesPerSecond
+    outSpeed = mon.recentUpstreamBytesPerSecond
+    totalIn = mon.totalDownstreamBytes
+    totalOut = mon.totalUpstreamBytes
+    activeConns = mon.activeTunnelConnections
+    totalReqs = mon.totalTunnelRequests
+  }
+
+  private func refreshTelemetry(force: Bool) async {
+    isProbingIp = true
+    let eff = appState.resolveEffectiveRoute(for: scenario)
+    let node = appState.resolveNode(for: scenario)
+    let info = await TvLocalProxyTunnelServer.shared.probeRealTimeIpInfo(
+      node: node,
+      routeMode: eff,
+      selectionMode: appState.proxySelectionMode,
+      forceRefresh: force
+    )
+    snapshot = info
+    isProbingIp = false
+  }
+
+  @ViewBuilder
+  private func infoRow(
+    label: String,
+    value: String,
+    color: Color,
+    badge: String? = nil,
+    monospaced: Bool = false
+  ) -> some View {
+    HStack(spacing: 8) {
+      Text(label)
+        .font(.system(size: 14, weight: .medium))
+        .foregroundColor(.white.opacity(0.58))
+        .frame(width: 90, alignment: .leading)
+      Text(value)
+        .font(.system(size: 14, weight: .semibold, design: monospaced ? .monospaced : .default))
+        .foregroundColor(color)
+        .lineLimit(1)
+      Spacer(minLength: 4)
+      if let badge, !badge.isEmpty {
+        Text(badge)
+          .font(.system(size: 12, weight: .bold, design: .monospaced))
+          .foregroundColor(.white.opacity(0.85))
+          .padding(.horizontal, 8)
+          .padding(.vertical, 2)
+          .background(Capsule().fill(Color.white.opacity(0.12)))
+      }
+    }
+  }
+
+  @ViewBuilder
+  private func metricBox(title: String, value: String, color: Color) -> some View {
+    VStack(alignment: .leading, spacing: 3) {
+      Text(title)
+        .font(.system(size: 13, weight: .medium))
+        .foregroundColor(.white.opacity(0.58))
+      Text(value)
+        .font(.system(size: 17, weight: .bold, design: .monospaced))
+        .foregroundColor(color)
+        .lineLimit(1)
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+}
+
 // MARK: - VOD & Live TV Fullscreen Player Modal (Pure SwiftUI OSD over TvRawAVPlayerLayerView — 100% Siri Remote Focusable)
 
 struct TvPlayerModalView: View {
@@ -1128,6 +1425,20 @@ struct TvPlayerModalView: View {
             .buttonStyle(
               TvApplePillButtonStyle(
                 isSelected: usingServerProxy || appState.shouldUseProxyOrRelay(for: playerScenario),
+                compact: true
+              )
+            )
+
+            Button {
+              withAnimation(.easeInOut(duration: 0.2)) {
+                appState.showProxyStatsOverlay.toggle()
+              }
+            } label: {
+              Label(appState.showProxyStatsOverlay ? "隐藏监控" : "代理监控", systemImage: "waveform.path.ecg.rectangle")
+            }
+            .buttonStyle(
+              TvApplePillButtonStyle(
+                isSelected: appState.showProxyStatsOverlay,
                 compact: true
               )
             )
@@ -1481,6 +1792,29 @@ struct TvPlayerModalView: View {
           }
         }
       }
+
+      if appState.showProxyStatsOverlay {
+        let playerScenario: TvRequestScenario = request.isLive ? .liveStream : .vodStream
+        VStack {
+          HStack {
+            Spacer()
+            TvVideoProxyStatsOverlayCard(
+              scenario: playerScenario,
+              onOpenSelector: {
+                showProxySelectorSheet = true
+              },
+              onClose: {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                  appState.showProxyStatsOverlay = false
+                }
+              }
+            )
+            .padding(.trailing, 54)
+            .padding(.top, showOverlayBar ? 118 : 36)
+          }
+          Spacer()
+        }
+      }
     }
   }
 
@@ -1609,9 +1943,14 @@ struct TvPlayerModalView: View {
         isPresented: $showProxySelectorSheet,
         scenario: sc
       ) {
-        let shouldRelay = appState.shouldUseServerRelay(for: sc)
-        usingServerProxy = shouldRelay
-        loadCurrentStream(forceProxy: shouldRelay)
+        appState.activateScenarioProxyTunnel(for: sc)
+        if request.isLive, let ch = request.liveChannel {
+          appState.playLiveChannel(ch, urlIndex: request.liveUrlIndex)
+        } else {
+          let shouldRelay = appState.shouldUseServerRelay(for: sc)
+          usingServerProxy = shouldRelay
+          loadCurrentStream(forceProxy: shouldRelay, resumeAt: positionSec)
+        }
       }
       .environmentObject(appState)
     }
@@ -1715,18 +2054,47 @@ struct TvPlayerModalView: View {
     }
   }
 
-  private func loadCurrentStream(forceProxy: Bool) {
-    didFallbackToProxy = forceProxy
+  private func loadCurrentStream(forceProxy: Bool, resumeAt: Double? = nil) {
+    let sc: TvRequestScenario = request.isLive ? .liveStream : .vodStream
+    appState.activateScenarioProxyTunnel(for: sc)
+    let eff = appState.resolveEffectiveRoute(for: sc)
+    let useRelay = forceProxy || (eff == .serverRelay)
+    didFallbackToProxy = useRelay
+    usingServerProxy = useRelay
     didPerformResumeSeek = false
     didTriggerOutroSkip = false
     using115Direct = false
     active115StreamUrl = ""
     active115Headers = [:]
     isBuffering = true
-    let targetUrl = (forceProxy && !request.backupProxyUrl.isEmpty)
+    let baseTargetUrl = (useRelay && !request.backupProxyUrl.isEmpty)
       ? request.backupProxyUrl
       : request.streamUrl
-    startPlayerItem(urlStr: targetUrl)
+
+    if eff == .proxyNode && !baseTargetUrl.contains("127.0.0.1:") {
+      if baseTargetUrl.lowercased().contains(".m3u8") {
+        Task {
+          if let proxiedHls = await TvLocalHlsProxyServer.shared.prepareProxyPlaylistUrl(
+            gatewayUrl: baseTargetUrl,
+            resolvedUrl: baseTargetUrl,
+            headers: request.headers
+          ) {
+            self.startPlayerItem(urlStr: proxiedHls, resumeAt: resumeAt)
+          } else {
+            self.startPlayerItem(urlStr: baseTargetUrl, resumeAt: resumeAt)
+          }
+        }
+        return
+      } else if baseTargetUrl.hasPrefix("http") {
+        let proxiedMp4 = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
+          remoteUrl: baseTargetUrl,
+          headers: request.headers
+        )
+        startPlayerItem(urlStr: proxiedMp4, resumeAt: resumeAt)
+        return
+      }
+    }
+    startPlayerItem(urlStr: baseTargetUrl, resumeAt: resumeAt)
   }
 
   private func startPlayerItem(
@@ -2427,6 +2795,15 @@ struct TvTelegramGalleryModalView: View {
                   }
                   .buttonStyle(TvApplePillButtonStyle(isSelected: appState.shouldUseProxyOrRelay(for: .telegram), compact: true))
 
+                  Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                      appState.showProxyStatsOverlay.toggle()
+                    }
+                  } label: {
+                    Label(appState.showProxyStatsOverlay ? "隐藏监控" : "代理监控", systemImage: "waveform.path.ecg.rectangle")
+                  }
+                  .buttonStyle(TvApplePillButtonStyle(isSelected: appState.showProxyStatsOverlay, compact: true))
+
                   if isVideo {
                     Button {
                       isMuted.toggle()
@@ -2548,6 +2925,28 @@ struct TvTelegramGalleryModalView: View {
         }
       }
       .padding(.bottom, 22)
+
+      if appState.showProxyStatsOverlay {
+        VStack {
+          HStack {
+            Spacer()
+            TvVideoProxyStatsOverlayCard(
+              scenario: .telegram,
+              onOpenSelector: {
+                showProxySelectorSheet = true
+              },
+              onClose: {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                  appState.showProxyStatsOverlay = false
+                }
+              }
+            )
+            .padding(.trailing, 54)
+            .padding(.top, !controlsHidden ? 114 : 36)
+          }
+          Spacer()
+        }
+      }
     }
   }
 
@@ -2643,8 +3042,9 @@ struct TvTelegramGalleryModalView: View {
         isPresented: $showProxySelectorSheet,
         scenario: .telegram
       ) {
+        appState.activateScenarioProxyTunnel(for: .telegram)
         if isVideo {
-          loadCurrentMedia()
+          loadCurrentMedia(resumeAt: positionSec)
         }
       }
       .environmentObject(appState)
@@ -2797,6 +3197,7 @@ struct TvTelegramGalleryModalView: View {
     custom115Headers: [String: String]? = nil
   ) {
     cleanupPlayer()
+    appState.activateScenarioProxyTunnel(for: .telegram)
     let msg = currentMessage
     guard msg.isVideo || msg.isAudio else {
       isPlaying = false

@@ -1706,15 +1706,18 @@ class TelegramOutgoingFile {
   final Uint8List bytes;
   final String mimeType;
   final String? filePath;
+  final int? fileSize;
 
   const TelegramOutgoingFile({
     required this.name,
     required this.bytes,
     this.mimeType = 'application/octet-stream',
     this.filePath,
+    this.fileSize,
   });
 
-  int get size => bytes.length;
+  int get size =>
+      (fileSize != null && fileSize! > 0) ? fileSize! : bytes.length;
 
   bool get isImage {
     final lower = name.toLowerCase();

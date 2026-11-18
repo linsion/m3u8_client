@@ -2742,13 +2742,23 @@ class ApiClient {
     });
 
     for (final f in files) {
-      request.files.add(
-        http.MultipartFile.fromBytes(
-          'files',
-          f.bytes,
-          filename: f.name,
-        ),
-      );
+      if (f.bytes.isEmpty && f.filePath != null && f.filePath!.isNotEmpty) {
+        request.files.add(
+          await http.MultipartFile.fromPath(
+            'files',
+            f.filePath!,
+            filename: f.name,
+          ),
+        );
+      } else {
+        request.files.add(
+          http.MultipartFile.fromBytes(
+            'files',
+            f.bytes,
+            filename: f.name,
+          ),
+        );
+      }
     }
 
     final streamed = await _client
