@@ -1244,8 +1244,31 @@ struct TvSubscriptionNode: Identifiable, Codable, Hashable {
     return "\(ms) ms"
   }
 
+  var isSupportedByClientTunnel: Bool {
+    let p = type.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+    let rawLower = rawUri.lowercased()
+    if subscriptionId != "manual" && subscriptionId != "server" {
+      if host == "127.0.0.1" || host == "0.0.0.0" || host == "localhost" || port <= 1 {
+        return false
+      }
+    }
+    if p == "trojan" || p == "socks5" || p == "socks" || p == "http" || p == "https" {
+      return true
+    }
+    if p == "vless" {
+      if rawLower.contains("security=reality") || rawLower.contains("pbk=") {
+        return false
+      }
+      return true
+    }
+    if p == "ss" || p == "shadowsocks" {
+      return true
+    }
+    return false
+  }
+
   var isAvailable: Bool {
-    guard let ms = latencyMs else { return false }
+    guard isSupportedByClientTunnel, let ms = latencyMs else { return false }
     return ms > 0 && ms < 9000
   }
 }

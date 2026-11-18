@@ -2496,14 +2496,14 @@ final class TvAppState: ObservableObject {
     }
   }
 
-  /// Lowest latency node in active pool
+  /// Lowest latency supported node in active pool
   var fastestProxyNode: TvSubscriptionNode? {
-    let pool = activePoolNodes
+    let pool = activePoolNodes.filter(\.isSupportedByClientTunnel)
     let available = pool.filter { ($0.latencyMs ?? 9999) > 0 && ($0.latencyMs ?? 9999) < 9000 }
     if let best = available.min(by: { ($0.latencyMs ?? 9999) < ($1.latencyMs ?? 9999) }) {
       return best
     }
-    return pool.first
+    return pool.first ?? activePoolNodes.first
   }
 
   /// Currently active global proxy node (respecting `autoFastest` vs `manual`)
@@ -2512,7 +2512,7 @@ final class TvAppState: ObservableObject {
     guard !pool.isEmpty else { return nil }
     if proxySelectionMode == .manual,
        !selectedProxyNodeId.isEmpty,
-       let matched = pool.first(where: { $0.id == selectedProxyNodeId }) {
+       let matched = pool.first(where: { $0.id == selectedProxyNodeId && $0.isSupportedByClientTunnel }) {
       return matched
     }
     if let fastest = fastestProxyNode {
@@ -2522,7 +2522,7 @@ final class TvAppState: ObservableObject {
        let matched = pool.first(where: { $0.id == selectedProxyNodeId }) {
       return matched
     }
-    return pool.first
+    return pool.first(where: \.isSupportedByClientTunnel) ?? pool.first
   }
 
   func setProxyEnabled(_ enabled: Bool) {
@@ -2553,12 +2553,14 @@ final class TvAppState: ObservableObject {
     proxyEnabled = true
     persistProxyState()
     Task {
-      let ms = await Self.tcpPing(host: node.host, port: node.port)
+      let ms = node.isSupportedByClientTunnel
+        ? await Self.tcpPing(host: node.host, port: node.port)
+        : 9999
       if let idx = subscriptionNodes.firstIndex(where: { $0.id == node.id }) {
         subscriptionNodes[idx].latencyMs = ms
         persistProxyState()
       }
-      let latStr = ms >= 9999 ? "超时" : "\(ms) ms"
+      let latStr = ms >= 9999 ? (node.isSupportedByClientTunnel ? "超时" : "协议暂不支持") : "\(ms) ms"
       showToast("🎯 已锁定代理节点：\(node.displayTitle) (\(latStr))")
     }
   }
@@ -2567,12 +2569,14 @@ final class TvAppState: ObservableObject {
     selectedProxyNodeId = node.id
     proxySelectionMode = .manual
     proxyEnabled = true
-    let ms = await Self.tcpPing(host: node.host, port: node.port)
+    let ms = node.isSupportedByClientTunnel
+      ? await Self.tcpPing(host: node.host, port: node.port)
+      : 9999
     if let idx = subscriptionNodes.firstIndex(where: { $0.id == node.id }) {
       subscriptionNodes[idx].latencyMs = ms
     }
     persistProxyState()
-    let latStr = ms >= 9999 ? "超时" : "\(ms) ms"
+    let latStr = ms >= 9999 ? (node.isSupportedByClientTunnel ? "超时" : "协议暂不支持") : "\(ms) ms"
     showToast("🎯 已锁定代理节点：\(node.displayTitle) (\(latStr))")
   }
 
@@ -3087,11 +3091,33 @@ final class TvAppState: ObservableObject {
 
   nonisolated private static func pingNodesConcurrently(_ input: [TvSubscriptionNode], maxCount: Int) async -> [TvSubscriptionNode] {
     var nodes = input
-    let countToPing = min(nodes.count, maxCount)
-    guard countToPing > 0 else { return nodes }
+    guard !nodes.isEmpty else { return nodes }
+
+    // Mark unsupported protocols (hysteria2, anytls, vless-reality) as 9999 immediately
+    var supportedIndices: [Int] = []
+    for idx in nodes.indices {
+      if nodes[idx].isSupportedByClientTunnel {
+        supportedIndices.append(idx)
+      } else {
+        nodes[idx].latencyMs = 9999
+      }
+    }
+
+    let indicesToPing = Array(supportedIndices.prefix(max(maxCount, 64)))
+    guard !indicesToPing.isEmpty else { return nodes }
+
+    // Pre-warm DoH Real-IP cache once per unique host before concurrent pinging
+    let uniqueHosts = Array(Set(indicesToPing.map { nodes[$0].host }))
+    await withTaskGroup(of: Void.self) { group in
+      for h in uniqueHosts {
+        group.addTask {
+          _ = await TvLocalProxyTunnelServer.resolveRealEntryIp(h)
+        }
+      }
+    }
 
     let results: [(Int, Int)] = await withTaskGroup(of: (Int, Int).self) { group in
-      for idx in 0..<countToPing {
+      for idx in indicesToPing {
         let host = nodes[idx].host
         let port = nodes[idx].port
         group.addTask {
@@ -3111,6 +3137,9 @@ final class TvAppState: ObservableObject {
     }
     nodes.sort { a, b in
       if a.favorite != b.favorite { return a.favorite && !b.favorite }
+      if a.isSupportedByClientTunnel != b.isSupportedByClientTunnel {
+        return a.isSupportedByClientTunnel && !b.isSupportedByClientTunnel
+      }
       return (a.latencyMs ?? 9999) < (b.latencyMs ?? 9999)
     }
     return nodes
@@ -3129,6 +3158,12 @@ final class TvAppState: ObservableObject {
       let host = (svc.listenHost.isEmpty || svc.listenHost == "0.0.0.0" || svc.listenHost == "127.0.0.1" || svc.listenHost == "::")
         ? serverHost
         : svc.listenHost
+      var authPrefix = ""
+      if !svc.username.isEmpty || !svc.password.isEmpty {
+        let u = svc.username.addingPercentEncoding(withAllowedCharacters: .urlUserAllowed) ?? svc.username
+        let p = svc.password.addingPercentEncoding(withAllowedCharacters: .urlPasswordAllowed) ?? svc.password
+        authPrefix = "\(u):\(p)@"
+      }
       let node = TvSubscriptionNode(
         id: "srv_\(idx)_\(svc.proto)_\(host)_\(svc.port)",
         name: svc.name.isEmpty ? "服务端 \(svc.proto.uppercased())" : svc.name,
@@ -3137,7 +3172,7 @@ final class TvAppState: ObservableObject {
         port: svc.port,
         subscriptionId: "server",
         subscriptionName: "流光服务端",
-        rawUri: "\(svc.proto.lowercased())://\(host):\(svc.port)#\(svc.name)",
+        rawUri: "\(svc.proto.lowercased())://\(authPrefix)\(host):\(svc.port)#\(svc.name)",
         latencyMs: nil
       )
       serverNodes.append(node)
@@ -3147,11 +3182,14 @@ final class TvAppState: ObservableObject {
     merged.insert(contentsOf: serverNodes, at: 0)
     merged.sort { a, b in
       if a.favorite != b.favorite { return a.favorite && !b.favorite }
+      if a.isSupportedByClientTunnel != b.isSupportedByClientTunnel {
+        return a.isSupportedByClientTunnel && !b.isSupportedByClientTunnel
+      }
       return (a.latencyMs ?? 9999) < (b.latencyMs ?? 9999)
     }
     self.subscriptionNodes = merged
     if selectedProxyNodeId.isEmpty || !merged.contains(where: { $0.id == selectedProxyNodeId }),
-       let first = merged.first {
+       let first = fastestProxyNode ?? merged.first {
       selectedProxyNodeId = first.id
     }
     persistProxyState()
@@ -3439,10 +3477,11 @@ final class TvAppState: ObservableObject {
 
   private nonisolated static func tcpPing(host: String, port: Int) async -> Int {
     guard let nwPort = NWEndpoint.Port(rawValue: UInt16(clamping: port)) else { return 9999 }
+    let realHost = await TvLocalProxyTunnelServer.resolveRealEntryIp(host)
     let start = DispatchTime.now()
     let serialQueue = DispatchQueue(label: "com.linsion.tvos.tcpping")
     return await withCheckedContinuation { cont in
-      let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
+      let conn = NWConnection(host: NWEndpoint.Host(realHost), port: nwPort, using: .tcp)
       final class OnceFlag: @unchecked Sendable {
         var done = false
       }
@@ -3465,7 +3504,7 @@ final class TvAppState: ObservableObject {
         }
       }
       conn.start(queue: serialQueue)
-      serialQueue.asyncAfter(deadline: .now() + 1.1) {
+      serialQueue.asyncAfter(deadline: .now() + 1.8) {
         guard !flag.done else { return }
         flag.done = true
         conn.cancel()

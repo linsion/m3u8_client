@@ -405,6 +405,10 @@ class ProxyNode {
       '公告',
       '流量重置',
       '请更新订阅',
+      '不支持',
+      '推荐客户端',
+      '内核版本',
+      '版本过低',
     ];
     for (final kw in infoKeywords) {
       if (lowerName.contains(kw)) return true;
@@ -418,7 +422,33 @@ class ProxyNode {
     return false;
   }
 
-  bool get isReachable => !isInfoNode && latencyMs != null && latencyMs! > 0;
+  /// Returns true if this node's protocol and security parameters are natively
+  /// supported by the built-in [LocalProxyTunnelBridge].
+  bool get isSupportedByClientTunnel {
+    if (isInfoNode) return false;
+    final p = protocol.toLowerCase().trim();
+    final rawLower = rawUri.toLowerCase();
+    if (p == 'trojan' ||
+        p == 'socks5' ||
+        p == 'socks' ||
+        p == 'http' ||
+        p == 'https') {
+      return true;
+    }
+    if (p == 'vless') {
+      if (rawLower.contains('security=reality') || rawLower.contains('pbk=')) {
+        return false;
+      }
+      return true;
+    }
+    if (p == 'ss' || p == 'shadowsocks') {
+      return LocalProxyTunnelBridge._resolveSsCipherSpec(cipher).supported;
+    }
+    return false;
+  }
+
+  bool get isReachable =>
+      isSupportedByClientTunnel && latencyMs != null && latencyMs! > 0;
   bool get isTimeout => latencyMs != null && latencyMs! < 0;
 
   /// Composite ranking score (lower is better) combining real end-to-end tunnel TTFB (`latencyMs`)
@@ -3974,6 +4004,146 @@ class LocalProxyTunnelBridge {
     }
   }
 
+  static final Map<String, ({String ip, int expiresAtMs})> _realEntryIpCache =
+      {};
+  static final Map<String, Future<String>> _inFlightDnsLookups = {};
+
+  /// Returns true if [ip] belongs to a TUN / router Fake-IP range (`198.18.0.0/15`,
+  /// `198.20.0.0/14` / `198.21.x.x`, `240.0.0.0/4`) or invalid loopback/zero address.
+  static bool isFakeOrBogusIp(String ip) {
+    final trimmed = ip.trim();
+    if (trimmed.isEmpty) return true;
+    return trimmed.startsWith('198.18.') ||
+        trimmed.startsWith('198.19.') ||
+        trimmed.startsWith('198.20.') ||
+        trimmed.startsWith('198.21.') ||
+        trimmed.startsWith('240.') ||
+        trimmed == '0.0.0.0' ||
+        trimmed == '255.255.255.255';
+  }
+
+  /// Resolves a proxy server domain name to its real public IPv4 address using DoH
+  /// (`223.5.5.5` / `119.29.29.29`), bypassing local TUN/router Fake-IP DNS poisoning
+  /// (`198.18.x.x` / `198.21.x.x`) that otherwise hijacks TLS SNI on Trojan/VLESS nodes.
+  static Future<String> resolveRealEntryIp(
+    String host, {
+    Duration timeout = const Duration(milliseconds: 2200),
+  }) async {
+    final clean = host.trim();
+    if (clean.isEmpty) return clean;
+    if (clean == 'localhost') return '127.0.0.1';
+    if (InternetAddress.tryParse(clean) != null) {
+      return clean;
+    }
+
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final cached = _realEntryIpCache[clean];
+    if (cached != null && nowMs < cached.expiresAtMs && cached.ip.isNotEmpty) {
+      return cached.ip;
+    }
+
+    final inflight = _inFlightDnsLookups[clean];
+    if (inflight != null) {
+      return inflight;
+    }
+
+    final future = _doResolveRealEntryIp(clean, timeout: timeout);
+    _inFlightDnsLookups[clean] = future;
+    try {
+      return await future;
+    } finally {
+      _inFlightDnsLookups.remove(clean);
+    }
+  }
+
+  static Future<String> _doResolveRealEntryIp(
+    String host, {
+    required Duration timeout,
+  }) async {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final hc = HttpClient()
+      ..connectionTimeout = timeout
+      ..findProxy = ((_) => 'DIRECT')
+      ..badCertificateCallback = (cert, h, p) => true;
+
+    try {
+      // 1. Primary: Alibaba Public DoH via direct IP (223.5.5.5 & 223.6.6.6)
+      for (final dohIp in const ['223.5.5.5', '223.6.6.6']) {
+        try {
+          final uri = Uri.parse(
+            'https://$dohIp/resolve?name=${Uri.encodeQueryComponent(host)}&type=A',
+          );
+          final req = await hc.getUrl(uri).timeout(timeout);
+          req.headers.set('Accept', 'application/dns-json');
+          final resp = await req.close().timeout(timeout);
+          if (resp.statusCode == 200) {
+            final body = await resp.transform(utf8.decoder).join();
+            final decoded = jsonDecode(body);
+            if (decoded is Map && decoded['Answer'] is List) {
+              for (final ans in decoded['Answer'] as List) {
+                if (ans is Map && ans['type'] == 1) {
+                  final candidate = (ans['data'] ?? '').toString().trim();
+                  if (InternetAddress.tryParse(candidate) != null &&
+                      !isFakeOrBogusIp(candidate) &&
+                      !candidate.startsWith('127.')) {
+                    _realEntryIpCache[host] = (
+                      ip: candidate,
+                      expiresAtMs: nowMs + 30 * 60 * 1000,
+                    );
+                    return candidate;
+                  }
+                }
+              }
+            }
+          }
+        } catch (_) {}
+      }
+
+      // 2. Secondary: DNSPod HTTP DNS via direct IP (119.29.29.29)
+      try {
+        final uri = Uri.parse(
+          'http://119.29.29.29/d?dn=${Uri.encodeQueryComponent(host)}',
+        );
+        final req = await hc.getUrl(uri).timeout(timeout);
+        final resp = await req.close().timeout(timeout);
+        if (resp.statusCode == 200) {
+          final body = (await resp.transform(utf8.decoder).join()).trim();
+          for (final part in body.split(RegExp(r'[;,]'))) {
+            final candidate = part.trim();
+            if (InternetAddress.tryParse(candidate) != null &&
+                !isFakeOrBogusIp(candidate) &&
+                !candidate.startsWith('127.')) {
+              _realEntryIpCache[host] = (
+                ip: candidate,
+                expiresAtMs: nowMs + 30 * 60 * 1000,
+              );
+              return candidate;
+            }
+          }
+        }
+      } catch (_) {}
+    } finally {
+      hc.close(force: true);
+    }
+
+    // 3. Fallback: System DNS (only if it does NOT return a Fake-IP)
+    try {
+      final addrs = await InternetAddress.lookup(host).timeout(timeout);
+      for (final a in addrs) {
+        if (a.type == InternetAddressType.IPv4 &&
+            !isFakeOrBogusIp(a.address)) {
+          _realEntryIpCache[host] = (
+            ip: a.address,
+            expiresAtMs: nowMs + 5 * 60 * 1000,
+          );
+          return a.address;
+        }
+      }
+    } catch (_) {}
+
+    return host;
+  }
+
   static Future<_UpstreamTunnel?> _openUpstreamTunnel({
     required ProxyNode node,
     required String targetHost,
@@ -3983,7 +4153,7 @@ class LocalProxyTunnelBridge {
     required List<int> initialBodyBytes,
     Duration timeout = const Duration(milliseconds: 5500),
   }) async {
-    if (node.isInfoNode) return null;
+    if (!node.isSupportedByClientTunnel) return null;
     final proto = node.protocol.toLowerCase();
     if (proto == 'trojan') {
       return _connectTrojanUpstream(
@@ -4052,8 +4222,9 @@ class LocalProxyTunnelBridge {
     required List<int> initialBodyBytes,
     required Duration timeout,
   }) async {
+    final connectHost = await resolveRealEntryIp(node.server, timeout: timeout);
     final rawSocket = await Socket.connect(
-      node.server,
+      connectHost,
       node.port,
       timeout: timeout,
     );
@@ -4176,8 +4347,9 @@ class LocalProxyTunnelBridge {
     required List<int> initialBodyBytes,
     required Duration timeout,
   }) async {
+    final connectHost = await resolveRealEntryIp(node.server, timeout: timeout);
     final rawSocket = await Socket.connect(
-      node.server,
+      connectHost,
       node.port,
       timeout: timeout,
     );
@@ -4339,13 +4511,15 @@ class LocalProxyTunnelBridge {
       trojanHeader.addAll(initialBodyBytes);
     }
 
+    final connectHost = await resolveRealEntryIp(node.server, timeout: timeout);
+
     if (node.network.toLowerCase() == 'ws') {
       final hc = HttpClient()
         ..connectionTimeout = timeout
         ..badCertificateCallback = (cert, host, port) => true;
       hc.connectionFactory = (Uri uri, String? proxyHost, int? proxyPort) async {
         final raw = await Socket.connect(
-          node.server,
+          connectHost,
           node.port,
           timeout: timeout,
         );
@@ -4416,7 +4590,7 @@ class LocalProxyTunnelBridge {
     }
 
     final rawSocket = await Socket.connect(
-      node.server,
+      connectHost,
       node.port,
       timeout: timeout,
     );
@@ -4482,6 +4656,7 @@ class LocalProxyTunnelBridge {
     final sni = node.sni.isNotEmpty
         ? node.sni
         : (node.wsHost.isNotEmpty ? node.wsHost : node.server);
+    final connectHost = await resolveRealEntryIp(node.server, timeout: timeout);
 
     if (node.network.toLowerCase() == 'ws') {
       final hc = HttpClient()
@@ -4489,7 +4664,7 @@ class LocalProxyTunnelBridge {
         ..badCertificateCallback = (cert, host, port) => true;
       hc.connectionFactory = (Uri uri, String? proxyHost, int? proxyPort) async {
         final raw = await Socket.connect(
-          node.server,
+          connectHost,
           node.port,
           timeout: timeout,
         );
@@ -4577,7 +4752,7 @@ class LocalProxyTunnelBridge {
       );
     } else {
       final rawSocket = await Socket.connect(
-        node.server,
+        connectHost,
         node.port,
         timeout: timeout,
       );
@@ -4671,8 +4846,9 @@ class LocalProxyTunnelBridge {
       return null;
     }
 
+    final connectHost = await resolveRealEntryIp(node.server, timeout: timeout);
     final rawSocket = await Socket.connect(
-      node.server,
+      connectHost,
       node.port,
       timeout: timeout,
     );
@@ -4854,16 +5030,17 @@ class LocalProxyTunnelBridge {
   ///    transfer throughput (`speedKbps`).
   static Future<({int latencyMs, int tcpPingMs, int speedKbps})>
       probeNodeRealSpeed(ProxyNode node) async {
-    if (node.isInfoNode) {
+    if (!node.isSupportedByClientTunnel) {
       return (latencyMs: -1, tcpPingMs: -1, speedKbps: 0);
     }
 
-    // 1. Measure raw TCP handshake to entry server
+    // 1. Resolve real entry IP (bypassing Fake-IP DNS) and measure raw TCP handshake
     int tcpPing = -1;
+    final connectHost = await resolveRealEntryIp(node.server);
     final tcpSw = Stopwatch()..start();
     try {
       final s = await Socket.connect(
-        node.server,
+        connectHost,
         node.port,
         timeout: const Duration(milliseconds: 2200),
       );
@@ -4872,21 +5049,6 @@ class LocalProxyTunnelBridge {
       s.destroy();
     } catch (_) {
       return (latencyMs: -1, tcpPingMs: -1, speedKbps: 0);
-    }
-
-    // 2. Check if this node's protocol & cipher are supported by LocalProxyTunnelBridge
-    final proto = node.protocol.toLowerCase();
-    final canVerifyTunnelNatively = proto == 'http' ||
-        proto == 'https' ||
-        proto == 'socks5' ||
-        proto == 'socks' ||
-        proto == 'trojan' ||
-        proto == 'vless' ||
-        ((proto == 'ss' || proto == 'shadowsocks') &&
-            _resolveSsCipherSpec(node.cipher).supported);
-
-    if (!canVerifyTunnelNatively) {
-      return (latencyMs: -1, tcpPingMs: tcpPing, speedKbps: 0);
     }
 
     // 3. Real end-to-end HTTP probe through the proxy tunnel!
@@ -5064,19 +5226,39 @@ class ProxyRoutingService extends ChangeNotifier {
   ProxyRoutingService() {
     _localBridge = LocalProxyTunnelBridge(
       resolveDefaultNode: () => activeNode,
-      resolveFallbackNodes: () => _nodes
-          .where((n) => n.enabled && !n.isInfoNode && n.isReachable)
-          .toList()
-        ..sort((a, b) => a.effectiveScore.compareTo(b.effectiveScore)),
+      resolveFallbackNodes: _resolveCandidateFallbackNodes,
       onNodeFeedback: _handleNodeRuntimeFeedback,
     );
+  }
+
+  List<ProxyNode> _resolveCandidateFallbackNodes() {
+    final reachable = _nodes
+        .where((n) => n.enabled && n.isSupportedByClientTunnel && n.isReachable)
+        .toList()
+      ..sort((a, b) => a.effectiveScore.compareTo(b.effectiveScore));
+    if (reachable.length >= 6) return reachable;
+    final untested = _nodes
+        .where(
+          (n) =>
+              n.enabled &&
+              n.isSupportedByClientTunnel &&
+              !n.isReachable &&
+              !n.isTimeout,
+        )
+        .take(6)
+        .toList();
+    return [...reachable, ...untested];
   }
 
   /// Returns true if [node] is currently reachable and not failing consecutively.
   /// Used in `autoFastest` mode so we stay locked on the current working IP
   /// and NEVER jump around unless the current IP actually fails repeatedly.
   bool isNodeHealthyAndSmooth(ProxyNode node) {
-    if (!node.enabled || node.isInfoNode || node.isTimeout) return false;
+    if (!node.enabled ||
+        !node.isSupportedByClientTunnel ||
+        node.isTimeout) {
+      return false;
+    }
     final streak = _nodeFailureStreaks[node.id] ?? 0;
     if (streak >= 4) return false;
     final lat = node.latencyMs;
@@ -5085,9 +5267,12 @@ class ProxyRoutingService extends ChangeNotifier {
   }
 
   void _ensureAutoSelectedNodeLocked() {
-    if (_selectionMode != ProxySelectionMode.autoFastest) return;
-    final enabledNodes =
-        _nodes.where((n) => n.enabled && !n.isInfoNode).toList();
+    final supportedEnabled = _nodes
+        .where((n) => n.enabled && n.isSupportedByClientTunnel)
+        .toList();
+    final enabledNodes = supportedEnabled.isNotEmpty
+        ? supportedEnabled
+        : _nodes.where((n) => n.enabled && !n.isInfoNode).toList();
     if (enabledNodes.isEmpty) return;
 
     ProxyNode? currentSelected;
@@ -5099,13 +5284,19 @@ class ProxyRoutingService extends ChangeNotifier {
         }
       }
     }
+    if (_selectionMode == ProxySelectionMode.manual) {
+      if (currentSelected == null) {
+        _selectedNodeId = (fastestNode ?? enabledNodes.first).id;
+      }
+      return;
+    }
     if (currentSelected != null && isNodeHealthyAndSmooth(currentSelected)) {
       return;
     }
     final fastest = fastestNode;
     if (fastest != null) {
       _selectedNodeId = fastest.id;
-    } else if (currentSelected == null) {
+    } else if (currentSelected == null || !currentSelected.isSupportedByClientTunnel) {
       _selectedNodeId = enabledNodes.first.id;
     }
   }
@@ -5219,10 +5410,7 @@ class ProxyRoutingService extends ChangeNotifier {
           (n) => n.id == node.id,
           orElse: () => node,
         ),
-        resolveFallbackNodes: () => _nodes
-            .where((n) => n.enabled && !n.isInfoNode && n.isReachable)
-            .toList()
-          ..sort((a, b) => a.effectiveScore.compareTo(b.effectiveScore)),
+        resolveFallbackNodes: _resolveCandidateFallbackNodes,
         onNodeFeedback: _handleNodeRuntimeFeedback,
       );
       _nodeBridges[node.id] = bridge;
@@ -5343,17 +5531,13 @@ class ProxyRoutingService extends ChangeNotifier {
       );
     }
 
-    String entryIp = isProxy ? node.server : '本机直连';
+    ProxyNode? effectiveNode = node;
+    String entryIp = isProxy ? '${node.server}:${node.port}' : '本机直连';
     if (isProxy) {
-      try {
-        final addrs = await InternetAddress.lookup(node.server)
-            .timeout(const Duration(milliseconds: 1800));
-        if (addrs.isNotEmpty) {
-          entryIp = '${addrs.first.address}:${node.port}';
-        }
-      } catch (_) {
-        entryIp = '${node.server}:${node.port}';
-      }
+      final resolvedHost = await LocalProxyTunnelBridge.resolveRealEntryIp(
+        node.server,
+      );
+      entryIp = '$resolvedHost:${node.port}';
     }
 
     String exitIp = '';
@@ -5361,29 +5545,20 @@ class ProxyRoutingService extends ChangeNotifier {
     String isp = '';
     int rttMs = isProxy ? (node.latencyMs ?? 0) : 0;
 
-    final hc = HttpClient()
-      ..connectionTimeout = const Duration(milliseconds: 4500)
-      ..badCertificateCallback = (cert, host, port) => true;
-
-    try {
-      if (isProxy) {
-        final p = await _ensureBridgeForNode(node);
-        if (p > 0) {
-          hc.findProxy = (_) => 'PROXY 127.0.0.1:$p';
-        }
-      } else {
-        hc.findProxy = (_) => 'DIRECT';
-      }
-
+    Future<bool> probeWithHttpClient(HttpClient hc) async {
       // 1. Fast JSON GeoIP lookup via ip-api.com (supports Chinese region/ISP names)
       final sw = Stopwatch()..start();
       try {
         final req = await hc
-            .getUrl(Uri.parse(
-                'http://ip-api.com/json/?lang=zh-CN&fields=status,country,regionName,city,isp,org,query'))
+            .getUrl(
+              Uri.parse(
+                'http://ip-api.com/json/?lang=zh-CN&fields=status,country,regionName,city,isp,org,query',
+              ),
+            )
             .timeout(const Duration(milliseconds: 4200));
         req.headers.set('User-Agent', 'Mozilla/5.0');
-        final resp = await req.close().timeout(const Duration(milliseconds: 4200));
+        final resp =
+            await req.close().timeout(const Duration(milliseconds: 4200));
         if (resp.statusCode == 200) {
           final body = await resp.transform(utf8.decoder).join();
           sw.stop();
@@ -5401,41 +5576,95 @@ class ProxyRoutingService extends ChangeNotifier {
             ];
             location = locParts.join(' · ');
             isp = (map['isp'] ?? map['org'] ?? '').toString().trim();
+            if (exitIp.isNotEmpty) return true;
           }
         }
       } catch (_) {}
 
       // 2. Fallback to Cloudflare cdn-cgi/trace if ip-api was blocked or timed out
-      if (exitIp.isEmpty) {
-        final sw2 = Stopwatch()..start();
-        try {
-          final req = await hc
-              .getUrl(Uri.parse('https://www.cloudflare.com/cdn-cgi/trace'))
-              .timeout(const Duration(milliseconds: 4200));
-          final resp =
-              await req.close().timeout(const Duration(milliseconds: 4200));
-          if (resp.statusCode == 200) {
-            final text = await resp.transform(utf8.decoder).join();
-            sw2.stop();
-            rttMs = sw2.elapsedMilliseconds.clamp(1, 9999);
-            for (final line in text.split('\n')) {
-              if (line.startsWith('ip=')) {
-                exitIp = line.substring(3).trim();
-              } else if (line.startsWith('loc=')) {
-                location = line.substring(4).trim();
-              } else if (line.startsWith('colo=')) {
-                isp = 'Cloudflare ${line.substring(5).trim()}';
-              }
+      final sw2 = Stopwatch()..start();
+      try {
+        final req = await hc
+            .getUrl(Uri.parse('https://www.cloudflare.com/cdn-cgi/trace'))
+            .timeout(const Duration(milliseconds: 4200));
+        final resp =
+            await req.close().timeout(const Duration(milliseconds: 4200));
+        if (resp.statusCode == 200) {
+          final text = await resp.transform(utf8.decoder).join();
+          sw2.stop();
+          rttMs = sw2.elapsedMilliseconds.clamp(1, 9999);
+          for (final line in text.split('\n')) {
+            if (line.startsWith('ip=')) {
+              exitIp = line.substring(3).trim();
+            } else if (line.startsWith('loc=')) {
+              location = line.substring(4).trim();
+            } else if (line.startsWith('colo=')) {
+              isp = 'Cloudflare ${line.substring(5).trim()}';
             }
           }
-        } catch (_) {}
-      }
-    } finally {
-      hc.close(force: true);
+          if (exitIp.isNotEmpty) return true;
+        }
+      } catch (_) {}
+      return false;
     }
 
+    if (isProxy) {
+      // Probe strictly through the proxy tunnel (never falling back to local direct network!)
+      final candidates = <ProxyNode>[
+        if (node.isSupportedByClientTunnel) node,
+        ..._resolveCandidateFallbackNodes().where(
+          (n) => n.id != node.id,
+        ),
+      ];
+      for (final candidate in candidates.take(4)) {
+        await _ensureBridgeForNode(candidate);
+        final proxyHc = _localBridge._getOrCreateStreamRelayHttpClient(
+          candidate,
+        );
+        final ok = await probeWithHttpClient(proxyHc);
+        if (ok) {
+          _handleNodeRuntimeFeedback(
+            candidate.id,
+            success: true,
+            rttMs: rttMs,
+          );
+          if (candidate.id != effectiveNode!.id) {
+            effectiveNode = candidate;
+            final resolvedHost =
+                await LocalProxyTunnelBridge.resolveRealEntryIp(
+              candidate.server,
+            );
+            entryIp = '$resolvedHost:${candidate.port}';
+            if (_selectionMode == ProxySelectionMode.autoFastest ||
+                !node.isSupportedByClientTunnel) {
+              _selectedNodeId = candidate.id;
+              notifyListeners();
+            }
+          }
+          break;
+        } else {
+          _handleNodeRuntimeFeedback(candidate.id, success: false);
+        }
+      }
+    } else {
+      final hc = HttpClient()
+        ..connectionTimeout = const Duration(milliseconds: 4500)
+        ..findProxy = ((_) => 'DIRECT')
+        ..badCertificateCallback = (cert, host, port) => true;
+      try {
+        await probeWithHttpClient(hc);
+      } finally {
+        hc.close(force: true);
+      }
+    }
+
+    final finalNode = effectiveNode ?? node;
+    final finalCacheKey = isProxy && finalNode != null
+        ? 'node:${finalNode.id}'
+        : cacheKey;
+
     if (exitIp.isNotEmpty) {
-      _ipProbeCache[cacheKey] = (
+      _ipProbeCache[finalCacheKey] = (
         entryIp: entryIp,
         exitIp: exitIp,
         location: location.isEmpty ? '未知地区' : location,
@@ -5443,6 +5672,9 @@ class ProxyRoutingService extends ChangeNotifier {
         rttMs: rttMs,
         updatedAtMs: nowMs,
       );
+      if (finalCacheKey != cacheKey) {
+        _ipProbeCache[cacheKey] = _ipProbeCache[finalCacheKey]!;
+      }
     }
 
     return (
@@ -5453,16 +5685,20 @@ class ProxyRoutingService extends ChangeNotifier {
           : (isRelay ? '服务端代理中转' : '客户端直连模式'),
       isUsingProxy: isProxy || isRelay,
       nodeName: isProxy
-          ? node.displayTitle
+          ? finalNode!.displayTitle
           : (isRelay ? '主服务端中转 (/api/vod/proxy)' : '本机网络直连 (Direct)'),
       protocolBadge: isProxy
-          ? node.protocolBadge
+          ? finalNode!.protocolBadge
           : (isRelay ? 'HTTP-RELAY' : 'DIRECT'),
-      entryHostPort: isProxy ? '${node.server}:${node.port}' : '本机网卡直出',
+      entryHostPort: isProxy
+          ? '${finalNode!.server}:${finalNode.port}'
+          : '本机网卡直出',
       entryResolvedIp: entryIp,
-      exitPublicIp: exitIp.isEmpty ? (isProxy ? node.server : '探测超时') : exitIp,
+      exitPublicIp: exitIp.isEmpty
+          ? (isProxy ? '代理连接不可用' : '探测超时')
+          : exitIp,
       exitLocation: location.isEmpty
-          ? (isProxy ? node.regionCategory : '本地网络')
+          ? (isProxy ? '请切换可用节点或重新测速' : '本地网络')
           : location,
       exitIsp: isp,
       rttMs: rttMs,
@@ -5472,8 +5708,9 @@ class ProxyRoutingService extends ChangeNotifier {
   /// Returns the fastest reachable enabled node ranked by real tunnel
   /// `effectiveScore` (combining real HTTP tunnel TTFB and transfer throughput).
   ProxyNode? get fastestNode {
-    final candidates =
-        _nodes.where((n) => n.enabled && n.isReachable).toList();
+    final candidates = _nodes
+        .where((n) => n.enabled && n.isSupportedByClientTunnel && n.isReachable)
+        .toList();
     if (candidates.isEmpty) return null;
     candidates.sort((a, b) => a.effectiveScore.compareTo(b.effectiveScore));
     return candidates.first;
@@ -5484,8 +5721,12 @@ class ProxyRoutingService extends ChangeNotifier {
   /// as long as it is healthy and smooth (`isNodeHealthyAndSmooth`), and only switches
   /// to [fastestNode] when the current node is unset, lagging, or unreachable.
   ProxyNode? get activeNode {
-    final enabledNodes =
-        _nodes.where((n) => n.enabled && !n.isInfoNode).toList();
+    final supportedEnabled = _nodes
+        .where((n) => n.enabled && n.isSupportedByClientTunnel)
+        .toList();
+    final enabledNodes = supportedEnabled.isNotEmpty
+        ? supportedEnabled
+        : _nodes.where((n) => n.enabled && !n.isInfoNode).toList();
     if (enabledNodes.isEmpty) {
       final fallbackAll = _nodes.where((n) => n.enabled).toList();
       return fallbackAll.isEmpty ? null : fallbackAll.first;
@@ -5673,6 +5914,50 @@ class ProxyRoutingService extends ChangeNotifier {
     final node = resolveNodeForScenario(scenario);
     if (node == null) return trimmed;
 
+    String targetUrlToProxy = trimmed;
+    Map<String, String> targetHeadersToProxy = headers;
+
+    // If the stream URL was wrapped as `/api/vod/proxy?url=...` by the backend server,
+    // unwrap the real upstream URL so the client proxy node connects directly to the
+    // video CDN instead of looping through the overseas proxy back to the backend server.
+    if (uri.path.toLowerCase().startsWith('/api/vod/proxy')) {
+      final innerUrl = (uri.queryParameters['url'] ?? '').trim();
+      final innerUri = Uri.tryParse(innerUrl);
+      if (innerUri != null &&
+          (innerUri.scheme == 'http' || innerUri.scheme == 'https') &&
+          innerUri.host.isNotEmpty &&
+          innerUri.host != '127.0.0.1' &&
+          innerUri.host != 'localhost') {
+        targetUrlToProxy = innerUrl;
+        final mergedHeaders = <String, String>{};
+        headers.forEach((k, v) {
+          if (k.toLowerCase() != 'authorization') {
+            mergedHeaders[k] = v;
+          }
+        });
+        final rawHdrParam = (uri.queryParameters['headers'] ?? '').trim();
+        if (rawHdrParam.isNotEmpty) {
+          try {
+            final decodedText = rawHdrParam.startsWith('{')
+                ? rawHdrParam
+                : utf8.decode(
+                    base64Url.decode(base64Url.normalize(rawHdrParam)),
+                    allowMalformed: true,
+                  );
+            final decodedMap = jsonDecode(decodedText);
+            if (decodedMap is Map) {
+              decodedMap.forEach((k, v) {
+                if (k != null && v != null) {
+                  mergedHeaders[k.toString()] = v.toString();
+                }
+              });
+            }
+          } catch (_) {}
+        }
+        targetHeadersToProxy = mergedHeaders;
+      }
+    }
+
     final port = await _ensureBridgeForNode(node);
     if (port <= 0) return trimmed;
     final bridge = (node.id == activeNode?.id)
@@ -5680,8 +5965,8 @@ class ProxyRoutingService extends ChangeNotifier {
         : (_nodeBridges[node.id] ?? _localBridge);
 
     return bridge.buildStreamRelayUrl(
-      targetUrl: trimmed,
-      headers: headers,
+      targetUrl: targetUrlToProxy,
+      headers: targetHeadersToProxy,
       cleanM3u8Ads: cleanM3u8Ads,
       preferredNodeId: node.id,
     );
@@ -5815,9 +6100,21 @@ class ProxyRoutingService extends ChangeNotifier {
     } catch (_) {}
 
     _ensureAutoSelectedNodeLocked();
-    if (_proxyEnabled) {
+    final anyScenarioNeedsBridge = _scenarioRules.values.any(
+      (r) =>
+          r.mode == ScenarioRouteMode.proxyNode ||
+          r.mode == ScenarioRouteMode.smartAuto,
+    );
+    if (_proxyEnabled || anyScenarioNeedsBridge) {
       await _localBridge.ensureStarted();
       _configureAutoFastestTimer();
+      final hasReachableSupported = _nodes.any(
+        (n) => n.enabled && n.isSupportedByClientTunnel && n.isReachable,
+      );
+      if (!hasReachableSupported &&
+          _nodes.any((n) => n.enabled && n.isSupportedByClientTunnel)) {
+        unawaited(testAllNodesLatency(silent: true));
+      }
     }
     notifyListeners();
   }
