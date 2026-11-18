@@ -63,25 +63,44 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 
   # 2b. Apple TV (tvOS) Native Release (.app + .ipa)
   echo "▶ [2b/5] 正在打包 Apple TV (tvOS) 原生版 (Release --no-codesign)..."
-  if xcodebuild -project tvos/Runner.xcodeproj -target Runner -sdk appletvos -configuration Release \
+  TVOS_APP_PATH="build/tvos/Build/Products/Release-appletvos/Runner.app"
+  if ! xcodebuild -project tvos/Runner.xcodeproj -target Runner -sdk appletvos -configuration Release \
       MARKETING_VERSION="${VERSION}" CURRENT_PROJECT_VERSION="${BUILD_NUM}" \
       SYMROOT="$ROOT_DIR/build/tvos/Build/Products" \
       OBJROOT="$ROOT_DIR/build/tvos/Build/Intermediates.noindex" \
-      CODE_SIGNING_ALLOWED=NO build >/dev/null; then
-    TVOS_APP_PATH="build/tvos/Build/Products/Release-appletvos/Runner.app"
-    if [[ -d "$TVOS_APP_PATH" ]]; then
-      TVOS_IPA="${DIST_DIR}/${APP_SLUG}-tvOS-v${VERSION}-unsigned.ipa"
-      rm -f "$TVOS_IPA"
-      IPA_STAGE="$(mktemp -d)"
-      mkdir -p "${IPA_STAGE}/Payload"
-      cp -R "$TVOS_APP_PATH" "${IPA_STAGE}/Payload/Runner.app"
-      codesign --force --sign - --timestamp=none "${IPA_STAGE}/Payload/Runner.app"
-      (cd "$IPA_STAGE" && zip -qry "$TVOS_IPA" Payload)
-      rm -rf "$IPA_STAGE"
-      echo "  ✓ Apple TV (tvOS) IPA: $TVOS_IPA"
-    fi
-  else
-    echo "  ⚠ 跳过本地 tvOS IPA 打包（若提示缺少 tvOS 平台组件，可执行: xcodebuild -downloadPlatform tvOS）"
+      CODE_SIGNING_ALLOWED=NO build >/dev/null 2>&1; then
+    TVOS_SDK_PATH="$(xcrun --sdk appletvos --show-sdk-path)"
+    mkdir -p "$TVOS_APP_PATH"
+    cp -f tvos/Runner/AppIcon.png tvos/Runner/TopShelfWide.png "$TVOS_APP_PATH/" 2>/dev/null || true
+    cp -f tvos/Runner/Info.plist "$TVOS_APP_PATH/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable Runner" "$TVOS_APP_PATH/Info.plist" || true
+    /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.linsion.m3u8Client.tvos" "$TVOS_APP_PATH/Info.plist" || true
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION}" "$TVOS_APP_PATH/Info.plist" || true
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUM}" "$TVOS_APP_PATH/Info.plist" || true
+    printf "APPL????" > "$TVOS_APP_PATH/PkgInfo"
+    xcrun --sdk appletvos swiftc \
+      -O -whole-module-optimization \
+      -sdk "$TVOS_SDK_PATH" \
+      -target arm64-apple-tvos16.0 \
+      -module-name Runner \
+      -enable-bare-slash-regex \
+      tvos/Runner/Models.swift \
+      tvos/Runner/TvApiClient.swift \
+      tvos/Runner/TvAppState.swift \
+      tvos/Runner/TvPlayerView.swift \
+      tvos/Runner/AppDelegate.swift \
+      -o "$TVOS_APP_PATH/Runner"
+  fi
+  if [[ -d "$TVOS_APP_PATH" ]]; then
+    TVOS_IPA="${DIST_DIR}/${APP_SLUG}-tvOS-v${VERSION}-unsigned.ipa"
+    rm -f "$TVOS_IPA"
+    IPA_STAGE="$(mktemp -d)"
+    mkdir -p "${IPA_STAGE}/Payload"
+    cp -R "$TVOS_APP_PATH" "${IPA_STAGE}/Payload/Runner.app"
+    codesign --force --deep --sign - --timestamp=none "${IPA_STAGE}/Payload/Runner.app"
+    (cd "$IPA_STAGE" && zip -qry "$TVOS_IPA" Payload)
+    rm -rf "$IPA_STAGE"
+    echo "  ✓ Apple TV (tvOS) IPA: $TVOS_IPA"
   fi
 fi
 

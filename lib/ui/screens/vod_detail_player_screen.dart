@@ -14,8 +14,10 @@ import '../../services/tv_platform_service.dart';
 import '../../state/app_state.dart';
 import '../theme.dart';
 import '../widgets/mobile_edge_swipe_back.dart';
+import '../widgets/video_115_accelerate_button.dart';
 import '../widgets/video_download_speed_badge.dart';
 import '../widgets/video_proxy_node_selector.dart';
+import '../../services/local_115_direct_service.dart';
 
 class VodDetailPlayerScreen extends StatefulWidget {
   final AppState appState;
@@ -70,6 +72,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
   String? _playError;
 
   bool _useServerProxy = false;
+  bool _using115Direct = false;
   double _playbackSpeed = 1.0;
   bool _isLongPressFastForward = false;
   bool _isFullscreenMode = false;
@@ -259,6 +262,16 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     _lastBackHandledAt = now;
 
     if (_isFullscreenMode) {
+      if (_fullscreenControlsVisible) {
+        _fullscreenControlsTimer?.cancel();
+        setState(() => _fullscreenControlsVisible = false);
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted && _isFullscreenMode && !_fullscreenControlsVisible) {
+            _fullscreenStageFocusNode.requestFocus();
+          }
+        });
+        return;
+      }
       _toggleFullscreenMode(forceValue: false);
       return;
     }
@@ -297,14 +310,17 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     }
     _useServerProxy = !widget.appState.serverConfig.preferDirectPlayback;
     _player = Player(
-      configuration: const PlayerConfiguration(
-        bufferSize: 128 * 1024 * 1024,
+      configuration: PlayerConfiguration(
+        bufferSize: (Platform.isAndroid || Platform.isIOS)
+            ? 32 * 1024 * 1024
+            : 128 * 1024 * 1024,
       ),
     );
     _videoController = VideoController(
       _player,
       configuration: VideoControllerConfiguration(
-        hwdec: Platform.isAndroid ? 'mediacodec-copy' : null,
+        hwdec: Platform.isAndroid ? 'no' : null,
+        enableHardwareAcceleration: !Platform.isAndroid,
       ),
     );
     _configureVodNativePlayer();
@@ -407,23 +423,24 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
   Future<void> _configureVodNativePlayer() async {
     try {
       final dynamic platform = _player.platform;
+      final isMobileOrTv = Platform.isAndroid || Platform.isIOS;
       final props = <String, String>{
-        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto-safe',
+        'hwdec': Platform.isAndroid ? 'no' : 'auto-safe',
         'hwdec-codecs': 'h264,hevc,vp8,vp9,av1',
         'vd-lavc-check-hw-profile': 'yes',
         'vd-lavc-software-fallback': 'yes',
         'cache': 'yes',
         'cache-on-disk': 'no',
-        'cache-secs': '120',
+        'cache-secs': isMobileOrTv ? '45' : '120',
         'cache-pause': 'yes',
         'cache-pause-initial': 'no',
         'cache-pause-wait': '0.8',
         'demuxer-thread': 'yes',
-        'demuxer-max-bytes': '134217728',
-        'demuxer-max-back-bytes': '33554432',
-        'demuxer-readahead-secs': '60',
+        'demuxer-max-bytes': isMobileOrTv ? '50331648' : '134217728',
+        'demuxer-max-back-bytes': isMobileOrTv ? '16777216' : '33554432',
+        'demuxer-readahead-secs': isMobileOrTv ? '30' : '60',
         'stream-buffer-size': '524288',
-        'vd-lavc-threads': '0',
+        'vd-lavc-threads': Platform.isAndroid ? '4' : '0',
         'ad-lavc-threads': '0',
         'demuxer-lavf-probesize': '131072',
         'demuxer-lavf-analyzeduration': '0.5',
@@ -1057,6 +1074,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
 
     _activeStreamUrl = finalMediaTarget;
     _activeStreamHeaders = headers;
+    _using115Direct = false;
     final startOffset = (!_hasAppliedInitialSeek && _pendingSeekSeconds > 3)
         ? Duration(seconds: _pendingSeekSeconds.round())
         : null;
@@ -1085,6 +1103,60 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         _triggerFastStartupFallback(reason: '当前线路响应超时');
       }
     });
+  }
+
+  String _resolveCurrent115DownloadUrl() {
+    final resolved = _resolvedPlayback;
+    if (resolved != null && resolved.directUrl.trim().isNotEmpty) {
+      return resolved.directUrl.trim();
+    }
+    if (_activeStreamUrl.trim().isNotEmpty &&
+        !_activeStreamUrl.contains('127.0.0.1')) {
+      return _activeStreamUrl.trim();
+    }
+    return _currentEpisode?.rawUrl.trim() ?? '';
+  }
+
+  String _resolveCurrent115VideoName() {
+    final vodTitle = (_detail?.vodName ?? widget.initialTitle).trim();
+    final epTitle = (_currentEpisode?.title ?? '').trim();
+    if (vodTitle.isNotEmpty && epTitle.isNotEmpty) {
+      return '$vodTitle - $epTitle';
+    }
+    if (vodTitle.isNotEmpty) return vodTitle;
+    return epTitle.isNotEmpty ? epTitle : '点播视频';
+  }
+
+  Future<void> _applyResolved115Stream(Resolved115Stream resolved) async {
+    if (!mounted) return;
+    _startupWatchdogTimer?.cancel();
+    _bufferingLagTimer?.cancel();
+    final curSec = _player.state.position.inSeconds;
+    setState(() {
+      _using115Direct = true;
+      _activeStreamUrl = resolved.proxyStreamUrl;
+      _activeStreamHeaders = resolved.headers;
+      _playError = null;
+      _isResolvingPlay = false;
+    });
+    final isLocalProxy = resolved.proxyStreamUrl.contains('127.0.0.1');
+    await _applyVodStreamHeaders(
+      resolved.headers,
+      streamUrl: resolved.proxyStreamUrl,
+      bypassClientProxy: true,
+    );
+    await _player.open(
+      Media(
+        resolved.proxyStreamUrl,
+        httpHeaders: isLocalProxy ? const {} : resolved.headers,
+        start: curSec > 2 ? Duration(seconds: curSec) : null,
+      ),
+      play: true,
+    );
+    if (_playbackSpeed != 1.0) {
+      await _player.setRate(_playbackSpeed);
+    }
+    _showAdToast('⚡ 已切换至本地直连 115 高速播放：${resolved.fileName}');
   }
 
   void _triggerFastStartupFallback({required String reason}) {
@@ -2472,6 +2544,22 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                             Center(
                               child: Padding(
                                 padding: const EdgeInsets.only(right: 4),
+                                child: Video115AccelerateButton(
+                                  api: widget.appState.api,
+                                  downloadUrlBuilder:
+                                      _resolveCurrent115DownloadUrl,
+                                  videoNameBuilder: _resolveCurrent115VideoName,
+                                  headersBuilder: () => _activeStreamHeaders,
+                                  isUsing115Direct: _using115Direct,
+                                  overlayStyle: false,
+                                  compact: isNarrow,
+                                  onResolved: _applyResolved115Stream,
+                                ),
+                              ),
+                            ),
+                            Center(
+                              child: Padding(
+                                padding: const EdgeInsets.only(right: 4),
                                 child: VideoProxyNodeSelector(
                                   proxyService: widget.appState.proxyService,
                                   scenario: RequestScenario.vodStream,
@@ -3000,6 +3088,17 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                       );
                                       if (mounted) setState(() {});
                                     },
+                            ),
+                            const SizedBox(width: 10),
+                            Video115AccelerateButton(
+                              api: widget.appState.api,
+                              downloadUrlBuilder: _resolveCurrent115DownloadUrl,
+                              videoNameBuilder: _resolveCurrent115VideoName,
+                              headersBuilder: () => _activeStreamHeaders,
+                              isUsing115Direct: _using115Direct,
+                              overlayStyle: false,
+                              compact: false,
+                              onResolved: _applyResolved115Stream,
                             ),
                             const SizedBox(width: 10),
                             VideoProxyNodeSelector(
@@ -3826,6 +3925,18 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                 ),
                               ],
                               const SizedBox(width: 8),
+                              Video115AccelerateButton(
+                                api: widget.appState.api,
+                                downloadUrlBuilder:
+                                    _resolveCurrent115DownloadUrl,
+                                videoNameBuilder: _resolveCurrent115VideoName,
+                                headersBuilder: () => _activeStreamHeaders,
+                                isUsing115Direct: _using115Direct,
+                                overlayStyle: isFullscreen,
+                                compact: true,
+                                onResolved: _applyResolved115Stream,
+                              ),
+                              const SizedBox(width: 8),
                               VideoProxyNodeSelector(
                                 proxyService: widget.appState.proxyService,
                                 scenario: RequestScenario.vodStream,
@@ -4315,6 +4426,17 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                         child: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
+                            Video115AccelerateButton(
+                              api: widget.appState.api,
+                              downloadUrlBuilder: _resolveCurrent115DownloadUrl,
+                              videoNameBuilder: _resolveCurrent115VideoName,
+                              headersBuilder: () => _activeStreamHeaders,
+                              isUsing115Direct: _using115Direct,
+                              overlayStyle: true,
+                              compact: screenSize.width < 520,
+                              onResolved: _applyResolved115Stream,
+                            ),
+                            const SizedBox(width: 6),
                             VideoProxyNodeSelector(
                               proxyService: widget.appState.proxyService,
                               scenario: RequestScenario.vodStream,

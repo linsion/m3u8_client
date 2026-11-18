@@ -1,13 +1,13 @@
 import 'dart:async';
-import 'dart:convert';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../models/models.dart';
+import '../../services/local_115_direct_service.dart';
 import '../../state/app_state.dart';
 import '../theme.dart';
+import '../widgets/video_115_accelerate_button.dart';
 
 class SettingsScreen extends StatefulWidget {
   final AppState appState;
@@ -121,11 +121,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
       });
     }
     try {
+      final local115 = await Local115DirectService.instance.verifyStatus();
+      if (local115.loggedIn) {
+        if (mounted) {
+          setState(() {
+            _is115LoggedIn = true;
+            _user115Info = local115.userName.isNotEmpty
+                ? '${local115.userName} (已启用本地直连 115)'
+                : '已登录 115 网盘';
+          });
+        }
+        return;
+      }
       final st115 = await widget.appState.api.fetch115Status();
       if (mounted) {
         setState(() {
-          _is115LoggedIn = st115['logged_in'] == true;
-          _user115Info = (st115['user_name'] ??
+          _is115LoggedIn = st115['logged_in'] == true ||
+              st115['Id'] != null ||
+              st115['user_id'] != null;
+          _user115Info = (st115['Name'] ??
+                  st115['user_name'] ??
                   st115['user_id'] ??
                   (_is115LoggedIn ? '已登录 115 网盘' : '未登录'))
               .toString();
@@ -135,140 +150,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> _show115QrCodeDialog() async {
-    Uint8List? qrImageBytes;
-    String statusText = '正在请求 115 登录二维码...';
-    Timer? pollTimer;
-    bool isLoading = true;
-
-    Future<void> startQrFlow(
-      StateSetter setDialogState,
-      VoidCallback onSuccessClose,
-    ) async {
-      pollTimer?.cancel();
-      setDialogState(() {
-        isLoading = true;
-        statusText = '正在获取 115 二维码...';
-      });
-      try {
-        final data = await widget.appState.api.fetch115QrCode();
-        final b64 = (data['image'] ?? '').toString().trim();
-        final token = (data['token'] ?? '').toString().trim();
-        if (b64.isEmpty || token.isEmpty) {
-          setDialogState(() {
-            isLoading = false;
-            statusText = '未能获取到有效二维码数据';
-          });
-          return;
-        }
-        final cleanB64 = b64.contains(',') ? b64.split(',').last : b64;
-        qrImageBytes = base64Decode(cleanB64);
-        setDialogState(() {
-          isLoading = false;
-          statusText = '请使用手机 115 网盘 App 扫描二维码并确认登录';
-        });
-
-        pollTimer = Timer.periodic(const Duration(seconds: 3), (t) async {
-          try {
-            final res = await widget.appState.api.check115QrCode(token);
-            final status = int.tryParse((res['status'] ?? 0).toString()) ?? 0;
-            if (status == 1 || res['logged_in'] == true) {
-              t.cancel();
-              onSuccessClose();
-            }
-          } catch (_) {}
-        });
-      } catch (e) {
-        setDialogState(() {
-          isLoading = false;
-          statusText = '获取二维码失败：$e';
-        });
-      }
-    }
-
-    bool initialized = false;
-    final loggedIn = await showDialog<bool>(
+    final loggedIn = await show115QuickLoginDialog(
       context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setDialogState) {
-          void closeSuccess() {
-            if (ctx.mounted) {
-              Navigator.of(ctx).pop(true);
-            }
-          }
-
-          if (!initialized) {
-            initialized = true;
-            Future.microtask(() => startQrFlow(setDialogState, closeSuccess));
-          }
-          return AlertDialog(
-            backgroundColor: VideoPlatformTheme.bgElevated,
-            title: const Row(
-              children: [
-                Icon(Icons.qr_code_scanner_rounded, size: 19),
-                SizedBox(width: 8),
-                Text(
-                  '115 网盘手机扫码登录',
-                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
-                ),
-              ],
-            ),
-            content: SizedBox(
-              width: 320,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Container(
-                    width: 210,
-                    height: 210,
-                    padding: const EdgeInsets.all(10),
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                    child: isLoading
-                        ? const Center(child: CircularProgressIndicator())
-                        : (qrImageBytes != null
-                            ? Image.memory(
-                                qrImageBytes!,
-                                fit: BoxFit.contain,
-                              )
-                            : const Center(
-                                child: Icon(
-                                  Icons.broken_image_outlined,
-                                  size: 42,
-                                  color: Colors.black45,
-                                ),
-                              )),
-                  ),
-                  const SizedBox(height: 14),
-                  Text(
-                    statusText,
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 12.5,
-                      color: VideoPlatformTheme.textSecondary,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            actions: [
-              TextButton.icon(
-                onPressed: () => startQrFlow(setDialogState, closeSuccess),
-                icon: const Icon(Icons.refresh_rounded, size: 15),
-                label: const Text('刷新二维码'),
-              ),
-              TextButton(
-                onPressed: () => Navigator.of(ctx).pop(false),
-                child: const Text('关闭'),
-              ),
-            ],
-          );
-        },
-      ),
+      api: widget.appState.api,
     );
-    pollTimer?.cancel();
-    if (loggedIn == true && mounted) {
+    if (loggedIn && mounted) {
       await _loadBackendSettingsAnd115();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -998,7 +884,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                 : () async {
                                     setState(() => _isBusy115 = true);
                                     try {
-                                      await state.api.logout115();
+                                      await Local115DirectService.instance
+                                          .clearCookie(
+                                        syncToServerApi: state.api,
+                                      );
                                       await _loadBackendSettingsAnd115();
                                     } finally {
                                       if (mounted) {
@@ -1034,7 +923,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                         ScaffoldMessenger.of(context);
                                     setState(() => _isBusy115 = true);
                                     try {
-                                      await state.api.login115WithCookie(ck);
+                                      await Local115DirectService.instance
+                                          .saveCookie(
+                                        ck,
+                                        syncToServerApi: state.api,
+                                      );
                                       _cookie115Ctrl.clear();
                                       await _loadBackendSettingsAnd115();
                                       messenger.showSnackBar(

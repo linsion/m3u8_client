@@ -1284,8 +1284,20 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
   @override
   void initState() {
     super.initState();
-    _player = Player();
-    _controller = VideoController(_player);
+    _player = Player(
+      configuration: PlayerConfiguration(
+        bufferSize: (Platform.isAndroid || Platform.isIOS)
+            ? 32 * 1024 * 1024
+            : 64 * 1024 * 1024,
+      ),
+    );
+    _controller = VideoController(
+      _player,
+      configuration: VideoControllerConfiguration(
+        hwdec: Platform.isAndroid ? 'no' : null,
+        enableHardwareAcceleration: !Platform.isAndroid,
+      ),
+    );
     _player.open(
       Media(widget.streamUrl, httpHeaders: widget.headers),
       play: true,

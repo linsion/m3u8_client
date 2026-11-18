@@ -269,7 +269,8 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     _videoController = VideoController(
       _player,
       configuration: VideoControllerConfiguration(
-        hwdec: Platform.isAndroid ? 'mediacodec-copy' : null,
+        hwdec: Platform.isAndroid ? 'no' : null,
+        enableHardwareAcceleration: !Platform.isAndroid,
       ),
     );
     _configureLiveNativePlayer();
@@ -590,7 +591,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
       final dynamic platform = (targetPlayer ?? _player).platform;
       final isMobileOrTv = Platform.isAndroid || Platform.isIOS;
       final props = <String, String>{
-        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto-safe',
+        'hwdec': Platform.isAndroid ? 'no' : 'auto-safe',
         'hwdec-codecs': 'h264,hevc,vp8,vp9,av1',
         'vd-lavc-check-hw-profile': 'yes',
         'vd-lavc-software-fallback': 'yes',
@@ -605,7 +606,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
         'demuxer-max-back-bytes': '8388608',
         'demuxer-readahead-secs': isMobileOrTv ? '18' : '25',
         'stream-buffer-size': '1048576',
-        'vd-lavc-threads': '0',
+        'vd-lavc-threads': Platform.isAndroid ? '4' : '0',
         'ad-lavc-threads': '0',
         'demuxer-lavf-probesize': '131072',
         'demuxer-lavf-analyzeduration': '0.5',
@@ -750,6 +751,16 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
       return true;
     }
     if (_isLiveFullscreen) {
+      if (_liveOsdVisible) {
+        _liveOsdTimer?.cancel();
+        setState(() => _liveOsdVisible = false);
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted && _isLiveFullscreen && !_liveOsdVisible) {
+            _playerFocusNode.requestFocus();
+          }
+        });
+        return true;
+      }
       _toggleLiveFullscreen(forceValue: false);
       return true;
     }
@@ -809,7 +820,8 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
       _subControllers[slot] = VideoController(
         p,
         configuration: VideoControllerConfiguration(
-          hwdec: Platform.isAndroid ? 'mediacodec-copy' : null,
+          hwdec: Platform.isAndroid ? 'no' : null,
+          enableHardwareAcceleration: !Platform.isAndroid,
         ),
       );
       unawaited(_configureLiveNativePlayer(p));

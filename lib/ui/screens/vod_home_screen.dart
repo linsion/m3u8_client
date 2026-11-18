@@ -104,6 +104,15 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
       setState(() => _categoriesExpanded = false);
       return true;
     }
+    if (_scrollController.hasClients && _scrollController.offset > 160.0) {
+      _savedScrollOffsets[_viewCacheKey()] = 0.0;
+      _scrollController.animateTo(
+        0.0,
+        duration: const Duration(milliseconds: 280),
+        curve: Curves.easeOutCubic,
+      );
+      return true;
+    }
     if (state.directoryBreadcrumbs.isNotEmpty) {
       state.navigateToDirectoryBreadcrumb(
         state.directoryBreadcrumbs.length - 2,

@@ -26,6 +26,7 @@ import 'theme.dart';
 import 'widgets/app_brand_logo.dart';
 import 'widgets/mobile_edge_swipe_back.dart';
 import 'widgets/source_picker_sheet.dart';
+import 'widgets/video_115_accelerate_button.dart';
 import 'widgets/video_download_speed_badge.dart';
 import 'widgets/video_proxy_node_selector.dart';
 
@@ -3507,7 +3508,8 @@ class _FloatingMiniPlayerOverlayState
     _controller = VideoController(
       _player,
       configuration: VideoControllerConfiguration(
-        hwdec: Platform.isAndroid ? 'mediacodec-copy' : null,
+        hwdec: Platform.isAndroid ? 'no' : null,
+        enableHardwareAcceleration: !Platform.isAndroid,
       ),
     );
     _posSub = _player.stream.position.listen(_onPosition);
@@ -3565,7 +3567,7 @@ class _FloatingMiniPlayerOverlayState
       final dynamic platform = _player.platform;
       final isMobileOrTv = Platform.isAndroid || Platform.isIOS;
       final props = <String, String>{
-        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto-safe',
+        'hwdec': Platform.isAndroid ? 'no' : 'auto-safe',
         'hwdec-codecs': 'h264,hevc,vp8,vp9,av1',
         'vd-lavc-check-hw-profile': 'yes',
         'vd-lavc-software-fallback': 'yes',
@@ -3576,11 +3578,11 @@ class _FloatingMiniPlayerOverlayState
         'cache-pause-initial': widget.session.isLive ? 'no' : 'yes',
         'cache-pause-wait': widget.session.isLive ? '1.5' : '3.5',
         'demuxer-thread': 'yes',
-        'demuxer-max-bytes': isMobileOrTv ? '67108864' : '134217728',
+        'demuxer-max-bytes': isMobileOrTv ? '50331648' : '134217728',
         'demuxer-max-back-bytes': isMobileOrTv ? '16777216' : '33554432',
         'demuxer-readahead-secs': widget.session.isLive ? '20' : '45',
-        'stream-buffer-size': isMobileOrTv ? '2097152' : '4194304',
-        'vd-lavc-threads': '0',
+        'stream-buffer-size': isMobileOrTv ? '524288' : '4194304',
+        'vd-lavc-threads': Platform.isAndroid ? '4' : '0',
         'ad-lavc-threads': '0',
         'demuxer-lavf-probesize': '524288',
         'demuxer-lavf-analyzeduration': '0',
@@ -4013,6 +4015,34 @@ class _FloatingMiniPlayerOverlayState
                             ],
                           ),
                         ),
+                        if (!widget.session.isLive) ...[
+                          const SizedBox(width: 4),
+                          Video115AccelerateButton(
+                            api: widget.appState.api,
+                            downloadUrlBuilder: () => widget.session.streamUrl,
+                            videoNameBuilder: () => widget.session.title,
+                            headersBuilder: () => widget.session.headers,
+                            compact: true,
+                            overlayStyle: true,
+                            onResolved: (resolved) async {
+                              if (!mounted) return;
+                              final curSec = _player.state.position.inSeconds;
+                              await _player.open(
+                                Media(
+                                  resolved.proxyStreamUrl,
+                                  httpHeaders: resolved.proxyStreamUrl
+                                          .contains('127.0.0.1')
+                                      ? const {}
+                                      : resolved.headers,
+                                  start: curSec > 2
+                                      ? Duration(seconds: curSec)
+                                      : null,
+                                ),
+                                play: true,
+                              );
+                            },
+                          ),
+                        ],
                         const SizedBox(width: 4),
                         VideoProxyNodeSelector(
                           proxyService: widget.appState.proxyService,

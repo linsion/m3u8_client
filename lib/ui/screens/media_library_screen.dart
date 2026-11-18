@@ -9,9 +9,11 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../models/models.dart';
+import '../../services/api_client.dart';
 import '../../state/app_state.dart';
 import '../theme.dart';
 import '../widgets/mobile_edge_swipe_back.dart';
+import '../widgets/video_115_accelerate_button.dart';
 import '../widgets/video_download_speed_badge.dart';
 
 class MediaLibraryScreen extends StatefulWidget {
@@ -149,6 +151,7 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
       showDialog<void>(
         context: context,
         builder: (_) => _MediaFilePlayerDialog(
+          api: widget.appState.api,
           title: entry.name,
           streamUrl: streamUrl,
           headers: headers,
@@ -1043,12 +1046,14 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
 }
 
 class _MediaFilePlayerDialog extends StatefulWidget {
+  final ApiClient api;
   final String title;
   final String streamUrl;
   final Map<String, String> headers;
   final ValueChanged<int>? onEnterMiniPlayer;
 
   const _MediaFilePlayerDialog({
+    required this.api,
     required this.title,
     required this.streamUrl,
     required this.headers,
@@ -1066,19 +1071,23 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
   String _fitMode = 'fit'; // 'fit', 'cover'
   bool? _landscapeOverride;
   bool _didChangeOrientation = false;
+  bool _using115Direct = false;
 
   @override
   void initState() {
     super.initState();
     _player = Player(
-      configuration: const PlayerConfiguration(
-        bufferSize: 128 * 1024 * 1024,
+      configuration: PlayerConfiguration(
+        bufferSize: (Platform.isAndroid || Platform.isIOS)
+            ? 32 * 1024 * 1024
+            : 128 * 1024 * 1024,
       ),
     );
     _controller = VideoController(
       _player,
       configuration: VideoControllerConfiguration(
-        hwdec: Platform.isAndroid ? 'mediacodec-copy' : null,
+        hwdec: Platform.isAndroid ? 'no' : null,
+        enableHardwareAcceleration: !Platform.isAndroid,
       ),
     );
     _configureMediaPlayer();
@@ -1091,16 +1100,18 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
   Future<void> _configureMediaPlayer() async {
     try {
       final dynamic platform = _player.platform;
+      final isMobileOrTv = Platform.isAndroid || Platform.isIOS;
       final props = <String, String>{
-        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto-safe',
+        'hwdec': Platform.isAndroid ? 'no' : 'auto-safe',
         'hwdec-codecs': 'h264,hevc,vp8,vp9,av1',
         'vd-lavc-software-fallback': 'yes',
+        'vd-lavc-threads': Platform.isAndroid ? '4' : '0',
         'cache': 'yes',
-        'cache-secs': '120',
+        'cache-secs': isMobileOrTv ? '45' : '120',
         'cache-pause-initial': 'no',
         'cache-pause-wait': '0.8',
-        'demuxer-max-bytes': '134217728',
-        'demuxer-readahead-secs': '60',
+        'demuxer-max-bytes': isMobileOrTv ? '50331648' : '134217728',
+        'demuxer-readahead-secs': isMobileOrTv ? '30' : '60',
         'stream-buffer-size': '524288',
         'tls-verify': 'no',
       };
@@ -1183,6 +1194,37 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
                         ),
                       ),
                     ),
+                    Video115AccelerateButton(
+                      api: widget.api,
+                      downloadUrlBuilder: () => widget.streamUrl,
+                      videoNameBuilder: () => widget.title,
+                      headersBuilder: () => widget.headers,
+                      isUsing115Direct: _using115Direct,
+                      compact: true,
+                      overlayStyle: false,
+                      onResolved: (resolved) async {
+                        if (!mounted) return;
+                        final curSec = _player.state.position.inSeconds;
+                        setState(() => _using115Direct = true);
+                        await _player.open(
+                          Media(
+                            resolved.proxyStreamUrl,
+                            httpHeaders:
+                                resolved.proxyStreamUrl.contains('127.0.0.1')
+                                    ? const {}
+                                    : resolved.headers,
+                            start: curSec > 2
+                                ? Duration(seconds: curSec)
+                                : null,
+                          ),
+                          play: true,
+                        );
+                        if (_rate != 1.0) {
+                          await _player.setRate(_rate);
+                        }
+                      },
+                    ),
+                    const SizedBox(width: 4),
                     IconButton(
                       tooltip: '快退 10 秒',
                       visualDensity: VisualDensity.compact,
