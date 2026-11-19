@@ -3210,30 +3210,74 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
                         ]) ...[
                           Padding(
                             padding: const EdgeInsets.only(right: 6),
-                            child: ChoiceChip(
-                              visualDensity: VisualDensity.compact,
-                              label: Text(
-                                cat.$2,
-                                style: const TextStyle(fontSize: 11.5),
-                              ),
-                              selected: _categoryFilter == cat.$1,
-                              onSelected: (_) =>
-                                  setState(() => _categoryFilter = cat.$1),
+                            child: StatefulBuilder(
+                              builder: (catCtx, setCatState) {
+                                final isSelected = _categoryFilter == cat.$1;
+                                return InkWell(
+                                  borderRadius: BorderRadius.circular(14),
+                                  onFocusChange: (_) {
+                                    if (catCtx.mounted) setCatState(() {});
+                                  },
+                                  onTap: () =>
+                                      setState(() => _categoryFilter = cat.$1),
+                                  child: Builder(
+                                    builder: (ctx) {
+                                      final isFocused =
+                                          Focus.of(ctx).hasPrimaryFocus;
+                                      return AnimatedContainer(
+                                        duration:
+                                            const Duration(milliseconds: 140),
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 10,
+                                          vertical: 5,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: isSelected
+                                              ? (isFocused
+                                                  ? VideoPlatformTheme
+                                                      .accentHover
+                                                  : VideoPlatformTheme.accent)
+                                              : (isFocused
+                                                  ? VideoPlatformTheme.accent
+                                                      .withValues(alpha: 0.34)
+                                                  : VideoPlatformTheme.bgCard),
+                                          borderRadius:
+                                              BorderRadius.circular(14),
+                                          border: Border.all(
+                                            color: isFocused
+                                                ? const Color(0xFFFFE066)
+                                                : (isSelected
+                                                    ? VideoPlatformTheme.accent
+                                                    : VideoPlatformTheme
+                                                        .borderSubtle),
+                                            width: isFocused ? 2.2 : 1.0,
+                                          ),
+                                        ),
+                                        child: Text(
+                                          cat.$2,
+                                          style: TextStyle(
+                                            fontSize: 11.5,
+                                            fontWeight:
+                                                (isSelected || isFocused)
+                                                    ? FontWeight.w700
+                                                    : FontWeight.w500,
+                                            color: (isSelected || isFocused)
+                                                ? Colors.white
+                                                : VideoPlatformTheme
+                                                    .textPrimary,
+                                          ),
+                                        ),
+                                      );
+                                    },
+                                  ),
+                                );
+                              },
                             ),
                           ),
                         ],
                         if (entries.any((e) => !e.isDir && e.isAudio)) ...[
                           const SizedBox(width: 4),
                           FilledButton.icon(
-                            style: FilledButton.styleFrom(
-                              backgroundColor: VideoPlatformTheme.accent,
-                              foregroundColor: Colors.white,
-                              visualDensity: VisualDensity.compact,
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 10,
-                                vertical: 5,
-                              ),
-                            ),
                             onPressed: () {
                               final firstAudio = entries
                                   .where((e) => !e.isDir && e.isAudio)
@@ -3252,13 +3296,7 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
                             ),
                           ),
                           const SizedBox(width: 6),
-                          FilledButton.tonalIcon(
-                            style: FilledButton.styleFrom(
-                              backgroundColor: VideoPlatformTheme.accent
-                                  .withValues(alpha: 0.16),
-                              foregroundColor: VideoPlatformTheme.accent,
-                              visualDensity: VisualDensity.compact,
-                            ),
+                          OutlinedButton.icon(
                             onPressed: () async {
                               final firstAudio = entries
                                   .where((e) => !e.isDir && e.isAudio)
@@ -3285,13 +3323,7 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
                           ),
                         ],
                         const SizedBox(width: 6),
-                        FilledButton.tonalIcon(
-                          style: FilledButton.styleFrom(
-                            backgroundColor:
-                                VideoPlatformTheme.accent.withValues(alpha: 0.14),
-                            foregroundColor: VideoPlatformTheme.accent,
-                            visualDensity: VisualDensity.compact,
-                          ),
+                        OutlinedButton.icon(
                           onPressed: () async {
                             await showDialog<void>(
                               context: context,

@@ -2270,10 +2270,100 @@ class _CloudMusicFolderPickerDialogState
                       for (final m in mounts)
                         Padding(
                           padding: const EdgeInsets.only(right: 8),
-                          child: ChoiceChip(
-                            label: Text(m.name),
-                            selected: activeMount?.id == m.id,
-                            onSelected: (_) => _selectMount(m),
+                          child: StatefulBuilder(
+                            builder: (mCtx, setMState) {
+                              final isSelected = activeMount?.id == m.id;
+                              return InkWell(
+                                borderRadius: BorderRadius.circular(18),
+                                onFocusChange: (_) {
+                                  if (mCtx.mounted) setMState(() {});
+                                },
+                                onTap: () => _selectMount(m),
+                                child: Builder(
+                                  builder: (ctx) {
+                                    final isFocused =
+                                        Focus.of(ctx).hasPrimaryFocus;
+                                    return AnimatedContainer(
+                                      duration:
+                                          const Duration(milliseconds: 140),
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 12,
+                                        vertical: 6,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: isSelected
+                                            ? (isFocused
+                                                ? VideoPlatformTheme.accentHover
+                                                : VideoPlatformTheme.accent)
+                                            : (isFocused
+                                                ? VideoPlatformTheme.accent
+                                                    .withValues(alpha: 0.34)
+                                                : VideoPlatformTheme.bgCard),
+                                        borderRadius: BorderRadius.circular(18),
+                                        border: Border.all(
+                                          color: isFocused
+                                              ? const Color(0xFFFFE066)
+                                              : (isSelected
+                                                  ? VideoPlatformTheme.accent
+                                                  : VideoPlatformTheme
+                                                      .borderSubtle),
+                                          width: isFocused ? 2.4 : 1.0,
+                                        ),
+                                        boxShadow: isFocused
+                                            ? [
+                                                BoxShadow(
+                                                  color: VideoPlatformTheme
+                                                      .accent
+                                                      .withValues(alpha: 0.55),
+                                                  blurRadius: 10,
+                                                  spreadRadius: 1,
+                                                ),
+                                              ]
+                                            : null,
+                                      ),
+                                      child: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Icon(
+                                            switch (m.kind) {
+                                              StorageSourceKind.server =>
+                                                Icons.dns_rounded,
+                                              StorageSourceKind.alist =>
+                                                Icons.cloud_circle_rounded,
+                                              StorageSourceKind.webdav =>
+                                                Icons.language_rounded,
+                                              StorageSourceKind.cloud115 =>
+                                                Icons.cloud_done_rounded,
+                                              StorageSourceKind.localCache =>
+                                                Icons.folder_special_rounded,
+                                            },
+                                            size: 14,
+                                            color: (isSelected || isFocused)
+                                                ? Colors.white
+                                                : VideoPlatformTheme.accent,
+                                          ),
+                                          const SizedBox(width: 6),
+                                          Text(
+                                            m.name,
+                                            style: TextStyle(
+                                              fontSize: 12.5,
+                                              fontWeight:
+                                                  (isSelected || isFocused)
+                                                      ? FontWeight.w700
+                                                      : FontWeight.w500,
+                                              color: (isSelected || isFocused)
+                                                  ? Colors.white
+                                                  : VideoPlatformTheme
+                                                      .textPrimary,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    );
+                                  },
+                                ),
+                              );
+                            },
                           ),
                         ),
                     ],
@@ -2326,23 +2416,76 @@ class _CloudMusicFolderPickerDialogState
                                           color: VideoPlatformTheme.textMuted,
                                         ),
                                       ),
-                                    InkWell(
-                                      onTap: () => _loadDir(
-                                        _breadcrumbs[i].path,
-                                        title: _breadcrumbs[i].title,
-                                      ),
-                                      child: Text(
-                                        _breadcrumbs[i].title,
-                                        style: TextStyle(
-                                          fontSize: 12.5,
-                                          fontWeight: i == _breadcrumbs.length - 1
-                                              ? FontWeight.w700
-                                              : FontWeight.w400,
-                                          color: i == _breadcrumbs.length - 1
-                                              ? VideoPlatformTheme.accent
-                                              : VideoPlatformTheme.textSecondary,
-                                        ),
-                                      ),
+                                    StatefulBuilder(
+                                      builder: (crumbCtx, setCrumbState) {
+                                        return InkWell(
+                                          borderRadius:
+                                              BorderRadius.circular(5),
+                                          onFocusChange: (_) {
+                                            if (crumbCtx.mounted) {
+                                              setCrumbState(() {});
+                                            }
+                                          },
+                                          onTap: () => _loadDir(
+                                            _breadcrumbs[i].path,
+                                            title: _breadcrumbs[i].title,
+                                          ),
+                                          child: Builder(
+                                            builder: (ctx) {
+                                              final isFocused =
+                                                  Focus.of(ctx).hasPrimaryFocus;
+                                              return Container(
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                  horizontal: 6,
+                                                  vertical: 2,
+                                                ),
+                                                decoration: BoxDecoration(
+                                                  color: isFocused
+                                                      ? VideoPlatformTheme
+                                                          .accent
+                                                          .withValues(
+                                                              alpha: 0.34)
+                                                      : Colors.transparent,
+                                                  borderRadius:
+                                                      BorderRadius.circular(5),
+                                                  border: isFocused
+                                                      ? Border.all(
+                                                          color: const Color(
+                                                            0xFFFFE066,
+                                                          ),
+                                                          width: 1.8,
+                                                        )
+                                                      : null,
+                                                ),
+                                                child: Text(
+                                                  _breadcrumbs[i].title,
+                                                  style: TextStyle(
+                                                    fontSize: 12.5,
+                                                    fontWeight: (i ==
+                                                                _breadcrumbs
+                                                                        .length -
+                                                                    1 ||
+                                                            isFocused)
+                                                        ? FontWeight.w700
+                                                        : FontWeight.w400,
+                                                    color: isFocused
+                                                        ? Colors.white
+                                                        : (i ==
+                                                                _breadcrumbs
+                                                                        .length -
+                                                                    1
+                                                            ? VideoPlatformTheme
+                                                                .accent
+                                                            : VideoPlatformTheme
+                                                                .textSecondary),
+                                                  ),
+                                                ),
+                                              );
+                                            },
+                                          ),
+                                        );
+                                      },
                                     ),
                                   ],
                                 ],
@@ -2378,14 +2521,7 @@ class _CloudMusicFolderPickerDialogState
                               ),
                             ),
                             const SizedBox(width: 6),
-                            FilledButton.tonalIcon(
-                              style: FilledButton.styleFrom(
-                                backgroundColor:
-                                    _isSelected(activeMount.id, _currentPath)
-                                        ? VideoPlatformTheme.accent
-                                            .withValues(alpha: 0.25)
-                                        : null,
-                              ),
+                            OutlinedButton.icon(
                               onPressed: () =>
                                   _toggleSelection(_currentDirectoryAsItem()),
                               icon: Icon(
@@ -2393,6 +2529,9 @@ class _CloudMusicFolderPickerDialogState
                                     ? Icons.check_box_rounded
                                     : Icons.add_box_outlined,
                                 size: 15,
+                                color: _isSelected(activeMount.id, _currentPath)
+                                    ? VideoPlatformTheme.accent
+                                    : null,
                               ),
                               label: Text(
                                 _isSelected(activeMount.id, _currentPath)
@@ -2507,86 +2646,120 @@ class _CloudMusicFolderPickerDialogState
                                   final checked = activeMount != null &&
                                       _isSelected(activeMount.id, e.path);
 
-                                  return ListTile(
-                                    dense: true,
-                                    contentPadding: EdgeInsets.symmetric(
-                                      horizontal: isMobile ? 8 : 12,
-                                    ),
-                                    leading: Icon(
-                                      e.isDir
-                                          ? Icons.folder_rounded
-                                          : (e.isStreamableMusicArchive
-                                              ? Icons.folder_zip_rounded
-                                              : (e.isAudio
-                                                  ? Icons.audiotrack_rounded
-                                                  : Icons
-                                                      .insert_drive_file_outlined)),
-                                      color: e.isDir
-                                          ? VideoPlatformTheme.warning
-                                          : (e.isStreamableMusicArchive
-                                              ? VideoPlatformTheme.badgeHot
-                                              : (e.isAudio
-                                                  ? VideoPlatformTheme.accent
-                                                  : VideoPlatformTheme
-                                                      .textMuted)),
-                                    ),
-                                    title: Text(
-                                      e.name,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: TextStyle(
-                                        fontSize: 13,
-                                        fontWeight: FontWeight.w600,
-                                        color: VideoPlatformTheme.textPrimary,
-                                      ),
-                                    ),
-                                    subtitle: Text(
-                                      e.isDir
-                                          ? '文件夹 · 点击进入，右侧可勾选随机播放'
-                                          : (e.isStreamableMusicArchive
-                                              ? '压缩包 (${e.formattedSize}) · 免整包下载直读音乐'
-                                              : '${e.typeTagText} · ${e.formattedSize}'),
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: TextStyle(
-                                        fontSize: 11,
-                                        color: VideoPlatformTheme.textMuted,
-                                      ),
-                                    ),
-                                    onTap: () {
-                                      if (e.isDir) {
-                                        _loadDir(e.path, title: e.name);
-                                      } else if (isSelectable &&
-                                          activeMount != null) {
-                                        _toggleSelection(
-                                          SavedMusicFolderItem(
-                                            mountId: activeMount.id,
-                                            mountName: activeMount.name,
-                                            sourceKind: activeMount.kind,
-                                            path: e.path,
-                                            title: e.name,
-                                            isArchive:
-                                                e.isStreamableMusicArchive,
-                                            size: e.size,
-                                            pickcode115: e.pickcode115,
-                                          ),
-                                        );
-                                      }
-                                    },
-                                    trailing: (isSelectable &&
-                                            activeMount != null)
-                                        ? Row(
-                                            mainAxisSize: MainAxisSize.min,
-                                            children: [
-                                              if (e.isDir ||
-                                                  e.isStreamableMusicArchive)
-                                                IconButton(
-                                                  visualDensity:
-                                                      VisualDensity.compact,
-                                                  tooltip: '加入常用音乐源',
-                                                  onPressed: () {
-                                                    _ctrl
-                                                        .addOrToggleSavedMusicFolder(
+                                  return StatefulBuilder(
+                                    builder: (rowCtx, setRowState) {
+                                      return Focus(
+                                        canRequestFocus: false,
+                                        onFocusChange: (_) {
+                                          if (rowCtx.mounted) setRowState(() {});
+                                        },
+                                        child: Builder(
+                                          builder: (ctx) {
+                                            final isFocused =
+                                                Focus.of(ctx).hasFocus;
+                                            return Container(
+                                              decoration: BoxDecoration(
+                                                color: isFocused
+                                                    ? VideoPlatformTheme.accent
+                                                        .withValues(alpha: 0.24)
+                                                    : (checked
+                                                        ? VideoPlatformTheme
+                                                            .accent
+                                                            .withValues(
+                                                                alpha: 0.14)
+                                                        : Colors.transparent),
+                                                borderRadius:
+                                                    BorderRadius.circular(8),
+                                                border: Border.all(
+                                                  color: isFocused
+                                                      ? const Color(0xFFFFE066)
+                                                      : (checked
+                                                          ? VideoPlatformTheme
+                                                              .accent
+                                                          : Colors.transparent),
+                                                  width: isFocused ? 2.2 : 1.0,
+                                                ),
+                                              ),
+                                              child: ListTile(
+                                                dense: true,
+                                                autofocus: idx == 0,
+                                                focusColor: VideoPlatformTheme
+                                                    .accent
+                                                    .withValues(alpha: 0.28),
+                                                shape: RoundedRectangleBorder(
+                                                  borderRadius:
+                                                      BorderRadius.circular(8),
+                                                ),
+                                                contentPadding:
+                                                    EdgeInsets.symmetric(
+                                                  horizontal: isMobile ? 8 : 12,
+                                                ),
+                                                leading: Icon(
+                                                  e.isDir
+                                                      ? Icons.folder_rounded
+                                                      : (e.isStreamableMusicArchive
+                                                          ? Icons
+                                                              .folder_zip_rounded
+                                                          : (e.isAudio
+                                                              ? Icons
+                                                                  .audiotrack_rounded
+                                                              : Icons
+                                                                  .insert_drive_file_outlined)),
+                                                  color: e.isDir
+                                                      ? VideoPlatformTheme
+                                                          .warning
+                                                      : (e.isStreamableMusicArchive
+                                                          ? VideoPlatformTheme
+                                                              .badgeHot
+                                                          : (e.isAudio
+                                                              ? VideoPlatformTheme
+                                                                  .accent
+                                                              : VideoPlatformTheme
+                                                                  .textMuted)),
+                                                ),
+                                                title: Text(
+                                                  e.name,
+                                                  maxLines: 1,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: TextStyle(
+                                                    fontSize: 13,
+                                                    fontWeight: (isFocused ||
+                                                            checked)
+                                                        ? FontWeight.w700
+                                                        : FontWeight.w600,
+                                                    color: isFocused
+                                                        ? Colors.white
+                                                        : VideoPlatformTheme
+                                                            .textPrimary,
+                                                  ),
+                                                ),
+                                                subtitle: Text(
+                                                  e.isDir
+                                                      ? '文件夹 · 点击进入，右侧可勾选随机播放'
+                                                      : (e.isStreamableMusicArchive
+                                                          ? '压缩包 (${e.formattedSize}) · 免整包下载直读音乐'
+                                                          : '${e.typeTagText} · ${e.formattedSize}'),
+                                                  maxLines: 1,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: TextStyle(
+                                                    fontSize: 11,
+                                                    color: isFocused
+                                                        ? Colors.white70
+                                                        : VideoPlatformTheme
+                                                            .textMuted,
+                                                  ),
+                                                ),
+                                                onTap: () {
+                                                  if (e.isDir) {
+                                                    _loadDir(
+                                                      e.path,
+                                                      title: e.name,
+                                                    );
+                                                  } else if (isSelectable &&
+                                                      activeMount != null) {
+                                                    _toggleSelection(
                                                       SavedMusicFolderItem(
                                                         mountId: activeMount.id,
                                                         mountName:
@@ -2602,49 +2775,102 @@ class _CloudMusicFolderPickerDialogState
                                                             e.pickcode115,
                                                       ),
                                                     );
-                                                    setState(() {});
-                                                  },
-                                                  icon: Icon(
-                                                    _ctrl.isMusicFolderSaved(
-                                                      activeMount.id,
-                                                      e.path,
-                                                    )
-                                                        ? Icons.star_rounded
-                                                        : Icons
-                                                            .star_border_rounded,
-                                                    size: 18,
-                                                    color: VideoPlatformTheme
-                                                        .warning,
-                                                  ),
-                                                ),
-                                              Checkbox(
-                                                visualDensity:
-                                                    VisualDensity.compact,
-                                                value: checked,
-                                                activeColor:
-                                                    VideoPlatformTheme.accent,
-                                                onChanged: (_) {
-                                                  _toggleSelection(
-                                                    SavedMusicFolderItem(
-                                                      mountId: activeMount.id,
-                                                      mountName:
-                                                          activeMount.name,
-                                                      sourceKind:
-                                                          activeMount.kind,
-                                                      path: e.path,
-                                                      title: e.name,
-                                                      isArchive: e
-                                                          .isStreamableMusicArchive,
-                                                      size: e.size,
-                                                      pickcode115:
-                                                          e.pickcode115,
-                                                    ),
-                                                  );
+                                                  }
                                                 },
+                                                trailing: (isSelectable &&
+                                                        activeMount != null)
+                                                    ? Row(
+                                                        mainAxisSize:
+                                                            MainAxisSize.min,
+                                                        children: [
+                                                          if (e.isDir ||
+                                                              e.isStreamableMusicArchive)
+                                                            IconButton(
+                                                              visualDensity:
+                                                                  VisualDensity
+                                                                      .compact,
+                                                              tooltip: '加入常用音乐源',
+                                                              onPressed: () {
+                                                                _ctrl.addOrToggleSavedMusicFolder(
+                                                                  SavedMusicFolderItem(
+                                                                    mountId:
+                                                                        activeMount
+                                                                            .id,
+                                                                    mountName:
+                                                                        activeMount
+                                                                            .name,
+                                                                    sourceKind:
+                                                                        activeMount
+                                                                            .kind,
+                                                                    path:
+                                                                        e.path,
+                                                                    title:
+                                                                        e.name,
+                                                                    isArchive: e
+                                                                        .isStreamableMusicArchive,
+                                                                    size:
+                                                                        e.size,
+                                                                    pickcode115:
+                                                                        e.pickcode115,
+                                                                  ),
+                                                                );
+                                                                setState(() {});
+                                                              },
+                                                              icon: Icon(
+                                                                _ctrl.isMusicFolderSaved(
+                                                                  activeMount
+                                                                      .id,
+                                                                  e.path,
+                                                                )
+                                                                    ? Icons
+                                                                        .star_rounded
+                                                                    : Icons
+                                                                        .star_border_rounded,
+                                                                size: 18,
+                                                                color: VideoPlatformTheme
+                                                                    .warning,
+                                                              ),
+                                                            ),
+                                                          Checkbox(
+                                                            visualDensity:
+                                                                VisualDensity
+                                                                    .compact,
+                                                            value: checked,
+                                                            activeColor:
+                                                                VideoPlatformTheme
+                                                                    .accent,
+                                                            onChanged: (_) {
+                                                              _toggleSelection(
+                                                                SavedMusicFolderItem(
+                                                                  mountId:
+                                                                      activeMount
+                                                                          .id,
+                                                                  mountName:
+                                                                      activeMount
+                                                                          .name,
+                                                                  sourceKind:
+                                                                      activeMount
+                                                                          .kind,
+                                                                  path: e.path,
+                                                                  title: e.name,
+                                                                  isArchive: e
+                                                                      .isStreamableMusicArchive,
+                                                                  size: e.size,
+                                                                  pickcode115: e
+                                                                      .pickcode115,
+                                                                ),
+                                                              );
+                                                            },
+                                                          ),
+                                                        ],
+                                                      )
+                                                    : null,
                                               ),
-                                            ],
-                                          )
-                                        : null,
+                                            );
+                                          },
+                                        ),
+                                      );
+                                    },
                                   );
                                 },
                               )),
@@ -2658,33 +2884,81 @@ class _CloudMusicFolderPickerDialogState
                   crossAxisAlignment: WrapCrossAlignment.center,
                   alignment: WrapAlignment.spaceBetween,
                   children: [
-                    Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        SizedBox(
-                          width: 28,
-                          height: 28,
-                          child: Checkbox(
-                            visualDensity: VisualDensity.compact,
-                            value: _includeSubfolders,
-                            activeColor: VideoPlatformTheme.accent,
-                            onChanged: (v) =>
-                                setState(() => _includeSubfolders = v ?? true),
+                    StatefulBuilder(
+                      builder: (recCtx, setRecState) {
+                        return InkWell(
+                          borderRadius: BorderRadius.circular(6),
+                          onFocusChange: (_) {
+                            if (recCtx.mounted) setRecState(() {});
+                          },
+                          onTap: () => setState(
+                            () => _includeSubfolders = !_includeSubfolders,
                           ),
-                        ),
-                        const SizedBox(width: 4),
-                        Flexible(
-                          child: Text(
-                            isMobile
-                                ? '递归扫描子目录与压缩包'
-                                : '自动递归扫描子目录与内部 .zip / .tar 音乐压缩包',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: VideoPlatformTheme.textSecondary,
-                            ),
+                          child: Builder(
+                            builder: (ctx) {
+                              final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                              return Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 6,
+                                  vertical: 2,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: isFocused
+                                      ? VideoPlatformTheme.accent
+                                          .withValues(alpha: 0.28)
+                                      : Colors.transparent,
+                                  borderRadius: BorderRadius.circular(6),
+                                  border: isFocused
+                                      ? Border.all(
+                                          color: const Color(0xFFFFE066),
+                                          width: 1.8,
+                                        )
+                                      : null,
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    SizedBox(
+                                      width: 24,
+                                      height: 24,
+                                      child: ExcludeFocus(
+                                        child: Checkbox(
+                                          visualDensity: VisualDensity.compact,
+                                          value: _includeSubfolders,
+                                          activeColor:
+                                              VideoPlatformTheme.accent,
+                                          onChanged: (v) => setState(
+                                            () =>
+                                                _includeSubfolders = v ?? true,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 4),
+                                    Flexible(
+                                      child: Text(
+                                        isMobile
+                                            ? '递归扫描子目录与压缩包'
+                                            : '自动递归扫描子目录与内部 .zip / .tar 音乐压缩包',
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          fontWeight: isFocused
+                                              ? FontWeight.w700
+                                              : FontWeight.w400,
+                                          color: isFocused
+                                              ? Colors.white
+                                              : VideoPlatformTheme
+                                                  .textSecondary,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              );
+                            },
                           ),
-                        ),
-                      ],
+                        );
+                      },
                     ),
                     Text(
                       _selectedItems.isEmpty
@@ -2733,10 +3007,6 @@ class _CloudMusicFolderPickerDialogState
               label: Text(isMobile ? '顺序播放' : '顺序播放所选'),
             ),
             FilledButton.icon(
-              style: FilledButton.styleFrom(
-                backgroundColor: VideoPlatformTheme.accent,
-                foregroundColor: Colors.white,
-              ),
               onPressed: () async {
                 final targets = _selectedItems.isNotEmpty
                     ? List<SavedMusicFolderItem>.from(_selectedItems)
@@ -2925,57 +3195,120 @@ class _CloudArchiveMusicBrowserDialogState
                                   track,
                                   fallbackArtist: widget.archiveEntry.name,
                                 );
-                                return ListTile(
-                                  dense: true,
-                                  leading: CircleAvatar(
-                                    radius: 14,
-                                    backgroundColor: VideoPlatformTheme.accent
-                                        .withValues(alpha: 0.2),
-                                    child: Text(
-                                      '${idx + 1}',
-                                      style: TextStyle(
-                                        fontSize: 11,
-                                        color: VideoPlatformTheme.accent,
-                                        fontWeight: FontWeight.w700,
+                                return StatefulBuilder(
+                                  builder: (arcRowCtx, setArcRowState) {
+                                    return Focus(
+                                      canRequestFocus: false,
+                                      onFocusChange: (_) {
+                                        if (arcRowCtx.mounted) {
+                                          setArcRowState(() {});
+                                        }
+                                      },
+                                      child: Builder(
+                                        builder: (ctx) {
+                                          final isFocused =
+                                              Focus.of(ctx).hasFocus;
+                                          return Container(
+                                            decoration: BoxDecoration(
+                                              color: isFocused
+                                                  ? VideoPlatformTheme.accent
+                                                      .withValues(alpha: 0.24)
+                                                  : Colors.transparent,
+                                              borderRadius:
+                                                  BorderRadius.circular(8),
+                                              border: isFocused
+                                                  ? Border.all(
+                                                      color: const Color(
+                                                        0xFFFFE066,
+                                                      ),
+                                                      width: 2.2,
+                                                    )
+                                                  : null,
+                                            ),
+                                            child: ListTile(
+                                              dense: true,
+                                              autofocus: idx == 0,
+                                              focusColor: VideoPlatformTheme
+                                                  .accent
+                                                  .withValues(alpha: 0.28),
+                                              shape: RoundedRectangleBorder(
+                                                borderRadius:
+                                                    BorderRadius.circular(8),
+                                              ),
+                                              leading: CircleAvatar(
+                                                radius: 14,
+                                                backgroundColor:
+                                                    VideoPlatformTheme.accent
+                                                        .withValues(alpha: 0.2),
+                                                child: Text(
+                                                  '${idx + 1}',
+                                                  style: TextStyle(
+                                                    fontSize: 11,
+                                                    color: isFocused
+                                                        ? Colors.white
+                                                        : VideoPlatformTheme
+                                                            .accent,
+                                                    fontWeight: FontWeight.w700,
+                                                  ),
+                                                ),
+                                              ),
+                                              title: Text(
+                                                meta.title,
+                                                maxLines: 1,
+                                                overflow: TextOverflow.ellipsis,
+                                                style: TextStyle(
+                                                  fontSize: 13.5,
+                                                  fontWeight: isFocused
+                                                      ? FontWeight.w700
+                                                      : FontWeight.w600,
+                                                  color: isFocused
+                                                      ? Colors.white
+                                                      : VideoPlatformTheme
+                                                          .textPrimary,
+                                                ),
+                                              ),
+                                              subtitle: Text(
+                                                '${track.archiveInnerPath} · ${track.formattedSize}',
+                                                maxLines: 1,
+                                                overflow: TextOverflow.ellipsis,
+                                                style: TextStyle(
+                                                  fontSize: 11,
+                                                  color: isFocused
+                                                      ? Colors.white70
+                                                      : VideoPlatformTheme
+                                                          .textMuted,
+                                                ),
+                                              ),
+                                              trailing: Icon(
+                                                Icons.play_circle_fill_rounded,
+                                                color: isFocused
+                                                    ? Colors.white
+                                                    : VideoPlatformTheme.accent,
+                                                size: 22,
+                                              ),
+                                              onTap: () async {
+                                                Navigator.of(context).pop();
+                                                widget.controller
+                                                    .registerDirectoryContext(
+                                                  mounts: widget.controller
+                                                      .availableMounts,
+                                                  directoryEntries: _allEntries,
+                                                );
+                                                await widget.controller
+                                                    .playFromDirectory(
+                                                  targetTrack: track,
+                                                  directoryEntries: _allEntries,
+                                                  mounts: widget.controller
+                                                      .availableMounts,
+                                                );
+                                                widget.onOpenFullscreenHall
+                                                    ?.call();
+                                              },
+                                            ),
+                                          );
+                                        },
                                       ),
-                                    ),
-                                  ),
-                                  title: Text(
-                                    meta.title,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(
-                                      fontSize: 13.5,
-                                      fontWeight: FontWeight.w600,
-                                      color: VideoPlatformTheme.textPrimary,
-                                    ),
-                                  ),
-                                  subtitle: Text(
-                                    '${track.archiveInnerPath} · ${track.formattedSize}',
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(
-                                      fontSize: 11,
-                                      color: VideoPlatformTheme.textMuted,
-                                    ),
-                                  ),
-                                  trailing: Icon(
-                                    Icons.play_circle_fill_rounded,
-                                    color: VideoPlatformTheme.accent,
-                                    size: 22,
-                                  ),
-                                  onTap: () async {
-                                    Navigator.of(context).pop();
-                                    widget.controller.registerDirectoryContext(
-                                      mounts: widget.controller.availableMounts,
-                                      directoryEntries: _allEntries,
                                     );
-                                    await widget.controller.playFromDirectory(
-                                      targetTrack: track,
-                                      directoryEntries: _allEntries,
-                                      mounts: widget.controller.availableMounts,
-                                    );
-                                    widget.onOpenFullscreenHall?.call();
                                   },
                                 );
                               },
@@ -3480,36 +3813,57 @@ class CloudMusicBottomDockBar extends StatelessWidget {
                             ),
                           ),
                           const SizedBox(width: 8),
-                          InkWell(
-                            onTap: controller.cycleSpeed,
-                            borderRadius: BorderRadius.circular(6),
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 7,
-                                vertical: 3,
-                              ),
-                              decoration: BoxDecoration(
-                                color: VideoPlatformTheme.bgHover,
+                          StatefulBuilder(
+                            builder: (dockSpdCtx, setDockSpdState) {
+                              return InkWell(
+                                onFocusChange: (_) {
+                                  if (dockSpdCtx.mounted) {
+                                    setDockSpdState(() {});
+                                  }
+                                },
+                                onTap: controller.cycleSpeed,
                                 borderRadius: BorderRadius.circular(6),
-                              ),
-                              child: Text(
-                                '${controller.speed}x',
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w700,
-                                  color: VideoPlatformTheme.textPrimary,
+                                child: Builder(
+                                  builder: (ctx) {
+                                    final isFocused =
+                                        Focus.of(ctx).hasPrimaryFocus;
+                                    return Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 7,
+                                        vertical: 3,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: isFocused
+                                            ? VideoPlatformTheme.accent
+                                                .withValues(alpha: 0.34)
+                                            : VideoPlatformTheme.bgHover,
+                                        borderRadius: BorderRadius.circular(6),
+                                        border: isFocused
+                                            ? Border.all(
+                                                color: const Color(0xFFFFE066),
+                                                width: 1.8,
+                                              )
+                                            : null,
+                                      ),
+                                      child: Text(
+                                        '${controller.speed}x',
+                                        style: TextStyle(
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.w700,
+                                          color: isFocused
+                                              ? Colors.white
+                                              : VideoPlatformTheme.textPrimary,
+                                        ),
+                                      ),
+                                    );
+                                  },
                                 ),
-                              ),
-                            ),
+                              );
+                            },
                           ),
                           const SizedBox(width: 8),
                         ],
-                        FilledButton.tonalIcon(
-                          style: FilledButton.styleFrom(
-                            backgroundColor: VideoPlatformTheme.accent
-                                .withValues(alpha: 0.18),
-                            foregroundColor: VideoPlatformTheme.accent,
-                          ),
+                        OutlinedButton.icon(
                           onPressed: onExpandFullscreen,
                           icon: const Icon(Icons.lyrics_rounded, size: 15),
                           label: Text(
@@ -3799,17 +4153,8 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
   KeyEventResult _handleKeyEvent(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
     final key = event.logicalKey;
-    if (key == LogicalKeyboardKey.space ||
-        key == LogicalKeyboardKey.mediaPlayPause) {
+    if (key == LogicalKeyboardKey.mediaPlayPause) {
       _ctrl.togglePlayPause();
-      return KeyEventResult.handled;
-    }
-    if (key == LogicalKeyboardKey.arrowLeft) {
-      _ctrl.seekRelative(const Duration(seconds: -5));
-      return KeyEventResult.handled;
-    }
-    if (key == LogicalKeyboardKey.arrowRight) {
-      _ctrl.seekRelative(const Duration(seconds: 5));
       return KeyEventResult.handled;
     }
     if (key == LogicalKeyboardKey.bracketLeft ||
@@ -3822,6 +4167,13 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
       _ctrl.stepTrack(1);
       return KeyEventResult.handled;
     }
+    // Only handle Space when the background container itself has primary focus
+    // (so Space/Enter on a focused button triggers that button's onPressed!).
+    // Never intercept arrowLeft / arrowRight so D-pad remote focus traversal works across all buttons!
+    if (node.hasPrimaryFocus && key == LogicalKeyboardKey.space) {
+      _ctrl.togglePlayPause();
+      return KeyEventResult.handled;
+    }
     return KeyEventResult.ignored;
   }
 
@@ -3829,7 +4181,7 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
   Widget build(BuildContext context) {
     return Focus(
       focusNode: _keyboardFocusNode,
-      autofocus: true,
+      canRequestFocus: false,
       onKeyEvent: _handleKeyEvent,
       child: ListenableBuilder(
         listenable: _ctrl,
@@ -3927,53 +4279,77 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
           for (int i = 0; i < items.length; i++) ...[
             if (i > 0) const SizedBox(width: 8),
             Expanded(
-              child: InkWell(
-                borderRadius: BorderRadius.circular(16),
-                onTap: () => setState(() => _mobileViewIndex = items[i].$1),
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 180),
-                  padding: const EdgeInsets.symmetric(vertical: 6),
-                  decoration: BoxDecoration(
-                    color: _mobileViewIndex == items[i].$1
-                        ? VideoPlatformTheme.accent.withValues(alpha: 0.2)
-                        : VideoPlatformTheme.bgCard,
+              child: StatefulBuilder(
+                builder: (swCtx, setSwState) {
+                  final isSelected = _mobileViewIndex == items[i].$1;
+                  return InkWell(
                     borderRadius: BorderRadius.circular(16),
-                    border: Border.all(
-                      color: _mobileViewIndex == items[i].$1
-                          ? VideoPlatformTheme.accent
-                          : VideoPlatformTheme.borderSubtle,
-                    ),
-                  ),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Icon(
-                        items[i].$2,
-                        size: 14,
-                        color: _mobileViewIndex == items[i].$1
-                            ? VideoPlatformTheme.accent
-                            : VideoPlatformTheme.textSecondary,
-                      ),
-                      const SizedBox(width: 4),
-                      Flexible(
-                        child: Text(
-                          items[i].$3,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 11.5,
-                            fontWeight: _mobileViewIndex == items[i].$1
-                                ? FontWeight.w700
-                                : FontWeight.w500,
-                            color: _mobileViewIndex == items[i].$1
+                    onFocusChange: (_) {
+                      if (swCtx.mounted) setSwState(() {});
+                    },
+                    onTap: () => setState(() => _mobileViewIndex = items[i].$1),
+                    child: Builder(
+                      builder: (ctx) {
+                        final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                        return AnimatedContainer(
+                          duration: const Duration(milliseconds: 180),
+                          padding: const EdgeInsets.symmetric(vertical: 6),
+                          decoration: BoxDecoration(
+                            color: isFocused
                                 ? VideoPlatformTheme.accent
-                                : VideoPlatformTheme.textSecondary,
+                                    .withValues(alpha: 0.34)
+                                : (isSelected
+                                    ? VideoPlatformTheme.accent
+                                        .withValues(alpha: 0.2)
+                                    : VideoPlatformTheme.bgCard),
+                            borderRadius: BorderRadius.circular(16),
+                            border: Border.all(
+                              color: isFocused
+                                  ? const Color(0xFFFFE066)
+                                  : (isSelected
+                                      ? VideoPlatformTheme.accent
+                                      : VideoPlatformTheme.borderSubtle),
+                              width: isFocused ? 2.2 : 1.0,
+                            ),
                           ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(
+                                items[i].$2,
+                                size: 14,
+                                color: isFocused
+                                    ? Colors.white
+                                    : (isSelected
+                                        ? VideoPlatformTheme.accent
+                                        : VideoPlatformTheme.textSecondary),
+                              ),
+                              const SizedBox(width: 4),
+                              Flexible(
+                                child: Text(
+                                  items[i].$3,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 11.5,
+                                    fontWeight: (isSelected || isFocused)
+                                        ? FontWeight.w700
+                                        : FontWeight.w500,
+                                    color: isFocused
+                                        ? Colors.white
+                                        : (isSelected
+                                            ? VideoPlatformTheme.accent
+                                            : VideoPlatformTheme.textSecondary),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+                  );
+                },
               ),
             ),
           ],
@@ -4254,10 +4630,7 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
               const SizedBox(width: 10),
             ],
             FilledButton.icon(
-              style: FilledButton.styleFrom(
-                backgroundColor: VideoPlatformTheme.accent,
-                foregroundColor: Colors.white,
-              ),
+              autofocus: track == null,
               onPressed: _openFolderAndArchivePicker,
               icon: const Icon(Icons.create_new_folder_rounded, size: 15),
               label: Text(
@@ -4268,12 +4641,7 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
             ),
             if (_ctrl.queue.length > 1) ...[
               const SizedBox(width: 8),
-              FilledButton.tonalIcon(
-                style: FilledButton.styleFrom(
-                  backgroundColor:
-                      VideoPlatformTheme.accent.withValues(alpha: 0.18),
-                  foregroundColor: VideoPlatformTheme.accent,
-                ),
+              OutlinedButton.icon(
                 onPressed: _ctrl.shuffleCurrentQueue,
                 icon: const Icon(Icons.shuffle_rounded, size: 15),
                 label: Text(
@@ -4330,11 +4698,7 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
             ],
             if (!widget.isStandalonePage) ...[
               const SizedBox(width: 8),
-              FilledButton.tonalIcon(
-                style: FilledButton.styleFrom(
-                  backgroundColor: VideoPlatformTheme.bgCard,
-                  foregroundColor: VideoPlatformTheme.textPrimary,
-                ),
+              OutlinedButton.icon(
                 onPressed: () => Navigator.of(context).pop(),
                 icon: const Icon(Icons.keyboard_arrow_down_rounded, size: 17),
                 label: Text(
@@ -4648,9 +5012,8 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                 alignment: WrapAlignment.center,
                 children: [
                   FilledButton.icon(
+                    autofocus: true,
                     style: FilledButton.styleFrom(
-                      backgroundColor: VideoPlatformTheme.accent,
-                      foregroundColor: Colors.white,
                       minimumSize: const Size(160, 40),
                       padding: const EdgeInsets.symmetric(
                         horizontal: 18,
@@ -4669,11 +5032,8 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                     ),
                   ),
                   if (_ctrl.savedMusicFolders.isNotEmpty)
-                    FilledButton.tonalIcon(
-                      style: FilledButton.styleFrom(
-                        backgroundColor:
-                            VideoPlatformTheme.accent.withValues(alpha: 0.2),
-                        foregroundColor: VideoPlatformTheme.accent,
+                    OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
                         minimumSize: const Size(160, 40),
                         padding: const EdgeInsets.symmetric(
                           horizontal: 16,
@@ -5477,44 +5837,63 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                     size: 28,
                   ),
                 ),
-                InkWell(
-                  onTap: _ctrl.togglePlayPause,
-                  customBorder: const CircleBorder(),
-                  child: Container(
-                    width: 48,
-                    height: 48,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      gradient: LinearGradient(
-                        colors: [
-                          VideoPlatformTheme.accent,
-                          VideoPlatformTheme.accentHover,
-                        ],
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color:
-                              VideoPlatformTheme.accent.withValues(alpha: 0.4),
-                          blurRadius: 12,
-                        ),
-                      ],
-                    ),
-                    child: _ctrl.isLoadingTrack
-                        ? const Padding(
-                            padding: EdgeInsets.all(13),
-                            child: CircularProgressIndicator(
-                              strokeWidth: 2.2,
-                              color: Colors.white,
+                StatefulBuilder(
+                  builder: (cPlayCtx, setCPlayState) {
+                    return InkWell(
+                      onFocusChange: (_) {
+                        if (cPlayCtx.mounted) setCPlayState(() {});
+                      },
+                      onTap: _ctrl.togglePlayPause,
+                      customBorder: const CircleBorder(),
+                      child: Builder(
+                        builder: (ctx) {
+                          final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                          return Container(
+                            width: 48,
+                            height: 48,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              gradient: LinearGradient(
+                                colors: [
+                                  VideoPlatformTheme.accent,
+                                  VideoPlatformTheme.accentHover,
+                                ],
+                              ),
+                              border: isFocused
+                                  ? Border.all(
+                                      color: const Color(0xFFFFE066),
+                                      width: 2.6,
+                                    )
+                                  : null,
+                              boxShadow: [
+                                BoxShadow(
+                                  color: VideoPlatformTheme.accent.withValues(
+                                    alpha: isFocused ? 0.75 : 0.4,
+                                  ),
+                                  blurRadius: isFocused ? 18 : 12,
+                                ),
+                              ],
                             ),
-                          )
-                        : Icon(
-                            _ctrl.isPlaying
-                                ? Icons.pause_rounded
-                                : Icons.play_arrow_rounded,
-                            color: Colors.white,
-                            size: 28,
-                          ),
-                  ),
+                            child: _ctrl.isLoadingTrack
+                                ? const Padding(
+                                    padding: EdgeInsets.all(13),
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2.2,
+                                      color: Colors.white,
+                                    ),
+                                  )
+                                : Icon(
+                                    _ctrl.isPlaying
+                                        ? Icons.pause_rounded
+                                        : Icons.play_arrow_rounded,
+                                    color: Colors.white,
+                                    size: 28,
+                                  ),
+                          );
+                        },
+                      ),
+                    );
+                  },
                 ),
                 IconButton(
                   tooltip: '下一首',
@@ -5537,30 +5916,51 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                     size: 21,
                   ),
                 ),
-                InkWell(
-                  borderRadius: BorderRadius.circular(14),
-                  onTap: _ctrl.cycleSpeed,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 8,
-                      vertical: 5,
-                    ),
-                    decoration: BoxDecoration(
-                      color: VideoPlatformTheme.bgCard,
+                StatefulBuilder(
+                  builder: (spdCtx, setSpdState) {
+                    return InkWell(
                       borderRadius: BorderRadius.circular(14),
-                      border:
-                          Border.all(color: VideoPlatformTheme.borderStrong),
-                    ),
-                    child: Text(
-                      '${_ctrl.speed}x',
-                      style: TextStyle(
-                        fontSize: 11.5,
-                        height: 1.2,
-                        fontWeight: FontWeight.w700,
-                        color: VideoPlatformTheme.textPrimary,
+                      onFocusChange: (_) {
+                        if (spdCtx.mounted) setSpdState(() {});
+                      },
+                      onTap: _ctrl.cycleSpeed,
+                      child: Builder(
+                        builder: (ctx) {
+                          final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                          return Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 5,
+                            ),
+                            decoration: BoxDecoration(
+                              color: isFocused
+                                  ? VideoPlatformTheme.accent
+                                      .withValues(alpha: 0.34)
+                                  : VideoPlatformTheme.bgCard,
+                              borderRadius: BorderRadius.circular(14),
+                              border: Border.all(
+                                color: isFocused
+                                    ? const Color(0xFFFFE066)
+                                    : VideoPlatformTheme.borderStrong,
+                                width: isFocused ? 2.2 : 1.0,
+                              ),
+                            ),
+                            child: Text(
+                              '${_ctrl.speed}x',
+                              style: TextStyle(
+                                fontSize: 11.5,
+                                height: 1.2,
+                                fontWeight: FontWeight.w700,
+                                color: isFocused
+                                    ? Colors.white
+                                    : VideoPlatformTheme.textPrimary,
+                              ),
+                            ),
+                          );
+                        },
                       ),
-                    ),
-                  ),
+                    );
+                  },
                 ),
               ],
             )
