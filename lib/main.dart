@@ -77,6 +77,7 @@ class M3u8VideoClientApp extends StatelessWidget {
             final mq = MediaQuery.of(context);
             return MediaQuery(
               data: mq.copyWith(
+                navigationMode: NavigationMode.directional,
                 textScaler: appState.tvMode
                     ? const TextScaler.linear(1.06)
                     : mq.textScaler.clamp(

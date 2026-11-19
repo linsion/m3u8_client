@@ -3525,31 +3525,34 @@ class CloudMusicBottomDockBar extends StatelessWidget {
             children: [
               SizedBox(
                 height: 14,
-                child: SliderTheme(
-                  data: SliderTheme.of(context).copyWith(
-                    trackHeight: 2.5,
-                    thumbShape: const RoundSliderThumbShape(
-                      enabledThumbRadius: 5.5,
+                child: ExcludeFocus(
+                  child: SliderTheme(
+                    data: SliderTheme.of(context).copyWith(
+                      trackHeight: 2.5,
+                      thumbShape: const RoundSliderThumbShape(
+                        enabledThumbRadius: 5.5,
+                      ),
+                      overlayShape: const RoundSliderOverlayShape(
+                        overlayRadius: 10,
+                      ),
+                      activeTrackColor: VideoPlatformTheme.accent,
+                      inactiveTrackColor: VideoPlatformTheme.borderStrong,
+                      thumbColor: VideoPlatformTheme.accentHover,
                     ),
-                    overlayShape: const RoundSliderOverlayShape(
-                      overlayRadius: 10,
+                    child: Slider(
+                      value: progress,
+                      onChanged: (v) {
+                        if (controller.duration > Duration.zero) {
+                          controller.seekTo(
+                            Duration(
+                              milliseconds:
+                                  (v * controller.duration.inMilliseconds)
+                                      .round(),
+                            ),
+                          );
+                        }
+                      },
                     ),
-                    activeTrackColor: VideoPlatformTheme.accent,
-                    inactiveTrackColor: VideoPlatformTheme.borderStrong,
-                    thumbColor: VideoPlatformTheme.accentHover,
-                  ),
-                  child: Slider(
-                    value: progress,
-                    onChanged: (v) {
-                      if (controller.duration > Duration.zero) {
-                        controller.seekTo(
-                          Duration(
-                            milliseconds:
-                                (v * controller.duration.inMilliseconds).round(),
-                          ),
-                        );
-                      }
-                    },
                   ),
                 ),
               ),
@@ -4087,6 +4090,8 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
   final ScrollController _lyricsScrollController = ScrollController();
   final TextEditingController _queueFilterCtrl = TextEditingController();
   final FocusNode _keyboardFocusNode = FocusNode();
+  final FocusNode _playPauseBtnFocusNode = FocusNode();
+  final FocusNode _topPickerBtnFocusNode = FocusNode();
 
   int _rightTabIndex = 0; // Desktop right pane: 0 = 实时同步歌词, 1 = 播放队列
   int _mobileViewIndex = 0; // Mobile 3-pane switcher: 0 = 黑胶唱盘, 1 = 同步歌词, 2 = 播放队列
@@ -4140,6 +4145,8 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
     _lyricsScrollController.dispose();
     _queueFilterCtrl.dispose();
     _keyboardFocusNode.dispose();
+    _playPauseBtnFocusNode.dispose();
+    _topPickerBtnFocusNode.dispose();
     super.dispose();
   }
 
@@ -4630,6 +4637,7 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
               const SizedBox(width: 10),
             ],
             FilledButton.icon(
+              focusNode: _topPickerBtnFocusNode,
               autofocus: track == null,
               onPressed: _openFolderAndArchivePicker,
               icon: const Icon(Icons.create_new_folder_rounded, size: 15),
@@ -5755,51 +5763,178 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Row(
-            children: [
-              Text(
-                CloudMusicBottomDockBar.formatDuration(_ctrl.position),
-                style: TextStyle(
-                  fontSize: 11.5,
-                  fontFeatures: const [FontFeature.tabularFigures()],
-                  color: VideoPlatformTheme.textSecondary,
-                ),
-              ),
-              Expanded(
-                child: SliderTheme(
-                  data: SliderTheme.of(context).copyWith(
-                    trackHeight: 3.5,
-                    thumbShape: const RoundSliderThumbShape(
-                      enabledThumbRadius: 6.5,
-                    ),
-                    activeTrackColor: VideoPlatformTheme.accent,
-                    inactiveTrackColor: VideoPlatformTheme.borderStrong,
-                    thumbColor: VideoPlatformTheme.accentHover,
-                  ),
-                  child: Slider(
-                    value: progress,
-                    onChanged: (v) {
-                      if (_ctrl.duration > Duration.zero) {
-                        _ctrl.seekTo(
-                          Duration(
-                            milliseconds:
-                                (v * _ctrl.duration.inMilliseconds).round(),
-                          ),
-                        );
+          StatefulBuilder(
+            builder: (scrubCtx, setScrubState) {
+              return Focus(
+                onFocusChange: (_) {
+                  if (scrubCtx.mounted) setScrubState(() {});
+                },
+                onKeyEvent: (node, event) {
+                  if (event is KeyDownEvent || event is KeyRepeatEvent) {
+                    if (event.logicalKey == LogicalKeyboardKey.arrowLeft) {
+                      _ctrl.seekRelative(const Duration(seconds: -5));
+                      return KeyEventResult.handled;
+                    }
+                    if (event.logicalKey == LogicalKeyboardKey.arrowRight) {
+                      _ctrl.seekRelative(const Duration(seconds: 5));
+                      return KeyEventResult.handled;
+                    }
+                    if (event is KeyDownEvent &&
+                        event.logicalKey == LogicalKeyboardKey.arrowUp) {
+                      final moved =
+                          node.focusInDirection(TraversalDirection.up);
+                      if (!moved || node.hasPrimaryFocus) {
+                        if (_topPickerBtnFocusNode.canRequestFocus) {
+                          _topPickerBtnFocusNode.requestFocus();
+                        } else {
+                          node.previousFocus();
+                        }
                       }
-                    },
-                  ),
+                      return KeyEventResult.handled;
+                    }
+                    if (event is KeyDownEvent &&
+                        event.logicalKey == LogicalKeyboardKey.arrowDown) {
+                      final moved =
+                          node.focusInDirection(TraversalDirection.down);
+                      if (!moved || node.hasPrimaryFocus) {
+                        if (_playPauseBtnFocusNode.canRequestFocus) {
+                          _playPauseBtnFocusNode.requestFocus();
+                        } else {
+                          node.nextFocus();
+                        }
+                      }
+                      return KeyEventResult.handled;
+                    }
+                    if (event is KeyDownEvent &&
+                        (event.logicalKey == LogicalKeyboardKey.select ||
+                            event.logicalKey == LogicalKeyboardKey.enter ||
+                            event.logicalKey ==
+                                LogicalKeyboardKey.numpadEnter ||
+                            event.logicalKey == LogicalKeyboardKey.space ||
+                            event.logicalKey ==
+                                LogicalKeyboardKey.gameButtonA)) {
+                      _ctrl.togglePlayPause();
+                      return KeyEventResult.handled;
+                    }
+                  }
+                  return KeyEventResult.ignored;
+                },
+                child: Builder(
+                  builder: (ctx) {
+                    final hasBarFocus = Focus.of(ctx).hasPrimaryFocus;
+                    return Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 2,
+                      ),
+                      decoration: BoxDecoration(
+                        color: hasBarFocus
+                            ? VideoPlatformTheme.accent.withValues(alpha: 0.16)
+                            : Colors.transparent,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(
+                          color: hasBarFocus
+                              ? const Color(0xFFFFE066)
+                              : Colors.transparent,
+                          width: hasBarFocus ? 2.0 : 1.0,
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          Text(
+                            CloudMusicBottomDockBar.formatDuration(
+                              _ctrl.position,
+                            ),
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              fontWeight: hasBarFocus
+                                  ? FontWeight.w700
+                                  : FontWeight.w500,
+                              fontFeatures: const [
+                                FontFeature.tabularFigures(),
+                              ],
+                              color: hasBarFocus
+                                  ? Colors.white
+                                  : VideoPlatformTheme.textSecondary,
+                            ),
+                          ),
+                          Expanded(
+                            child: ExcludeFocus(
+                              child: SliderTheme(
+                                data: SliderTheme.of(context).copyWith(
+                                  trackHeight: hasBarFocus ? 5.0 : 3.5,
+                                  thumbShape: RoundSliderThumbShape(
+                                    enabledThumbRadius:
+                                        hasBarFocus ? 8.5 : 6.5,
+                                  ),
+                                  activeTrackColor: hasBarFocus
+                                      ? const Color(0xFFFFE066)
+                                      : VideoPlatformTheme.accent,
+                                  inactiveTrackColor:
+                                      VideoPlatformTheme.borderStrong,
+                                  thumbColor: hasBarFocus
+                                      ? const Color(0xFFFFE066)
+                                      : VideoPlatformTheme.accentHover,
+                                ),
+                                child: Slider(
+                                  value: progress,
+                                  onChanged: (v) {
+                                    if (_ctrl.duration > Duration.zero) {
+                                      _ctrl.seekTo(
+                                        Duration(
+                                          milliseconds: (v *
+                                                  _ctrl.duration.inMilliseconds)
+                                              .round(),
+                                        ),
+                                      );
+                                    }
+                                  },
+                                ),
+                              ),
+                            ),
+                          ),
+                          Text(
+                            CloudMusicBottomDockBar.formatDuration(
+                              _ctrl.duration,
+                            ),
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              fontFeatures: const [
+                                FontFeature.tabularFigures(),
+                              ],
+                              color: hasBarFocus
+                                  ? Colors.white
+                                  : VideoPlatformTheme.textSecondary,
+                            ),
+                          ),
+                          if (hasBarFocus && isWide) ...[
+                            const SizedBox(width: 8),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 6,
+                                vertical: 2,
+                              ),
+                              decoration: BoxDecoration(
+                                color: VideoPlatformTheme.accent,
+                                borderRadius: BorderRadius.circular(5),
+                              ),
+                              child: const Text(
+                                '◀▶ 快退/快进5s · ▲▼ 切换按钮',
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w700,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    );
+                  },
                 ),
-              ),
-              Text(
-                CloudMusicBottomDockBar.formatDuration(_ctrl.duration),
-                style: TextStyle(
-                  fontSize: 11.5,
-                  fontFeatures: const [FontFeature.tabularFigures()],
-                  color: VideoPlatformTheme.textSecondary,
-                ),
-              ),
-            ],
+              );
+            },
           ),
           if (isCompactDeck)
             Row(
@@ -5840,6 +5975,7 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                 StatefulBuilder(
                   builder: (cPlayCtx, setCPlayState) {
                     return InkWell(
+                      focusNode: _playPauseBtnFocusNode,
                       onFocusChange: (_) {
                         if (cPlayCtx.mounted) setCPlayState(() {});
                       },
@@ -6017,6 +6153,7 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                 StatefulBuilder(
                   builder: (playBtnCtx, setPlayBtnState) {
                     return InkWell(
+                      focusNode: _playPauseBtnFocusNode,
                       onFocusChange: (_) {
                         if (playBtnCtx.mounted) setPlayBtnState(() {});
                       },
@@ -6102,21 +6239,23 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                 ),
                 SizedBox(
                   width: 110,
-                  child: SliderTheme(
-                    data: SliderTheme.of(context).copyWith(
-                      trackHeight: 3,
-                      thumbShape: const RoundSliderThumbShape(
-                        enabledThumbRadius: 5,
+                  child: ExcludeFocus(
+                    child: SliderTheme(
+                      data: SliderTheme.of(context).copyWith(
+                        trackHeight: 3,
+                        thumbShape: const RoundSliderThumbShape(
+                          enabledThumbRadius: 5,
+                        ),
+                        activeTrackColor: VideoPlatformTheme.accent,
+                        inactiveTrackColor: VideoPlatformTheme.borderStrong,
+                        thumbColor: VideoPlatformTheme.accentHover,
                       ),
-                      activeTrackColor: VideoPlatformTheme.accent,
-                      inactiveTrackColor: VideoPlatformTheme.borderStrong,
-                      thumbColor: VideoPlatformTheme.accentHover,
-                    ),
-                    child: Slider(
-                      value: _ctrl.volume,
-                      min: 0,
-                      max: 100,
-                      onChanged: _ctrl.setVolume,
+                      child: Slider(
+                        value: _ctrl.volume,
+                        min: 0,
+                        max: 100,
+                        onChanged: _ctrl.setVolume,
+                      ),
                     ),
                   ),
                 ),

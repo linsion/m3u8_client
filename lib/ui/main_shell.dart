@@ -4188,35 +4188,37 @@ class _FloatingMiniPlayerOverlayState
                                       .clamp(0.0, maxMs);
                                   return SizedBox(
                                     height: 16,
-                                    child: SliderTheme(
-                                      data: SliderTheme.of(context).copyWith(
-                                        trackHeight: 2.8,
-                                        thumbShape:
-                                            const RoundSliderThumbShape(
-                                          enabledThumbRadius: 5.5,
+                                    child: ExcludeFocus(
+                                      child: SliderTheme(
+                                        data: SliderTheme.of(context).copyWith(
+                                          trackHeight: 2.8,
+                                          thumbShape:
+                                              const RoundSliderThumbShape(
+                                            enabledThumbRadius: 5.5,
+                                          ),
+                                          overlayShape:
+                                              const RoundSliderOverlayShape(
+                                            overlayRadius: 10.0,
+                                          ),
+                                          activeTrackColor:
+                                              VideoPlatformTheme.accent,
+                                          inactiveTrackColor: Colors.white24,
+                                          thumbColor: Colors.white,
                                         ),
-                                        overlayShape:
-                                            const RoundSliderOverlayShape(
-                                          overlayRadius: 10.0,
+                                        child: Slider(
+                                          value: curMs,
+                                          min: 0.0,
+                                          max: maxMs,
+                                          onChanged: (val) {
+                                            if (dur.inMilliseconds > 0) {
+                                              _player.seek(
+                                                Duration(
+                                                  milliseconds: val.round(),
+                                                ),
+                                              );
+                                            }
+                                          },
                                         ),
-                                        activeTrackColor:
-                                            VideoPlatformTheme.accent,
-                                        inactiveTrackColor: Colors.white24,
-                                        thumbColor: Colors.white,
-                                      ),
-                                      child: Slider(
-                                        value: curMs,
-                                        min: 0.0,
-                                        max: maxMs,
-                                        onChanged: (val) {
-                                          if (dur.inMilliseconds > 0) {
-                                            _player.seek(
-                                              Duration(
-                                                milliseconds: val.round(),
-                                              ),
-                                            );
-                                          }
-                                        },
                                       ),
                                     ),
                                   );
@@ -4320,33 +4322,35 @@ class _FloatingMiniPlayerOverlayState
                         SizedBox(
                           width: _isLargeSize ? 90 : 64,
                           height: 24,
-                          child: SliderTheme(
-                            data: SliderTheme.of(context).copyWith(
-                              trackHeight: 2.5,
-                              thumbShape: const RoundSliderThumbShape(
-                                enabledThumbRadius: 5,
+                          child: ExcludeFocus(
+                            child: SliderTheme(
+                              data: SliderTheme.of(context).copyWith(
+                                trackHeight: 2.5,
+                                thumbShape: const RoundSliderThumbShape(
+                                  enabledThumbRadius: 5,
+                                ),
+                                overlayShape: const RoundSliderOverlayShape(
+                                  overlayRadius: 9,
+                                ),
+                                activeTrackColor: VideoPlatformTheme.accent,
+                                inactiveTrackColor: Colors.white24,
+                                thumbColor: Colors.white,
                               ),
-                              overlayShape: const RoundSliderOverlayShape(
-                                overlayRadius: 9,
+                              child: Slider(
+                                value: (_isMuted ? 0.0 : _volume)
+                                    .clamp(0.0, 100.0),
+                                min: 0,
+                                max: 100,
+                                onChanged: (val) {
+                                  final clamped = val.clamp(0.0, 100.0);
+                                  if (clamped > 0) _preMuteVolume = clamped;
+                                  setState(() {
+                                    _volume = clamped;
+                                    _isMuted = clamped <= 0;
+                                  });
+                                  _player.setVolume(clamped);
+                                },
                               ),
-                              activeTrackColor: VideoPlatformTheme.accent,
-                              inactiveTrackColor: Colors.white24,
-                              thumbColor: Colors.white,
-                            ),
-                            child: Slider(
-                              value: (_isMuted ? 0.0 : _volume)
-                                  .clamp(0.0, 100.0),
-                              min: 0,
-                              max: 100,
-                              onChanged: (val) {
-                                final clamped = val.clamp(0.0, 100.0);
-                                if (clamped > 0) _preMuteVolume = clamped;
-                                setState(() {
-                                  _volume = clamped;
-                                  _isMuted = clamped <= 0;
-                                });
-                                _player.setVolume(clamped);
-                              },
                             ),
                           ),
                         ),

@@ -15145,24 +15145,26 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
                               SizedBox(
                                 width: 52,
                                 height: 16,
-                                child: SliderTheme(
-                                  data: SliderTheme.of(context).copyWith(
-                                    trackHeight: 2.2,
-                                    thumbShape: const RoundSliderThumbShape(
-                                      enabledThumbRadius: 4.5,
+                                child: ExcludeFocus(
+                                  child: SliderTheme(
+                                    data: SliderTheme.of(context).copyWith(
+                                      trackHeight: 2.2,
+                                      thumbShape: const RoundSliderThumbShape(
+                                        enabledThumbRadius: 4.5,
+                                      ),
+                                      overlayShape: const RoundSliderOverlayShape(
+                                        overlayRadius: 8,
+                                      ),
+                                      activeTrackColor: widget.tg.tgBlueBright,
+                                      inactiveTrackColor: Colors.white30,
+                                      thumbColor: Colors.white,
                                     ),
-                                    overlayShape: const RoundSliderOverlayShape(
-                                      overlayRadius: 8,
+                                    child: Slider(
+                                      value: _isMuted ? 0 : _volume,
+                                      min: 0,
+                                      max: 100,
+                                      onChanged: _setInlineVolume,
                                     ),
-                                    activeTrackColor: widget.tg.tgBlueBright,
-                                    inactiveTrackColor: Colors.white30,
-                                    thumbColor: Colors.white,
-                                  ),
-                                  child: Slider(
-                                    value: _isMuted ? 0 : _volume,
-                                    min: 0,
-                                    max: 100,
-                                    onChanged: _setInlineVolume,
                                   ),
                                 ),
                               ),
@@ -15452,34 +15454,36 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
                   if (isVideo && _isInlineMode)
                     SizedBox(
                       height: 16,
-                      child: SliderTheme(
-                        data: SliderTheme.of(context).copyWith(
-                          trackHeight: 3.0,
-                          thumbShape: const RoundSliderThumbShape(
-                            enabledThumbRadius: 5.0,
+                      child: ExcludeFocus(
+                        child: SliderTheme(
+                          data: SliderTheme.of(context).copyWith(
+                            trackHeight: 3.0,
+                            thumbShape: const RoundSliderThumbShape(
+                              enabledThumbRadius: 5.0,
+                            ),
+                            overlayShape: const RoundSliderOverlayShape(
+                              overlayRadius: 9.0,
+                            ),
+                            activeTrackColor: widget.tg.tgBlueBright,
+                            inactiveTrackColor: Colors.white30,
+                            thumbColor: Colors.white,
                           ),
-                          overlayShape: const RoundSliderOverlayShape(
-                            overlayRadius: 9.0,
+                          child: Slider(
+                            value: progress,
+                            min: 0.0,
+                            max: 1.0,
+                            onChanged: (val) {
+                              final maxMs = _duration.inMilliseconds > 0
+                                  ? _duration.inMilliseconds
+                                  : ((att?.duration ?? 0) * 1000);
+                              if (maxMs > 0) {
+                                final target =
+                                    Duration(milliseconds: (val * maxMs).round());
+                                setState(() => _position = target);
+                                _inlinePlayer?.seek(target);
+                              }
+                            },
                           ),
-                          activeTrackColor: widget.tg.tgBlueBright,
-                          inactiveTrackColor: Colors.white30,
-                          thumbColor: Colors.white,
-                        ),
-                        child: Slider(
-                          value: progress,
-                          min: 0.0,
-                          max: 1.0,
-                          onChanged: (val) {
-                            final maxMs = _duration.inMilliseconds > 0
-                                ? _duration.inMilliseconds
-                                : ((att?.duration ?? 0) * 1000);
-                            if (maxMs > 0) {
-                              final target =
-                                  Duration(milliseconds: (val * maxMs).round());
-                              setState(() => _position = target);
-                              _inlinePlayer?.seek(target);
-                            }
-                          },
                         ),
                       ),
                     ),

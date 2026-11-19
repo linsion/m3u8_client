@@ -85,6 +85,10 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       FocusNode(debugLabel: 'VodFullscreenStage');
   final FocusNode _fullscreenPlayBtnFocusNode =
       FocusNode(debugLabel: 'VodFullscreenPlayBtn');
+  final FocusNode _windowedStageFocusNode =
+      FocusNode(debugLabel: 'VodWindowedStage');
+  final FocusNode _windowedPlayBtnFocusNode =
+      FocusNode(debugLabel: 'VodWindowedPlayBtn');
   bool _isHorizontalSeeking = false;
   double _seekStartSeconds = 0.0;
   double _seekPreviewSeconds = 0.0;
@@ -613,6 +617,8 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     _mobileStageOsdTimer?.cancel();
     _fullscreenStageFocusNode.dispose();
     _fullscreenPlayBtnFocusNode.dispose();
+    _windowedStageFocusNode.dispose();
+    _windowedPlayBtnFocusNode.dispose();
     _adToastTimer?.cancel();
     _sleepTimer?.cancel();
     _startupWatchdogTimer?.cancel();
@@ -3721,10 +3727,37 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                             LogicalKeyboardKey.arrowRight) {
                           _skipForwardSeconds(15, customReason: '已快进 15s');
                           return KeyEventResult.handled;
-                        } else if (_isFullscreenMode &&
-                            event is KeyDownEvent &&
+                        } else if (event is KeyDownEvent &&
                             event.logicalKey == LogicalKeyboardKey.arrowUp) {
-                          node.focusInDirection(TraversalDirection.up);
+                          final moved =
+                              node.focusInDirection(TraversalDirection.up);
+                          if (!moved || node.hasPrimaryFocus) {
+                            if (isFullscreen) {
+                              if (_fullscreenPlayBtnFocusNode.canRequestFocus) {
+                                _fullscreenPlayBtnFocusNode.requestFocus();
+                              }
+                            } else if (_windowedStageFocusNode
+                                .canRequestFocus) {
+                              _windowedStageFocusNode.requestFocus();
+                            } else {
+                              node.previousFocus();
+                            }
+                          }
+                          return KeyEventResult.handled;
+                        } else if (event is KeyDownEvent &&
+                            event.logicalKey == LogicalKeyboardKey.arrowDown) {
+                          final targetBtn = isFullscreen
+                              ? _fullscreenPlayBtnFocusNode
+                              : _windowedPlayBtnFocusNode;
+                          final moved =
+                              node.focusInDirection(TraversalDirection.down);
+                          if (!moved || node.hasPrimaryFocus) {
+                            if (targetBtn.canRequestFocus) {
+                              targetBtn.requestFocus();
+                            } else {
+                              node.nextFocus();
+                            }
+                          }
                           return KeyEventResult.handled;
                         }
                       }
@@ -3864,7 +3897,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                   return _buildTvFocusableControlBtn(
                                     focusNode: isFullscreen
                                         ? _fullscreenPlayBtnFocusNode
-                                        : null,
+                                        : _windowedPlayBtnFocusNode,
                                     icon: playing
                                         ? Icons.pause_rounded
                                         : Icons.play_arrow_rounded,
@@ -4797,6 +4830,8 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     );
 
     final Widget focusableStage = Focus(
+      focusNode: isFullscreen ? null : _windowedStageFocusNode,
+      canRequestFocus: !isFullscreen,
       onFocusChange: (_) {
         if (mounted) setState(() {});
       },
@@ -4954,43 +4989,45 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                           ),
                         ),
                         Expanded(
-                          child: SliderTheme(
-                            data: SliderTheme.of(context).copyWith(
-                              trackHeight: 3.0,
-                              thumbShape: const RoundSliderThumbShape(
-                                enabledThumbRadius: 6.5,
+                          child: ExcludeFocus(
+                            child: SliderTheme(
+                              data: SliderTheme.of(context).copyWith(
+                                trackHeight: 3.0,
+                                thumbShape: const RoundSliderThumbShape(
+                                  enabledThumbRadius: 6.5,
+                                ),
+                                overlayShape: const RoundSliderOverlayShape(
+                                  overlayRadius: 12.0,
+                                ),
+                                activeTrackColor: VideoPlatformTheme.accent,
+                                inactiveTrackColor:
+                                    VideoPlatformTheme.borderStrong,
+                                thumbColor: Colors.white,
                               ),
-                              overlayShape: const RoundSliderOverlayShape(
-                                overlayRadius: 12.0,
+                              child: Slider(
+                                value: curSec,
+                                min: 0.0,
+                                max: maxSec,
+                                onChangeStart: (val) {
+                                  setState(() {
+                                    _isSliderDragging = true;
+                                    _sliderPreviewSeconds = val;
+                                  });
+                                },
+                                onChanged: (val) {
+                                  setState(() {
+                                    _isSliderDragging = true;
+                                    _sliderPreviewSeconds = val;
+                                  });
+                                },
+                                onChangeEnd: (val) {
+                                  setState(() {
+                                    _isSliderDragging = false;
+                                    _sliderPreviewSeconds = val;
+                                  });
+                                  _player.seek(Duration(seconds: val.round()));
+                                },
                               ),
-                              activeTrackColor: VideoPlatformTheme.accent,
-                              inactiveTrackColor:
-                                  VideoPlatformTheme.borderStrong,
-                              thumbColor: Colors.white,
-                            ),
-                            child: Slider(
-                              value: curSec,
-                              min: 0.0,
-                              max: maxSec,
-                              onChangeStart: (val) {
-                                setState(() {
-                                  _isSliderDragging = true;
-                                  _sliderPreviewSeconds = val;
-                                });
-                              },
-                              onChanged: (val) {
-                                setState(() {
-                                  _isSliderDragging = true;
-                                  _sliderPreviewSeconds = val;
-                                });
-                              },
-                              onChangeEnd: (val) {
-                                setState(() {
-                                  _isSliderDragging = false;
-                                  _sliderPreviewSeconds = val;
-                                });
-                                _player.seek(Duration(seconds: val.round()));
-                              },
                             ),
                           ),
                         ),
