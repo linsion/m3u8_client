@@ -439,10 +439,46 @@ class VideoPlatformTheme {
       ),
       chipTheme: ChipThemeData(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        backgroundColor: p.bgCard,
+        selectedColor: p.accent,
+        checkmarkColor: Colors.white,
+        color: WidgetStateProperty.resolveWith((states) {
+          if (states.contains(WidgetState.focused)) {
+            return states.contains(WidgetState.selected)
+                ? p.accentHover
+                : p.accent.withValues(alpha: 0.36);
+          }
+          if (states.contains(WidgetState.selected)) {
+            return p.accent;
+          }
+          return p.bgCard;
+        }),
+        side: WidgetStateBorderSide.resolveWith((states) {
+          if (states.contains(WidgetState.focused)) {
+            return const BorderSide(color: Color(0xFFFFE066), width: 2.2);
+          }
+          if (states.contains(WidgetState.selected)) {
+            return BorderSide(color: p.accent, width: 1.4);
+          }
+          return BorderSide(color: p.borderSubtle);
+        }),
         labelStyle: TextStyle(
           fontSize: 12,
           height: 1.2,
+          fontWeight: FontWeight.w600,
           color: p.textPrimary,
+        ),
+        secondaryLabelStyle: const TextStyle(
+          fontSize: 12,
+          height: 1.2,
+          fontWeight: FontWeight.w700,
+          color: Colors.white,
+        ),
+      ),
+      listTileTheme: ListTileThemeData(
+        selectedTileColor: p.accent.withValues(alpha: 0.18),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(8),
         ),
       ),
       iconButtonTheme: IconButtonThemeData(

@@ -1867,56 +1867,88 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
             const SizedBox(width: 6),
             if (state.liveSources.isNotEmpty)
               Flexible(
-                child: DropdownButtonHideUnderline(
-                  child: Container(
-                    height: 32,
-                    padding: const EdgeInsets.symmetric(horizontal: 8),
-                    decoration: BoxDecoration(
-                      color: VideoPlatformTheme.bgCard,
-                      borderRadius: BorderRadius.circular(6),
-                      border: Border.all(
-                        color: VideoPlatformTheme.borderSubtle,
-                      ),
-                    ),
-                    child: DropdownButton<LiveSource>(
-                      value: state.liveSources.contains(selectedSource)
-                          ? selectedSource
-                          : state.liveSources.first,
-                      isDense: true,
-                      isExpanded: false,
-                      dropdownColor: VideoPlatformTheme.bgElevated,
-                      style: TextStyle(
-                        fontSize: 12.5,
-                        fontWeight: FontWeight.w600,
-                        color: VideoPlatformTheme.textPrimary,
-                      ),
-                      items: state.liveSources
-                          .map(
-                            (s) => DropdownMenuItem(
-                              value: s,
-                              child: ConstrainedBox(
-                                constraints:
-                                    const BoxConstraints(maxWidth: 120),
-                                child: Text(
-                                  s.displayName,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
+                child: StatefulBuilder(
+                  builder: (srcBoxCtx, setSrcBoxState) {
+                    return Focus(
+                      canRequestFocus: false,
+                      onFocusChange: (_) {
+                        if (srcBoxCtx.mounted) setSrcBoxState(() {});
+                      },
+                      child: Builder(
+                        builder: (ctx) {
+                          final isFocused = Focus.of(ctx).hasFocus;
+                          return DropdownButtonHideUnderline(
+                            child: Container(
+                              height: 32,
+                              padding:
+                                  const EdgeInsets.symmetric(horizontal: 8),
+                              decoration: BoxDecoration(
+                                color: isFocused
+                                    ? VideoPlatformTheme.accent
+                                        .withValues(alpha: 0.34)
+                                    : VideoPlatformTheme.bgCard,
+                                borderRadius: BorderRadius.circular(6),
+                                border: Border.all(
+                                  color: isFocused
+                                      ? const Color(0xFFFFE066)
+                                      : VideoPlatformTheme.borderSubtle,
+                                  width: isFocused ? 2.2 : 1.0,
                                 ),
                               ),
+                              child: DropdownButton<LiveSource>(
+                                value:
+                                    state.liveSources.contains(selectedSource)
+                                        ? selectedSource
+                                        : state.liveSources.first,
+                                isDense: true,
+                                isExpanded: false,
+                                focusColor: Colors.transparent,
+                                dropdownColor: VideoPlatformTheme.bgElevated,
+                                iconEnabledColor: isFocused
+                                    ? Colors.white
+                                    : VideoPlatformTheme.accent,
+                                style: TextStyle(
+                                  fontSize: 12.5,
+                                  fontWeight: isFocused
+                                      ? FontWeight.w700
+                                      : FontWeight.w600,
+                                  color: isFocused
+                                      ? Colors.white
+                                      : VideoPlatformTheme.textPrimary,
+                                ),
+                                items: state.liveSources
+                                    .map(
+                                      (s) => DropdownMenuItem(
+                                        value: s,
+                                        child: ConstrainedBox(
+                                          constraints: const BoxConstraints(
+                                            maxWidth: 120,
+                                          ),
+                                          child: Text(
+                                            s.displayName,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                        ),
+                                      ),
+                                    )
+                                    .toList(),
+                                onChanged: (val) {
+                                  if (val != null) {
+                                    setState(() => _selectedGroup = '全部');
+                                    state.selectLiveSource(
+                                      val,
+                                      preferClientDirect: !_useServerProxy,
+                                    );
+                                  }
+                                },
+                              ),
                             ),
-                          )
-                          .toList(),
-                      onChanged: (val) {
-                        if (val != null) {
-                          setState(() => _selectedGroup = '全部');
-                          state.selectLiveSource(
-                            val,
-                            preferClientDirect: !_useServerProxy,
                           );
-                        }
-                      },
-                    ),
-                  ),
+                        },
+                      ),
+                    );
+                  },
                 ),
               )
             else
@@ -2138,45 +2170,91 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                   ),
                   const SizedBox(width: 12),
                   if (state.liveSources.isNotEmpty)
-                    DropdownButtonHideUnderline(
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 10),
-                        decoration: BoxDecoration(
-                          color: VideoPlatformTheme.bgCard,
-                          borderRadius: BorderRadius.circular(5),
-                          border: Border.all(
-                            color: VideoPlatformTheme.borderSubtle,
-                          ),
-                        ),
-                        child: DropdownButton<LiveSource>(
-                          value: state.liveSources.contains(selectedSource)
-                              ? selectedSource
-                              : state.liveSources.first,
-                          isDense: true,
-                          dropdownColor: VideoPlatformTheme.bgElevated,
-                          style: TextStyle(
-                            fontSize: 13,
-                            color: VideoPlatformTheme.textPrimary,
-                          ),
-                          items: state.liveSources
-                              .map(
-                                (s) => DropdownMenuItem(
-                                  value: s,
-                                  child: Text(s.displayName),
-                                ),
-                              )
-                              .toList(),
-                          onChanged: (val) {
-                            if (val != null) {
-                              setState(() => _selectedGroup = '全部');
-                              state.selectLiveSource(
-                                val,
-                                preferClientDirect: !_useServerProxy,
-                              );
-                            }
+                    StatefulBuilder(
+                      builder: (srcBoxCtx, setSrcBoxState) {
+                        return Focus(
+                          canRequestFocus: false,
+                          onFocusChange: (_) {
+                            if (srcBoxCtx.mounted) setSrcBoxState(() {});
                           },
-                        ),
-                      ),
+                          child: Builder(
+                            builder: (ctx) {
+                              final isFocused = Focus.of(ctx).hasFocus;
+                              return DropdownButtonHideUnderline(
+                                child: AnimatedContainer(
+                                  duration: const Duration(milliseconds: 140),
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 10,
+                                    vertical: 2,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: isFocused
+                                        ? VideoPlatformTheme.accent
+                                            .withValues(alpha: 0.34)
+                                        : VideoPlatformTheme.bgCard,
+                                    borderRadius: BorderRadius.circular(6),
+                                    border: Border.all(
+                                      color: isFocused
+                                          ? const Color(0xFFFFE066)
+                                          : VideoPlatformTheme.borderSubtle,
+                                      width: isFocused ? 2.4 : 1.0,
+                                    ),
+                                    boxShadow: isFocused
+                                        ? [
+                                            BoxShadow(
+                                              color: VideoPlatformTheme.accent
+                                                  .withValues(alpha: 0.55),
+                                              blurRadius: 10,
+                                              spreadRadius: 1,
+                                            ),
+                                          ]
+                                        : null,
+                                  ),
+                                  child: DropdownButton<LiveSource>(
+                                    value: state.liveSources
+                                            .contains(selectedSource)
+                                        ? selectedSource
+                                        : state.liveSources.first,
+                                    isDense: true,
+                                    focusColor: Colors.transparent,
+                                    dropdownColor:
+                                        VideoPlatformTheme.bgElevated,
+                                    iconEnabledColor: isFocused
+                                        ? Colors.white
+                                        : VideoPlatformTheme.accent,
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      fontWeight: isFocused
+                                          ? FontWeight.w700
+                                          : FontWeight.w600,
+                                      color: isFocused
+                                          ? Colors.white
+                                          : VideoPlatformTheme.textPrimary,
+                                    ),
+                                    items: state.liveSources
+                                        .map(
+                                          (s) => DropdownMenuItem(
+                                            value: s,
+                                            child: Text(s.displayName),
+                                          ),
+                                        )
+                                        .toList(),
+                                    onChanged: (val) {
+                                      if (val != null) {
+                                        setState(() => _selectedGroup = '全部');
+                                        state.selectLiveSource(
+                                          val,
+                                          preferClientDirect: !_useServerProxy,
+                                        );
+                                      }
+                                    },
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                        );
+                      },
                     ),
                   if (selectedSource != null && selectedSource.isCustom) ...[
                     const SizedBox(width: 6),
@@ -2778,46 +2856,77 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                   ),
                 ),
                 const Spacer(),
-                InkWell(
-                  borderRadius: BorderRadius.circular(4),
-                  onTap: () {
-                    setState(() {
-                      if (allCollapsed) {
-                        _collapsedGroups.clear();
-                      } else {
-                        _collapsedGroups.addAll(
-                          groupEntries.map((e) => e.key),
-                        );
-                      }
-                    });
+                StatefulBuilder(
+                  builder: (colCtx, setColState) {
+                    return InkWell(
+                      borderRadius: BorderRadius.circular(4),
+                      onFocusChange: (_) {
+                        if (colCtx.mounted) setColState(() {});
+                      },
+                      onTap: () {
+                        setState(() {
+                          if (allCollapsed) {
+                            _collapsedGroups.clear();
+                          } else {
+                            _collapsedGroups.addAll(
+                              groupEntries.map((e) => e.key),
+                            );
+                          }
+                        });
+                      },
+                      child: Builder(
+                        builder: (ctx) {
+                          final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                          return Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 3,
+                            ),
+                            decoration: BoxDecoration(
+                              color: isFocused
+                                  ? VideoPlatformTheme.accent
+                                      .withValues(alpha: 0.34)
+                                  : Colors.transparent,
+                              borderRadius: BorderRadius.circular(4),
+                              border: isFocused
+                                  ? Border.all(
+                                      color: const Color(0xFFFFE066),
+                                      width: 1.8,
+                                    )
+                                  : null,
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  allCollapsed
+                                      ? Icons.unfold_more_rounded
+                                      : Icons.unfold_less_rounded,
+                                  size: 14,
+                                  color: isFocused
+                                      ? Colors.white
+                                      : VideoPlatformTheme.accent,
+                                ),
+                                const SizedBox(width: 3),
+                                Text(
+                                  allCollapsed ? '展开全部分组' : '折叠全部分组',
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: isFocused
+                                        ? FontWeight.w700
+                                        : FontWeight.w500,
+                                    color: isFocused
+                                        ? Colors.white
+                                        : VideoPlatformTheme.accent,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+                    );
                   },
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 6,
-                      vertical: 3,
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          allCollapsed
-                              ? Icons.unfold_more_rounded
-                              : Icons.unfold_less_rounded,
-                          size: 14,
-                          color: VideoPlatformTheme.accent,
-                        ),
-                        const SizedBox(width: 3),
-                        Text(
-                          allCollapsed ? '展开全部分组' : '折叠全部分组',
-                          style: TextStyle(
-                            fontSize: 11,
-                            fontWeight: FontWeight.w500,
-                            color: VideoPlatformTheme.accent,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
                 ),
               ],
             ),
@@ -3440,37 +3549,66 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                                     const SizedBox(width: 8),
                                     VideoDownloadSpeedBadge(player: _player),
                                     const SizedBox(width: 8),
-                                    InkWell(
-                                      borderRadius: BorderRadius.circular(18),
-                                      onTap: _cycleLiveAspectMode,
-                                      child: Container(
-                                        padding: const EdgeInsets.symmetric(
-                                          horizontal: 10,
-                                          vertical: 5,
-                                        ),
-                                        decoration: BoxDecoration(
-                                          color: const Color(0xBB090E14),
+                                    StatefulBuilder(
+                                      builder: (aspCtx, setAspState) {
+                                        return InkWell(
                                           borderRadius:
                                               BorderRadius.circular(18),
-                                          border: Border.all(
-                                            color: _liveAspectMode != 'fit'
-                                                ? VideoPlatformTheme.accent
-                                                : Colors.white24,
+                                          onFocusChange: (_) {
+                                            if (aspCtx.mounted) {
+                                              setAspState(() {});
+                                            }
+                                          },
+                                          onTap: _cycleLiveAspectMode,
+                                          child: Builder(
+                                            builder: (ctx) {
+                                              final isFocused =
+                                                  Focus.of(ctx).hasPrimaryFocus;
+                                              return Container(
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                  horizontal: 10,
+                                                  vertical: 5,
+                                                ),
+                                                decoration: BoxDecoration(
+                                                  color: isFocused
+                                                      ? VideoPlatformTheme
+                                                          .accent
+                                                      : const Color(0xBB090E14),
+                                                  borderRadius:
+                                                      BorderRadius.circular(18),
+                                                  border: Border.all(
+                                                    color: isFocused
+                                                        ? const Color(0xFFFFE066)
+                                                        : (_liveAspectMode !=
+                                                                'fit'
+                                                            ? VideoPlatformTheme
+                                                                .accent
+                                                            : Colors.white24),
+                                                    width:
+                                                        isFocused ? 2.2 : 1.0,
+                                                  ),
+                                                ),
+                                                child: Text(
+                                                  _liveAspectMode == 'fit'
+                                                      ? '比例:适应'
+                                                      : (_liveAspectMode ==
+                                                              'cover'
+                                                          ? '比例:铺满'
+                                                          : '比例:16:9'),
+                                                  style: TextStyle(
+                                                    color: Colors.white,
+                                                    fontSize: 11.5,
+                                                    fontWeight: isFocused
+                                                        ? FontWeight.w700
+                                                        : FontWeight.w600,
+                                                  ),
+                                                ),
+                                              );
+                                            },
                                           ),
-                                        ),
-                                        child: Text(
-                                          _liveAspectMode == 'fit'
-                                              ? '比例:适应'
-                                              : (_liveAspectMode == 'cover'
-                                                  ? '比例:铺满'
-                                                  : '比例:16:9'),
-                                          style: const TextStyle(
-                                            color: Colors.white,
-                                            fontSize: 11.5,
-                                            fontWeight: FontWeight.w600,
-                                          ),
-                                        ),
-                                      ),
+                                        );
+                                      },
                                     ),
                                     if ((Platform.isAndroid ||
                                             Platform.isIOS) &&

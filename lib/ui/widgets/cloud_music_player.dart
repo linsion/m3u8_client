@@ -3229,91 +3229,146 @@ class CloudMusicBottomDockBar extends StatelessWidget {
                     return Row(
                       children: [
                         Expanded(
-                          child: InkWell(
-                            onTap: onExpandFullscreen,
-                            borderRadius: BorderRadius.circular(10),
-                            child: Row(
-                              children: [
-                                _MiniSpinningVinylAvatar(
-                                  isPlaying: controller.isPlaying,
-                                  coverUrl: controller.coverImageUrl,
-                                  coverHeaders: controller.coverImageHeaders,
-                                  isLocalFile: controller.coverIsLocalFile,
-                                ),
-                                const SizedBox(width: 10),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      Row(
+                          child: StatefulBuilder(
+                            builder: (dockInfoCtx, setDockInfoState) {
+                              return InkWell(
+                                onFocusChange: (_) {
+                                  if (dockInfoCtx.mounted) {
+                                    setDockInfoState(() {});
+                                  }
+                                },
+                                onTap: onExpandFullscreen,
+                                borderRadius: BorderRadius.circular(10),
+                                child: Builder(
+                                  builder: (ctx) {
+                                    final isFocused =
+                                        Focus.of(ctx).hasPrimaryFocus;
+                                    return Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 6,
+                                        vertical: 3,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: isFocused
+                                            ? VideoPlatformTheme.accent
+                                                .withValues(alpha: 0.25)
+                                            : Colors.transparent,
+                                        borderRadius: BorderRadius.circular(10),
+                                        border: isFocused
+                                            ? Border.all(
+                                                color: const Color(0xFFFFE066),
+                                                width: 2.0,
+                                              )
+                                            : null,
+                                      ),
+                                      child: Row(
                                         children: [
-                                          Container(
-                                            padding: const EdgeInsets.symmetric(
-                                              horizontal: 5,
-                                              vertical: 1.5,
-                                            ),
-                                            decoration: BoxDecoration(
-                                              color: VideoPlatformTheme.accent
-                                                  .withValues(alpha: 0.18),
-                                              borderRadius:
-                                                  BorderRadius.circular(4),
-                                              border: Border.all(
-                                                color: VideoPlatformTheme.accent
-                                                    .withValues(alpha: 0.5),
-                                              ),
-                                            ),
-                                            child: Text(
-                                              meta.qualityTag,
-                                              style: TextStyle(
-                                                fontSize: 9.5,
-                                                fontWeight: FontWeight.w800,
-                                                color:
-                                                    VideoPlatformTheme.accent,
-                                              ),
-                                            ),
+                                          _MiniSpinningVinylAvatar(
+                                            isPlaying: controller.isPlaying,
+                                            coverUrl: controller.coverImageUrl,
+                                            coverHeaders:
+                                                controller.coverImageHeaders,
+                                            isLocalFile:
+                                                controller.coverIsLocalFile,
                                           ),
-                                          const SizedBox(width: 6),
+                                          const SizedBox(width: 10),
                                           Expanded(
-                                            child: Text(
-                                              meta.title,
-                                              maxLines: 1,
-                                              overflow: TextOverflow.ellipsis,
-                                              style: TextStyle(
-                                                fontSize: 13,
-                                                fontWeight: FontWeight.w700,
-                                                color: VideoPlatformTheme
-                                                    .textPrimary,
-                                              ),
+                                            child: Column(
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.start,
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                Row(
+                                                  children: [
+                                                    Container(
+                                                      padding: const EdgeInsets
+                                                          .symmetric(
+                                                        horizontal: 5,
+                                                        vertical: 1.5,
+                                                      ),
+                                                      decoration: BoxDecoration(
+                                                        color: VideoPlatformTheme
+                                                            .accent
+                                                            .withValues(
+                                                                alpha: 0.18),
+                                                        borderRadius:
+                                                            BorderRadius
+                                                                .circular(4),
+                                                        border: Border.all(
+                                                          color:
+                                                              VideoPlatformTheme
+                                                                  .accent
+                                                                  .withValues(
+                                                                      alpha:
+                                                                          0.5),
+                                                        ),
+                                                      ),
+                                                      child: Text(
+                                                        meta.qualityTag,
+                                                        style: TextStyle(
+                                                          fontSize: 9.5,
+                                                          fontWeight:
+                                                              FontWeight.w800,
+                                                          color:
+                                                              VideoPlatformTheme
+                                                                  .accent,
+                                                        ),
+                                                      ),
+                                                    ),
+                                                    const SizedBox(width: 6),
+                                                    Expanded(
+                                                      child: Text(
+                                                        meta.title,
+                                                        maxLines: 1,
+                                                        overflow: TextOverflow
+                                                            .ellipsis,
+                                                        style: TextStyle(
+                                                          fontSize: 13,
+                                                          fontWeight:
+                                                              FontWeight.w700,
+                                                          color: isFocused
+                                                              ? Colors.white
+                                                              : VideoPlatformTheme
+                                                                  .textPrimary,
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                                const SizedBox(height: 3),
+                                                Text(
+                                                  controller
+                                                          .errorText.isNotEmpty
+                                                      ? controller.errorText
+                                                      : (lyricLine.isNotEmpty
+                                                          ? '♪ $lyricLine'
+                                                          : '${meta.artist} · ${controller.mountNameFor(activeTrack)}'),
+                                                  maxLines: 1,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: TextStyle(
+                                                    fontSize: 11,
+                                                    color: controller.errorText
+                                                            .isNotEmpty
+                                                        ? VideoPlatformTheme
+                                                            .danger
+                                                        : (lyricLine.isNotEmpty
+                                                            ? VideoPlatformTheme
+                                                                .accent
+                                                            : VideoPlatformTheme
+                                                                .textSecondary),
+                                                  ),
+                                                ),
+                                              ],
                                             ),
                                           ),
                                         ],
                                       ),
-                                      const SizedBox(height: 3),
-                                      Text(
-                                        controller.errorText.isNotEmpty
-                                            ? controller.errorText
-                                            : (lyricLine.isNotEmpty
-                                                ? '♪ $lyricLine'
-                                                : '${meta.artist} · ${controller.mountNameFor(activeTrack)}'),
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: TextStyle(
-                                          fontSize: 11,
-                                          color: controller.errorText.isNotEmpty
-                                              ? VideoPlatformTheme.danger
-                                              : (lyricLine.isNotEmpty
-                                                  ? VideoPlatformTheme.accent
-                                                  : VideoPlatformTheme
-                                                      .textSecondary),
-                                        ),
-                                      ),
-                                    ],
-                                  ),
+                                    );
+                                  },
                                 ),
-                              ],
-                            ),
+                              );
+                            },
                           ),
                         ),
                         const SizedBox(width: 6),
@@ -3341,37 +3396,58 @@ class CloudMusicBottomDockBar extends StatelessWidget {
                           ),
                           const SizedBox(width: 4),
                         ],
-                        InkWell(
-                          onTap: controller.togglePlayPause,
-                          customBorder: const CircleBorder(),
-                          child: Container(
-                            width: 36,
-                            height: 36,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              gradient: LinearGradient(
-                                colors: [
-                                  VideoPlatformTheme.accent,
-                                  VideoPlatformTheme.accentHover,
-                                ],
-                              ),
-                            ),
-                            child: controller.isLoadingTrack
-                                ? const Padding(
-                                    padding: EdgeInsets.all(9),
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
-                                      color: Colors.white,
+                        StatefulBuilder(
+                          builder: (dockPlayCtx, setDockPlayState) {
+                            return InkWell(
+                              onFocusChange: (_) {
+                                if (dockPlayCtx.mounted) {
+                                  setDockPlayState(() {});
+                                }
+                              },
+                              onTap: controller.togglePlayPause,
+                              customBorder: const CircleBorder(),
+                              child: Builder(
+                                builder: (ctx) {
+                                  final isFocused =
+                                      Focus.of(ctx).hasPrimaryFocus;
+                                  return Container(
+                                    width: 36,
+                                    height: 36,
+                                    decoration: BoxDecoration(
+                                      shape: BoxShape.circle,
+                                      gradient: LinearGradient(
+                                        colors: [
+                                          VideoPlatformTheme.accent,
+                                          VideoPlatformTheme.accentHover,
+                                        ],
+                                      ),
+                                      border: isFocused
+                                          ? Border.all(
+                                              color: const Color(0xFFFFE066),
+                                              width: 2.2,
+                                            )
+                                          : null,
                                     ),
-                                  )
-                                : Icon(
-                                    controller.isPlaying
-                                        ? Icons.pause_rounded
-                                        : Icons.play_arrow_rounded,
-                                    color: Colors.white,
-                                    size: 20,
-                                  ),
-                          ),
+                                    child: controller.isLoadingTrack
+                                        ? const Padding(
+                                            padding: EdgeInsets.all(9),
+                                            child: CircularProgressIndicator(
+                                              strokeWidth: 2,
+                                              color: Colors.white,
+                                            ),
+                                          )
+                                        : Icon(
+                                            controller.isPlaying
+                                                ? Icons.pause_rounded
+                                                : Icons.play_arrow_rounded,
+                                            color: Colors.white,
+                                            size: 20,
+                                          ),
+                                  );
+                                },
+                              ),
+                            );
+                          },
                         ),
                         const SizedBox(width: 2),
                         IconButton(
@@ -4302,44 +4378,69 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
             ),
           ],
           const SizedBox(width: 6),
-          InkWell(
-            borderRadius: BorderRadius.circular(14),
-            onTap: () {
-              _ctrl.scanAndPlayFoldersOrArchives(
-                sources: saved,
-                shuffle: true,
+          StatefulBuilder(
+            builder: (rndAllCtx, setRndAllState) {
+              return InkWell(
+                borderRadius: BorderRadius.circular(14),
+                onFocusChange: (_) {
+                  if (rndAllCtx.mounted) setRndAllState(() {});
+                },
+                onTap: () {
+                  _ctrl.scanAndPlayFoldersOrArchives(
+                    sources: saved,
+                    shuffle: true,
+                  );
+                },
+                child: Builder(
+                  builder: (ctx) {
+                    final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                    return Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color: isFocused
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.accent.withValues(alpha: 0.18),
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(
+                          color: isFocused
+                              ? const Color(0xFFFFE066)
+                              : VideoPlatformTheme.accent
+                                  .withValues(alpha: 0.5),
+                          width: isFocused ? 2.2 : 1.0,
+                        ),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.shuffle_rounded,
+                            size: 13,
+                            color: isFocused
+                                ? Colors.white
+                                : VideoPlatformTheme.accent,
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            '全部随机 (${saved.length})',
+                            style: TextStyle(
+                              fontSize: 11,
+                              height: 1.2,
+                              fontWeight: FontWeight.w700,
+                              color: isFocused
+                                  ? Colors.white
+                                  : VideoPlatformTheme.accent,
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
               );
             },
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-              decoration: BoxDecoration(
-                color: VideoPlatformTheme.accent.withValues(alpha: 0.18),
-                borderRadius: BorderRadius.circular(14),
-                border: Border.all(
-                  color: VideoPlatformTheme.accent.withValues(alpha: 0.5),
-                ),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    Icons.shuffle_rounded,
-                    size: 13,
-                    color: VideoPlatformTheme.accent,
-                  ),
-                  const SizedBox(width: 4),
-                  Text(
-                    '全部随机 (${saved.length})',
-                    style: TextStyle(
-                      fontSize: 11,
-                      height: 1.2,
-                      fontWeight: FontWeight.w700,
-                      color: VideoPlatformTheme.accent,
-                    ),
-                  ),
-                ],
-              ),
-            ),
           ),
           const SizedBox(width: 8),
           Expanded(
@@ -4350,48 +4451,75 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
               itemBuilder: (context, idx) {
                 final item = saved[idx];
                 return Center(
-                  child: InkWell(
-                    borderRadius: BorderRadius.circular(14),
-                    onTap: () => _ctrl.scanAndPlayFoldersOrArchives(
-                      sources: [item],
-                      shuffle: true,
-                    ),
-                    onLongPress: () => _ctrl.addOrToggleSavedMusicFolder(item),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 9,
-                        vertical: 4,
-                      ),
-                      decoration: BoxDecoration(
-                        color: VideoPlatformTheme.bgCard,
+                  child: StatefulBuilder(
+                    builder: (svCtx, setSvState) {
+                      return InkWell(
                         borderRadius: BorderRadius.circular(14),
-                        border:
-                            Border.all(color: VideoPlatformTheme.borderSubtle),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            item.isArchive
-                                ? Icons.folder_zip_rounded
-                                : Icons.folder_special_rounded,
-                            size: 13,
-                            color: item.isArchive
-                                ? VideoPlatformTheme.badgeHot
-                                : VideoPlatformTheme.warning,
-                          ),
-                          const SizedBox(width: 5),
-                          Text(
-                            '${item.mountName}: ${item.title}',
-                            style: TextStyle(
-                              fontSize: 11.5,
-                              height: 1.2,
-                              color: VideoPlatformTheme.textPrimary,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
+                        onFocusChange: (_) {
+                          if (svCtx.mounted) setSvState(() {});
+                        },
+                        onTap: () => _ctrl.scanAndPlayFoldersOrArchives(
+                          sources: [item],
+                          shuffle: true,
+                        ),
+                        onLongPress: () =>
+                            _ctrl.addOrToggleSavedMusicFolder(item),
+                        child: Builder(
+                          builder: (ctx) {
+                            final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                            return Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 9,
+                                vertical: 4,
+                              ),
+                              decoration: BoxDecoration(
+                                color: isFocused
+                                    ? VideoPlatformTheme.accent
+                                        .withValues(alpha: 0.34)
+                                    : VideoPlatformTheme.bgCard,
+                                borderRadius: BorderRadius.circular(14),
+                                border: Border.all(
+                                  color: isFocused
+                                      ? const Color(0xFFFFE066)
+                                      : VideoPlatformTheme.borderSubtle,
+                                  width: isFocused ? 2.2 : 1.0,
+                                ),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    item.isArchive
+                                        ? Icons.folder_zip_rounded
+                                        : Icons.folder_special_rounded,
+                                    size: 13,
+                                    color: isFocused
+                                        ? Colors.white
+                                        : (item.isArchive
+                                            ? VideoPlatformTheme.badgeHot
+                                            : VideoPlatformTheme.warning),
+                                  ),
+                                  const SizedBox(width: 5),
+                                  Text(
+                                    '${item.mountName}: ${item.title}',
+                                    style: TextStyle(
+                                      fontSize: 11.5,
+                                      height: 1.2,
+                                      fontWeight: isFocused
+                                          ? FontWeight.w700
+                                          : FontWeight.w500,
+                                      color: isFocused
+                                          ? Colors.white
+                                          : VideoPlatformTheme.textPrimary,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            );
+                          },
+                        ),
+                      );
+                    },
                   ),
                 );
               },
@@ -4845,47 +4973,71 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
     required String label,
   }) {
     final selected = _rightTabIndex == index;
-    return InkWell(
-      onTap: () => setState(() => _rightTabIndex = index),
-      borderRadius: BorderRadius.circular(18),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
-        decoration: BoxDecoration(
-          color: selected
-              ? VideoPlatformTheme.accent.withValues(alpha: 0.22)
-              : VideoPlatformTheme.bgCard,
+    return StatefulBuilder(
+      builder: (pillCtx, setPillState) {
+        return InkWell(
+          onFocusChange: (_) {
+            if (pillCtx.mounted) setPillState(() {});
+          },
+          onTap: () => setState(() => _rightTabIndex = index),
           borderRadius: BorderRadius.circular(18),
-          border: Border.all(
-            color: selected
-                ? VideoPlatformTheme.accent
-                : VideoPlatformTheme.borderSubtle,
+          child: Builder(
+            builder: (ctx) {
+              final isFocused = Focus.of(ctx).hasPrimaryFocus;
+              return Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+                decoration: BoxDecoration(
+                  color: isFocused
+                      ? VideoPlatformTheme.accent.withValues(alpha: 0.34)
+                      : (selected
+                          ? VideoPlatformTheme.accent.withValues(alpha: 0.22)
+                          : VideoPlatformTheme.bgCard),
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(
+                    color: isFocused
+                        ? const Color(0xFFFFE066)
+                        : (selected
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.borderSubtle),
+                    width: isFocused ? 2.2 : 1.0,
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      icon,
+                      size: 16,
+                      color: isFocused
+                          ? Colors.white
+                          : (selected
+                              ? VideoPlatformTheme.accent
+                              : VideoPlatformTheme.textSecondary),
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      label,
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        height: 1.2,
+                        fontWeight: (selected || isFocused)
+                            ? FontWeight.w700
+                            : FontWeight.w500,
+                        color: isFocused
+                            ? Colors.white
+                            : (selected
+                                ? VideoPlatformTheme.accent
+                                : VideoPlatformTheme.textSecondary),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            },
           ),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              icon,
-              size: 16,
-              color: selected
-                  ? VideoPlatformTheme.accent
-                  : VideoPlatformTheme.textSecondary,
-            ),
-            const SizedBox(width: 6),
-            Text(
-              label,
-              style: TextStyle(
-                fontSize: 12.5,
-                height: 1.2,
-                fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
-                color: selected
-                    ? VideoPlatformTheme.accent
-                    : VideoPlatformTheme.textSecondary,
-              ),
-            ),
-          ],
-        ),
-      ),
+        );
+      },
     );
   }
 
@@ -5086,111 +5238,141 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                 item.entry,
                 fallbackArtist: _ctrl.mountNameFor(item.entry),
               );
-              return InkWell(
-                onTap: () => _ctrl.playQueueIndex(item.index),
-                borderRadius: BorderRadius.circular(10),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 9,
-                  ),
-                  decoration: BoxDecoration(
-                    color: isCurrent
-                        ? VideoPlatformTheme.accent.withValues(alpha: 0.16)
-                        : VideoPlatformTheme.bgCard,
+              return StatefulBuilder(
+                builder: (qRowCtx, setQRowState) {
+                  return InkWell(
+                    onFocusChange: (_) {
+                      if (qRowCtx.mounted) setQRowState(() {});
+                    },
+                    onTap: () => _ctrl.playQueueIndex(item.index),
                     borderRadius: BorderRadius.circular(10),
-                    border: Border.all(
-                      color: isCurrent
-                          ? VideoPlatformTheme.accent.withValues(alpha: 0.65)
-                          : VideoPlatformTheme.borderSubtle,
-                    ),
-                  ),
-                  child: Row(
-                    children: [
-                      SizedBox(
-                        width: 28,
-                        child: isCurrent
-                            ? Icon(
-                                Icons.equalizer_rounded,
-                                color: VideoPlatformTheme.accent,
-                                size: 20,
-                              )
-                            : Text(
-                                '${item.index + 1}'.padLeft(2, '0'),
-                                style: TextStyle(
-                                  fontSize: 12,
+                    child: Builder(
+                      builder: (ctx) {
+                        final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                        return Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 9,
+                          ),
+                          decoration: BoxDecoration(
+                            color: isFocused
+                                ? VideoPlatformTheme.accent
+                                    .withValues(alpha: 0.30)
+                                : (isCurrent
+                                    ? VideoPlatformTheme.accent
+                                        .withValues(alpha: 0.16)
+                                    : VideoPlatformTheme.bgCard),
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(
+                              color: isFocused
+                                  ? const Color(0xFFFFE066)
+                                  : (isCurrent
+                                      ? VideoPlatformTheme.accent
+                                          .withValues(alpha: 0.65)
+                                      : VideoPlatformTheme.borderSubtle),
+                              width: isFocused ? 2.2 : 1.0,
+                            ),
+                          ),
+                          child: Row(
+                            children: [
+                              SizedBox(
+                                width: 28,
+                                child: isCurrent
+                                    ? Icon(
+                                        Icons.equalizer_rounded,
+                                        color: isFocused
+                                            ? Colors.white
+                                            : VideoPlatformTheme.accent,
+                                        size: 20,
+                                      )
+                                    : Text(
+                                        '${item.index + 1}'.padLeft(2, '0'),
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          color: isFocused
+                                              ? Colors.white70
+                                              : VideoPlatformTheme.textMuted,
+                                        ),
+                                      ),
+                              ),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      meta.title,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        fontSize: 13.5,
+                                        fontWeight: (isCurrent || isFocused)
+                                            ? FontWeight.w700
+                                            : FontWeight.w500,
+                                        color: isFocused
+                                            ? Colors.white
+                                            : (isCurrent
+                                                ? VideoPlatformTheme.accent
+                                                : VideoPlatformTheme
+                                                    .textPrimary),
+                                      ),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      '${meta.artist} · ${_ctrl.mountNameFor(item.entry)} · ${item.entry.formattedSize}',
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        color: isFocused
+                                            ? Colors.white70
+                                            : VideoPlatformTheme.textMuted,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 6,
+                                  vertical: 2,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: VideoPlatformTheme.bgHover,
+                                  borderRadius: BorderRadius.circular(4),
+                                ),
+                                child: Text(
+                                  item.entry.isInsideArchive
+                                      ? '📦 ${item.entry.normalizedExt.replaceAll('.', '').toUpperCase()}'
+                                      : item.entry.normalizedExt
+                                          .replaceAll('.', '')
+                                          .toUpperCase(),
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.w700,
+                                    color: VideoPlatformTheme.accent,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 4),
+                              IconButton(
+                                tooltip: '从队列移除',
+                                visualDensity: VisualDensity.compact,
+                                onPressed: () =>
+                                    _ctrl.removeTrackAt(item.index),
+                                icon: Icon(
+                                  Icons.close_rounded,
+                                  size: 16,
                                   color: VideoPlatformTheme.textMuted,
                                 ),
                               ),
-                      ),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              meta.title,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontSize: 13.5,
-                                fontWeight: isCurrent
-                                    ? FontWeight.w700
-                                    : FontWeight.w500,
-                                color: isCurrent
-                                    ? VideoPlatformTheme.accent
-                                    : VideoPlatformTheme.textPrimary,
-                              ),
-                            ),
-                            const SizedBox(height: 2),
-                            Text(
-                              '${meta.artist} · ${_ctrl.mountNameFor(item.entry)} · ${item.entry.formattedSize}',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontSize: 11,
-                                color: VideoPlatformTheme.textMuted,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 6,
-                          vertical: 2,
-                        ),
-                        decoration: BoxDecoration(
-                          color: VideoPlatformTheme.bgHover,
-                          borderRadius: BorderRadius.circular(4),
-                        ),
-                        child: Text(
-                          item.entry.isInsideArchive
-                              ? '📦 ${item.entry.normalizedExt.replaceAll('.', '').toUpperCase()}'
-                              : item.entry.normalizedExt
-                                  .replaceAll('.', '')
-                                  .toUpperCase(),
-                          style: TextStyle(
-                            fontSize: 10,
-                            fontWeight: FontWeight.w700,
-                            color: VideoPlatformTheme.accent,
+                            ],
                           ),
-                        ),
-                      ),
-                      const SizedBox(width: 4),
-                      IconButton(
-                        tooltip: '从队列移除',
-                        visualDensity: VisualDensity.compact,
-                        onPressed: () => _ctrl.removeTrackAt(item.index),
-                        icon: Icon(
-                          Icons.close_rounded,
-                          size: 16,
-                          color: VideoPlatformTheme.textMuted,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
+                        );
+                      },
+                    ),
+                  );
+                },
               );
             },
           ),
@@ -5432,44 +5614,63 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                   ),
                 ),
                 const SizedBox(width: 8),
-                InkWell(
-                  onTap: _ctrl.togglePlayPause,
-                  customBorder: const CircleBorder(),
-                  child: Container(
-                    width: 52,
-                    height: 52,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      gradient: LinearGradient(
-                        colors: [
-                          VideoPlatformTheme.accent,
-                          VideoPlatformTheme.accentHover,
-                        ],
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color:
-                              VideoPlatformTheme.accent.withValues(alpha: 0.4),
-                          blurRadius: 14,
-                        ),
-                      ],
-                    ),
-                    child: _ctrl.isLoadingTrack
-                        ? const Padding(
-                            padding: EdgeInsets.all(14),
-                            child: CircularProgressIndicator(
-                              strokeWidth: 2.5,
-                              color: Colors.white,
+                StatefulBuilder(
+                  builder: (playBtnCtx, setPlayBtnState) {
+                    return InkWell(
+                      onFocusChange: (_) {
+                        if (playBtnCtx.mounted) setPlayBtnState(() {});
+                      },
+                      onTap: _ctrl.togglePlayPause,
+                      customBorder: const CircleBorder(),
+                      child: Builder(
+                        builder: (ctx) {
+                          final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                          return Container(
+                            width: 52,
+                            height: 52,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              gradient: LinearGradient(
+                                colors: [
+                                  VideoPlatformTheme.accent,
+                                  VideoPlatformTheme.accentHover,
+                                ],
+                              ),
+                              border: isFocused
+                                  ? Border.all(
+                                      color: const Color(0xFFFFE066),
+                                      width: 2.8,
+                                    )
+                                  : null,
+                              boxShadow: [
+                                BoxShadow(
+                                  color: VideoPlatformTheme.accent.withValues(
+                                    alpha: isFocused ? 0.75 : 0.4,
+                                  ),
+                                  blurRadius: isFocused ? 20 : 14,
+                                ),
+                              ],
                             ),
-                          )
-                        : Icon(
-                            _ctrl.isPlaying
-                                ? Icons.pause_rounded
-                                : Icons.play_arrow_rounded,
-                            color: Colors.white,
-                            size: 30,
-                          ),
-                  ),
+                            child: _ctrl.isLoadingTrack
+                                ? const Padding(
+                                    padding: EdgeInsets.all(14),
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2.5,
+                                      color: Colors.white,
+                                    ),
+                                  )
+                                : Icon(
+                                    _ctrl.isPlaying
+                                        ? Icons.pause_rounded
+                                        : Icons.play_arrow_rounded,
+                                    color: Colors.white,
+                                    size: 30,
+                                  ),
+                          );
+                        },
+                      ),
+                    );
+                  },
                 ),
                 const SizedBox(width: 8),
                 IconButton(

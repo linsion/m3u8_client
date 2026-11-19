@@ -56,7 +56,7 @@ class _VideoProxyStatsButtonState extends State<VideoProxyStatsButton> {
 
     return Focus(
       focusNode: widget.focusNode,
-      canRequestFocus: widget.focusNode != null,
+      canRequestFocus: true,
       onFocusChange: (focused) {
         if (focused) {
           widget.onInteraction?.call();
@@ -100,9 +100,11 @@ class _VideoProxyStatsButtonState extends State<VideoProxyStatsButton> {
         }
         return KeyEventResult.ignored;
       },
-      child: Tooltip(
-        message: active ? '隐藏代理实时 IP 与流量监控窗口' : '显示代理实时 IP 与流量监控窗口',
-        child: InkWell(
+      child: ExcludeFocus(
+        excluding: true,
+        child: Tooltip(
+          message: active ? '隐藏代理实时 IP 与流量监控窗口' : '显示代理实时 IP 与流量监控窗口',
+          child: InkWell(
           borderRadius: BorderRadius.circular(6),
           onTap: () {
             widget.onInteraction?.call();
@@ -162,6 +164,7 @@ class _VideoProxyStatsButtonState extends State<VideoProxyStatsButton> {
             ),
           ),
         ),
+      ),
       ),
     );
   }

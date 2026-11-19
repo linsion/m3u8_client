@@ -212,7 +212,7 @@ class _VideoProxyNodeSelectorState extends State<VideoProxyNodeSelector> {
 
         return Focus(
           focusNode: widget.focusNode,
-          canRequestFocus: widget.focusNode != null,
+          canRequestFocus: true,
           onFocusChange: (focused) {
             if (focused) {
               widget.onInteraction?.call();
@@ -257,7 +257,7 @@ class _VideoProxyNodeSelectorState extends State<VideoProxyNodeSelector> {
             return KeyEventResult.ignored;
           },
           child: ExcludeFocus(
-            excluding: widget.focusNode != null,
+            excluding: true,
             child: PopupMenuButton<String>(
             key: _menuKey,
             tooltip: '切换视频播放代理节点',

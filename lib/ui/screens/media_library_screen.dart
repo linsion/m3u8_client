@@ -2589,77 +2589,109 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
             for (final mount in _mounts) ...[
               Padding(
                 padding: const EdgeInsets.only(right: 8),
-                child: InkWell(
-                  borderRadius: BorderRadius.circular(18),
-                  onTap: () => _switchMount(mount.id),
-                  onLongPress: mount.isBuiltIn
-                      ? null
-                      : () => _showMountStorageDialog(existing: mount),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 6,
-                    ),
-                    decoration: BoxDecoration(
-                      color: mount.id == _activeMountId
-                          ? VideoPlatformTheme.accent
-                          : VideoPlatformTheme.bgCard,
+                child: StatefulBuilder(
+                  builder: (mountCtx, setMountState) {
+                    final isSelected = mount.id == _activeMountId;
+                    return InkWell(
                       borderRadius: BorderRadius.circular(18),
-                      border: Border.all(
-                        color: mount.id == _activeMountId
-                            ? VideoPlatformTheme.accent
-                            : VideoPlatformTheme.borderSubtle,
-                      ),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          _iconForMountKind(mount.kind),
-                          size: 15,
-                          color: mount.id == _activeMountId
-                              ? Colors.white
-                              : VideoPlatformTheme.accent,
-                        ),
-                        const SizedBox(width: 6),
-                        Text(
-                          mount.name,
-                          style: TextStyle(
-                            fontSize: 12.5,
-                            fontWeight: mount.id == _activeMountId
-                                ? FontWeight.w700
-                                : FontWeight.w500,
-                            color: mount.id == _activeMountId
-                                ? Colors.white
-                                : VideoPlatformTheme.textPrimary,
-                          ),
-                        ),
-                        const SizedBox(width: 6),
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 5,
-                            vertical: 1,
-                          ),
-                          decoration: BoxDecoration(
-                            color: mount.id == _activeMountId
-                                ? Colors.black26
-                                : VideoPlatformTheme.bgElevated,
-                            borderRadius: BorderRadius.circular(8),
-                          ),
-                          child: Text(
-                            mount.kind.badge,
-                            style: TextStyle(
-                              fontSize: 10,
-                              fontWeight: FontWeight.w600,
-                              color: mount.id == _activeMountId
-                                  ? Colors.white
-                                  : VideoPlatformTheme.textMuted,
+                      onFocusChange: (_) {
+                        if (mountCtx.mounted) setMountState(() {});
+                      },
+                      onTap: () => _switchMount(mount.id),
+                      onLongPress: mount.isBuiltIn
+                          ? null
+                          : () => _showMountStorageDialog(existing: mount),
+                      child: Builder(
+                        builder: (ctx) {
+                          final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                          return AnimatedContainer(
+                            duration: const Duration(milliseconds: 140),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 6,
                             ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
+                            decoration: BoxDecoration(
+                              color: isSelected
+                                  ? (isFocused
+                                      ? VideoPlatformTheme.accentHover
+                                      : VideoPlatformTheme.accent)
+                                  : (isFocused
+                                      ? VideoPlatformTheme.accent
+                                          .withValues(alpha: 0.34)
+                                      : VideoPlatformTheme.bgCard),
+                              borderRadius: BorderRadius.circular(18),
+                              border: Border.all(
+                                color: isFocused
+                                    ? const Color(0xFFFFE066)
+                                    : (isSelected
+                                        ? VideoPlatformTheme.accent
+                                        : VideoPlatformTheme.borderSubtle),
+                                width: isFocused ? 2.4 : 1.0,
+                              ),
+                              boxShadow: isFocused
+                                  ? [
+                                      BoxShadow(
+                                        color: VideoPlatformTheme.accent
+                                            .withValues(alpha: 0.55),
+                                        blurRadius: 10,
+                                        spreadRadius: 1,
+                                      ),
+                                    ]
+                                  : null,
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  _iconForMountKind(mount.kind),
+                                  size: 15,
+                                  color: (isSelected || isFocused)
+                                      ? Colors.white
+                                      : VideoPlatformTheme.accent,
+                                ),
+                                const SizedBox(width: 6),
+                                Text(
+                                  mount.name,
+                                  style: TextStyle(
+                                    fontSize: 12.5,
+                                    fontWeight: (isSelected || isFocused)
+                                        ? FontWeight.w700
+                                        : FontWeight.w500,
+                                    color: (isSelected || isFocused)
+                                        ? Colors.white
+                                        : VideoPlatformTheme.textPrimary,
+                                  ),
+                                ),
+                                const SizedBox(width: 6),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 5,
+                                    vertical: 1,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: (isSelected || isFocused)
+                                        ? Colors.black26
+                                        : VideoPlatformTheme.bgElevated,
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: Text(
+                                    mount.kind.badge,
+                                    style: TextStyle(
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w600,
+                                      color: (isSelected || isFocused)
+                                          ? Colors.white
+                                          : VideoPlatformTheme.textMuted,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+                    );
+                  },
                 ),
               ),
             ],
@@ -2818,23 +2850,58 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
                       color: VideoPlatformTheme.textMuted,
                     ),
                   ),
-                InkWell(
-                  onTap: () => _loadDirectory(
-                    _cloud115Breadcrumbs[i].cid,
-                    folderTitleHint: _cloud115Breadcrumbs[i].name,
-                  ),
-                  child: Text(
-                    _cloud115Breadcrumbs[i].name,
-                    style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: i == _cloud115Breadcrumbs.length - 1
-                          ? FontWeight.w700
-                          : FontWeight.w400,
-                      color: i == _cloud115Breadcrumbs.length - 1
-                          ? VideoPlatformTheme.textPrimary
-                          : VideoPlatformTheme.accent,
-                    ),
-                  ),
+                StatefulBuilder(
+                  builder: (crumbCtx, setCrumbState) {
+                    return InkWell(
+                      borderRadius: BorderRadius.circular(5),
+                      onFocusChange: (_) {
+                        if (crumbCtx.mounted) setCrumbState(() {});
+                      },
+                      onTap: () => _loadDirectory(
+                        _cloud115Breadcrumbs[i].cid,
+                        folderTitleHint: _cloud115Breadcrumbs[i].name,
+                      ),
+                      child: Builder(
+                        builder: (ctx) {
+                          final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                          return Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 2,
+                            ),
+                            decoration: BoxDecoration(
+                              color: isFocused
+                                  ? VideoPlatformTheme.accent
+                                      .withValues(alpha: 0.34)
+                                  : Colors.transparent,
+                              borderRadius: BorderRadius.circular(5),
+                              border: isFocused
+                                  ? Border.all(
+                                      color: const Color(0xFFFFE066),
+                                      width: 1.8,
+                                    )
+                                  : null,
+                            ),
+                            child: Text(
+                              _cloud115Breadcrumbs[i].name,
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: (i == _cloud115Breadcrumbs.length - 1 ||
+                                        isFocused)
+                                    ? FontWeight.w700
+                                    : FontWeight.w400,
+                                color: isFocused
+                                    ? Colors.white
+                                    : (i == _cloud115Breadcrumbs.length - 1
+                                        ? VideoPlatformTheme.textPrimary
+                                        : VideoPlatformTheme.accent),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    );
+                  },
                 ),
               ],
             ],
@@ -2859,20 +2926,55 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
         scrollDirection: Axis.horizontal,
         child: Row(
           children: [
-            InkWell(
-              onTap: () => _loadDirectory(
-                mount.kind == StorageSourceKind.server ? '' : mount.rootPath,
-              ),
-              child: Text(
-                '/ ${mount.name}',
-                style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: parts.isEmpty ? FontWeight.w700 : FontWeight.w400,
-                  color: parts.isEmpty
-                      ? VideoPlatformTheme.textPrimary
-                      : VideoPlatformTheme.accent,
-                ),
-              ),
+            StatefulBuilder(
+              builder: (rootCrumbCtx, setRootCrumbState) {
+                return InkWell(
+                  borderRadius: BorderRadius.circular(5),
+                  onFocusChange: (_) {
+                    if (rootCrumbCtx.mounted) setRootCrumbState(() {});
+                  },
+                  onTap: () => _loadDirectory(
+                    mount.kind == StorageSourceKind.server ? '' : mount.rootPath,
+                  ),
+                  child: Builder(
+                    builder: (ctx) {
+                      final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                      return Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 6,
+                          vertical: 2,
+                        ),
+                        decoration: BoxDecoration(
+                          color: isFocused
+                              ? VideoPlatformTheme.accent.withValues(alpha: 0.34)
+                              : Colors.transparent,
+                          borderRadius: BorderRadius.circular(5),
+                          border: isFocused
+                              ? Border.all(
+                                  color: const Color(0xFFFFE066),
+                                  width: 1.8,
+                                )
+                              : null,
+                        ),
+                        child: Text(
+                          '/ ${mount.name}',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: (parts.isEmpty || isFocused)
+                                ? FontWeight.w700
+                                : FontWeight.w400,
+                            color: isFocused
+                                ? Colors.white
+                                : (parts.isEmpty
+                                    ? VideoPlatformTheme.textPrimary
+                                    : VideoPlatformTheme.accent),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                );
+              },
             ),
             for (var i = 0; i < parts.length; i++) ...[
               Padding(
@@ -2883,28 +2985,62 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
                   color: VideoPlatformTheme.textMuted,
                 ),
               ),
-              InkWell(
-                onTap: () {
-                  final prefix = currentPath.startsWith('/') ? '/' : '';
-                  final sep = mount.kind == StorageSourceKind.localCache
-                      ? Platform.pathSeparator
-                      : '/';
-                  final targetPath =
-                      '$prefix${parts.sublist(0, i + 1).join(sep)}';
-                  _loadDirectory(targetPath);
+              StatefulBuilder(
+                builder: (partCtx, setPartState) {
+                  return InkWell(
+                    borderRadius: BorderRadius.circular(5),
+                    onFocusChange: (_) {
+                      if (partCtx.mounted) setPartState(() {});
+                    },
+                    onTap: () {
+                      final prefix = currentPath.startsWith('/') ? '/' : '';
+                      final sep = mount.kind == StorageSourceKind.localCache
+                          ? Platform.pathSeparator
+                          : '/';
+                      final targetPath =
+                          '$prefix${parts.sublist(0, i + 1).join(sep)}';
+                      _loadDirectory(targetPath);
+                    },
+                    child: Builder(
+                      builder: (ctx) {
+                        final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                        return Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: isFocused
+                                ? VideoPlatformTheme.accent
+                                    .withValues(alpha: 0.34)
+                                : Colors.transparent,
+                            borderRadius: BorderRadius.circular(5),
+                            border: isFocused
+                                ? Border.all(
+                                    color: const Color(0xFFFFE066),
+                                    width: 1.8,
+                                  )
+                                : null,
+                          ),
+                          child: Text(
+                            parts[i],
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: (i == parts.length - 1 || isFocused)
+                                  ? FontWeight.w700
+                                  : FontWeight.w400,
+                              color: isFocused
+                                  ? Colors.white
+                                  : (i == parts.length - 1
+                                      ? VideoPlatformTheme.textPrimary
+                                      : VideoPlatformTheme.accent),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  );
                 },
-                child: Text(
-                  parts[i],
-                  style: TextStyle(
-                    fontSize: 12,
-                    fontWeight: i == parts.length - 1
-                        ? FontWeight.w700
-                        : FontWeight.w400,
-                    color: i == parts.length - 1
-                        ? VideoPlatformTheme.textPrimary
-                        : VideoPlatformTheme.accent,
-                  ),
-                ),
               ),
             ],
           ],
@@ -3305,56 +3441,94 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
                           ),
                         ),
                         const SizedBox(width: 6),
-                        PopupMenuButton<String>(
-                          tooltip: '排序方式',
-                          initialValue: _sortMode,
-                          onSelected: (m) => setState(() => _sortMode = m),
-                          itemBuilder: (_) => const [
-                            PopupMenuItem(
-                              value: 'time_desc',
-                              child: Text('按修改时间 (最新优先)'),
-                            ),
-                            PopupMenuItem(
-                              value: 'size_desc',
-                              child: Text('按文件大小 (由大到小)'),
-                            ),
-                            PopupMenuItem(
-                              value: 'name_asc',
-                              child: Text('按文件名称 (A - Z)'),
-                            ),
-                            PopupMenuItem(
-                              value: 'type_asc',
-                              child: Text('按文件类型'),
-                            ),
-                          ],
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 9,
-                              vertical: 5,
-                            ),
-                            decoration: BoxDecoration(
-                              borderRadius: BorderRadius.circular(5),
-                              border: Border.all(
-                                color: VideoPlatformTheme.borderStrong,
+                        StatefulBuilder(
+                          builder: (sortCtx, setSortState) {
+                            return Focus(
+                              canRequestFocus: false,
+                              onFocusChange: (_) {
+                                if (sortCtx.mounted) setSortState(() {});
+                              },
+                              child: Builder(
+                                builder: (ctx) {
+                                  final isFocused = Focus.of(ctx).hasFocus;
+                                  return PopupMenuButton<String>(
+                                    tooltip: '排序方式',
+                                    initialValue: _sortMode,
+                                    onSelected: (m) =>
+                                        setState(() => _sortMode = m),
+                                    itemBuilder: (_) => const [
+                                      PopupMenuItem(
+                                        value: 'time_desc',
+                                        child: Text('按修改时间 (最新优先)'),
+                                      ),
+                                      PopupMenuItem(
+                                        value: 'size_desc',
+                                        child: Text('按文件大小 (由大到小)'),
+                                      ),
+                                      PopupMenuItem(
+                                        value: 'name_asc',
+                                        child: Text('按文件名称 (A - Z)'),
+                                      ),
+                                      PopupMenuItem(
+                                        value: 'type_asc',
+                                        child: Text('按文件类型'),
+                                      ),
+                                    ],
+                                    child: Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 9,
+                                        vertical: 5,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: isFocused
+                                            ? VideoPlatformTheme.accent
+                                                .withValues(alpha: 0.34)
+                                            : Colors.transparent,
+                                        borderRadius: BorderRadius.circular(5),
+                                        border: Border.all(
+                                          color: isFocused
+                                              ? const Color(0xFFFFE066)
+                                              : VideoPlatformTheme.borderStrong,
+                                          width: isFocused ? 2.0 : 1.0,
+                                        ),
+                                      ),
+                                      child: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Icon(
+                                            Icons.sort_rounded,
+                                            size: 15,
+                                            color: isFocused
+                                                ? Colors.white
+                                                : VideoPlatformTheme.textPrimary,
+                                          ),
+                                          const SizedBox(width: 4),
+                                          Text(
+                                            switch (_sortMode) {
+                                              'size_desc' => '大小',
+                                              'name_asc' => '名称',
+                                              'type_asc' => '类型',
+                                              _ => '时间',
+                                            },
+                                            style: TextStyle(
+                                              fontSize: 11.5,
+                                              fontWeight: isFocused
+                                                  ? FontWeight.w700
+                                                  : FontWeight.w500,
+                                              color: isFocused
+                                                  ? Colors.white
+                                                  : VideoPlatformTheme
+                                                      .textPrimary,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  );
+                                },
                               ),
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                const Icon(Icons.sort_rounded, size: 15),
-                                const SizedBox(width: 4),
-                                Text(
-                                  switch (_sortMode) {
-                                    'size_desc' => '大小',
-                                    'name_asc' => '名称',
-                                    'type_asc' => '类型',
-                                    _ => '时间',
-                                  },
-                                  style: const TextStyle(fontSize: 11.5),
-                                ),
-                              ],
-                            ),
-                          ),
+                            );
+                          },
                         ),
                         const SizedBox(width: 6),
                         IconButton(
@@ -3428,63 +3602,101 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
                           final active =
                               mId == _activeMountId && path == (_listing?.path ?? '');
                           return Center(
-                            child: InkWell(
-                              borderRadius: BorderRadius.circular(5),
-                              onTap: () async {
-                                if (_activeMountId != mId) {
-                                  await _switchMount(mId);
-                                }
-                                await _loadDirectory(path, folderTitleHint: title);
-                              },
-                              onLongPress: () async {
-                                setState(() => _bookmarkedRecords.removeAt(idx));
-                                final prefs =
-                                    await SharedPreferences.getInstance();
-                                await prefs.setStringList(
-                                  _prefBookmarksKey,
-                                  _bookmarkedRecords,
+                            child: StatefulBuilder(
+                              builder: (bmCtx, setBmState) {
+                                return InkWell(
+                                  borderRadius: BorderRadius.circular(5),
+                                  onFocusChange: (_) {
+                                    if (bmCtx.mounted) setBmState(() {});
+                                  },
+                                  onTap: () async {
+                                    if (_activeMountId != mId) {
+                                      await _switchMount(mId);
+                                    }
+                                    await _loadDirectory(
+                                      path,
+                                      folderTitleHint: title,
+                                    );
+                                  },
+                                  onLongPress: () async {
+                                    setState(
+                                      () => _bookmarkedRecords.removeAt(idx),
+                                    );
+                                    final prefs =
+                                        await SharedPreferences.getInstance();
+                                    await prefs.setStringList(
+                                      _prefBookmarksKey,
+                                      _bookmarkedRecords,
+                                    );
+                                  },
+                                  child: Builder(
+                                    builder: (ctx) {
+                                      final isFocused =
+                                          Focus.of(ctx).hasPrimaryFocus;
+                                      return Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 8,
+                                          vertical: 2.5,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: isFocused
+                                              ? VideoPlatformTheme.accent
+                                                  .withValues(alpha: 0.34)
+                                              : (active
+                                                  ? VideoPlatformTheme.accent
+                                                      .withValues(alpha: 0.16)
+                                                  : VideoPlatformTheme
+                                                      .bgElevated),
+                                          borderRadius:
+                                              BorderRadius.circular(5),
+                                          border: Border.all(
+                                            color: isFocused
+                                                ? const Color(0xFFFFE066)
+                                                : (active
+                                                    ? VideoPlatformTheme.accent
+                                                    : VideoPlatformTheme
+                                                        .borderSubtle),
+                                            width: isFocused ? 2.0 : 1.0,
+                                          ),
+                                        ),
+                                        child: Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            Icon(
+                                              Icons.folder_special_outlined,
+                                              size: 13,
+                                              color: isFocused
+                                                  ? Colors.white
+                                                  : (active
+                                                      ? VideoPlatformTheme
+                                                          .accent
+                                                      : VideoPlatformTheme
+                                                          .warning),
+                                            ),
+                                            const SizedBox(width: 4),
+                                            Text(
+                                              title,
+                                              style: TextStyle(
+                                                fontSize: 11.5,
+                                                fontWeight: (active || isFocused)
+                                                    ? FontWeight.w700
+                                                    : FontWeight.w500,
+                                                color: isFocused
+                                                    ? Colors.white
+                                                    : (active
+                                                        ? VideoPlatformTheme
+                                                            .accent
+                                                        : VideoPlatformTheme
+                                                            .textPrimary),
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      );
+                                    },
+                                  ),
                                 );
                               },
-                              child: Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 8,
-                                  vertical: 2.5,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: active
-                                      ? VideoPlatformTheme.accent
-                                          .withValues(alpha: 0.16)
-                                      : VideoPlatformTheme.bgElevated,
-                                  borderRadius: BorderRadius.circular(5),
-                                  border: Border.all(
-                                    color: active
-                                        ? VideoPlatformTheme.accent
-                                        : VideoPlatformTheme.borderSubtle,
-                                  ),
-                                ),
-                                child: Row(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    Icon(
-                                      Icons.folder_special_outlined,
-                                      size: 13,
-                                      color: active
-                                          ? VideoPlatformTheme.accent
-                                          : VideoPlatformTheme.warning,
-                                    ),
-                                    const SizedBox(width: 4),
-                                    Text(
-                                      title,
-                                      style: TextStyle(
-                                        fontSize: 11.5,
-                                        color: active
-                                            ? VideoPlatformTheme.accent
-                                            : VideoPlatformTheme.textPrimary,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
                             ),
                           );
                         },
@@ -3693,111 +3905,161 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
         itemCount: totalCount,
         itemBuilder: (_, rawIdx) {
           if (_canNavigateUp && rawIdx == 0) {
-            return InkWell(
-              borderRadius: BorderRadius.circular(12),
-              onTap: _navigateUp,
-              child: Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: VideoPlatformTheme.bgCard,
+            return StatefulBuilder(
+              builder: (upCtx, setUpState) {
+                return InkWell(
                   borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: VideoPlatformTheme.borderSubtle),
-                ),
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(
-                      Icons.drive_folder_upload_rounded,
-                      size: 36,
-                      color: VideoPlatformTheme.warning,
-                    ),
-                    const SizedBox(height: 8),
-                    const Text(
-                      '.. 返回上级目录',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
+                  onFocusChange: (_) {
+                    if (upCtx.mounted) setUpState(() {});
+                  },
+                  onTap: _navigateUp,
+                  child: Builder(
+                    builder: (ctx) {
+                      final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                      return Container(
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: isFocused
+                              ? VideoPlatformTheme.accent
+                                  .withValues(alpha: 0.28)
+                              : VideoPlatformTheme.bgCard,
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(
+                            color: isFocused
+                                ? const Color(0xFFFFE066)
+                                : VideoPlatformTheme.borderSubtle,
+                            width: isFocused ? 2.4 : 1.0,
+                          ),
+                        ),
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(
+                              Icons.drive_folder_upload_rounded,
+                              size: 36,
+                              color: isFocused
+                                  ? Colors.white
+                                  : VideoPlatformTheme.warning,
+                            ),
+                            const SizedBox(height: 8),
+                            Text(
+                              '.. 返回上级目录',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w700,
+                                color: isFocused
+                                    ? Colors.white
+                                    : VideoPlatformTheme.textPrimary,
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+                );
+              },
             );
           }
 
           final entry = entries[_canNavigateUp ? rawIdx - 1 : rawIdx];
           final checked = _selectedPaths.contains(entry.path);
-          return InkWell(
-            borderRadius: BorderRadius.circular(12),
-            onTap: () => _handleDirectEntryClick(entry),
-            onLongPress: () => _showFileActionSheet(entry),
-            onSecondaryTap: () => _showFileActionSheet(entry),
-            child: Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: checked
-                    ? VideoPlatformTheme.accent.withValues(alpha: 0.16)
-                    : VideoPlatformTheme.bgCard,
+          return StatefulBuilder(
+            builder: (gridCtx, setGridState) {
+              return InkWell(
                 borderRadius: BorderRadius.circular(12),
-                border: Border.all(
-                  color: checked
-                      ? VideoPlatformTheme.accent
-                      : VideoPlatformTheme.borderSubtle,
-                ),
-              ),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Stack(
-                    alignment: Alignment.topRight,
-                    children: [
-                      Center(
-                        child: Icon(
-                          _iconForEntry(entry),
-                          size: 38,
-                          color: _colorForEntry(entry),
+                onFocusChange: (_) {
+                  if (gridCtx.mounted) setGridState(() {});
+                },
+                onTap: () => _handleDirectEntryClick(entry),
+                onLongPress: () => _showFileActionSheet(entry),
+                onSecondaryTap: () => _showFileActionSheet(entry),
+                child: Builder(
+                  builder: (ctx) {
+                    final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                    return Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: isFocused
+                            ? VideoPlatformTheme.accent.withValues(alpha: 0.28)
+                            : (checked
+                                ? VideoPlatformTheme.accent
+                                    .withValues(alpha: 0.16)
+                                : VideoPlatformTheme.bgCard),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: isFocused
+                              ? const Color(0xFFFFE066)
+                              : (checked
+                                  ? VideoPlatformTheme.accent
+                                  : VideoPlatformTheme.borderSubtle),
+                          width: isFocused ? 2.4 : 1.0,
                         ),
                       ),
-                      if (_multiSelectMode)
-                        Icon(
-                          checked
-                              ? Icons.check_circle_rounded
-                              : Icons.radio_button_unchecked_rounded,
-                          size: 18,
-                          color: checked
-                              ? VideoPlatformTheme.accent
-                              : VideoPlatformTheme.textMuted,
-                        ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    entry.name,
-                    maxLines: 2,
-                    textAlign: TextAlign.center,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      fontSize: 12.5,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    entry.isDir
-                        ? '文件夹'
-                        : '${entry.typeTagText} · ${entry.formattedSize}',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 10.5,
-                      color: VideoPlatformTheme.textMuted,
-                    ),
-                  ),
-                ],
-              ),
-            ),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Stack(
+                            alignment: Alignment.topRight,
+                            children: [
+                              Center(
+                                child: Icon(
+                                  _iconForEntry(entry),
+                                  size: 38,
+                                  color: _colorForEntry(entry),
+                                ),
+                              ),
+                              if (_multiSelectMode)
+                                Icon(
+                                  checked
+                                      ? Icons.check_circle_rounded
+                                      : Icons.radio_button_unchecked_rounded,
+                                  size: 18,
+                                  color: checked
+                                      ? VideoPlatformTheme.accent
+                                      : VideoPlatformTheme.textMuted,
+                                ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            entry.name,
+                            maxLines: 2,
+                            textAlign: TextAlign.center,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              fontWeight: isFocused
+                                  ? FontWeight.w700
+                                  : FontWeight.w600,
+                              color: isFocused
+                                  ? Colors.white
+                                  : VideoPlatformTheme.textPrimary,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            entry.isDir
+                                ? '文件夹'
+                                : '${entry.typeTagText} · ${entry.formattedSize}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 10.5,
+                              color: isFocused
+                                  ? Colors.white70
+                                  : VideoPlatformTheme.textMuted,
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              );
+            },
           );
         },
       );
@@ -3810,33 +4072,64 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
       separatorBuilder: (_, __) => const Divider(height: 1),
       itemBuilder: (_, rawIdx) {
         if (_canNavigateUp && rawIdx == 0) {
-          return ListTile(
-            dense: true,
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(8),
-            ),
-            leading: Icon(
-              Icons.drive_folder_upload_rounded,
-              color: VideoPlatformTheme.warning,
-              size: 23,
-            ),
-            title: const Text(
-              '.. (返回上级目录)',
-              style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w700),
-            ),
-            subtitle: Text(
-              '点击直接返回上一层文件夹',
-              style: TextStyle(
-                fontSize: 11,
-                color: VideoPlatformTheme.textMuted,
-              ),
-            ),
-            trailing: Icon(
-              Icons.chevron_right_rounded,
-              size: 18,
-              color: VideoPlatformTheme.textMuted,
-            ),
-            onTap: _navigateUp,
+          return StatefulBuilder(
+            builder: (upTileCtx, setUpTileState) {
+              return Focus(
+                canRequestFocus: false,
+                onFocusChange: (_) {
+                  if (upTileCtx.mounted) setUpTileState(() {});
+                },
+                child: Builder(
+                  builder: (ctx) {
+                    final isFocused = Focus.of(ctx).hasFocus;
+                    return Container(
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(8),
+                        border: isFocused
+                            ? Border.all(
+                                color: const Color(0xFFFFE066),
+                                width: 2.2,
+                              )
+                            : null,
+                      ),
+                      child: ListTile(
+                        dense: true,
+                        focusColor: VideoPlatformTheme.accent
+                            .withValues(alpha: 0.28),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        leading: Icon(
+                          Icons.drive_folder_upload_rounded,
+                          color: VideoPlatformTheme.warning,
+                          size: 23,
+                        ),
+                        title: const Text(
+                          '.. (返回上级目录)',
+                          style: TextStyle(
+                            fontSize: 13.5,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        subtitle: Text(
+                          '点击直接返回上一层文件夹',
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: VideoPlatformTheme.textMuted,
+                          ),
+                        ),
+                        trailing: Icon(
+                          Icons.chevron_right_rounded,
+                          size: 18,
+                          color: VideoPlatformTheme.textMuted,
+                        ),
+                        onTap: _navigateUp,
+                      ),
+                    );
+                  },
+                ),
+              );
+            },
           );
         }
 
@@ -3845,108 +4138,148 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
 
         return GestureDetector(
           onSecondaryTap: () => _showFileActionSheet(entry),
-          child: ListTile(
-            dense: true,
-            selected: checked,
-            selectedTileColor:
-                VideoPlatformTheme.accent.withValues(alpha: 0.14),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(8),
-            ),
-            leading: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (_multiSelectMode) ...[
-                  Icon(
-                    checked
-                        ? Icons.check_circle_rounded
-                        : Icons.radio_button_unchecked_rounded,
-                    size: 18,
-                    color: checked
-                        ? VideoPlatformTheme.accent
-                        : VideoPlatformTheme.textMuted,
-                  ),
-                  const SizedBox(width: 8),
-                ],
-                Icon(
-                  _iconForEntry(entry),
-                  color: _colorForEntry(entry),
-                  size: 23,
+          child: StatefulBuilder(
+            builder: (tileCtx, setTileState) {
+              return Focus(
+                canRequestFocus: false,
+                onFocusChange: (_) {
+                  if (tileCtx.mounted) setTileState(() {});
+                },
+                child: Builder(
+                  builder: (ctx) {
+                    final isFocused = Focus.of(ctx).hasFocus;
+                    return Container(
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(8),
+                        border: isFocused
+                            ? Border.all(
+                                color: const Color(0xFFFFE066),
+                                width: 2.2,
+                              )
+                            : null,
+                      ),
+                      child: ListTile(
+                        dense: true,
+                        selected: checked,
+                        focusColor: VideoPlatformTheme.accent
+                            .withValues(alpha: 0.28),
+                        selectedTileColor: VideoPlatformTheme.accent
+                            .withValues(alpha: 0.14),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        leading: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            if (_multiSelectMode) ...[
+                              Icon(
+                                checked
+                                    ? Icons.check_circle_rounded
+                                    : Icons.radio_button_unchecked_rounded,
+                                size: 18,
+                                color: checked
+                                    ? VideoPlatformTheme.accent
+                                    : VideoPlatformTheme.textMuted,
+                              ),
+                              const SizedBox(width: 8),
+                            ],
+                            Icon(
+                              _iconForEntry(entry),
+                              color: _colorForEntry(entry),
+                              size: 23,
+                            ),
+                          ],
+                        ),
+                        title: Text(
+                          entry.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 13.5,
+                            fontWeight: isFocused
+                                ? FontWeight.w700
+                                : FontWeight.w600,
+                            color: isFocused
+                                ? Colors.white
+                                : VideoPlatformTheme.textPrimary,
+                          ),
+                        ),
+                        subtitle: Row(
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 5,
+                                vertical: 0.5,
+                              ),
+                              decoration: BoxDecoration(
+                                color: _colorForEntry(entry)
+                                    .withValues(alpha: 0.14),
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Text(
+                                entry.typeTagText,
+                                style: TextStyle(
+                                  fontSize: 9.5,
+                                  fontWeight: FontWeight.w700,
+                                  color: _colorForEntry(entry),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                entry.modTime.isEmpty
+                                    ? (entry.isDir
+                                        ? '点击进入文件夹'
+                                        : entry.formattedSize)
+                                    : entry.modTime,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: isFocused
+                                      ? Colors.white70
+                                      : VideoPlatformTheme.textMuted,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              entry.formattedSize,
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w500,
+                                color: isFocused
+                                    ? Colors.white
+                                    : VideoPlatformTheme.textSecondary,
+                              ),
+                            ),
+                            const SizedBox(width: 4),
+                            IconButton(
+                              visualDensity: VisualDensity.compact,
+                              tooltip:
+                                  '文件操作菜单 (下载 / 上传 / 重命名 / 复制 / 删除)',
+                              onPressed: () => _showFileActionSheet(entry),
+                              icon: Icon(
+                                Icons.more_horiz_rounded,
+                                size: 18,
+                                color: VideoPlatformTheme.textMuted,
+                              ),
+                            ),
+                          ],
+                        ),
+                        onTap: () => _handleDirectEntryClick(entry),
+                        onLongPress: () => _showFileActionSheet(entry),
+                      ),
+                    );
+                  },
                 ),
-              ],
-            ),
-            title: Text(
-              entry.name,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontSize: 13.5,
-                fontWeight: FontWeight.w600,
-                color: VideoPlatformTheme.textPrimary,
-              ),
-            ),
-            subtitle: Row(
-              children: [
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 5,
-                    vertical: 0.5,
-                  ),
-                  decoration: BoxDecoration(
-                    color: _colorForEntry(entry).withValues(alpha: 0.14),
-                    borderRadius: BorderRadius.circular(4),
-                  ),
-                  child: Text(
-                    entry.typeTagText,
-                    style: TextStyle(
-                      fontSize: 9.5,
-                      fontWeight: FontWeight.w700,
-                      color: _colorForEntry(entry),
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    entry.modTime.isEmpty
-                        ? (entry.isDir ? '点击进入文件夹' : entry.formattedSize)
-                        : entry.modTime,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: VideoPlatformTheme.textMuted,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            trailing: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  entry.formattedSize,
-                  style: TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w500,
-                    color: VideoPlatformTheme.textSecondary,
-                  ),
-                ),
-                const SizedBox(width: 4),
-                IconButton(
-                  visualDensity: VisualDensity.compact,
-                  tooltip: '文件操作菜单 (下载 / 上传 / 重命名 / 复制 / 删除)',
-                  onPressed: () => _showFileActionSheet(entry),
-                  icon: Icon(
-                    Icons.more_horiz_rounded,
-                    size: 18,
-                    color: VideoPlatformTheme.textMuted,
-                  ),
-                ),
-              ],
-            ),
-            onTap: () => _handleDirectEntryClick(entry),
-            onLongPress: () => _showFileActionSheet(entry),
+              );
+            },
           ),
         );
       },
