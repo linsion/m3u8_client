@@ -2589,10 +2589,18 @@ class _TelegramScreenState extends State<TelegramScreen> {
     if (lower.endsWith('.mkv')) return 'video/x-matroska';
     if (lower.endsWith('.webm')) return 'video/webm';
     if (lower.endsWith('.mp3')) return 'audio/mpeg';
-    if (lower.endsWith('.m4a')) return 'audio/mp4';
-    if (lower.endsWith('.wav')) return 'audio/wav';
+    if (lower.endsWith('.m4a') || lower.endsWith('.alac')) return 'audio/mp4';
+    if (lower.endsWith('.aac')) return 'audio/aac';
+    if (lower.endsWith('.wav') || lower.endsWith('.wave')) return 'audio/wav';
     if (lower.endsWith('.flac')) return 'audio/flac';
-    if (lower.endsWith('.ogg') || lower.endsWith('.opus')) return 'audio/ogg';
+    if (lower.endsWith('.ape') || lower.endsWith('.mac')) return 'audio/x-ape';
+    if (lower.endsWith('.aiff') || lower.endsWith('.aif')) return 'audio/aiff';
+    if (lower.endsWith('.wma')) return 'audio/x-ms-wma';
+    if (lower.endsWith('.ogg') ||
+        lower.endsWith('.oga') ||
+        lower.endsWith('.opus')) {
+      return 'audio/ogg';
+    }
     if (lower.endsWith('.pdf')) return 'application/pdf';
     if (lower.endsWith('.zip')) return 'application/zip';
     if (lower.endsWith('.json')) return 'application/json';

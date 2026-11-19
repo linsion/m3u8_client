@@ -148,21 +148,6 @@ class _MobileEdgeSwipeBackState extends State<MobileEdgeSwipeBack> {
         fit: StackFit.passthrough,
         children: [
           widget.child,
-          // Narrow 22px left-edge horizontal-drag guard so horizontal ScrollViews
-          // or video seek bars don't steal left-edge back swipes, while taps and
-          // vertical scrolls pass through normally.
-          Positioned(
-            left: 0,
-            top: 0,
-            bottom: 0,
-            width: 22,
-            child: GestureDetector(
-              behavior: HitTestBehavior.translucent,
-              onHorizontalDragStart: (_) {},
-              onHorizontalDragUpdate: (_) {},
-              onHorizontalDragEnd: (_) {},
-            ),
-          ),
           if (_isCommitted && _dragDx > 6)
             Positioned(
               left: (_dragDx * 0.38 - 18).clamp(-16.0, 36.0),

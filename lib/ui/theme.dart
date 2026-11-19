@@ -236,6 +236,8 @@ class VideoPlatformTheme {
 
     return ThemeData(
       useMaterial3: true,
+      visualDensity: VisualDensity.compact,
+      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
       brightness: p.brightness,
       scaffoldBackgroundColor: p.bgPrimary,
       colorScheme: colorScheme,
@@ -304,6 +306,9 @@ class VideoPlatformTheme {
       ),
       filledButtonTheme: FilledButtonThemeData(
         style: ButtonStyle(
+          visualDensity: VisualDensity.compact,
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          minimumSize: WidgetStateProperty.all(const Size(44, 34)),
           backgroundColor: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.disabled)) {
               return p.bgHover;
@@ -320,11 +325,11 @@ class VideoPlatformTheme {
           ),
           shadowColor: WidgetStateProperty.all(p.accent.withValues(alpha: 0.85)),
           padding: WidgetStateProperty.all(
-            const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+            const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
           ),
           side: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.focused)) {
-              return const BorderSide(color: Colors.white, width: 2.6);
+              return const BorderSide(color: Colors.white, width: 2.2);
             }
             return BorderSide.none;
           }),
@@ -335,7 +340,8 @@ class VideoPlatformTheme {
           ),
           textStyle: WidgetStateProperty.all(
             const TextStyle(
-              fontSize: 13,
+              fontSize: 12.5,
+              height: 1.2,
               fontWeight: FontWeight.w600,
             ),
           ),
@@ -343,6 +349,9 @@ class VideoPlatformTheme {
       ),
       outlinedButtonTheme: OutlinedButtonThemeData(
         style: ButtonStyle(
+          visualDensity: VisualDensity.compact,
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          minimumSize: WidgetStateProperty.all(const Size(44, 34)),
           backgroundColor: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.focused)) {
               return p.accent.withValues(alpha: 0.34);
@@ -364,12 +373,12 @@ class VideoPlatformTheme {
           shadowColor: WidgetStateProperty.all(p.accent.withValues(alpha: 0.7)),
           side: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.focused)) {
-              return const BorderSide(color: Colors.white, width: 2.5);
+              return const BorderSide(color: Colors.white, width: 2.2);
             }
             return BorderSide(color: p.borderStrong);
           }),
           padding: WidgetStateProperty.all(
-            const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
           ),
           shape: WidgetStateProperty.all(
             RoundedRectangleBorder(
@@ -378,7 +387,8 @@ class VideoPlatformTheme {
           ),
           textStyle: WidgetStateProperty.all(
             const TextStyle(
-              fontSize: 13,
+              fontSize: 12.5,
+              height: 1.2,
               fontWeight: FontWeight.w600,
             ),
           ),
@@ -386,6 +396,9 @@ class VideoPlatformTheme {
       ),
       textButtonTheme: TextButtonThemeData(
         style: ButtonStyle(
+          visualDensity: VisualDensity.compact,
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          minimumSize: WidgetStateProperty.all(const Size(40, 32)),
           backgroundColor: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.focused)) {
               return p.accent.withValues(alpha: 0.34);
@@ -403,12 +416,12 @@ class VideoPlatformTheme {
           }),
           side: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.focused)) {
-              return const BorderSide(color: Colors.white, width: 2.4);
+              return const BorderSide(color: Colors.white, width: 2.0);
             }
             return BorderSide.none;
           }),
           padding: WidgetStateProperty.all(
-            const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
           ),
           shape: WidgetStateProperty.all(
             RoundedRectangleBorder(
@@ -417,10 +430,19 @@ class VideoPlatformTheme {
           ),
           textStyle: WidgetStateProperty.all(
             const TextStyle(
-              fontSize: 13,
+              fontSize: 12.5,
+              height: 1.2,
               fontWeight: FontWeight.w600,
             ),
           ),
+        ),
+      ),
+      chipTheme: ChipThemeData(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        labelStyle: TextStyle(
+          fontSize: 12,
+          height: 1.2,
+          color: p.textPrimary,
         ),
       ),
       iconButtonTheme: IconButtonThemeData(

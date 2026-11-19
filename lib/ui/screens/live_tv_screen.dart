@@ -610,9 +610,9 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
         'stream-buffer-size': '1048576',
         'vd-lavc-threads': Platform.isAndroid ? '4' : '0',
         'ad-lavc-threads': '0',
-        'demuxer-lavf-probesize': '131072',
-        'demuxer-lavf-analyzeduration': '0.5',
-        'network-timeout': '12',
+        'demuxer-lavf-probesize': '524288',
+        'demuxer-lavf-analyzeduration': '2.0',
+        'network-timeout': '14',
         'tls-verify': 'no',
         // Never set force-seekable=yes or loop-file=inf on live streams:
         // AndroidVideoController.widListener calls player.seek() on surface resize,
@@ -622,9 +622,6 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
         // Enable FFmpeg/libavformat HTTP stream auto-reconnect
         'stream-lavf-o':
             'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=4xx,5xx,reconnect_delay_max=5',
-        // Enable HTTP persistent keep-alive and pipelining
-        'demuxer-lavf-o':
-            'seg_max_retry=10,live_start_index=-1,http_persistent=1,http_multiple=1,allowed_extensions=ALL',
       };
       for (final entry in props.entries) {
         await platform.setProperty(entry.key.trim(), entry.value);
@@ -852,7 +849,20 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
       Map<String, String> headers = resolved.directUrl.isNotEmpty
           ? {...resolved.headers}
           : {...widget.appState.api.authHeaders};
-      await p.open(Media(playUrl, httpHeaders: headers), play: true);
+      final relayed = await widget.appState.proxyService.resolveProxiedStreamUrl(
+        RequestScenario.liveStream,
+        playUrl,
+        headers: headers,
+      );
+      if (!mounted || _subPlayers[slot] != p) return;
+      final useRelay = relayed != playUrl && relayed.contains('/__m3u8_proxy__/');
+      await p.open(
+        Media(
+          useRelay ? relayed : playUrl,
+          httpHeaders: useRelay ? const {} : headers,
+        ),
+        play: true,
+      );
       _syncMultiViewAudioFocus();
     } catch (_) {}
   }
@@ -1043,7 +1053,8 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
       );
       if (!mounted || sessionId != _playSessionId) return;
 
-      final forceProxy = _useServerProxy || resolved.backendProxyPlayback;
+      final forceProxy = _useServerProxy ||
+          (resolved.backendProxyPlayback && resolved.directUrl.isEmpty);
       String playUrl = resolved.directUrl;
       Map<String, String> headers = {...resolved.headers};
       String routeLabel = '客户端直连';
@@ -1073,7 +1084,9 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
       if (relayed != playUrl && relayed.contains('/__m3u8_proxy__/')) {
         finalPlayUrl = relayed;
         usingStreamRelay = true;
-        routeLabel = '客户端代理';
+        if (!relayed.contains('direct=1')) {
+          routeLabel = '客户端代理';
+        }
       }
 
       final parsedPlayUri = Uri.tryParse(finalPlayUrl.trim());
@@ -1124,7 +1137,19 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
       // Start startup watchdog: if this signal line hangs without producing any
       // video frames or downstream bytes and there are untested backup lines, switch automatically.
       _startupTimer?.cancel();
-      final watchdogMs = usingStreamRelay ? 5600 : 3500;
+      final lowerPlayUrl = finalPlayUrl.toLowerCase();
+      final lowerRawUrl = rawUrl.toLowerCase();
+      final isFlvLiveStream = lowerPlayUrl.contains('.flv') ||
+          lowerPlayUrl.contains('douyu') ||
+          lowerPlayUrl.contains('huya') ||
+          lowerPlayUrl.contains('yy.com') ||
+          lowerRawUrl.contains('ottiptv.cc') ||
+          lowerRawUrl.contains('/douyu/') ||
+          lowerRawUrl.contains('/huya/') ||
+          lowerRawUrl.contains('/yy/');
+      final watchdogMs = isFlvLiveStream
+          ? 12000
+          : (usingStreamRelay ? 6500 : 5000);
       _startupTimer = Timer(Duration(milliseconds: watchdogMs), () {
         if (!mounted || sessionId != _playSessionId) return;
         final hasFlow =

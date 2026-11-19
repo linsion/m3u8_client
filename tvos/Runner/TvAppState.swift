@@ -1,4 +1,5 @@
 import AVFoundation
+import Compression
 import Foundation
 import Network
 import SwiftUI
@@ -88,13 +89,13 @@ final class TvAppState: ObservableObject {
   var appVersion: String {
     let raw = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String)?
       .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    return (raw.isEmpty || raw.contains("$(")) ? "1.2.0" : raw
+    return (raw.isEmpty || raw.contains("$(")) ? "1.2.1" : raw
   }
 
   var appBuildNumber: String {
     let raw = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String)?
       .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    return (raw.isEmpty || raw.contains("$(")) ? "32" : raw
+    return (raw.isEmpty || raw.contains("$(")) ? "33" : raw
   }
 
   var appFullVersion: String {
@@ -287,9 +288,64 @@ final class TvAppState: ObservableObject {
   @Published var extractedCandidates: [TvExtractedCandidate] = []
   @Published var isExtractingWeb: Bool = false
 
-  // 6. Server Media Library (/api/files)
+  // 6. Server Media Library & Multi-Storage File Manager (Server / AList / WebDAV / 115 / Local Cache)
   @Published var fileListing: TvFileListing = TvFileListing(path: "", parent: "", root: "/", entries: [])
+  @Published var displayedFileEntries: [TvFileEntry] = []
+  @Published var visibleFileLimit: Int = 80
   @Published var isLoadingFiles: Bool = false
+  @Published var isLoadingMoreFiles: Bool = false
+  @Published var fileManagerError: String? = nil
+  @Published var storageMounts: [TvStorageMount] = []
+  @Published var activeStorageMountId: String = "builtin_server"
+  @Published var fileTransferTasks: [TvFileTransferTask] = []
+  @Published var fileClipboard: TvFileClipboardItem? = nil
+  @Published var fileFavoritePaths: [String] = [] // Format: "<mountId>::<name>::<path>"
+  @Published var fileSortOption: TvFileSortOption = .dateDesc {
+    didSet { recomputeDisplayedFileEntries() }
+  }
+  @Published var fileCategoryFilter: TvFileCategoryFilter = .all {
+    didSet { recomputeDisplayedFileEntries() }
+  }
+  @Published var fileViewIsGrid: Bool = false
+  @Published var fileSearchKeyword: String = "" {
+    didSet { recomputeDisplayedFileEntries() }
+  }
+  @Published var fileMultiSelectMode: Bool = false
+  @Published var fileSelectedPaths: Set<String> = []
+  @Published var cloud115Breadcrumbs: [(cid: String, name: String)] = [("0", "115根目录")]
+  private var loadFilesGeneration: Int = 0
+
+  // 6b. Cloud Hi-Fi Music Player State (115 / AList / WebDAV / Server / Local Cache)
+  @Published var cloudMusicQueue: [TvFileEntry] = []
+  @Published var cloudMusicCurrentIndex: Int = -1
+  @Published var isCloudMusicPlaying: Bool = false
+  @Published var isCloudMusicLoading: Bool = false
+  @Published var cloudMusicPosition: Double = 0
+  @Published var cloudMusicDuration: Double = 0
+  @Published var cloudMusicSpeed: Float = 1.0
+  @Published var cloudMusicPlayMode: String = "repeatAll" // repeatAll, repeatOne, shuffle, sequential
+  @Published var cloudMusicErrorText: String = ""
+  @Published var cloudMusicSubtitle: String = ""
+  @Published var cloudMusicCoverImage: UIImage? = nil
+  @Published var cloudMusicLyrics: [TvCloudLrcLine] = []
+  @Published var cloudMusicLyricsSource: String = ""
+  @Published var isCloudMusicLoadingLyrics: Bool = false
+  @Published var showCloudMusicFullscreen: Bool = false
+  @Published var savedMusicFolders: [TvSavedMusicFolderItem] = []
+  @Published var isScanningMusicFolders: Bool = false
+  @Published var scanningMusicStatusText: String = ""
+  @Published var activeArchiveMusicBrowserEntry: TvFileEntry? = nil
+  @Published var showMusicFolderPickerSheet: Bool = false
+  var musicFolderPickerBackHandler: (() -> Bool)? = nil
+  private var cloudMusicPlayer: AVPlayer? = nil
+  private var cloudMusicTimeObserver: Any? = nil
+  private var cloudMusicEndObserver: NSObjectProtocol? = nil
+  private var cloudMusicFailObserver: NSObjectProtocol? = nil
+  private var cloudMusicOpenSeq: Int = 0
+  private var cloudMusicRetriedWithProxy: Bool = false
+  private var cloudMusicDirectorySiblingsByKey: [String: [TvFileEntry]] = [:]
+  private var archiveInspectionCache: [String: [TvFileEntry]] = [:]
+  private var extractedArchiveTempFileCache: [String: URL] = [:]
 
   // 7. Proxy, Multi-Subscription & Scenario Routing (1:1 Parity with ProxyRoutingService)
   @Published var proxyEnabled: Bool = false
@@ -451,6 +507,31 @@ final class TvAppState: ObservableObject {
       }
     }
     self.scenarioRules = defaultRules
+    if let initialNode = self.fastestProxyNode ?? self.activeProxyNode {
+      TvLocalProxyTunnelServer.shared.seedFallbackNode(initialNode)
+    }
+
+    // Load persisted storage mounts (Built-in Server, 115 Cloud Drive, Local Cache + custom AList / WebDAV mounts)
+    let builtInMounts: [TvStorageMount] = [
+      TvStorageMount(id: "builtin_server", name: "流光服务端", kind: .server, rootPath: "/", enabled: true),
+      TvStorageMount(id: "builtin_115", name: "115 网盘直连", kind: .cloud115, rootPath: "0", enabled: true),
+      TvStorageMount(id: "builtin_local", name: "Apple TV 本机缓存", kind: .localCache, rootPath: "/", enabled: true)
+    ]
+    if let mountData = UserDefaults.standard.data(forKey: "tv_storage_mounts_v1"),
+       let customMounts = try? JSONDecoder().decode([TvStorageMount].self, from: mountData) {
+      let filteredCustom = customMounts.filter { !$0.isBuiltIn }
+      self.storageMounts = builtInMounts + filteredCustom
+    } else {
+      self.storageMounts = builtInMounts
+    }
+    if let savedFavPaths = UserDefaults.standard.stringArray(forKey: "tv_file_fav_paths_v1") {
+      self.fileFavoritePaths = savedFavPaths
+    }
+    if let savedMusicData = UserDefaults.standard.data(forKey: "tv_saved_music_folders_v1"),
+       let decodedMusic = try? JSONDecoder().decode([TvSavedMusicFolderItem].self, from: savedMusicData) {
+      self.savedMusicFolders = decodedMusic
+    }
+    self.fileViewIsGrid = UserDefaults.standard.bool(forKey: "tv_file_view_grid_v1")
   }
 
   func showToast(_ message: String) {
@@ -631,7 +712,30 @@ final class TvAppState: ObservableObject {
           return
         }
       case .mediaLibrary:
-        if !fileListing.path.isEmpty && fileListing.path != fileListing.root {
+        if fileMultiSelectMode {
+          fileMultiSelectMode = false
+          fileSelectedPaths.removeAll()
+          return
+        }
+        if !fileSearchKeyword.isEmpty {
+          fileSearchKeyword = ""
+          return
+        }
+        if fileCategoryFilter != .all {
+          fileCategoryFilter = .all
+          return
+        }
+        if activeStorageMount.kind == .cloud115 {
+          if !fileListing.path.isEmpty && fileListing.path != "0" {
+            if cloud115Breadcrumbs.count >= 2 {
+              let prev = cloud115Breadcrumbs[cloud115Breadcrumbs.count - 2]
+              Task { await loadFiles(path: prev.cid, folderTitleHint: prev.name) }
+            } else {
+              Task { await loadFiles(path: "0", folderTitleHint: "115根目录") }
+            }
+            return
+          }
+        } else if !fileListing.path.isEmpty && fileListing.path != fileListing.root && fileListing.path != "/" {
           Task { await loadFiles(path: fileListing.parent) }
           return
         }
@@ -810,6 +914,14 @@ final class TvAppState: ObservableObject {
       await refreshDownloadTasks()
       await loadFiles(path: "")
       await refresh115Status()
+      if self.subscriptionNodes.isEmpty {
+        await refreshAllSubscriptions(silent: true)
+      } else if let best = self.fastestProxyNode ?? self.activeProxyNode {
+        let backups = self.activePoolNodes
+          .filter(\.isSupportedByClientTunnel)
+          .sorted { ($0.latencyMs ?? 9999) < ($1.latencyMs ?? 9999) }
+        TvLocalProxyTunnelServer.shared.seedFallbackNode(best, backupNodes: backups)
+      }
     }
   }
 
@@ -1511,7 +1623,7 @@ final class TvAppState: ObservableObject {
         forceServerRelay: useRelay
       )
       var headers = resolved.headers
-      if !api.cookieHeaderValue.isEmpty {
+      if !api.cookieHeaderValue.isEmpty && (resolved.directUrl.contains("/api/") || resolved.backendProxyPlayback) {
         headers["Cookie"] = api.cookieHeaderValue
       }
       self.playerControlsVisible = true
@@ -1529,7 +1641,10 @@ final class TvAppState: ObservableObject {
         playGroupIndex: 0,
         episodeIndex: 0,
         liveChannel: channel,
-        liveUrlIndex: idx
+        liveUrlIndex: idx,
+        isFlvHardwareStream: resolved.isFlvHardwareStream,
+        flvPrimaryUrl: resolved.flvPrimaryUrl,
+        flvGatewayUrl: resolved.flvGatewayUrl
       )
     }
   }
@@ -2412,24 +2527,462 @@ final class TvAppState: ObservableObject {
     )
   }
 
-  // MARK: - 7. Server Media Library (/api/files)
+  // MARK: - 7. Multi-Storage File Manager (Server / AList / WebDAV / 115 / Apple TV Local Cache) & Transfer Engine
 
-  func loadFiles(path: String) async {
+  var activeStorageMount: TvStorageMount {
+    storageMounts.first(where: { $0.id == activeStorageMountId })
+      ?? TvStorageMount(id: "builtin_server", name: "流光服务端", kind: .server, rootPath: "/", enabled: true)
+  }
+
+  private func persistStorageMounts() {
+    let customOnly = storageMounts.filter { !$0.isBuiltIn }
+    if let data = try? JSONEncoder().encode(customOnly) {
+      defaults.set(data, forKey: "tv_storage_mounts_v1")
+    }
+  }
+
+  @discardableResult
+  func upsertStorageMount(
+    id: String? = nil,
+    name: String,
+    kind: TvStorageSourceKind,
+    baseUrl: String,
+    username: String,
+    password: String,
+    token: String,
+    rootPath: String
+  ) -> TvStorageMount {
+    let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      ? "\(kind.title) (\(URL(string: baseUrl)?.host ?? "远程盘"))"
+      : name.trimmingCharacters(in: .whitespacesAndNewlines)
+    let cleanRoot = rootPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      ? "/"
+      : TvRemoteStorageClient.normalizePath(rootPath)
+    if let editId = id, let idx = storageMounts.firstIndex(where: { $0.id == editId }) {
+      storageMounts[idx].name = cleanName
+      storageMounts[idx].kind = kind
+      storageMounts[idx].baseUrl = baseUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+      storageMounts[idx].username = username.trimmingCharacters(in: .whitespacesAndNewlines)
+      storageMounts[idx].password = password
+      storageMounts[idx].token = token.trimmingCharacters(in: .whitespacesAndNewlines)
+      storageMounts[idx].rootPath = cleanRoot
+      persistStorageMounts()
+      showToast("✓ 已更新挂载存储：\(cleanName)")
+      return storageMounts[idx]
+    }
+    let mount = TvStorageMount(
+      id: "mount_\(Int(Date().timeIntervalSince1970 * 1000))",
+      name: cleanName,
+      kind: kind,
+      baseUrl: baseUrl.trimmingCharacters(in: .whitespacesAndNewlines),
+      username: username.trimmingCharacters(in: .whitespacesAndNewlines),
+      password: password,
+      token: token.trimmingCharacters(in: .whitespacesAndNewlines),
+      rootPath: cleanRoot,
+      enabled: true
+    )
+    storageMounts.append(mount)
+    persistStorageMounts()
+    showToast("✓ 已挂载 \(kind.title)：\(cleanName)")
+    return mount
+  }
+
+  func deleteStorageMount(_ mountId: String) {
+    guard let mount = storageMounts.first(where: { $0.id == mountId }), !mount.isBuiltIn else { return }
+    storageMounts.removeAll { $0.id == mountId }
+    persistStorageMounts()
+    if activeStorageMountId == mountId {
+      switchStorageMount("builtin_server")
+    }
+    showToast("已卸载远程存储：\(mount.name)")
+  }
+
+  func recomputeDisplayedFileEntries() {
+    let keyword = fileSearchKeyword.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let cat = fileCategoryFilter
+    let raw = fileListing.entries
+    let filtered = raw.filter { entry in
+      if !keyword.isEmpty && !entry.name.lowercased().contains(keyword) {
+        return false
+      }
+      if entry.isDir {
+        return true
+      }
+      switch cat {
+      case .all:
+        return true
+      case .video:
+        return entry.isVideo
+      case .audio:
+        return entry.isAudio
+      case .image:
+        return entry.isImage
+      case .document:
+        return entry.isTextPreviewable || entry.isArchive
+      }
+    }
+
+    let useFastCompare = filtered.count > 250
+    let sortOpt = fileSortOption
+    displayedFileEntries = filtered.sorted { a, b in
+      if a.isDir != b.isDir {
+        return a.isDir && !b.isDir
+      }
+      switch sortOpt {
+      case .nameAsc:
+        if useFastCompare { return a.name < b.name }
+        return a.name.localizedStandardCompare(b.name) == .orderedAscending
+      case .sizeDesc:
+        if a.size != b.size { return a.size > b.size }
+        return a.name < b.name
+      case .dateDesc:
+        if a.modTime != b.modTime { return a.modTime > b.modTime }
+        return a.name < b.name
+      case .typeAsc:
+        if a.normalizedExt != b.normalizedExt { return a.normalizedExt < b.normalizedExt }
+        return a.name < b.name
+      }
+    }
+  }
+
+  func switchStorageMount(_ mountId: String) {
+    guard let mount = storageMounts.first(where: { $0.id == mountId }) else { return }
+    loadFilesGeneration &+= 1
+    activeStorageMountId = mount.id
+    fileMultiSelectMode = false
+    fileSelectedPaths.removeAll()
+    fileSearchKeyword = ""
+    fileManagerError = nil
+    visibleFileLimit = 80
+    let initialPath = mount.kind == .cloud115 ? "0" : (mount.kind == .server ? "" : mount.rootPath)
+    let initialRoot = mount.kind == .cloud115 ? "0" : (mount.kind == .server ? "/" : mount.rootPath)
+    fileListing = TvFileListing(path: initialPath, parent: "", root: initialRoot, entries: [])
+    displayedFileEntries = []
+    if mount.kind == .cloud115 {
+      cloud115Breadcrumbs = [("0", "115根目录")]
+    }
+    Task {
+      await loadFiles(path: initialPath)
+    }
+  }
+
+  func toggleFileViewMode() {
+    fileViewIsGrid.toggle()
+    defaults.set(fileViewIsGrid, forKey: "tv_file_view_grid_v1")
+  }
+
+  func toggleFavoriteCurrentDirectory() {
+    let mount = activeStorageMount
+    let curPath = fileListing.path.isEmpty ? mount.rootPath : fileListing.path
+    let folderName: String = {
+      if mount.kind == .cloud115 {
+        return cloud115Breadcrumbs.last?.name ?? "115目录"
+      }
+      let last = (curPath as NSString).lastPathComponent
+      return (last.isEmpty || last == "/") ? mount.name : last
+    }()
+    let keyPrefix = "\(mount.id)::"
+    let existingIdx = fileFavoritePaths.firstIndex(where: { item in
+      let parts = item.components(separatedBy: "::")
+      return parts.count >= 3 && parts[0] == mount.id && parts.dropFirst(2).joined(separator: "::") == curPath
+    })
+    if let idx = existingIdx {
+      fileFavoritePaths.remove(at: idx)
+      defaults.set(fileFavoritePaths, forKey: "tv_file_fav_paths_v1")
+      showToast("已取消收藏目录：\(folderName)")
+    } else {
+      let record = "\(keyPrefix)\(folderName)::\(curPath)"
+      fileFavoritePaths.insert(record, at: 0)
+      defaults.set(fileFavoritePaths, forKey: "tv_file_fav_paths_v1")
+      showToast("★ 已收藏常用目录：\(folderName)")
+    }
+  }
+
+  var isCurrentDirectoryFavorited: Bool {
+    let mount = activeStorageMount
+    let curPath = fileListing.path.isEmpty ? mount.rootPath : fileListing.path
+    return fileFavoritePaths.contains(where: { item in
+      let parts = item.components(separatedBy: "::")
+      return parts.count >= 3 && parts[0] == mount.id && parts.dropFirst(2).joined(separator: "::") == curPath
+    })
+  }
+
+  nonisolated static func localOfflineRootUrl() -> URL {
+    let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+      ?? URL(fileURLWithPath: NSTemporaryDirectory())
+    let dir = base.appendingPathComponent("TvOfflineFiles", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir
+  }
+
+  nonisolated static func resolveLocalOfflineUrl(relativePath: String) -> URL {
+    let root = localOfflineRootUrl()
+    let clean = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    if clean.isEmpty { return root }
+    return root.appendingPathComponent(clean)
+  }
+
+  private func listLocalOfflineDirectory(path: String) -> TvFileListing {
+    let norm = TvRemoteStorageClient.normalizePath(path)
+    let targetUrl = Self.resolveLocalOfflineUrl(relativePath: norm)
+    let fm = FileManager.default
+    try? fm.createDirectory(at: targetUrl, withIntermediateDirectories: true)
+    let items = (try? fm.contentsOfDirectory(
+      at: targetUrl,
+      includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey],
+      options: [.skipsHiddenFiles]
+    )) ?? []
+    let df = DateFormatter()
+    df.dateFormat = "yyyy-MM-dd HH:mm"
+
+    var entries: [TvFileEntry] = []
+    for itemUrl in items {
+      let vals = try? itemUrl.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey])
+      let isDir = vals?.isDirectory == true
+      let size = Int64(vals?.fileSize ?? 0)
+      let modDate = vals?.contentModificationDate ?? Date()
+      let name = itemUrl.lastPathComponent
+      let itemPath = TvRemoteStorageClient.joinPath(norm, name)
+      let ext = isDir ? "" : ".\(itemUrl.pathExtension.lowercased())"
+      entries.append(
+        TvFileEntry(
+          name: name,
+          path: itemPath,
+          size: size,
+          modTime: df.string(from: modDate),
+          isDir: isDir,
+          isMp4: ext == ".mp4",
+          ext: ext,
+          mountId: "builtin_local",
+          sourceKind: .localCache,
+          rawDownloadUrl: itemUrl.absoluteString
+        )
+      )
+    }
+
+    return TvFileListing(
+      path: norm,
+      parent: TvRemoteStorageClient.parentPath(of: norm),
+      root: "/",
+      entries: entries
+    )
+  }
+
+  func loadFiles(path: String, folderTitleHint: String? = nil) async {
+    loadFilesGeneration &+= 1
+    let reqGen = loadFilesGeneration
+    let mount = activeStorageMount
+    let reqMountId = mount.id
+
     isLoadingFiles = true
-    defer { isLoadingFiles = false }
-    if let listing = try? await api.fetchFiles(path: path) {
+    fileManagerError = nil
+    visibleFileLimit = 80
+    defer {
+      if reqGen == self.loadFilesGeneration {
+        isLoadingFiles = false
+      }
+    }
+
+    do {
+      let listing: TvFileListing
+      switch mount.kind {
+      case .server:
+        listing = try await api.fetchFiles(path: path)
+
+      case .alist:
+        listing = try await TvRemoteStorageClient.shared.listAlistDirectory(mount: mount, path: path, page: 1, perPage: 250)
+
+      case .webdav:
+        listing = try await TvRemoteStorageClient.shared.listWebdavDirectory(mount: mount, path: path)
+
+      case .cloud115:
+        if !TvLocal115DirectClient.shared.hasLocalCookie {
+          let srvSettings = await api.fetchServerSettings()
+          let srvCookie = TvApiClient.stringValue(
+            srvSettings["cookie_115"],
+            fallback: TvApiClient.stringValue(
+              srvSettings["115_cookie"],
+              fallback: TvApiClient.stringValue(srvSettings["cookies"])
+            )
+          )
+          let norm = TvLocal115DirectClient.normalizeCookieString(srvCookie)
+          if norm.contains("UID=") && norm.contains("CID=") && norm.contains("SEID=") {
+            TvLocal115DirectClient.shared.savedCookie = norm
+            self.is115LoggedIn = true
+          }
+        }
+        let targetCid = (path.isEmpty || path == "/") ? "0" : path
+        listing = try await TvLocal115DirectClient.shared.list115Directory(cid: targetCid, mountId: mount.id, page: 1, perPage: 100)
+        guard reqGen == self.loadFilesGeneration, reqMountId == self.activeStorageMountId else { return }
+        if targetCid == "0" {
+          self.cloud115Breadcrumbs = [("0", "115根目录")]
+        } else if let existingIdx = self.cloud115Breadcrumbs.firstIndex(where: { $0.cid == targetCid }) {
+          self.cloud115Breadcrumbs = Array(self.cloud115Breadcrumbs.prefix(existingIdx + 1))
+        } else {
+          let title = folderTitleHint ?? "目录 \(targetCid.prefix(6))"
+          self.cloud115Breadcrumbs.append((targetCid, title))
+        }
+
+      case .localCache:
+        listing = listLocalOfflineDirectory(path: path)
+      }
+
+      guard reqGen == self.loadFilesGeneration, reqMountId == self.activeStorageMountId else { return }
       self.fileListing = listing
+      self.recomputeDisplayedFileEntries()
+    } catch {
+      guard reqGen == self.loadFilesGeneration, reqMountId == self.activeStorageMountId else { return }
+      let fallbackPath = mount.kind == .cloud115 ? ((path.isEmpty || path == "/") ? "0" : path) : path
+      let fallbackRoot = mount.kind == .cloud115 ? "0" : mount.rootPath
+      self.fileListing = TvFileListing(path: fallbackPath, parent: "", root: fallbackRoot, entries: [])
+      self.recomputeDisplayedFileEntries()
+      self.fileManagerError = error.localizedDescription
+      self.showToast("⚠️ 读取目录失败：\(error.localizedDescription)")
+    }
+  }
+
+  /// Appends the next page of directory entries for paginated storage sources (AList / 115) so directories with thousands of files never freeze
+  func loadNextPageOfFiles() async {
+    guard !isLoadingFiles, !isLoadingMoreFiles, fileListing.hasMoreRemotePages else { return }
+    let mount = activeStorageMount
+    let nextPage = fileListing.currentPage + 1
+    let curPath = fileListing.path
+    let reqGen = loadFilesGeneration
+
+    isLoadingMoreFiles = true
+    defer { isLoadingMoreFiles = false }
+
+    do {
+      let nextListing: TvFileListing
+      switch mount.kind {
+      case .alist:
+        nextListing = try await TvRemoteStorageClient.shared.listAlistDirectory(
+          mount: mount,
+          path: curPath,
+          page: nextPage,
+          perPage: 250
+        )
+      case .cloud115:
+        nextListing = try await TvLocal115DirectClient.shared.list115Directory(
+          cid: curPath.isEmpty ? "0" : curPath,
+          mountId: mount.id,
+          page: nextPage,
+          perPage: 100
+        )
+      default:
+        return
+      }
+      guard reqGen == self.loadFilesGeneration, mount.id == self.activeStorageMountId else { return }
+      guard !nextListing.entries.isEmpty else {
+        self.fileListing.totalCount = self.fileListing.entries.count
+        return
+      }
+      let existingIds = Set(self.fileListing.entries.map(\.id))
+      let uniqueNew = nextListing.entries.filter { !existingIds.contains($0.id) }
+      self.fileListing.entries.append(contentsOf: uniqueNew)
+      self.fileListing.currentPage = nextPage
+      self.fileListing.totalCount = max(nextListing.totalCount, self.fileListing.entries.count)
+      self.recomputeDisplayedFileEntries()
+      self.visibleFileLimit += 100
+    } catch {
+      showToast("⚠️ 加载下一页失败：\(error.localizedDescription)")
+    }
+  }
+
+  /// Resolves a direct HTTP stream / download URL and headers for any file entry across all 5 storage sources
+  func resolveFileStreamEndpoint(_ entry: TvFileEntry) async throws -> (url: String, headers: [String: String], subtitle: String) {
+    let mount = storageMounts.first(where: { $0.id == entry.mountId }) ?? activeStorageMount
+    switch entry.sourceKind {
+    case .server:
+      let url = api.buildFileStreamUrl(path: entry.path)
+      return (url, api.authHeaders, "流光服务端 · \(entry.formattedSize)")
+
+    case .alist:
+      let info = try await TvRemoteStorageClient.shared.resolveAlistStreamInfo(
+        mount: mount,
+        path: entry.path,
+        fallbackUrl: entry.rawDownloadUrl
+      )
+      return (info.url, info.headers, "\(mount.name) · \(entry.formattedSize)")
+
+    case .webdav:
+      let url = TvRemoteStorageClient.shared.buildWebdavUrl(mount: mount, path: entry.path)?.absoluteString ?? entry.rawDownloadUrl
+      let headers = TvRemoteStorageClient.shared.webdavAuthHeaders(for: mount)
+      return (url, headers, "\(mount.name) · \(entry.formattedSize)")
+
+    case .cloud115:
+      guard !entry.pickcode115.isEmpty else {
+        throw NSError(domain: "Tv115", code: -1, userInfo: [NSLocalizedDescriptionKey: "无法获取 115 文件直链，请确认登录状态"])
+      }
+      let directUrl: String?
+      if entry.isImage {
+        directUrl = await TvLocal115DirectClient.shared.resolvePickcodeImageUrl(pickcode: entry.pickcode115)
+      } else {
+        directUrl = await TvLocal115DirectClient.shared.resolvePickcodeStreamUrl(pickcode: entry.pickcode115)
+      }
+      guard let validUrl = directUrl, !validUrl.isEmpty else {
+        throw NSError(domain: "Tv115", code: -1, userInfo: [NSLocalizedDescriptionKey: "无法获取 115 文件直链，请确认登录状态"])
+      }
+      let hdrs: [String: String] = [
+        "User-Agent": TvLocal115DirectClient.browserUserAgent,
+        "Cookie": TvLocal115DirectClient.shared.savedCookie,
+        "Referer": "https://115.com/"
+      ]
+      return (validUrl, hdrs, "115 网盘原画直连 · \(entry.formattedSize)")
+
+    case .localCache:
+      let localUrl = Self.resolveLocalOfflineUrl(relativePath: entry.path).absoluteString
+      return (localUrl, [:], "Apple TV 本机离线缓存 · \(entry.formattedSize)")
     }
   }
 
   func playMediaFile(_ entry: TvFileEntry) {
-    let serverFileUrl = api.buildFileStreamUrl(path: entry.path)
-    guard !serverFileUrl.isEmpty else { return }
-    if TvLocal115DirectClient.shared.hasLocalCookie {
-      Task {
-        self.isResolvingPlay = true
-        defer { self.isResolvingPlay = false }
+    if entry.isStreamableMusicArchive {
+      activeArchiveMusicBrowserEntry = entry
+      return
+    }
+    if entry.isAudio {
+      playCloudMusicFromDirectory(entry, openFullscreen: true)
+      return
+    }
+    if isCloudMusicPlaying {
+      cloudMusicPlayer?.pause()
+      isCloudMusicPlaying = false
+    }
+    if entry.sourceKind == .localCache {
+      let fileUrl = Self.resolveLocalOfflineUrl(relativePath: entry.path)
+      guard FileManager.default.fileExists(atPath: fileUrl.path) else {
+        showToast("⚠️ 本地缓存文件不存在")
+        return
+      }
+      playerControlsVisible = true
+      playerShowEpisodeDrawer = false
+      activePlayback = TvPlaybackRequest(
+        title: entry.name,
+        subtitle: "Apple TV 本机离线缓存 · \(entry.formattedSize)",
+        streamUrl: fileUrl.absoluteString,
+        backupProxyUrl: fileUrl.absoluteString,
+        headers: [:],
+        resumeSeconds: 0,
+        isLive: false,
+        vodSource: nil,
+        vodDetail: nil,
+        playGroupIndex: 0,
+        episodeIndex: 0,
+        liveChannel: nil,
+        liveUrlIndex: 0
+      )
+      return
+    }
+
+    Task {
+      self.isResolvingPlay = true
+      defer { self.isResolvingPlay = false }
+
+      // For server files, check if 115 Cloud Drive already has this file for instant domestic CDN acceleration
+      if entry.sourceKind == .server, TvLocal115DirectClient.shared.hasLocalCookie {
         if let resolved115 = await TvLocal115DirectClient.shared.findAndResolveDirectPlayUrl(keywords: [entry.name]) {
+          let serverFallback = self.api.buildFileStreamUrl(path: entry.path)
           self.showToast("⚡ 已从本地直连 115 网盘播放：\(entry.name)")
           self.playerControlsVisible = true
           self.playerShowEpisodeDrawer = false
@@ -2437,7 +2990,7 @@ final class TvAppState: ObservableObject {
             title: entry.name,
             subtitle: "115 本地直连 · \(entry.formattedSize)",
             streamUrl: resolved115.proxyStreamUrl,
-            backupProxyUrl: serverFileUrl,
+            backupProxyUrl: serverFallback,
             headers: resolved115.headers,
             resumeSeconds: 0,
             isLive: false,
@@ -2450,29 +3003,2284 @@ final class TvAppState: ObservableObject {
           )
           return
         }
-        let localProxyServerFile = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
-          remoteUrl: serverFileUrl,
-          headers: self.api.authHeaders
-        )
-        self.playDirectStream(
+      }
+
+      // Direct 115 Cloud Drive playback:
+      // - For non-MP4/MOV containers (.mkv / .avi / .rmvb / .wmv / .flv / .ts), prefer 115 official HLS .m3u8 transcode stream proxied via local HLS server so tvOS AVPlayer decodes seamlessly
+      // - For .mp4 / .mov / .m4v / audio, play the resolved 115 CDN direct link directly with 115 headers (avoiding multi-connection 403 on large tail-moov MP4s), with 115 HLS .m3u8 or local chunked proxy as backup
+      if entry.sourceKind == .cloud115 {
+        guard !entry.pickcode115.isEmpty else {
+          self.showToast("⚠️ 该 115 文件缺少 pickcode，无法播放")
+          return
+        }
+        let hdrs: [String: String] = [
+          "User-Agent": TvLocal115DirectClient.browserUserAgent,
+          "Cookie": TvLocal115DirectClient.shared.savedCookie,
+          "Referer": "https://115.com/"
+        ]
+        let ext = entry.normalizedExt
+        let needsHlsTranscode = [".mkv", ".avi", ".rmvb", ".wmv", ".flv", ".ts", ".webm", ".iso"].contains(ext)
+        async let hlsTask = TvLocal115DirectClient.shared.resolvePickcodeHlsM3u8Url(pickcode: entry.pickcode115)
+        async let directTask = TvLocal115DirectClient.shared.resolvePickcodeStreamUrl(pickcode: entry.pickcode115)
+        let (hlsUrl, directUrl) = await (hlsTask, directTask)
+
+        var proxiedHlsUrl: String? = nil
+        if let hls = hlsUrl, !hls.isEmpty {
+          proxiedHlsUrl = await TvLocalHlsProxyServer.shared.prepareProxyPlaylistUrl(
+            gatewayUrl: hls,
+            resolvedUrl: hls,
+            headers: hdrs
+          ) ?? hls
+        }
+
+        var primaryStream = ""
+        var backupStream = ""
+
+        if needsHlsTranscode, let phls = proxiedHlsUrl, !phls.isEmpty {
+          primaryStream = phls
+          if let dir = directUrl, !dir.isEmpty {
+            backupStream = dir
+          } else {
+            backupStream = hlsUrl ?? phls
+          }
+        } else if let dir = directUrl, !dir.isEmpty {
+          if dir.lowercased().contains(".m3u8") {
+            primaryStream = proxiedHlsUrl ?? dir
+            backupStream = dir
+          } else {
+            primaryStream = dir
+            backupStream = proxiedHlsUrl
+              ?? TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(remoteUrl: dir, headers: hdrs)
+          }
+        } else if let phls = proxiedHlsUrl, !phls.isEmpty {
+          primaryStream = phls
+          backupStream = hlsUrl ?? phls
+        }
+
+        guard !primaryStream.isEmpty else {
+          self.showToast("⚠️ 无法获取 115 视频播放直链，请确认 115 登录状态")
+          return
+        }
+
+        self.playerControlsVisible = true
+        self.playerShowEpisodeDrawer = false
+        self.activePlayback = TvPlaybackRequest(
           title: entry.name,
-          subtitle: "服务器媒体库 · \(entry.formattedSize)",
-          url: localProxyServerFile,
-          headers: self.api.authHeaders
+          subtitle: "115 网盘直连 · \(entry.formattedSize)",
+          streamUrl: primaryStream,
+          backupProxyUrl: backupStream.isEmpty ? primaryStream : backupStream,
+          headers: hdrs,
+          resumeSeconds: 0,
+          isLive: false,
+          vodSource: nil,
+          vodDetail: nil,
+          playGroupIndex: 0,
+          episodeIndex: 0,
+          liveChannel: nil,
+          liveUrlIndex: 0
         )
+        return
+      }
+
+      do {
+        if entry.sourceKind == .alist {
+          let mount = self.storageMounts.first(where: { $0.id == entry.mountId }) ?? self.activeStorageMount
+          let info = try await TvRemoteStorageClient.shared.resolveAlistStreamInfo(
+            mount: mount,
+            path: entry.path,
+            fallbackUrl: entry.rawDownloadUrl
+          )
+          guard !info.url.isEmpty else { return }
+          var primaryUrl = info.url
+          var backupUrl = info.alistProxyUrl != info.url ? info.alistProxyUrl : info.url
+          var playHeaders = info.headers
+
+          // If this AList file is a non-MP4 container (.mkv / .avi / .ts / .rmvb / .flv) and the user has 115 logged in locally,
+          // also check if 115 has an official HLS .m3u8 transcode stream for this file as a seamless fallback
+          let ext = entry.normalizedExt
+          let isNonMp4Container = [".mkv", ".avi", ".rmvb", ".wmv", ".flv", ".ts", ".webm", ".iso"].contains(ext)
+          if isNonMp4Container, TvLocal115DirectClient.shared.hasLocalCookie {
+            if let resolved115 = await TvLocal115DirectClient.shared.findAndResolveDirectPlayUrl(keywords: [entry.name]) {
+              backupUrl = primaryUrl
+              primaryUrl = resolved115.proxyStreamUrl
+              for (k, v) in resolved115.headers {
+                playHeaders[k] = v
+              }
+            }
+          }
+
+          self.playerControlsVisible = true
+          self.playerShowEpisodeDrawer = false
+          self.activePlayback = TvPlaybackRequest(
+            title: entry.name,
+            subtitle: "\(mount.name) · \(entry.formattedSize)",
+            streamUrl: primaryUrl,
+            backupProxyUrl: backupUrl,
+            headers: playHeaders,
+            resumeSeconds: 0,
+            isLive: false,
+            vodSource: nil,
+            vodDetail: nil,
+            playGroupIndex: 0,
+            episodeIndex: 0,
+            liveChannel: nil,
+            liveUrlIndex: 0
+          )
+          return
+        }
+
+        let resolved = try await self.resolveFileStreamEndpoint(entry)
+        guard !resolved.url.isEmpty else { return }
+        let streamUrl = resolved.url
+        let backupUrl = resolved.url
+        self.playerControlsVisible = true
+        self.playerShowEpisodeDrawer = false
+        self.activePlayback = TvPlaybackRequest(
+          title: entry.name,
+          subtitle: resolved.subtitle,
+          streamUrl: streamUrl,
+          backupProxyUrl: backupUrl,
+          headers: resolved.headers,
+          resumeSeconds: 0,
+          isLive: false,
+          vodSource: nil,
+          vodDetail: nil,
+          playGroupIndex: 0,
+          episodeIndex: 0,
+          liveChannel: nil,
+          liveUrlIndex: 0
+        )
+      } catch {
+        self.showToast("播放失败：\(error.localizedDescription)")
+      }
+    }
+  }
+
+  // MARK: - Cloud Hi-Fi Music Player Engine (115 / AList / WebDAV / Server / Local Cache)
+
+  var currentCloudMusicTrack: TvFileEntry? {
+    guard cloudMusicCurrentIndex >= 0 && cloudMusicCurrentIndex < cloudMusicQueue.count else {
+      return nil
+    }
+    return cloudMusicQueue[cloudMusicCurrentIndex]
+  }
+
+  var activeCloudLyricIndex: Int {
+    guard !cloudMusicLyrics.isEmpty else { return -1 }
+    let pos = cloudMusicPosition + 0.18
+    var idx = -1
+    for (i, line) in cloudMusicLyrics.enumerated() {
+      if line.timeSeconds <= pos {
+        idx = i
+      } else {
+        break
+      }
+    }
+    return idx
+  }
+
+  var currentCloudLyricLineText: String {
+    let idx = activeCloudLyricIndex
+    guard idx >= 0 && idx < cloudMusicLyrics.count else { return "" }
+    return cloudMusicLyrics[idx].text
+  }
+
+  static func parseCloudTrackMetadata(_ entry: TvFileEntry, fallbackArtist: String = "") -> (title: String, artist: String, qualityTag: String) {
+    var base = (entry.name as NSString).deletingPathExtension
+    if base.isEmpty { base = entry.name }
+    if let range = base.range(of: #"^\s*(\[\d+\]|\d+[\.\-_、\s]+)\s*"#, options: .regularExpression) {
+      base.removeSubrange(range)
+    }
+    base = base.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    var artist = fallbackArtist
+    var title = base
+    if let dashRange = base.range(of: " - ") {
+      let a = String(base[..<dashRange.lowerBound]).trimmingCharacters(in: .whitespaces)
+      let t = String(base[dashRange.upperBound...]).trimmingCharacters(in: .whitespaces)
+      if !a.isEmpty && !t.isEmpty {
+        artist = a
+        title = t
+      }
+    } else if let dashIdx = base.firstIndex(of: "-") {
+      let a = String(base[..<dashIdx]).trimmingCharacters(in: .whitespaces)
+      let t = String(base[base.index(after: dashIdx)...]).trimmingCharacters(in: .whitespaces)
+      if a.count >= 2 && a.count <= 22 && !t.isEmpty {
+        artist = a
+        title = t
+      }
+    }
+    if title.isEmpty { title = entry.name }
+
+    let ext = entry.normalizedExt.replacingOccurrences(of: ".", with: "").uppercased()
+    let qualityTag: String
+    switch ext {
+    case "FLAC":
+      qualityTag = entry.size > 35 * 1024 * 1024 ? "Hi-Res · FLAC 无损" : "FLAC 无损"
+    case "WAV", "AIFF", "AIF":
+      qualityTag = "\(ext) 母带无损"
+    case "APE", "ALAC":
+      qualityTag = "\(ext) 无损音频"
+    case "DSF", "DFF":
+      qualityTag = "DSD 母带"
+    case "MP3":
+      qualityTag = entry.size > 7 * 1024 * 1024 ? "MP3 320K" : "MP3"
+    case "M4A", "AAC":
+      qualityTag = "AAC 高清"
+    case "OGG", "OPUS":
+      qualityTag = "\(ext) 高清"
+    default:
+      qualityTag = ext.isEmpty ? "AUDIO" : ext
+    }
+    return (title, artist, qualityTag)
+  }
+
+  func mountDisplayName(for entry: TvFileEntry) -> String {
+    if let m = storageMounts.first(where: { $0.id == entry.mountId }) {
+      return m.name
+    }
+    return entry.sourceKind.title
+  }
+
+  private func dirKeyForCloudMusicEntry(_ entry: TvFileEntry) -> String {
+    if entry.isInsideArchive {
+      return "\(entry.mountId)::archive::\(entry.archiveContainerPath)"
+    }
+    if entry.sourceKind == .cloud115 {
+      return "\(entry.mountId)::\(entry.cid115)"
+    }
+    let parent = (entry.path as NSString).deletingLastPathComponent
+    return "\(entry.mountId)::\(parent.isEmpty ? "/" : parent)"
+  }
+
+  private func cacheCurrentDirectorySiblings() {
+    let all = fileListing.entries
+    guard let first = all.first else { return }
+    cloudMusicDirectorySiblingsByKey[dirKeyForCloudMusicEntry(first)] = all
+  }
+
+  func toggleSavedMusicFolder(_ item: TvSavedMusicFolderItem) {
+    if let idx = savedMusicFolders.firstIndex(where: { $0.mountId == item.mountId && $0.path == item.path }) {
+      savedMusicFolders.remove(at: idx)
+      showToast("已移除常用音乐源：\(item.title)")
+    } else {
+      savedMusicFolders.append(item)
+      showToast("⭐ 已加入常用音乐源：\(item.title)")
+    }
+    if let data = try? JSONEncoder().encode(savedMusicFolders) {
+      defaults.set(data, forKey: "tv_saved_music_folders_v1")
+    }
+  }
+
+  func isMusicFolderSaved(mountId: String, path: String) -> Bool {
+    savedMusicFolders.contains { $0.mountId == mountId && $0.path == path }
+  }
+
+  func shuffleCurrentCloudMusicQueue() {
+    guard cloudMusicQueue.count > 1 else { return }
+    cloudMusicPlayMode = "shuffle"
+    var shuffled = cloudMusicQueue
+    shuffled.shuffle()
+    cloudMusicQueue = shuffled
+    cloudMusicCurrentIndex = 0
+    openCurrentCloudMusicTrack()
+    showToast("🔀 已随机打乱播放队列（共 \(cloudMusicQueue.count) 首）")
+  }
+
+  func listDirectoryForMount(mount: TvStorageMount, path: String) async throws -> [TvFileEntry] {
+    switch mount.kind {
+    case .server:
+      let res = try await api.fetchFiles(path: path)
+      return res.entries
+    case .alist:
+      let res = try await TvRemoteStorageClient.shared.listAlistDirectory(
+        mount: mount,
+        path: path.isEmpty ? mount.rootPath : path,
+        page: 1,
+        perPage: 250
+      )
+      return res.entries
+    case .webdav:
+      let res = try await TvRemoteStorageClient.shared.listWebdavDirectory(
+        mount: mount,
+        path: path.isEmpty ? mount.rootPath : path
+      )
+      return res.entries
+    case .cloud115:
+      let cid = (path.isEmpty || path == "/") ? "0" : path
+      let res = try await TvLocal115DirectClient.shared.list115Directory(
+        cid: cid,
+        mountId: mount.id,
+        page: 1,
+        perPage: 200
+      )
+      return res.entries
+    case .localCache:
+      return listLocalOfflineDirectory(path: path).entries
+    }
+  }
+
+  // MARK: - HTTP Range Archive (.zip / .cbz / .tar) Music Inspector & Per-Track Extractor
+
+  private func fetchArchiveByteRange(
+    archiveEntry: TvFileEntry,
+    start: Int64,
+    endInclusive: Int64
+  ) async throws -> Data {
+    if archiveEntry.sourceKind == .localCache {
+      let localUrl = Self.resolveLocalOfflineUrl(relativePath: archiveEntry.path)
+      let handle = try FileHandle(forReadingFrom: localUrl)
+      defer { try? handle.close() }
+      try handle.seek(toOffset: UInt64(max(0, start)))
+      let len = Int(max(0, endInclusive - start + 1))
+      return try handle.read(upToCount: len) ?? Data()
+    }
+    let resolved = try await resolveFileStreamEndpoint(archiveEntry)
+    guard let url = URL(string: resolved.url) else {
+      throw NSError(domain: "TvArchive", code: -1, userInfo: [NSLocalizedDescriptionKey: "压缩包直链无效"])
+    }
+    var req = URLRequest(url: url)
+    req.timeoutInterval = 25
+    for (k, v) in resolved.headers {
+      req.setValue(v, forHTTPHeaderField: k)
+    }
+    req.setValue("bytes=\(start)-\(endInclusive)", forHTTPHeaderField: "Range")
+    let (data, resp) = try await URLSession.shared.data(for: req)
+    if let http = resp as? HTTPURLResponse, http.statusCode >= 400 {
+      throw NSError(domain: "TvArchive", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "压缩包 Range 读取失败 (HTTP \(http.statusCode))"])
+    }
+    let expectedLen = Int(max(0, endInclusive - start + 1))
+    if data.count > expectedLen && Int(start) + expectedLen <= data.count {
+      return data.subdata(in: Int(start)..<(Int(start) + expectedLen))
+    }
+    return data
+  }
+
+  private static func readUInt16LE(_ data: Data, _ offset: Int) -> UInt16 {
+    guard offset + 2 <= data.count else { return 0 }
+    return UInt16(data[offset]) | (UInt16(data[offset + 1]) << 8)
+  }
+
+  private static func readUInt32LE(_ data: Data, _ offset: Int) -> UInt32 {
+    guard offset + 4 <= data.count else { return 0 }
+    return UInt32(data[offset])
+      | (UInt32(data[offset + 1]) << 8)
+      | (UInt32(data[offset + 2]) << 16)
+      | (UInt32(data[offset + 3]) << 24)
+  }
+
+  private static func readUInt64LE(_ data: Data, _ offset: Int) -> UInt64 {
+    guard offset + 8 <= data.count else { return 0 }
+    let lo = UInt64(readUInt32LE(data, offset))
+    let hi = UInt64(readUInt32LE(data, offset + 4))
+    return lo | (hi << 32)
+  }
+
+  func inspectArchiveEntries(_ archiveEntry: TvFileEntry) async throws -> [TvFileEntry] {
+    let cacheKey = "\(archiveEntry.mountId)::\(archiveEntry.path)::\(archiveEntry.size)"
+    if let cached = archiveInspectionCache[cacheKey], !cached.isEmpty {
+      return cached
+    }
+    let ext = archiveEntry.normalizedExt
+    let entries: [TvFileEntry]
+    if ext == ".zip" || ext == ".cbz" {
+      entries = try await inspectZipArchive(archiveEntry)
+    } else if ext == ".tar" {
+      entries = try await inspectTarArchive(archiveEntry)
+    } else {
+      return []
+    }
+    archiveInspectionCache[cacheKey] = entries
+    cloudMusicDirectorySiblingsByKey["\(archiveEntry.mountId)::archive::\(archiveEntry.path)"] = entries
+    return entries
+  }
+
+  private func inspectZipArchive(_ archiveEntry: TvFileEntry) async throws -> [TvFileEntry] {
+    let totalSize = archiveEntry.size
+    if totalSize <= 0 || totalSize <= 8 * 1024 * 1024 {
+      let endIdx = totalSize > 0 ? totalSize - 1 : 8 * 1024 * 1024 - 1
+      let fullBytes = try await fetchArchiveByteRange(archiveEntry: archiveEntry, start: 0, endInclusive: endIdx)
+      return parseZipCentralDirectory(
+        archiveEntry: archiveEntry,
+        buffer: fullBytes,
+        bufferStartOffsetInFile: 0,
+        totalFileSize: Int64(fullBytes.count)
+      )
+    }
+    let tailLen = min(Int64(65558), totalSize)
+    let tailStart = totalSize - tailLen
+    let tailBytes = try await fetchArchiveByteRange(
+      archiveEntry: archiveEntry,
+      start: tailStart,
+      endInclusive: totalSize - 1
+    )
+
+    var eocdPos = -1
+    if tailBytes.count >= 22 {
+      for i in stride(from: tailBytes.count - 22, through: 0, by: -1) {
+        if tailBytes[i] == 0x50 && tailBytes[i + 1] == 0x4B && tailBytes[i + 2] == 0x05 && tailBytes[i + 3] == 0x06 {
+          eocdPos = i
+          break
+        }
+      }
+    }
+    guard eocdPos >= 0 else {
+      throw NSError(domain: "TvArchive", code: -2, userInfo: [NSLocalizedDescriptionKey: "未找到 ZIP 中央目录签名"])
+    }
+
+    var cdSize = Int64(Self.readUInt32LE(tailBytes, eocdPos + 12))
+    var cdOffset = Int64(Self.readUInt32LE(tailBytes, eocdPos + 16))
+
+    if (cdOffset == 0xFFFFFFFF || cdSize == 0xFFFFFFFF) && eocdPos >= 20 {
+      let locPos = eocdPos - 20
+      if tailBytes[locPos] == 0x50 && tailBytes[locPos + 1] == 0x4B && tailBytes[locPos + 2] == 0x06 && tailBytes[locPos + 3] == 0x07 {
+        let zip64EocdOffset = Int64(Self.readUInt64LE(tailBytes, locPos + 8))
+        let z64Bytes = try await fetchArchiveByteRange(
+          archiveEntry: archiveEntry,
+          start: zip64EocdOffset,
+          endInclusive: min(totalSize - 1, zip64EocdOffset + 56)
+        )
+        if z64Bytes.count >= 56 && Self.readUInt32LE(z64Bytes, 0) == 0x06064B50 {
+          cdSize = Int64(Self.readUInt64LE(z64Bytes, 40))
+          cdOffset = Int64(Self.readUInt64LE(z64Bytes, 48))
+        }
+      }
+    }
+
+    if cdOffset >= tailStart && (cdOffset + cdSize) <= totalSize {
+      return parseZipCentralDirectory(
+        archiveEntry: archiveEntry,
+        buffer: tailBytes,
+        bufferStartOffsetInFile: tailStart,
+        totalFileSize: totalSize,
+        explicitCdOffset: cdOffset,
+        explicitCdSize: cdSize
+      )
+    }
+
+    let cdBytes = try await fetchArchiveByteRange(
+      archiveEntry: archiveEntry,
+      start: cdOffset,
+      endInclusive: min(totalSize - 1, cdOffset + cdSize - 1)
+    )
+    return parseZipCentralDirectory(
+      archiveEntry: archiveEntry,
+      buffer: cdBytes,
+      bufferStartOffsetInFile: cdOffset,
+      totalFileSize: totalSize,
+      explicitCdOffset: cdOffset,
+      explicitCdSize: Int64(cdBytes.count)
+    )
+  }
+
+  private func parseZipCentralDirectory(
+    archiveEntry: TvFileEntry,
+    buffer: Data,
+    bufferStartOffsetInFile: Int64,
+    totalFileSize: Int64,
+    explicitCdOffset: Int64? = nil,
+    explicitCdSize: Int64? = nil
+  ) -> [TvFileEntry] {
+    var cdOffsetInBuf = 0
+    var cdEndInBuf = buffer.count
+    if let expOff = explicitCdOffset, let expSize = explicitCdSize {
+      cdOffsetInBuf = Int(expOff - bufferStartOffsetInFile)
+      cdEndInBuf = min(buffer.count, cdOffsetInBuf + Int(expSize))
+    } else if buffer.count >= 22 {
+      for i in stride(from: buffer.count - 22, through: 0, by: -1) {
+        if buffer[i] == 0x50 && buffer[i + 1] == 0x4B && buffer[i + 2] == 0x05 && buffer[i + 3] == 0x06 {
+          let cSize = Int(Self.readUInt32LE(buffer, i + 12))
+          let cOff = Int(Self.readUInt32LE(buffer, i + 16))
+          cdOffsetInBuf = cOff - Int(bufferStartOffsetInFile)
+          cdEndInBuf = min(buffer.count, cdOffsetInBuf + cSize)
+          break
+        }
+      }
+    }
+    if cdOffsetInBuf < 0 || cdOffsetInBuf >= buffer.count {
+      cdOffsetInBuf = 0
+      cdEndInBuf = buffer.count
+    }
+
+    var results: [TvFileEntry] = []
+    var ptr = cdOffsetInBuf
+    while ptr + 46 <= cdEndInBuf {
+      let sig = Self.readUInt32LE(buffer, ptr)
+      if sig != 0x02014B50 { break }
+      let flags = Int(Self.readUInt16LE(buffer, ptr + 8))
+      let method = Int(Self.readUInt16LE(buffer, ptr + 10))
+      var compSize = Int64(Self.readUInt32LE(buffer, ptr + 20))
+      var uncompSize = Int64(Self.readUInt32LE(buffer, ptr + 24))
+      let nameLen = Int(Self.readUInt16LE(buffer, ptr + 28))
+      let extraLen = Int(Self.readUInt16LE(buffer, ptr + 30))
+      let commentLen = Int(Self.readUInt16LE(buffer, ptr + 32))
+      var localHeaderOffset = Int64(Self.readUInt32LE(buffer, ptr + 42))
+
+      if ptr + 46 + nameLen > buffer.count { break }
+      let nameData = buffer.subdata(in: (ptr + 46)..<(ptr + 46 + nameLen))
+      let rawName = String(data: nameData, encoding: .utf8)
+        ?? String(data: nameData, encoding: String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue))))
+        ?? String(decoding: nameData, as: UTF8.self)
+
+      if (uncompSize == 0xFFFFFFFF || compSize == 0xFFFFFFFF || localHeaderOffset == 0xFFFFFFFF) && extraLen >= 4 {
+        let extraStart = ptr + 46 + nameLen
+        let extraEnd = min(buffer.count, extraStart + extraLen)
+        var ep = extraStart
+        while ep + 4 <= extraEnd {
+          let hId = Self.readUInt16LE(buffer, ep)
+          let dSize = Int(Self.readUInt16LE(buffer, ep + 2))
+          if hId == 0x0001 {
+            var zp = ep + 4
+            if uncompSize == 0xFFFFFFFF && zp + 8 <= ep + 4 + dSize {
+              uncompSize = Int64(Self.readUInt64LE(buffer, zp))
+              zp += 8
+            }
+            if compSize == 0xFFFFFFFF && zp + 8 <= ep + 4 + dSize {
+              compSize = Int64(Self.readUInt64LE(buffer, zp))
+              zp += 8
+            }
+            if localHeaderOffset == 0xFFFFFFFF && zp + 8 <= ep + 4 + dSize {
+              localHeaderOffset = Int64(Self.readUInt64LE(buffer, zp))
+            }
+            break
+          }
+          ep += 4 + dSize
+        }
+      }
+
+      ptr += 46 + nameLen + extraLen + commentLen
+      let isEncrypted = (flags & 0x01) != 0
+      if isEncrypted { continue }
+      let cleanPath = rawName.replacingOccurrences(of: "\\", with: "/").trimmingCharacters(in: .whitespacesAndNewlines)
+      if cleanPath.isEmpty || cleanPath.hasSuffix("/") { continue }
+      let baseName = (cleanPath as NSString).lastPathComponent
+      if baseName.isEmpty || baseName.hasPrefix("._") || cleanPath.contains("__MACOSX/") { continue }
+      let ext = (baseName as NSString).pathExtension.lowercased()
+      let dotExt = ext.isEmpty ? "" : ".\(ext)"
+
+      let virtualEntry = TvFileEntry(
+        name: baseName,
+        path: "\(archiveEntry.path)#/\(cleanPath)",
+        size: uncompSize > 0 ? uncompSize : compSize,
+        modTime: archiveEntry.modTime,
+        isDir: false,
+        isMp4: dotExt == ".mp4",
+        ext: dotExt,
+        mountId: archiveEntry.mountId,
+        sourceKind: archiveEntry.sourceKind,
+        rawDownloadUrl: archiveEntry.rawDownloadUrl,
+        thumbUrl: archiveEntry.thumbUrl,
+        pickcode115: archiveEntry.pickcode115,
+        fid115: archiveEntry.fid115,
+        cid115: archiveEntry.cid115,
+        archiveContainerPath: archiveEntry.path,
+        archiveContainerName: archiveEntry.name,
+        archiveInnerPath: cleanPath,
+        archiveOffset: localHeaderOffset,
+        archiveCompressedSize: compSize,
+        archiveCompressionMethod: method
+      )
+      if virtualEntry.isAudio || virtualEntry.isImage || dotExt == ".lrc" {
+        results.append(virtualEntry)
+      }
+    }
+    results.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    return results
+  }
+
+  private func inspectTarArchive(_ archiveEntry: TvFileEntry) async throws -> [TvFileEntry] {
+    var results: [TvFileEntry] = []
+    let totalSize = archiveEntry.size
+    var offset: Int64 = 0
+    var scannedEntries = 0
+    while (totalSize <= 0 || offset + 512 <= totalSize) && scannedEntries < 400 {
+      scannedEntries += 1
+      let header = try await fetchArchiveByteRange(archiveEntry: archiveEntry, start: offset, endInclusive: offset + 511)
+      if header.count < 512 { break }
+      if header.allSatisfy({ $0 == 0 }) { break }
+
+      func readNullTerminated(_ start: Int, _ maxLen: Int) -> String {
+        let sub = header.subdata(in: start..<min(header.count, start + maxLen))
+        let prefix = sub.prefix(while: { $0 != 0 })
+        return (String(data: prefix, encoding: .utf8) ?? String(decoding: prefix, as: UTF8.self)).trimmingCharacters(in: .whitespacesAndNewlines)
+      }
+
+      let name = readNullTerminated(0, 100)
+      let sizeOctal = readNullTerminated(124, 12)
+      let typeFlag = header[156]
+      let prefix = readNullTerminated(345, 155)
+      let fullName = prefix.isEmpty ? name : "\(prefix)/\(name)"
+      let fileSize = Int64(sizeOctal, radix: 8) ?? 0
+      let dataOffset = offset + 512
+
+      if (typeFlag == 0 || typeFlag == 48) && fileSize > 0 && !fullName.isEmpty {
+        let cleanPath = fullName.replacingOccurrences(of: "\\", with: "/")
+        let baseName = (cleanPath as NSString).lastPathComponent
+        if !baseName.hasPrefix("._") && !cleanPath.contains("__MACOSX/") {
+          let ext = (baseName as NSString).pathExtension.lowercased()
+          let dotExt = ext.isEmpty ? "" : ".\(ext)"
+          let virtualEntry = TvFileEntry(
+            name: baseName,
+            path: "\(archiveEntry.path)#/\(cleanPath)",
+            size: fileSize,
+            modTime: archiveEntry.modTime,
+            isDir: false,
+            isMp4: dotExt == ".mp4",
+            ext: dotExt,
+            mountId: archiveEntry.mountId,
+            sourceKind: archiveEntry.sourceKind,
+            rawDownloadUrl: archiveEntry.rawDownloadUrl,
+            thumbUrl: archiveEntry.thumbUrl,
+            pickcode115: archiveEntry.pickcode115,
+            fid115: archiveEntry.fid115,
+            cid115: archiveEntry.cid115,
+            archiveContainerPath: archiveEntry.path,
+            archiveContainerName: archiveEntry.name,
+            archiveInnerPath: cleanPath,
+            archiveOffset: dataOffset,
+            archiveCompressedSize: fileSize,
+            archiveCompressionMethod: 0
+          )
+          if virtualEntry.isAudio || virtualEntry.isImage || dotExt == ".lrc" {
+            results.append(virtualEntry)
+          }
+        }
+      }
+      let blocks = (fileSize + 511) / 512
+      offset = dataOffset + blocks * 512
+    }
+    results.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    return results
+  }
+
+  private func extractArchiveEntryData(_ innerEntry: TvFileEntry) async throws -> Data {
+    let containerExt = ((innerEntry.archiveContainerName as NSString).pathExtension).lowercased()
+    let containerEntry = TvFileEntry(
+      name: innerEntry.archiveContainerName,
+      path: innerEntry.archiveContainerPath,
+      size: 0,
+      modTime: innerEntry.modTime,
+      isDir: false,
+      isMp4: false,
+      ext: containerExt.isEmpty ? ".zip" : ".\(containerExt)",
+      mountId: innerEntry.mountId,
+      sourceKind: innerEntry.sourceKind,
+      rawDownloadUrl: innerEntry.rawDownloadUrl,
+      thumbUrl: innerEntry.thumbUrl,
+      pickcode115: innerEntry.pickcode115,
+      fid115: innerEntry.fid115,
+      cid115: innerEntry.cid115
+    )
+
+    if containerExt == "tar" {
+      let start = innerEntry.archiveOffset
+      let end = start + innerEntry.archiveCompressedSize - 1
+      return try await fetchArchiveByteRange(archiveEntry: containerEntry, start: start, endInclusive: end)
+    }
+
+    let localHeaderOffset = innerEntry.archiveOffset
+    let compSize = innerEntry.archiveCompressedSize
+    let fetchStart = localHeaderOffset
+    let fetchEnd = localHeaderOffset + 30 + 512 + compSize - 1
+    let chunk = try await fetchArchiveByteRange(archiveEntry: containerEntry, start: fetchStart, endInclusive: fetchEnd)
+    guard chunk.count >= 30, Self.readUInt32LE(chunk, 0) == 0x04034B50 else {
+      throw NSError(domain: "TvArchive", code: -3, userInfo: [NSLocalizedDescriptionKey: "ZIP Local File Header 校验失败"])
+    }
+    let method = Int(Self.readUInt16LE(chunk, 8))
+    let nameLen = Int(Self.readUInt16LE(chunk, 26))
+    let extraLen = Int(Self.readUInt16LE(chunk, 28))
+    let dataStartInChunk = 30 + nameLen + extraLen
+
+    let payload: Data
+    if dataStartInChunk + Int(compSize) <= chunk.count {
+      payload = chunk.subdata(in: dataStartInChunk..<(dataStartInChunk + Int(compSize)))
+    } else {
+      let exactDataStart = localHeaderOffset + Int64(dataStartInChunk)
+      payload = try await fetchArchiveByteRange(
+        archiveEntry: containerEntry,
+        start: exactDataStart,
+        endInclusive: exactDataStart + compSize - 1
+      )
+    }
+
+    if method == 0 {
+      return payload
+    } else if method == 8 {
+      let expectedOutSize = max(Int(innerEntry.size), payload.count * 3) + 65536
+      var dstBuffer = Data(count: expectedOutSize)
+      let decodedSize = payload.withUnsafeBytes { srcPtr -> Int in
+        guard let srcBase = srcPtr.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return 0 }
+        return dstBuffer.withUnsafeMutableBytes { dstPtr -> Int in
+          guard let dstBase = dstPtr.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return 0 }
+          return compression_decode_buffer(
+            dstBase,
+            expectedOutSize,
+            srcBase,
+            payload.count,
+            nil,
+            COMPRESSION_ZLIB
+          )
+        }
+      }
+      guard decodedSize > 0 else {
+        throw NSError(domain: "TvArchive", code: -4, userInfo: [NSLocalizedDescriptionKey: "ZIP Deflate 解压失败"])
+      }
+      dstBuffer.count = decodedSize
+      return dstBuffer
+    } else {
+      throw NSError(domain: "TvArchive", code: -5, userInfo: [NSLocalizedDescriptionKey: "暂不支持的 ZIP 压缩算法 (Method \(method))"])
+    }
+  }
+
+  private func extractArchiveAudioToTempUrl(_ innerEntry: TvFileEntry) async throws -> URL {
+    let cacheKey = "\(innerEntry.mountId)::\(innerEntry.path)::\(innerEntry.archiveOffset)"
+    if let existingUrl = extractedArchiveTempFileCache[cacheKey],
+       FileManager.default.fileExists(atPath: existingUrl.path) {
+      return existingUrl
+    }
+    let bytes = try await extractArchiveEntryData(innerEntry)
+    let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("liuguang_archive_music", isDirectory: true)
+    try? FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+    let ext = innerEntry.normalizedExt.isEmpty ? ".mp3" : innerEntry.normalizedExt
+    let fileUrl = tmpDir.appendingPathComponent("track_\(abs(cacheKey.hashValue))\(ext)")
+    try bytes.write(to: fileUrl, options: .atomic)
+    extractedArchiveTempFileCache[cacheKey] = fileUrl
+    return fileUrl
+  }
+
+  /// Plays all audio files inside a `.zip` / `.cbz` / `.tar` archive directly via HTTP Range!
+  func playArchiveMusic(
+    archiveEntry: TvFileEntry,
+    shuffle: Bool = false,
+    startWithInnerTrack: TvFileEntry? = nil,
+    openFullscreen: Bool = true
+  ) async -> Int {
+    isScanningMusicFolders = true
+    scanningMusicStatusText = "正在读取压缩包「\(archiveEntry.name)」内的音乐列表..."
+    cloudMusicErrorText = ""
+    do {
+      let allInner = try await inspectArchiveEntries(archiveEntry)
+      isScanningMusicFolders = false
+      scanningMusicStatusText = ""
+      var audioTracks = allInner.filter { $0.isAudio }
+      guard !audioTracks.isEmpty else {
+        showToast("⚠️ 压缩包「\(archiveEntry.name)」内未找到音频文件")
+        return 0
+      }
+      if shuffle {
+        cloudMusicPlayMode = "shuffle"
+        audioTracks.shuffle()
+        cloudMusicQueue = audioTracks
+        cloudMusicCurrentIndex = 0
+      } else {
+        cloudMusicQueue = audioTracks
+        if let start = startWithInnerTrack,
+           let idx = cloudMusicQueue.firstIndex(where: { $0.path == start.path }) {
+          cloudMusicCurrentIndex = idx
+        } else {
+          cloudMusicCurrentIndex = 0
+        }
+      }
+      if openFullscreen {
+        showCloudMusicFullscreen = true
+      }
+      openCurrentCloudMusicTrack()
+      return audioTracks.count
+    } catch {
+      isScanningMusicFolders = false
+      scanningMusicStatusText = ""
+      showToast("⚠️ 解析压缩包音乐失败：\(error.localizedDescription)")
+      return 0
+    }
+  }
+
+  /// Recursively scans selected folders and/or archives across 115 / AList / WebDAV / Server / Local Cache and shuffle-plays them!
+  func scanAndPlayMusicFoldersOrArchives(
+    sources: [TvSavedMusicFolderItem],
+    shuffle: Bool = true,
+    includeSubfolders: Bool = true,
+    includeArchives: Bool = true,
+    openFullscreen: Bool = true
+  ) async -> Int {
+    guard !sources.isEmpty else { return 0 }
+    isScanningMusicFolders = true
+    scanningMusicStatusText = "正在扫描所选目录与压缩包中的音乐..."
+    cloudMusicErrorText = ""
+
+    var collectedTracks: [TvFileEntry] = []
+    var visitedKeys: Set<String> = []
+
+    func scanFolderRecursive(mount: TvStorageMount, folderPath: String, folderTitle: String, depth: Int) async {
+      let key = "\(mount.id)::\(folderPath)"
+      guard !visitedKeys.contains(key) else { return }
+      visitedKeys.insert(key)
+      scanningMusicStatusText = "正在扫描「\(mount.name) / \(folderTitle)」... (已发现 \(collectedTracks.count) 首)"
+      guard let entries = try? await listDirectoryForMount(mount: mount, path: folderPath) else { return }
+      if let first = entries.first {
+        cloudMusicDirectorySiblingsByKey[dirKeyForCloudMusicEntry(first)] = entries
+      }
+      for e in entries where !e.isDir && e.isAudio {
+        collectedTracks.append(e)
+      }
+      if includeArchives {
+        for e in entries where !e.isDir && e.isStreamableMusicArchive {
+          scanningMusicStatusText = "正在解析压缩包「\(e.name)」... (已发现 \(collectedTracks.count) 首)"
+          if let innerList = try? await inspectArchiveEntries(e) {
+            for inner in innerList where inner.isAudio {
+              collectedTracks.append(inner)
+            }
+          }
+        }
+      }
+      if includeSubfolders && depth < 3 && collectedTracks.count < 600 {
+        for sub in entries where sub.isDir {
+          if collectedTracks.count >= 600 { break }
+          await scanFolderRecursive(mount: mount, folderPath: sub.path, folderTitle: sub.name, depth: depth + 1)
+        }
+      }
+    }
+
+    for src in sources {
+      let mount = storageMounts.first(where: { $0.id == src.mountId })
+        ?? TvStorageMount(id: src.mountId, name: src.mountName, kind: src.sourceKind, rootPath: src.path, enabled: true)
+      if src.isArchive {
+        let dot = (src.title as NSString).pathExtension.lowercased()
+        let archEntry = TvFileEntry(
+          name: src.title,
+          path: src.path,
+          size: src.size,
+          modTime: "",
+          isDir: false,
+          isMp4: false,
+          ext: dot.isEmpty ? ".zip" : ".\(dot)",
+          mountId: src.mountId,
+          sourceKind: src.sourceKind,
+          pickcode115: src.pickcode115
+        )
+        if let innerList = try? await inspectArchiveEntries(archEntry) {
+          for inner in innerList where inner.isAudio {
+            collectedTracks.append(inner)
+          }
+        }
+      } else {
+        await scanFolderRecursive(mount: mount, folderPath: src.path, folderTitle: src.title, depth: 0)
+      }
+    }
+
+    isScanningMusicFolders = false
+    scanningMusicStatusText = ""
+
+    guard !collectedTracks.isEmpty else {
+      cloudMusicErrorText = "所选目录或压缩包内未发现可播放的音频文件"
+      showToast("⚠️ 所选目录或压缩包内未发现音乐文件")
+      return 0
+    }
+
+    if shuffle {
+      cloudMusicPlayMode = "shuffle"
+      collectedTracks.shuffle()
+    }
+    cloudMusicQueue = collectedTracks
+    cloudMusicCurrentIndex = 0
+    if openFullscreen && selectedSection != .music {
+      showCloudMusicFullscreen = true
+    }
+    openCurrentCloudMusicTrack()
+    showToast("🎵 已为您\(shuffle ? "随机" : "顺序")播放 \(collectedTracks.count) 首音乐")
+    return collectedTracks.count
+  }
+
+  func playCloudMusicFromDirectory(
+    _ targetTrack: TvFileEntry,
+    openFullscreen: Bool = true,
+    shuffle: Bool = false
+  ) {
+    if isAudioPlaying {
+      audioPlayer?.pause()
+      isAudioPlaying = false
+    }
+    cacheCurrentDirectorySiblings()
+    let currentList = displayedFileEntries.isEmpty ? fileListing.entries : displayedFileEntries
+    var audioTracks = currentList.filter { !$0.isDir && $0.isAudio }
+    if audioTracks.isEmpty {
+      cloudMusicQueue = [targetTrack]
+      cloudMusicCurrentIndex = 0
+    } else if shuffle {
+      cloudMusicPlayMode = "shuffle"
+      audioTracks.shuffle()
+      cloudMusicQueue = audioTracks
+      cloudMusicCurrentIndex = 0
+    } else {
+      cloudMusicQueue = audioTracks
+      if let idx = cloudMusicQueue.firstIndex(where: { $0.path == targetTrack.path && $0.mountId == targetTrack.mountId }) {
+        cloudMusicCurrentIndex = idx
+      } else {
+        cloudMusicQueue.insert(targetTrack, at: 0)
+        cloudMusicCurrentIndex = 0
+      }
+    }
+    if openFullscreen {
+      showCloudMusicFullscreen = true
+    }
+    openCurrentCloudMusicTrack()
+  }
+
+  func addCloudMusicToQueue(_ track: TvFileEntry, playNext: Bool = false) {
+    cacheCurrentDirectorySiblings()
+    if cloudMusicQueue.isEmpty || cloudMusicCurrentIndex < 0 {
+      cloudMusicQueue = [track]
+      cloudMusicCurrentIndex = 0
+      openCurrentCloudMusicTrack()
+      return
+    }
+    if let existingIdx = cloudMusicQueue.firstIndex(where: { $0.path == track.path && $0.mountId == track.mountId }) {
+      if playNext && existingIdx != cloudMusicCurrentIndex {
+        let item = cloudMusicQueue.remove(at: existingIdx)
+        if existingIdx < cloudMusicCurrentIndex {
+          cloudMusicCurrentIndex -= 1
+        }
+        let insertIdx = min(max(0, cloudMusicCurrentIndex + 1), cloudMusicQueue.count)
+        cloudMusicQueue.insert(item, at: insertIdx)
       }
       return
     }
-    let localProxyServerFile = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
-      remoteUrl: serverFileUrl,
-      headers: api.authHeaders
+    if playNext {
+      let insertIdx = min(max(0, cloudMusicCurrentIndex + 1), cloudMusicQueue.count)
+      cloudMusicQueue.insert(track, at: insertIdx)
+    } else {
+      cloudMusicQueue.append(track)
+    }
+  }
+
+  func playCloudMusicQueueIndex(_ index: Int) {
+    guard index >= 0 && index < cloudMusicQueue.count else { return }
+    if index == cloudMusicCurrentIndex, cloudMusicPlayer != nil, cloudMusicErrorText.isEmpty {
+      toggleCloudMusicPlayPause()
+      return
+    }
+    cloudMusicCurrentIndex = index
+    openCurrentCloudMusicTrack()
+  }
+
+  func removeCloudMusicTrackAt(_ index: Int) {
+    guard index >= 0 && index < cloudMusicQueue.count else { return }
+    let removingCurrent = (index == cloudMusicCurrentIndex)
+    cloudMusicQueue.remove(at: index)
+    if cloudMusicQueue.isEmpty {
+      stopCloudMusicPlayer()
+      return
+    }
+    if index < cloudMusicCurrentIndex {
+      cloudMusicCurrentIndex -= 1
+    } else if removingCurrent {
+      if cloudMusicCurrentIndex >= cloudMusicQueue.count {
+        cloudMusicCurrentIndex = 0
+      }
+      openCurrentCloudMusicTrack()
+    }
+  }
+
+  private func openCurrentCloudMusicTrack(useLocalChunkProxy: Bool = false) {
+    guard let track = currentCloudMusicTrack else { return }
+    cloudMusicOpenSeq &+= 1
+    let seq = cloudMusicOpenSeq
+    if !useLocalChunkProxy {
+      cloudMusicRetriedWithProxy = false
+    }
+
+    cleanupCloudMusicPlayerInstance()
+    isCloudMusicLoading = true
+    cloudMusicErrorText = ""
+    cloudMusicPosition = 0
+    cloudMusicDuration = 0
+
+    if !useLocalChunkProxy {
+      loadCloudMusicCoverAndLyrics(for: track, seq: seq)
+    }
+
+    Task {
+      do {
+        if track.isInsideArchive {
+          let extractedUrl = try await self.extractArchiveAudioToTempUrl(track)
+          guard seq == self.cloudMusicOpenSeq else { return }
+          self.cloudMusicSubtitle = "压缩包直读 (\(track.archiveContainerName)) · \(track.formattedSize)"
+          self.startCloudMusicAvPlayer(url: extractedUrl, headers: [:], track: track, seq: seq)
+          return
+        }
+
+        if track.sourceKind == .localCache {
+          let localUrl = Self.resolveLocalOfflineUrl(relativePath: track.path)
+          guard seq == self.cloudMusicOpenSeq else { return }
+          self.cloudMusicSubtitle = "Apple TV 本机离线缓存 · \(track.formattedSize)"
+          self.startCloudMusicAvPlayer(url: localUrl, headers: [:], track: track, seq: seq)
+          return
+        }
+
+        let resolved = try await self.resolveFileStreamEndpoint(track)
+        guard seq == self.cloudMusicOpenSeq else { return }
+        guard !resolved.url.isEmpty else {
+          self.isCloudMusicLoading = false
+          self.cloudMusicErrorText = "无法解析音频播放直链"
+          return
+        }
+
+        self.cloudMusicSubtitle = resolved.subtitle
+        var targetUrlStr = resolved.url
+        var targetHeaders = resolved.headers
+
+        // For 115 Cloud Drive (or when retrying with local chunk proxy), route through local loopback proxy
+        // with the real audio extension (`.flac`, `.mp3`, `.m4a`, `.wav`) and inferred audio MIME Content-Type
+        if track.sourceKind == .cloud115 || useLocalChunkProxy {
+          targetUrlStr = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
+            remoteUrl: resolved.url,
+            headers: resolved.headers,
+            extHint: track.normalizedExt
+          )
+          targetHeaders = [:]
+        }
+
+        guard let playUrl = URL(string: targetUrlStr) else {
+          self.isCloudMusicLoading = false
+          self.cloudMusicErrorText = "音频地址格式无效"
+          return
+        }
+        self.startCloudMusicAvPlayer(url: playUrl, headers: targetHeaders, track: track, seq: seq)
+      } catch {
+        guard seq == self.cloudMusicOpenSeq else { return }
+        self.isCloudMusicLoading = false
+        self.isCloudMusicPlaying = false
+        self.cloudMusicErrorText = "音频加载失败：\(error.localizedDescription)"
+      }
+    }
+  }
+
+  private func startCloudMusicAvPlayer(
+    url: URL,
+    headers: [String: String],
+    track: TvFileEntry,
+    seq: Int
+  ) {
+    let options: [String: Any] = headers.isEmpty ? [:] : ["AVURLAssetHTTPHeaderFieldsKey": headers]
+    let asset = AVURLAsset(url: url, options: options)
+    let item = AVPlayerItem(asset: asset)
+    item.preferredForwardBufferDuration = 30
+    let player = AVPlayer(playerItem: item)
+    player.automaticallyWaitsToMinimizeStalling = true
+    self.cloudMusicPlayer = player
+
+    cloudMusicTimeObserver = player.addPeriodicTimeObserver(
+      forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
+      queue: .main
+    ) { [weak self] time in
+      let sec = CMTimeGetSeconds(time)
+      let durSec = player.currentItem.map { CMTimeGetSeconds($0.duration) } ?? 0
+      let itemStatus = player.currentItem?.status ?? .unknown
+      let itemErr = player.currentItem?.error
+      Task { @MainActor [weak self] in
+        guard let self = self, seq == self.cloudMusicOpenSeq else { return }
+        if itemStatus == .failed {
+          if !self.cloudMusicRetriedWithProxy && track.sourceKind != .localCache {
+            self.cloudMusicRetriedWithProxy = true
+            self.openCurrentCloudMusicTrack(useLocalChunkProxy: true)
+            return
+          }
+          self.isCloudMusicLoading = false
+          self.isCloudMusicPlaying = false
+          self.cloudMusicErrorText = "音频解码失败：\(itemErr?.localizedDescription ?? "格式暂不支持")"
+          return
+        }
+        if sec.isFinite && sec >= 0 {
+          self.cloudMusicPosition = sec
+          if sec > 0.05 && self.isCloudMusicLoading {
+            self.isCloudMusicLoading = false
+          }
+        }
+        if durSec.isFinite && durSec > 0 {
+          self.cloudMusicDuration = durSec
+          if self.isCloudMusicLoading && itemStatus == .readyToPlay {
+            self.isCloudMusicLoading = false
+          }
+        }
+      }
+    }
+
+    cloudMusicEndObserver = NotificationCenter.default.addObserver(
+      forName: .AVPlayerItemDidPlayToEndTime,
+      object: item,
+      queue: .main
+    ) { [weak self] _ in
+      guard let self = self else { return }
+      Task { @MainActor in
+        guard seq == self.cloudMusicOpenSeq else { return }
+        self.onCloudMusicTrackCompleted()
+      }
+    }
+
+    cloudMusicFailObserver = NotificationCenter.default.addObserver(
+      forName: .AVPlayerItemFailedToPlayToEndTime,
+      object: item,
+      queue: .main
+    ) { [weak self] _ in
+      guard let self = self else { return }
+      Task { @MainActor in
+        guard seq == self.cloudMusicOpenSeq else { return }
+        if !self.cloudMusicRetriedWithProxy && track.sourceKind != .localCache {
+          self.cloudMusicRetriedWithProxy = true
+          self.openCurrentCloudMusicTrack(useLocalChunkProxy: true)
+        }
+      }
+    }
+
+    player.playImmediately(atRate: cloudMusicSpeed)
+    isCloudMusicPlaying = true
+  }
+
+  private func loadCloudMusicCoverAndLyrics(for track: TvFileEntry, seq: Int) {
+    cloudMusicCoverImage = nil
+    cloudMusicLyrics = []
+    cloudMusicLyricsSource = ""
+    isCloudMusicLoadingLyrics = true
+
+    let dirKey = dirKeyForCloudMusicEntry(track)
+    let siblings = cloudMusicDirectorySiblingsByKey[dirKey] ?? fileListing.entries
+    let baseName = ((track.name as NSString).deletingPathExtension).lowercased()
+
+    Task {
+      // 1. Discover cover art in same 115 / AList / WebDAV / Local directory
+      var coverEntry: TvFileEntry? = siblings.first(where: {
+        $0.isImage && (($0.name as NSString).deletingPathExtension).lowercased() == baseName
+      })
+      if coverEntry == nil {
+        let stdNames: Set<String> = ["cover", "folder", "album", "front", "artwork", "thumb"]
+        coverEntry = siblings.first(where: {
+          $0.isImage && stdNames.contains((($0.name as NSString).deletingPathExtension).lowercased())
+        })
+      }
+      if coverEntry == nil {
+        coverEntry = siblings.first(where: { $0.isImage })
+      }
+
+      if let ce = coverEntry {
+        if ce.isInsideArchive {
+          if let d = try? await self.extractArchiveEntryData(ce),
+             let img = UIImage(data: d),
+             seq == self.cloudMusicOpenSeq {
+            self.cloudMusicCoverImage = img
+          }
+        } else if ce.sourceKind == .localCache {
+          let localUrl = Self.resolveLocalOfflineUrl(relativePath: ce.path)
+          if let d = try? Data(contentsOf: localUrl), let img = UIImage(data: d), seq == self.cloudMusicOpenSeq {
+            self.cloudMusicCoverImage = img
+          }
+        } else if ce.sourceKind == .cloud115 {
+          if let resolved = try? await self.resolveFileStreamEndpoint(ce),
+             let data = await TvLocal115DirectClient.shared.fetch115ImageData(urlStr: resolved.url),
+             let img = UIImage(data: data),
+             seq == self.cloudMusicOpenSeq {
+            self.cloudMusicCoverImage = img
+          } else if !ce.thumbUrl.isEmpty,
+                    let data = await TvLocal115DirectClient.shared.fetch115ImageData(urlStr: ce.thumbUrl),
+                    let img = UIImage(data: data),
+                    seq == self.cloudMusicOpenSeq {
+            self.cloudMusicCoverImage = img
+          }
+        } else if let resolved = try? await self.resolveFileStreamEndpoint(ce),
+                  let data = await self.api.fetchFilePreviewImageData(urlStr: resolved.url, headers: resolved.headers),
+                  let img = UIImage(data: data),
+                  seq == self.cloudMusicOpenSeq {
+          self.cloudMusicCoverImage = img
+        }
+      } else if !track.thumbUrl.isEmpty {
+        if let data = await self.api.fetchFilePreviewImageData(urlStr: track.thumbUrl, headers: [:]),
+           let img = UIImage(data: data),
+           seq == self.cloudMusicOpenSeq {
+          self.cloudMusicCoverImage = img
+        }
+      }
+
+      // 2. Discover `.lrc` sidecar file in the same 115 / AList / WebDAV / Local directory
+      let lrcEntry = siblings.first(where: { s in
+        guard !s.isDir && s.normalizedExt == ".lrc" else { return false }
+        let sBase = ((s.name as NSString).deletingPathExtension).lowercased()
+        return sBase == baseName || baseName.contains(sBase) || sBase.contains(baseName)
+      })
+
+      if let lrc = lrcEntry {
+        if let rawText = try? await self.fetchCloudTextContent(for: lrc),
+           !rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+          let parsed = Self.parseCloudLrcText(rawText)
+          if !parsed.isEmpty, seq == self.cloudMusicOpenSeq {
+            self.cloudMusicLyrics = parsed
+            self.cloudMusicLyricsSource = "同目录 .lrc 歌词 (\(lrc.name))"
+            self.isCloudMusicLoadingLyrics = false
+            return
+          }
+        }
+      }
+
+      // 3. Fallback: Query open-source LRCLIB synchronized lyrics API
+      let meta = Self.parseCloudTrackMetadata(track)
+      let query = (!meta.artist.isEmpty && !meta.artist.contains("115") && !meta.artist.contains("AList"))
+        ? "\(meta.artist) \(meta.title)"
+        : meta.title
+      if let onlineLrc = await Self.fetchOnlineLrclibLyrics(query: query),
+         !onlineLrc.isEmpty,
+         seq == self.cloudMusicOpenSeq {
+        self.cloudMusicLyrics = onlineLrc
+        self.cloudMusicLyricsSource = "LRCLIB 云端同步歌词"
+        self.isCloudMusicLoadingLyrics = false
+        return
+      }
+
+      if seq == self.cloudMusicOpenSeq {
+        self.isCloudMusicLoadingLyrics = false
+      }
+    }
+  }
+
+  private func fetchCloudTextContent(for entry: TvFileEntry) async throws -> String {
+    if entry.isInsideArchive {
+      let d = try await extractArchiveEntryData(entry)
+      return String(data: d, encoding: .utf8) ?? String(decoding: d, as: UTF8.self)
+    }
+    if entry.sourceKind == .localCache {
+      let localUrl = Self.resolveLocalOfflineUrl(relativePath: entry.path)
+      let d = try Data(contentsOf: localUrl)
+      return String(data: d, encoding: .utf8) ?? String(decoding: d, as: UTF8.self)
+    }
+    let resolved = try await resolveFileStreamEndpoint(entry)
+    return try await api.fetchFilePreviewText(urlStr: resolved.url, headers: resolved.headers)
+  }
+
+  static func parseCloudLrcText(_ raw: String) -> [TvCloudLrcLine] {
+    var result: [TvCloudLrcLine] = []
+    guard let regex = try? NSRegularExpression(pattern: #"\[(\d{1,3}):(\d{1,2})(?:[\.:](\d{1,3}))?\]"#) else {
+      return result
+    }
+    let lines = raw.components(separatedBy: .newlines)
+    for line in lines {
+      let nsLine = line as NSString
+      let matches = regex.matches(in: line, range: NSRange(location: 0, length: nsLine.length))
+      guard !matches.isEmpty else { continue }
+      let cleanText = regex.stringByReplacingMatches(
+        in: line,
+        range: NSRange(location: 0, length: nsLine.length),
+        withTemplate: ""
+      ).trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !cleanText.isEmpty else { continue }
+
+      for m in matches {
+        let minStr = nsLine.substring(with: m.range(at: 1))
+        let secStr = nsLine.substring(with: m.range(at: 2))
+        let mins = Double(minStr) ?? 0
+        let secs = Double(secStr) ?? 0
+        var ms: Double = 0
+        if m.range(at: 3).location != NSNotFound {
+          let fracStr = nsLine.substring(with: m.range(at: 3))
+          let fracVal = Double(fracStr) ?? 0
+          if fracStr.count == 1 {
+            ms = fracVal * 100.0
+          } else if fracStr.count == 2 {
+            ms = fracVal * 10.0
+          } else {
+            ms = fracVal
+          }
+        }
+        let totalSec = mins * 60.0 + secs + (ms / 1000.0)
+        result.append(TvCloudLrcLine(timeSeconds: totalSec, text: cleanText))
+      }
+    }
+    result.sort { $0.timeSeconds < $1.timeSeconds }
+    return result
+  }
+
+  private static func fetchOnlineLrclibLyrics(query: String) async -> [TvCloudLrcLine]? {
+    let cleaned = query.replacingOccurrences(
+      of: #"\(.*?\)|\[.*?\]|【.*?】"#,
+      with: " ",
+      options: .regularExpression
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !cleaned.isEmpty,
+          let enc = cleaned.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+          let url = URL(string: "https://lrclib.net/api/search?q=\(enc)") else {
+      return nil
+    }
+    var req = URLRequest(url: url)
+    req.timeoutInterval = 6.0
+    req.setValue("LiuguangMusicPlayerTV/1.2.1", forHTTPHeaderField: "User-Agent")
+    guard let (data, resp) = try? await URLSession.shared.data(for: req),
+          let http = resp as? HTTPURLResponse,
+          http.statusCode == 200,
+          let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+      return nil
+    }
+    for item in arr {
+      if let synced = item["syncedLyrics"] as? String, !synced.isEmpty {
+        let parsed = parseCloudLrcText(synced)
+        if !parsed.isEmpty { return parsed }
+      }
+    }
+    for item in arr {
+      if let plain = item["plainLyrics"] as? String, !plain.isEmpty {
+        let rawLines = plain
+          .components(separatedBy: .newlines)
+          .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+          .filter { !$0.isEmpty }
+        if !rawLines.isEmpty {
+          return rawLines.enumerated().map { idx, txt in
+            TvCloudLrcLine(timeSeconds: Double(idx * 4), text: txt)
+          }
+        }
+      }
+    }
+    return nil
+  }
+
+  func toggleCloudMusicPlayPause() {
+    guard currentCloudMusicTrack != nil else { return }
+    if !cloudMusicErrorText.isEmpty || cloudMusicPlayer == nil {
+      openCurrentCloudMusicTrack()
+      return
+    }
+    if isCloudMusicPlaying {
+      cloudMusicPlayer?.pause()
+      isCloudMusicPlaying = false
+    } else {
+      cloudMusicPlayer?.playImmediately(atRate: cloudMusicSpeed)
+      isCloudMusicPlaying = true
+    }
+  }
+
+  func seekCloudMusic(to seconds: Double) {
+    guard let player = cloudMusicPlayer else { return }
+    let clamped = max(0, min(seconds, cloudMusicDuration > 0 ? cloudMusicDuration : 86400))
+    cloudMusicPosition = clamped
+    player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600))
+  }
+
+  func seekCloudMusicRelative(delta: Double) {
+    seekCloudMusic(to: cloudMusicPosition + delta)
+  }
+
+  func stepCloudMusicTrack(delta: Int) {
+    guard !cloudMusicQueue.isEmpty else { return }
+    if delta < 0 && cloudMusicPosition >= 5.0 {
+      seekCloudMusic(to: 0)
+      return
+    }
+    if cloudMusicQueue.count == 1 {
+      seekCloudMusic(to: 0)
+      cloudMusicPlayer?.playImmediately(atRate: cloudMusicSpeed)
+      isCloudMusicPlaying = true
+      return
+    }
+    if cloudMusicPlayMode == "shuffle" {
+      let indices = cloudMusicQueue.indices.filter { $0 != cloudMusicCurrentIndex }
+      cloudMusicCurrentIndex = indices.randomElement() ?? 0
+    } else {
+      cloudMusicCurrentIndex = (cloudMusicCurrentIndex + delta + cloudMusicQueue.count) % cloudMusicQueue.count
+    }
+    openCurrentCloudMusicTrack()
+  }
+
+  private func onCloudMusicTrackCompleted() {
+    guard !cloudMusicQueue.isEmpty else { return }
+    if cloudMusicPlayMode == "repeatOne" {
+      seekCloudMusic(to: 0)
+      cloudMusicPlayer?.playImmediately(atRate: cloudMusicSpeed)
+      isCloudMusicPlaying = true
+      return
+    }
+    if cloudMusicQueue.count == 1 {
+      if cloudMusicPlayMode == "repeatAll" {
+        seekCloudMusic(to: 0)
+        cloudMusicPlayer?.playImmediately(atRate: cloudMusicSpeed)
+        isCloudMusicPlaying = true
+      } else {
+        isCloudMusicPlaying = false
+        cloudMusicPosition = 0
+      }
+      return
+    }
+    if cloudMusicPlayMode == "shuffle" {
+      let indices = cloudMusicQueue.indices.filter { $0 != cloudMusicCurrentIndex }
+      cloudMusicCurrentIndex = indices.randomElement() ?? 0
+      openCurrentCloudMusicTrack()
+    } else if cloudMusicCurrentIndex + 1 < cloudMusicQueue.count {
+      cloudMusicCurrentIndex += 1
+      openCurrentCloudMusicTrack()
+    } else if cloudMusicPlayMode == "repeatAll" {
+      cloudMusicCurrentIndex = 0
+      openCurrentCloudMusicTrack()
+    } else {
+      isCloudMusicPlaying = false
+      cloudMusicPosition = 0
+    }
+  }
+
+  func cycleCloudMusicPlayMode() {
+    let modes = ["repeatAll", "repeatOne", "shuffle", "sequential"]
+    let idx = modes.firstIndex(of: cloudMusicPlayMode) ?? 0
+    cloudMusicPlayMode = modes[(idx + 1) % modes.count]
+    showToast("音乐播放模式：\(cloudMusicPlayModeLabel)")
+  }
+
+  var cloudMusicPlayModeLabel: String {
+    switch cloudMusicPlayMode {
+    case "repeatOne": return "单曲循环"
+    case "shuffle": return "随机播放"
+    case "sequential": return "顺序播放"
+    default: return "列表循环"
+    }
+  }
+
+  var cloudMusicPlayModeIcon: String {
+    switch cloudMusicPlayMode {
+    case "repeatOne": return "repeat.1"
+    case "shuffle": return "shuffle"
+    case "sequential": return "text.line.first.and.arrowtriangle.forward"
+    default: return "repeat"
+    }
+  }
+
+  func cycleCloudMusicSpeed() {
+    let speeds: [Float] = [1.0, 1.25, 1.5, 2.0, 0.75]
+    let idx = speeds.firstIndex(of: cloudMusicSpeed) ?? 0
+    cloudMusicSpeed = speeds[(idx + 1) % speeds.count]
+    if isCloudMusicPlaying {
+      cloudMusicPlayer?.rate = cloudMusicSpeed
+    }
+  }
+
+  private func cleanupCloudMusicPlayerInstance() {
+    if let obs = cloudMusicTimeObserver {
+      cloudMusicPlayer?.removeTimeObserver(obs)
+      cloudMusicTimeObserver = nil
+    }
+    if let endObs = cloudMusicEndObserver {
+      NotificationCenter.default.removeObserver(endObs)
+      cloudMusicEndObserver = nil
+    }
+    if let failObs = cloudMusicFailObserver {
+      NotificationCenter.default.removeObserver(failObs)
+      cloudMusicFailObserver = nil
+    }
+    cloudMusicPlayer?.pause()
+    cloudMusicPlayer = nil
+  }
+
+  func stopCloudMusicPlayer() {
+    cloudMusicOpenSeq &+= 1
+    cleanupCloudMusicPlayerInstance()
+    cloudMusicQueue = []
+    cloudMusicCurrentIndex = -1
+    isCloudMusicPlaying = false
+    isCloudMusicLoading = false
+    cloudMusicErrorText = ""
+    cloudMusicPosition = 0
+    cloudMusicDuration = 0
+    cloudMusicCoverImage = nil
+    cloudMusicLyrics = []
+    showCloudMusicFullscreen = false
+  }
+
+  // MARK: - Unified File Operations (Mkdir / Rename / Delete / Copy / Move) Across All Storage Mounts
+
+  func createFolderInActiveMount(name: String) async {
+    let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    let mount = activeStorageMount
+    let currentDir = fileListing.path.isEmpty ? mount.rootPath : fileListing.path
+    do {
+      switch mount.kind {
+      case .server:
+        try await api.createDirectory(parentPath: fileListing.path, name: trimmed)
+      case .alist:
+        try await TvRemoteStorageClient.shared.createAlistFolder(mount: mount, parentPath: currentDir, name: trimmed)
+      case .webdav:
+        try await TvRemoteStorageClient.shared.createWebdavFolder(mount: mount, parentPath: currentDir, name: trimmed)
+      case .cloud115:
+        try await TvLocal115DirectClient.shared.create115Folder(parentCid: currentDir, name: trimmed)
+      case .localCache:
+        let folderUrl = Self.resolveLocalOfflineUrl(relativePath: TvRemoteStorageClient.joinPath(currentDir, trimmed))
+        try FileManager.default.createDirectory(at: folderUrl, withIntermediateDirectories: true)
+      }
+      showToast("✓ 已新建文件夹：\(trimmed)")
+      await loadFiles(path: fileListing.path)
+    } catch {
+      showToast("新建文件夹失败：\(error.localizedDescription)")
+    }
+  }
+
+  func renameEntryInActiveMount(_ entry: TvFileEntry, newName: String) async {
+    let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty, trimmed != entry.name else { return }
+    let mount = storageMounts.first(where: { $0.id == entry.mountId }) ?? activeStorageMount
+    do {
+      switch mount.kind {
+      case .server:
+        try await api.renameFile(path: entry.path, newName: trimmed)
+      case .alist:
+        try await TvRemoteStorageClient.shared.renameAlistEntry(mount: mount, path: entry.path, newName: trimmed)
+      case .webdav:
+        let parent = TvRemoteStorageClient.parentPath(of: entry.path)
+        let dst = TvRemoteStorageClient.joinPath(parent.isEmpty ? "/" : parent, trimmed)
+        try await TvRemoteStorageClient.shared.moveOrCopyWebdavEntry(mount: mount, srcPath: entry.path, dstPath: dst, isMove: true)
+      case .cloud115:
+        try await TvLocal115DirectClient.shared.rename115File(fid: entry.fid115.isEmpty ? entry.path : entry.fid115, newName: trimmed)
+      case .localCache:
+        let srcUrl = Self.resolveLocalOfflineUrl(relativePath: entry.path)
+        let dstUrl = srcUrl.deletingLastPathComponent().appendingPathComponent(trimmed)
+        try FileManager.default.moveItem(at: srcUrl, to: dstUrl)
+      }
+      showToast("✓ 已重命名为：\(trimmed)")
+      await loadFiles(path: fileListing.path)
+    } catch {
+      showToast("重命名失败：\(error.localizedDescription)")
+    }
+  }
+
+  func deleteEntriesInActiveMount(_ entries: [TvFileEntry]) async {
+    guard !entries.isEmpty else { return }
+    let mount = activeStorageMount
+    let currentDir = fileListing.path.isEmpty ? mount.rootPath : fileListing.path
+    do {
+      switch mount.kind {
+      case .server:
+        for e in entries {
+          try await api.deleteFile(path: e.path)
+        }
+      case .alist:
+        let names = entries.map(\.name)
+        try await TvRemoteStorageClient.shared.deleteAlistEntries(mount: mount, dirPath: currentDir, names: names)
+      case .webdav:
+        for e in entries {
+          try await TvRemoteStorageClient.shared.deleteWebdavEntry(mount: mount, path: e.path, isDir: e.isDir)
+        }
+      case .cloud115:
+        for e in entries {
+          let fid = e.fid115.isEmpty ? e.path : e.fid115
+          try await TvLocal115DirectClient.shared.delete115File(fid: fid, parentCid: currentDir)
+        }
+      case .localCache:
+        for e in entries {
+          let url = Self.resolveLocalOfflineUrl(relativePath: e.path)
+          try? FileManager.default.removeItem(at: url)
+        }
+      }
+      fileSelectedPaths.removeAll()
+      fileMultiSelectMode = false
+      showToast("🗑️ 已删除 \(entries.count) 个项目")
+      await loadFiles(path: fileListing.path)
+    } catch {
+      showToast("删除失败：\(error.localizedDescription)")
+    }
+  }
+
+  func setClipboard(entries: [TvFileEntry], operation: TvFileClipboardOperation) {
+    guard !entries.isEmpty else { return }
+    let mount = activeStorageMount
+    let srcDir = fileListing.path.isEmpty ? mount.rootPath : fileListing.path
+    fileClipboard = TvFileClipboardItem(
+      mountId: mount.id,
+      sourceDirectory: srcDir,
+      entries: entries,
+      operation: operation
     )
-    playDirectStream(
-      title: entry.name,
-      subtitle: "服务器媒体库 · \(entry.formattedSize)",
-      url: localProxyServerFile,
-      headers: api.authHeaders
+    fileMultiSelectMode = false
+    fileSelectedPaths.removeAll()
+    let verb = operation == .copy ? "已复制" : "已剪切"
+    showToast("📋 \(verb) \(entries.count) 个项目，请进入目标文件夹后点击「粘贴到此处」")
+  }
+
+  func pasteClipboardToCurrentDirectory() async {
+    guard let clip = fileClipboard else { return }
+    let dstMount = activeStorageMount
+    let dstDir = fileListing.path.isEmpty ? dstMount.rootPath : fileListing.path
+
+    // Same-mount fast copy/move for AList, WebDAV, and Local Cache
+    if clip.mountId == dstMount.id {
+      do {
+        switch dstMount.kind {
+        case .alist:
+          let names = clip.entries.map(\.name)
+          try await TvRemoteStorageClient.shared.copyOrMoveAlistEntries(
+            mount: dstMount,
+            srcDir: clip.sourceDirectory,
+            dstDir: dstDir,
+            names: names,
+            isMove: clip.operation == .move
+          )
+          fileClipboard = nil
+          showToast("✓ 已\(clip.operation == .move ? "移动" : "复制") \(names.count) 个项目到当前目录")
+          await loadFiles(path: fileListing.path)
+          return
+
+        case .webdav:
+          for entry in clip.entries {
+            let dstPath = TvRemoteStorageClient.joinPath(dstDir, entry.name)
+            try await TvRemoteStorageClient.shared.moveOrCopyWebdavEntry(
+              mount: dstMount,
+              srcPath: entry.path,
+              dstPath: dstPath,
+              isMove: clip.operation == .move
+            )
+          }
+          fileClipboard = nil
+          showToast("✓ 已\(clip.operation == .move ? "移动" : "复制") \(clip.entries.count) 个项目")
+          await loadFiles(path: fileListing.path)
+          return
+
+        case .localCache:
+          for entry in clip.entries {
+            let srcUrl = Self.resolveLocalOfflineUrl(relativePath: entry.path)
+            let dstUrl = Self.resolveLocalOfflineUrl(relativePath: TvRemoteStorageClient.joinPath(dstDir, entry.name))
+            if clip.operation == .move {
+              try FileManager.default.moveItem(at: srcUrl, to: dstUrl)
+            } else {
+              try FileManager.default.copyItem(at: srcUrl, to: dstUrl)
+            }
+          }
+          fileClipboard = nil
+          showToast("✓ 已\(clip.operation == .move ? "移动" : "复制") \(clip.entries.count) 个本地文件")
+          await loadFiles(path: fileListing.path)
+          return
+
+        default:
+          break
+        }
+      } catch {
+        showToast("粘贴操作失败：\(error.localizedDescription)")
+        return
+      }
+    }
+
+    // Cross-mount transfer (e.g., Server/115/AList -> Local Cache or Local Cache/Server -> AList/WebDAV) with full progress!
+    let filesToTransfer = clip.entries.filter { !$0.isDir }
+    guard !filesToTransfer.isEmpty else {
+      showToast("⚠️ 跨存储源暂仅支持复制/上传文件（不支持空文件夹跨源粘贴）")
+      return
+    }
+    fileClipboard = nil
+    for entry in filesToTransfer {
+      if dstMount.kind == .localCache {
+        startDownloadFileWithProgress(entry, targetSubfolder: dstDir)
+      } else {
+        startCrossMountUploadWithProgress(entry: entry, targetMount: dstMount, targetDir: dstDir)
+      }
+    }
+  }
+
+  // MARK: - Upload & Download Transfer Manager with Real-Time Progress Display
+
+  var activeRunningTransfersCount: Int {
+    fileTransferTasks.filter { $0.status == .running }.count
+  }
+
+  var primaryActiveTransferTask: TvFileTransferTask? {
+    fileTransferTasks.first(where: { $0.status == .running }) ?? fileTransferTasks.first
+  }
+
+  func updateTransferTaskProgress(
+    id: String,
+    transferredBytes: Int64,
+    totalBytes: Int64,
+    speedBytesPerSec: Double,
+    status: TvFileTransferStatus? = nil,
+    detail: String? = nil,
+    localSavedPath: String? = nil
+  ) {
+    guard let idx = fileTransferTasks.firstIndex(where: { $0.id == id }) else { return }
+    fileTransferTasks[idx].transferredBytes = max(0, transferredBytes)
+    if totalBytes > 0 {
+      fileTransferTasks[idx].totalBytes = totalBytes
+    }
+    fileTransferTasks[idx].speedBytesPerSec = max(0, speedBytesPerSec)
+    if let st = status {
+      fileTransferTasks[idx].status = st
+    }
+    if let d = detail {
+      fileTransferTasks[idx].detailMessage = d
+    }
+    if let lp = localSavedPath {
+      fileTransferTasks[idx].localSavedPath = lp
+    }
+  }
+
+  func cancelFileTransfer(id: String) {
+    TvStreamingHttpTransfer.shared.cancelTransfer(id: id)
+    if let idx = fileTransferTasks.firstIndex(where: { $0.id == id }) {
+      fileTransferTasks[idx].status = .cancelled
+      fileTransferTasks[idx].speedBytesPerSec = 0
+      fileTransferTasks[idx].detailMessage = "用户已取消"
+    }
+    showToast("已取消传输任务")
+  }
+
+  func clearCompletedFileTransfers() {
+    fileTransferTasks.removeAll { $0.status != .running }
+  }
+
+  /// Downloads any file from Server / AList / WebDAV / 115 to Apple TV Local Offline Cache with real-time progress bar & speed
+  func startDownloadFileWithProgress(_ entry: TvFileEntry, targetSubfolder: String = "/") {
+    guard !entry.isDir else {
+      showToast("暂不支持直接整目录下载，请进入目录后选择文件下载")
+      return
+    }
+    let transferId = "dl_\(Int(Date().timeIntervalSince1970 * 1000))_\(UUID().uuidString.prefix(4))"
+    let sourceMount = storageMounts.first(where: { $0.id == entry.mountId }) ?? activeStorageMount
+    let newTask = TvFileTransferTask(
+      id: transferId,
+      name: entry.name,
+      direction: .download,
+      sourceLabel: sourceMount.name,
+      targetLabel: "本机离线缓存",
+      totalBytes: max(0, entry.size),
+      transferredBytes: 0,
+      speedBytesPerSec: 0,
+      status: .running,
+      detailMessage: "正在解析下载直链...",
+      localSavedPath: nil,
+      createdAt: Date()
     )
+    fileTransferTasks.insert(newTask, at: 0)
+    showToast("⬇️ 开始下载「\(entry.name)」，可在顶部传输栏实时查看进度")
+
+    Task {
+      let startTime = Date().timeIntervalSince1970
+      do {
+        let resolved: (url: String, headers: [String: String], subtitle: String)
+        if entry.sourceKind == .server {
+          let dlUrl = self.api.buildFileDownloadUrl(path: entry.path)
+          resolved = (dlUrl, self.api.authHeaders, "服务端")
+        } else {
+          resolved = try await self.resolveFileStreamEndpoint(entry)
+        }
+        guard let url = URL(string: resolved.url) else {
+          throw NSError(domain: "TvDownload", code: -1, userInfo: [NSLocalizedDescriptionKey: "下载地址无效"])
+        }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 3600
+        for (k, v) in resolved.headers {
+          req.setValue(v, forHTTPHeaderField: k)
+        }
+        let relDestPath = TvRemoteStorageClient.joinPath(targetSubfolder, entry.name)
+        let destFileUrl = Self.resolveLocalOfflineUrl(relativePath: relDestPath)
+
+        _ = try await TvStreamingHttpTransfer.shared.downloadToFile(
+          transferId: transferId,
+          request: req,
+          destinationUrl: destFileUrl,
+          expectedSizeHint: entry.size
+        ) { received, total in
+          let elapsed = max(0.15, Date().timeIntervalSince1970 - startTime)
+          let speed = Double(received) / elapsed
+          Task { @MainActor [weak self] in
+            self?.updateTransferTaskProgress(
+              id: transferId,
+              transferredBytes: received,
+              totalBytes: total,
+              speedBytesPerSec: speed,
+              status: .running,
+              detail: "正在下载至本机离线缓存..."
+            )
+          }
+        }
+
+        let finalSize = (try? FileManager.default.attributesOfItem(atPath: destFileUrl.path)[.size] as? Int64) ?? entry.size
+        let elapsed = max(0.2, Date().timeIntervalSince1970 - startTime)
+        self.updateTransferTaskProgress(
+          id: transferId,
+          transferredBytes: finalSize,
+          totalBytes: max(finalSize, entry.size),
+          speedBytesPerSec: Double(finalSize) / elapsed,
+          status: .completed,
+          detail: "✓ 已下载至 Apple TV 本机缓存（支持零缓冲离线播放）",
+          localSavedPath: relDestPath
+        )
+        self.showToast("✅ 下载完成：\(entry.name)")
+        if self.activeStorageMount.kind == .localCache {
+          await self.loadFiles(path: self.fileListing.path)
+        }
+      } catch {
+        if (error as NSError).code == NSURLErrorCancelled {
+          return
+        }
+        self.updateTransferTaskProgress(
+          id: transferId,
+          transferredBytes: 0,
+          totalBytes: entry.size,
+          speedBytesPerSec: 0,
+          status: .failed,
+          detail: "下载失败：\(error.localizedDescription)"
+        )
+        self.showToast("⚠️ 下载失败：\(error.localizedDescription)")
+      }
+    }
+  }
+
+  /// Uploads a server file to 115 Cloud Drive (`/api/files/upload-115`) while tracking real-time upload progress in `fileTransferTasks`
+  func startUploadServerFileTo115WithProgress(_ entry: TvFileEntry) {
+    let transferId = "up115_\(Int(Date().timeIntervalSince1970 * 1000))"
+    let totalBytes = max(1, entry.size)
+    let task = TvFileTransferTask(
+      id: transferId,
+      name: entry.name,
+      direction: .upload,
+      sourceLabel: "流光服务端",
+      targetLabel: "115 网盘",
+      totalBytes: totalBytes,
+      transferredBytes: 0,
+      speedBytesPerSec: 0,
+      status: .running,
+      detailMessage: "正在提交 115 网盘上传任务...",
+      localSavedPath: nil,
+      createdAt: Date()
+    )
+    fileTransferTasks.insert(task, at: 0)
+    showToast("☁️ 已开始上传「\(entry.name)」到 115 网盘，正在实时跟踪进度...")
+
+    Task {
+      let startTime = Date().timeIntervalSince1970
+      do {
+        if TvLocal115DirectClient.shared.hasLocalCookie {
+          try? await self.api.login115WithCookie(cookie: TvLocal115DirectClient.shared.savedCookie)
+        }
+        try await self.api.uploadFileTo115(path: entry.path)
+
+        // Poll `/api/tasks` and 115 Cloud Drive to track real-time upload progress
+        var finished = false
+        for tick in 0..<180 {
+          try? await Task.sleep(nanoseconds: 1_000_000_000)
+          let tasks = await self.api.fetchDownloadTasks()
+          self.downloadTasks = tasks
+          if let matching = tasks.first(where: {
+            $0.outputFile == entry.path || $0.name.contains(entry.name) || entry.name.contains($0.name)
+          }) {
+            if matching.status == "Uploading" {
+              let pct = max(2.0, min(99.0, matching.progress))
+              let transferred = Int64(Double(totalBytes) * (pct / 100.0))
+              let elapsed = max(0.5, Date().timeIntervalSince1970 - startTime)
+              let speed = matching.speed > 0 ? matching.speed : (Double(transferred) / elapsed)
+              self.updateTransferTaskProgress(
+                id: transferId,
+                transferredBytes: transferred,
+                totalBytes: totalBytes,
+                speedBytesPerSec: speed,
+                status: .running,
+                detail: String(format: "正在上传至 115 网盘 (%.1f%%)", pct)
+              )
+              continue
+            } else if matching.status == "Failed" {
+              throw NSError(domain: "Tv115Upload", code: -1, userInfo: [NSLocalizedDescriptionKey: matching.error.isEmpty ? "115 上传失败" : matching.error])
+            }
+          }
+
+          // Check if file already appeared in 115 Cloud Drive (or rapid upload succeeded)
+          if tick >= 2, TvLocal115DirectClient.shared.hasLocalCookie {
+            if let _ = await TvLocal115DirectClient.shared.findAndResolveDirectPlayUrl(keywords: [entry.name]) {
+              finished = true
+              break
+            }
+          }
+          // Smooth synthetic progress if backend performs synchronous/rapid upload without a `/api/tasks` row
+          let simulatedPct = min(0.92, Double(tick + 1) * 0.15)
+          let simBytes = Int64(Double(totalBytes) * simulatedPct)
+          let elapsed = max(0.5, Date().timeIntervalSince1970 - startTime)
+          self.updateTransferTaskProgress(
+            id: transferId,
+            transferredBytes: simBytes,
+            totalBytes: totalBytes,
+            speedBytesPerSec: Double(simBytes) / elapsed,
+            status: .running,
+            detail: "服务端正在同步至 115 网盘..."
+          )
+          if tick >= 6 && !tasks.contains(where: { $0.status == "Uploading" }) {
+            finished = true
+            break
+          }
+        }
+
+        if finished {
+          let elapsed = max(0.5, Date().timeIntervalSince1970 - startTime)
+          self.updateTransferTaskProgress(
+            id: transferId,
+            transferredBytes: totalBytes,
+            totalBytes: totalBytes,
+            speedBytesPerSec: Double(totalBytes) / elapsed,
+            status: .completed,
+            detail: "✓ 已成功上传至 115 网盘"
+          )
+          self.showToast("✅ 已上传至 115 网盘：\(entry.name)")
+        }
+      } catch {
+        self.updateTransferTaskProgress(
+          id: transferId,
+          transferredBytes: 0,
+          totalBytes: totalBytes,
+          speedBytesPerSec: 0,
+          status: .failed,
+          detail: "上传 115 失败：\(error.localizedDescription)"
+        )
+        self.showToast("⚠️ 上传 115 失败：\(error.localizedDescription)")
+      }
+    }
+  }
+
+  /// Uploads raw data (e.g. from LAN Phone/PC browser upload or local cache file) into the specified mount & directory with live progress on Apple TV
+  func uploadRawDataToMountWithProgress(
+    transferId: String = "up_\(Int(Date().timeIntervalSince1970 * 1000))_\(UUID().uuidString.prefix(4))",
+    fileName: String,
+    fileData: Data,
+    targetMount: TvStorageMount? = nil,
+    targetDir: String? = nil,
+    sourceLabel: String = "局域网快传"
+  ) async -> Bool {
+    let mount = targetMount ?? activeStorageMount
+    let dir = targetDir ?? (fileListing.path.isEmpty ? mount.rootPath : fileListing.path)
+    let totalBytes = Int64(fileData.count)
+
+    if !fileTransferTasks.contains(where: { $0.id == transferId }) {
+      let task = TvFileTransferTask(
+        id: transferId,
+        name: fileName,
+        direction: .upload,
+        sourceLabel: sourceLabel,
+        targetLabel: "\(mount.name) (\(dir.isEmpty ? "/" : dir))",
+        totalBytes: totalBytes,
+        transferredBytes: 0,
+        speedBytesPerSec: 0,
+        status: .running,
+        detailMessage: "正在上传文件...",
+        localSavedPath: nil,
+        createdAt: Date()
+      )
+      fileTransferTasks.insert(task, at: 0)
+    }
+
+    let startTime = Date().timeIntervalSince1970
+    do {
+      switch mount.kind {
+      case .localCache:
+        let relPath = TvRemoteStorageClient.joinPath(dir, fileName)
+        let destUrl = Self.resolveLocalOfflineUrl(relativePath: relPath)
+        try? FileManager.default.createDirectory(at: destUrl.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fileData.write(to: destUrl, options: .atomic)
+        updateTransferTaskProgress(
+          id: transferId,
+          transferredBytes: totalBytes,
+          totalBytes: totalBytes,
+          speedBytesPerSec: Double(totalBytes) / max(0.1, Date().timeIntervalSince1970 - startTime),
+          status: .completed,
+          detail: "✓ 已存入 Apple TV 本机离线缓存",
+          localSavedPath: relPath
+        )
+
+      case .alist:
+        try await TvRemoteStorageClient.shared.uploadToAlist(
+          transferId: transferId,
+          mount: mount,
+          targetDir: dir,
+          fileName: fileName,
+          fileData: fileData
+        ) { sent, total in
+          let elapsed = max(0.15, Date().timeIntervalSince1970 - startTime)
+          Task { @MainActor [weak self] in
+            self?.updateTransferTaskProgress(
+              id: transferId,
+              transferredBytes: sent,
+              totalBytes: total,
+              speedBytesPerSec: Double(sent) / elapsed,
+              status: .running,
+              detail: "正在上传至 \(mount.name)..."
+            )
+          }
+        }
+        updateTransferTaskProgress(
+          id: transferId,
+          transferredBytes: totalBytes,
+          totalBytes: totalBytes,
+          speedBytesPerSec: Double(totalBytes) / max(0.2, Date().timeIntervalSince1970 - startTime),
+          status: .completed,
+          detail: "✓ 已上传至 \(mount.name)"
+        )
+
+      case .webdav:
+        try await TvRemoteStorageClient.shared.uploadToWebdav(
+          transferId: transferId,
+          mount: mount,
+          targetDir: dir,
+          fileName: fileName,
+          fileData: fileData
+        ) { sent, total in
+          let elapsed = max(0.15, Date().timeIntervalSince1970 - startTime)
+          Task { @MainActor [weak self] in
+            self?.updateTransferTaskProgress(
+              id: transferId,
+              transferredBytes: sent,
+              totalBytes: total,
+              speedBytesPerSec: Double(sent) / elapsed,
+              status: .running,
+              detail: "正在通过 WebDAV 上传至 \(mount.name)..."
+            )
+          }
+        }
+        updateTransferTaskProgress(
+          id: transferId,
+          transferredBytes: totalBytes,
+          totalBytes: totalBytes,
+          speedBytesPerSec: Double(totalBytes) / max(0.2, Date().timeIntervalSince1970 - startTime),
+          status: .completed,
+          detail: "✓ 已通过 WebDAV 上传至 \(mount.name)"
+        )
+
+      case .server, .cloud115:
+        // Always save a copy to Apple TV local cache first so it can be served or played immediately
+        let cacheRelPath = TvRemoteStorageClient.joinPath("/", fileName)
+        let cacheUrl = Self.resolveLocalOfflineUrl(relativePath: cacheRelPath)
+        try? fileData.write(to: cacheUrl, options: .atomic)
+        if !lanInputRunning {
+          startLanInputServer()
+        }
+        try await api.uploadDataToServerDirectory(
+          fileData: fileData,
+          fileName: fileName,
+          targetDir: dir,
+          lanBaseUrl: lanInputUrl
+        ) { sent, total in
+          let elapsed = max(0.15, Date().timeIntervalSince1970 - startTime)
+          Task { @MainActor [weak self] in
+            self?.updateTransferTaskProgress(
+              id: transferId,
+              transferredBytes: sent,
+              totalBytes: total,
+              speedBytesPerSec: Double(sent) / elapsed,
+              status: .running,
+              detail: "正在上传至流光服务端..."
+            )
+          }
+        }
+        updateTransferTaskProgress(
+          id: transferId,
+          transferredBytes: totalBytes,
+          totalBytes: totalBytes,
+          speedBytesPerSec: Double(totalBytes) / max(0.2, Date().timeIntervalSince1970 - startTime),
+          status: .completed,
+          detail: "✓ 已上传至流光服务端并缓存至本机",
+          localSavedPath: cacheRelPath
+        )
+      }
+
+      showToast("✅ 上传完成：\(fileName)")
+      if activeStorageMount.id == mount.id {
+        await loadFiles(path: fileListing.path)
+      }
+      return true
+    } catch {
+      updateTransferTaskProgress(
+        id: transferId,
+        transferredBytes: 0,
+        totalBytes: totalBytes,
+        speedBytesPerSec: 0,
+        status: .failed,
+        detail: "上传失败：\(error.localizedDescription)"
+      )
+      showToast("⚠️ 上传失败：\(error.localizedDescription)")
+      return false
+    }
+  }
+
+  /// Cross-mount upload: downloads file from source mount if remote, then uploads it to `targetMount` (e.g. AList / WebDAV / Server) with live progress
+  func startCrossMountUploadWithProgress(
+    entry: TvFileEntry,
+    targetMount: TvStorageMount,
+    targetDir: String
+  ) {
+    let transferId = "xup_\(Int(Date().timeIntervalSince1970 * 1000))_\(UUID().uuidString.prefix(4))"
+    let sourceMount = storageMounts.first(where: { $0.id == entry.mountId }) ?? activeStorageMount
+    let task = TvFileTransferTask(
+      id: transferId,
+      name: entry.name,
+      direction: .upload,
+      sourceLabel: sourceMount.name,
+      targetLabel: targetMount.name,
+      totalBytes: max(0, entry.size),
+      transferredBytes: 0,
+      speedBytesPerSec: 0,
+      status: .running,
+      detailMessage: "正在准备跨源上传...",
+      localSavedPath: nil,
+      createdAt: Date()
+    )
+    fileTransferTasks.insert(task, at: 0)
+    showToast("⬆️ 开始上传「\(entry.name)」至 \(targetMount.name)")
+
+    Task {
+      do {
+        let fileData: Data
+        if entry.sourceKind == .localCache {
+          let localUrl = Self.resolveLocalOfflineUrl(relativePath: entry.path)
+          fileData = try Data(contentsOf: localUrl)
+        } else {
+          self.updateTransferTaskProgress(
+            id: transferId,
+            transferredBytes: 0,
+            totalBytes: entry.size,
+            speedBytesPerSec: 0,
+            status: .running,
+            detail: "阶段 1/2 · 正在读取源文件数据..."
+          )
+          let resolved = try await self.resolveFileStreamEndpoint(entry)
+          guard let u = URL(string: resolved.url) else {
+            throw NSError(domain: "TvCrossUpload", code: -1, userInfo: [NSLocalizedDescriptionKey: "源文件地址无效"])
+          }
+          var req = URLRequest(url: u)
+          for (k, v) in resolved.headers {
+            req.setValue(v, forHTTPHeaderField: k)
+          }
+          let tmpUrl = FileManager.default.temporaryDirectory.appendingPathComponent("xup_\(UUID().uuidString)")
+          let startDl = Date().timeIntervalSince1970
+          _ = try await TvStreamingHttpTransfer.shared.downloadToFile(
+            transferId: transferId,
+            request: req,
+            destinationUrl: tmpUrl,
+            expectedSizeHint: entry.size
+          ) { rec, tot in
+            let elapsed = max(0.15, Date().timeIntervalSince1970 - startDl)
+            Task { @MainActor [weak self] in
+              self?.updateTransferTaskProgress(
+                id: transferId,
+                transferredBytes: rec / 2,
+                totalBytes: tot,
+                speedBytesPerSec: Double(rec) / elapsed,
+                status: .running,
+                detail: "阶段 1/2 · 正在拉取源文件..."
+              )
+            }
+          }
+          fileData = try Data(contentsOf: tmpUrl)
+          try? FileManager.default.removeItem(at: tmpUrl)
+        }
+
+        _ = await self.uploadRawDataToMountWithProgress(
+          transferId: transferId,
+          fileName: entry.name,
+          fileData: fileData,
+          targetMount: targetMount,
+          targetDir: targetDir,
+          sourceLabel: sourceMount.name
+        )
+      } catch {
+        self.updateTransferTaskProgress(
+          id: transferId,
+          transferredBytes: 0,
+          totalBytes: entry.size,
+          speedBytesPerSec: 0,
+          status: .failed,
+          detail: "上传失败：\(error.localizedDescription)"
+        )
+      }
+    }
+  }
+
+  /// Creates a remote URL / Magnet / M3U8 download task and tracks its progress in `fileTransferTasks`
+  func startRemoteUrlDownloadToServerWithProgress(url: String, customName: String = "") {
+    let cleanUrl = url.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !cleanUrl.isEmpty else { return }
+    let fileName: String = {
+      let trimmed = customName.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !trimmed.isEmpty { return trimmed }
+      let last = (URL(string: cleanUrl)?.lastPathComponent ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+      return last.isEmpty ? "离线下载_\(Int(Date().timeIntervalSince1970))" : last
+    }()
+
+    // If current active mount is Apple TV Local Cache and URL is a direct HTTP file (not m3u8/magnet), download directly to Apple TV with byte progress
+    if activeStorageMount.kind == .localCache && cleanUrl.lowercased().hasPrefix("http") && !cleanUrl.lowercased().contains(".m3u8") {
+      let pseudoEntry = TvFileEntry(
+        name: fileName,
+        path: cleanUrl,
+        size: 0,
+        modTime: "",
+        isDir: false,
+        isMp4: fileName.lowercased().hasSuffix(".mp4"),
+        ext: ".\((fileName as NSString).pathExtension.lowercased())",
+        mountId: "builtin_local",
+        sourceKind: .alist,
+        rawDownloadUrl: cleanUrl
+      )
+      startDownloadFileWithProgress(pseudoEntry, targetSubfolder: fileListing.path)
+      return
+    }
+
+    let transferId = "remdl_\(Int(Date().timeIntervalSince1970 * 1000))"
+    let task = TvFileTransferTask(
+      id: transferId,
+      name: fileName,
+      direction: .download,
+      sourceLabel: "远程链接",
+      targetLabel: "流光服务端媒体库",
+      totalBytes: 100,
+      transferredBytes: 0,
+      speedBytesPerSec: 0,
+      status: .running,
+      detailMessage: "正在提交服务端高速离线下载任务...",
+      localSavedPath: nil,
+      createdAt: Date()
+    )
+    fileTransferTasks.insert(task, at: 0)
+    showToast("⬇️ 已提交离线下载：\(fileName)")
+
+    Task {
+      do {
+        let serverTaskId = try await self.api.createDownloadTask(url: cleanUrl, name: fileName)
+        for _ in 0..<600 {
+          try? await Task.sleep(nanoseconds: 1_200_000_000)
+          let tasks = await self.api.fetchDownloadTasks()
+          self.downloadTasks = tasks
+          guard let t = tasks.first(where: { $0.id == serverTaskId || $0.name == fileName || $0.url == cleanUrl }) else {
+            break
+          }
+          let pct = Int64(max(0, min(100, t.progress)))
+          if t.status == "Completed" || t.status == "Duplicate" {
+            self.updateTransferTaskProgress(
+              id: transferId,
+              transferredBytes: 100,
+              totalBytes: 100,
+              speedBytesPerSec: t.speed,
+              status: .completed,
+              detail: "✓ 服务端离线下载已完成"
+            )
+            self.showToast("✅ 离线下载完成：\(fileName)")
+            if self.activeStorageMount.kind == .server {
+              await self.loadFiles(path: self.fileListing.path)
+            }
+            return
+          } else if t.status == "Failed" {
+            throw NSError(domain: "TvRemoteDl", code: -1, userInfo: [NSLocalizedDescriptionKey: t.error.isEmpty ? "下载失败" : t.error])
+          } else {
+            let seg = t.totalSegments > 0 ? " · 分片 \(t.downloadedSegments)/\(t.totalSegments)" : ""
+            self.updateTransferTaskProgress(
+              id: transferId,
+              transferredBytes: pct,
+              totalBytes: 100,
+              speedBytesPerSec: t.speed,
+              status: .running,
+              detail: "服务端\(t.statusLabel) \(String(format: "%.1f%%", t.progress))\(seg)"
+            )
+          }
+        }
+      } catch {
+        self.updateTransferTaskProgress(
+          id: transferId,
+          transferredBytes: 0,
+          totalBytes: 100,
+          speedBytesPerSec: 0,
+          status: .failed,
+          detail: "离线下载失败：\(error.localizedDescription)"
+        )
+        self.showToast("⚠️ 离线下载失败：\(error.localizedDescription)")
+      }
+    }
   }
 
   // MARK: - 8. Multi-Subscription Proxy Management & 6-Scenario Routing (1:1 Parity with ProxyRoutingService)
@@ -2745,6 +5553,12 @@ final class TvAppState: ObservableObject {
           selectedProxyNodeId = best.id
         }
       }
+      if let best = fastestProxyNode ?? activeProxyNode {
+        let backups = activePoolNodes
+          .filter(\.isSupportedByClientTunnel)
+          .sorted { ($0.latencyMs ?? 9999) < ($1.latencyMs ?? 9999) }
+        TvLocalProxyTunnelServer.shared.seedFallbackNode(best, backupNodes: backups)
+      }
       persistProxyState()
       if !silent {
         showToast("✓ 「\(sub.name)」已更新 \(freshNodes.count) 个节点并完成测速")
@@ -3010,6 +5824,7 @@ final class TvAppState: ObservableObject {
   }
 
   /// Resolves the effective route mode for a scenario (matching `resolveEffectiveRoute` in `proxy_routing_service.dart`)
+  /// Never automatically falls back to `.serverRelay` unless the user explicitly selected `.serverRelay`!
   func resolveEffectiveRoute(for scenario: TvRequestScenario) -> TvScenarioRouteMode {
     let r = rule(for: scenario)
     switch r.mode {
@@ -3018,15 +5833,15 @@ final class TvAppState: ObservableObject {
     case .serverRelay:
       return .serverRelay
     case .proxyNode:
-      return activePoolNodes.isEmpty ? .serverRelay : .proxyNode
+      return activePoolNodes.isEmpty ? .direct : .proxyNode
     case .smartAuto:
       if scenario == .telegram || scenario == .externalWeb {
-        return activePoolNodes.isEmpty ? .serverRelay : .proxyNode
+        return activePoolNodes.isEmpty ? .direct : .proxyNode
       }
       return .direct
     case .followGlobal:
       if !proxyEnabled { return .direct }
-      return activePoolNodes.isEmpty ? .serverRelay : .proxyNode
+      return activePoolNodes.isEmpty ? .direct : .proxyNode
     }
   }
 
@@ -3077,7 +5892,12 @@ final class TvAppState: ObservableObject {
   /// Configures `TvLocalProxyTunnelServer.shared` for the given scenario's effective route & node
   func activateScenarioProxyTunnel(for scenario: TvRequestScenario) {
     let eff = resolveEffectiveRoute(for: scenario)
-    if eff == .proxyNode, let node = resolveNode(for: scenario) {
+    let fallbackNode = resolveNode(for: scenario) ?? fastestProxyNode ?? activeProxyNode
+    let backups = activePoolNodes
+      .filter(\.isSupportedByClientTunnel)
+      .sorted { ($0.latencyMs ?? 9999) < ($1.latencyMs ?? 9999) }
+    TvLocalProxyTunnelServer.shared.seedFallbackNode(fallbackNode, backupNodes: backups)
+    if eff == .proxyNode, let node = fallbackNode {
       TvLocalProxyTunnelServer.shared.configure(node: node, enabled: true)
     } else {
       TvLocalProxyTunnelServer.shared.configure(node: nil, enabled: false)
@@ -3289,101 +6109,350 @@ final class TvAppState: ObservableObject {
 
   private nonisolated static func handleLanHttpConnection(_ conn: NWConnection, appState: TvAppState) {
     conn.start(queue: .global(qos: .userInitiated))
-    conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, _, _ in
-      guard let data = data, !data.isEmpty,
-            let rawReq = String(data: data, encoding: .utf8) else {
-        conn.cancel()
-        return
-      }
 
-      let parts = rawReq.components(separatedBy: "\r\n\r\n")
-      let headerPart = parts.first ?? ""
-      let bodyPart = parts.dropFirst().joined(separator: "\r\n\r\n")
-      let firstLine = headerPart.components(separatedBy: "\r\n").first ?? ""
+    final class LanStreamBuffer: @unchecked Sendable {
+      var buffer = Data()
+      var headerParsed = false
+      var headerEndOffset = 0
+      var contentLength = 0
+      var method = ""
+      var pathAndQuery = ""
+      var headers: [String: String] = [:]
+      var uploadTaskId: String? = nil
+      var uploadFileName: String = "上传文件"
+      var uploadStartedAt: TimeInterval = Date().timeIntervalSince1970
+      var lastProgressTick: TimeInterval = 0
+    }
+    let state = LanStreamBuffer()
 
-      if firstLine.hasPrefix("POST /push") {
-        let form = parseFormUrlEncoded(bodyPart)
-        let subNameInput = (form["sub_name"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let subInput = form["sub_url"] ?? ""
-        let cookieInput = form["cookie_115"] ?? ""
-        let serverInput = form["server_url"] ?? ""
-        let pwdInput = form["server_pwd"] ?? ""
+    @Sendable func readMore() {
+      conn.receive(minimumIncompleteLength: 1, maximumLength: 262144) { data, _, isComplete, error in
+        if let data = data, !data.isEmpty {
+          state.buffer.append(data)
 
-        Task { @MainActor in
-          var actions: [String] = []
-          let rawLines = subInput
-            .components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-
-          if !rawLines.isEmpty {
-            var subIdsToRefresh: [String] = []
-            var rawNodeLines: [String] = []
-
-            for (idx, line) in rawLines.enumerated() {
-              let lower = line.lowercased()
-              if lower.hasPrefix("vmess://") || lower.hasPrefix("vless://") || lower.hasPrefix("ss://")
-                  || lower.hasPrefix("trojan://") || lower.hasPrefix("hy2://") || lower.hasPrefix("hysteria2://")
-                  || lower.hasPrefix("socks5://") {
-                rawNodeLines.append(line)
-              } else {
-                let name = rawLines.count > 1 && !subNameInput.isEmpty
-                  ? "\(subNameInput) \(idx + 1)"
-                  : subNameInput
-                if let sub = appState.upsertSubscription(name: name, url: line, enabled: true) {
-                  subIdsToRefresh.append(sub.id)
+          if !state.headerParsed {
+            let sep = Data("\r\n\r\n".utf8)
+            if let range = state.buffer.range(of: sep) {
+              state.headerParsed = true
+              state.headerEndOffset = range.upperBound
+              let headerData = state.buffer.subdata(in: 0..<range.lowerBound)
+              let headerStr = String(data: headerData, encoding: .utf8) ?? ""
+              let lines = headerStr.components(separatedBy: "\r\n")
+              let firstParts = (lines.first ?? "").split(separator: " ")
+              if firstParts.count >= 2 {
+                state.method = String(firstParts[0]).uppercased()
+                state.pathAndQuery = String(firstParts[1])
+              }
+              for line in lines.dropFirst() {
+                if let colon = line.firstIndex(of: ":") {
+                  let k = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+                  let v = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+                  state.headers[k] = v
                 }
               }
-            }
+              state.contentLength = Int(state.headers["content-length"] ?? "0") ?? 0
 
-            if !subIdsToRefresh.isEmpty {
-              actions.append("\(subIdsToRefresh.count) 个代理订阅")
-              Task {
-                for sid in subIdsToRefresh {
-                  await appState.refreshSubscription(sid, silent: false)
+              if state.method == "POST" && state.pathAndQuery.hasPrefix("/upload-raw") {
+                let comps = URLComponents(string: "http://localhost\(state.pathAndQuery)")
+                let rawName = comps?.queryItems?.first(where: { $0.name == "name" })?.value ?? "上传文件_\(Int(Date().timeIntervalSince1970))"
+                state.uploadFileName = rawName.removingPercentEncoding ?? rawName
+                let tid = "lanup_\(Int(Date().timeIntervalSince1970 * 1000))_\(UUID().uuidString.prefix(4))"
+                state.uploadTaskId = tid
+                state.uploadStartedAt = Date().timeIntervalSince1970
+                let totalLen = Int64(max(1, state.contentLength))
+                let fname = state.uploadFileName
+                Task { @MainActor in
+                  let mount = appState.activeStorageMount
+                  let dir = appState.fileListing.path.isEmpty ? mount.rootPath : appState.fileListing.path
+                  let newTask = TvFileTransferTask(
+                    id: tid,
+                    name: fname,
+                    direction: .upload,
+                    sourceLabel: "手机/电脑浏览器快传",
+                    targetLabel: "\(mount.name) (\(dir.isEmpty ? "/" : dir))",
+                    totalBytes: totalLen,
+                    transferredBytes: 0,
+                    speedBytesPerSec: 0,
+                    status: .running,
+                    detailMessage: "正在接收局域网浏览器上传数据流...",
+                    localSavedPath: nil,
+                    createdAt: Date()
+                  )
+                  appState.fileTransferTasks.insert(newTask, at: 0)
                 }
-              }
-            }
-            if !rawNodeLines.isEmpty {
-              actions.append("节点直链")
-              Task {
-                _ = await appState.importManualNodesFromText(rawNodeLines.joined(separator: "\n"))
               }
             }
           }
 
-          if !cookieInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            actions.append("115 Cookie")
-            Task {
-              await appState.save115Cookie(cookieInput)
+          if state.headerParsed {
+            let receivedBodyBytes = max(0, state.buffer.count - state.headerEndOffset)
+            if let tid = state.uploadTaskId, state.contentLength > 0 {
+              let now = Date().timeIntervalSince1970
+              if now - state.lastProgressTick >= 0.12 || receivedBodyBytes >= state.contentLength {
+                state.lastProgressTick = now
+                let elapsed = max(0.1, now - state.uploadStartedAt)
+                let speed = Double(receivedBodyBytes) / elapsed
+                let rec64 = Int64(receivedBodyBytes)
+                let tot64 = Int64(state.contentLength)
+                Task { @MainActor in
+                  appState.updateTransferTaskProgress(
+                    id: tid,
+                    transferredBytes: min(rec64, tot64),
+                    totalBytes: tot64,
+                    speedBytesPerSec: speed,
+                    status: .running,
+                    detail: "正在接收局域网快传数据..."
+                  )
+                }
+              }
+            }
+
+            if receivedBodyBytes >= state.contentLength {
+              let bodyEnd = min(state.buffer.count, state.headerEndOffset + state.contentLength)
+              let bodyData = state.buffer.subdata(in: state.headerEndOffset..<bodyEnd)
+              processCompleteLanRequest(
+                conn: conn,
+                appState: appState,
+                method: state.method,
+                pathAndQuery: state.pathAndQuery,
+                bodyData: bodyData,
+                uploadTaskId: state.uploadTaskId,
+                uploadFileName: state.uploadFileName
+              )
+              return
             }
           }
-          if !serverInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            appState.saveConfig(
-              newUrl: serverInput,
-              newSecret: pwdInput.isEmpty ? appState.authSecret : pwdInput,
-              adFilter: appState.enableAdFilter,
-              directPlayback: appState.preferDirectPlayback,
-              introSec: appState.skipIntroSeconds,
-              outroSec: appState.skipOutroSeconds
+        }
+
+        if isComplete || error != nil {
+          if state.headerParsed {
+            let bodyData = state.buffer.count > state.headerEndOffset
+              ? state.buffer.subdata(in: state.headerEndOffset..<state.buffer.count)
+              : Data()
+            processCompleteLanRequest(
+              conn: conn,
+              appState: appState,
+              method: state.method,
+              pathAndQuery: state.pathAndQuery,
+              bodyData: bodyData,
+              uploadTaskId: state.uploadTaskId,
+              uploadFileName: state.uploadFileName
             )
-            actions.append("服务器配置")
-            Task { await appState.bootstrapAll() }
+          } else {
+            conn.cancel()
           }
-          let summary = actions.isEmpty ? "配置" : actions.joined(separator: "、")
-          appState.showToast("📱 已收到手机扫码推送的\(summary)，正在自动更新测速！")
-          let existingSummary = appState.subscriptions.map { "• \($0.name): \($0.maskedUrlSummary) (\($0.nodeCount) 节点)" }.joined(separator: "<br>")
-          let okHtml = buildLanWebHtml(pushedSuccess: true, existingSubsHtml: existingSummary)
-          sendHttpResponse(conn: conn, html: okHtml)
+          return
         }
-      } else {
-        Task { @MainActor in
-          let existingSummary = appState.subscriptions.map { "• \($0.name): \($0.maskedUrlSummary) (\($0.nodeCount) 节点)" }.joined(separator: "<br>")
-          let html = buildLanWebHtml(pushedSuccess: false, existingSubsHtml: existingSummary)
-          sendHttpResponse(conn: conn, html: html)
-        }
+        readMore()
       }
     }
+    readMore()
+  }
+
+  private nonisolated static func processCompleteLanRequest(
+    conn: NWConnection,
+    appState: TvAppState,
+    method: String,
+    pathAndQuery: String,
+    bodyData: Data,
+    uploadTaskId: String?,
+    uploadFileName: String
+  ) {
+    // 1. Raw file stream upload from LAN Web File Portal (`POST /upload-raw?name=...`)
+    if method == "POST" && pathAndQuery.hasPrefix("/upload-raw") {
+      let tid = uploadTaskId ?? "lanup_\(Int(Date().timeIntervalSince1970 * 1000))"
+      Task { @MainActor in
+        let ok = await appState.uploadRawDataToMountWithProgress(
+          transferId: tid,
+          fileName: uploadFileName,
+          fileData: bodyData,
+          sourceLabel: "手机/电脑浏览器快传"
+        )
+        let json = ok
+          ? "{\"ok\":true,\"name\":\"\(uploadFileName)\",\"size\":\(bodyData.count)}"
+          : "{\"ok\":false,\"error\":\"upload_failed\"}"
+        sendHttpRawResponse(conn: conn, status: ok ? "200 OK" : "500 Internal Server Error", contentType: "application/json; charset=utf-8", bodyData: Data(json.utf8))
+      }
+      return
+    }
+
+    // 2. Mount AList / WebDAV remotely from phone/PC browser (`POST /mount-storage`)
+    if method == "POST" && pathAndQuery.hasPrefix("/mount-storage") {
+      let bodyStr = String(data: bodyData, encoding: .utf8) ?? ""
+      let form = parseFormUrlEncoded(bodyStr)
+      let kindStr = (form["kind"] ?? "alist").lowercased()
+      let name = form["name"] ?? ""
+      let baseUrl = form["base_url"] ?? ""
+      let username = form["username"] ?? ""
+      let password = form["password"] ?? ""
+      let token = form["token"] ?? ""
+      let rootPath = form["root_path"] ?? "/"
+      Task { @MainActor in
+        if !baseUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+          let kind: TvStorageSourceKind = kindStr == "webdav" ? .webdav : .alist
+          let created = appState.upsertStorageMount(
+            name: name,
+            kind: kind,
+            baseUrl: baseUrl,
+            username: username,
+            password: password,
+            token: token,
+            rootPath: rootPath
+          )
+          appState.switchStorageMount(created.id)
+        }
+        let html = buildLanPortalPage(appState: appState, pushedBanner: "✅ 已成功挂载远程存储并在 Apple TV 打开！")
+        sendHttpResponse(conn: conn, html: html)
+      }
+      return
+    }
+
+    // 3. Download file from Apple TV Local Offline Cache (`GET /local-cache/<filename>`)
+    if method == "GET" && pathAndQuery.hasPrefix("/local-cache/") {
+      let rel = String(pathAndQuery.dropFirst("/local-cache/".count)).removingPercentEncoding ?? ""
+      let fileUrl = resolveLocalOfflineUrl(relativePath: rel)
+      if let fileData = try? Data(contentsOf: fileUrl) {
+        let fname = fileUrl.lastPathComponent
+        let header = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"\(fname)\"\r\nContent-Length: \(fileData.count)\r\nConnection: close\r\n\r\n"
+        var packet = Data(header.utf8)
+        packet.append(fileData)
+        conn.send(content: packet, completion: .contentProcessed { _ in conn.cancel() })
+      } else {
+        sendHttpRawResponse(conn: conn, status: "404 Not Found", contentType: "text/plain; charset=utf-8", bodyData: Data("File not found".utf8))
+      }
+      return
+    }
+
+    // 4. Download / Proxy current directory file to Phone/PC browser (`GET /download-entry?idx=<index>`)
+    if method == "GET" && pathAndQuery.hasPrefix("/download-entry") {
+      let comps = URLComponents(string: "http://localhost\(pathAndQuery)")
+      let idx = Int(comps?.queryItems?.first(where: { $0.name == "idx" })?.value ?? "-1") ?? -1
+      Task { @MainActor in
+        let entries = appState.fileListing.entries
+        guard idx >= 0 && idx < entries.count else {
+          sendHttpRawResponse(conn: conn, status: "404 Not Found", contentType: "text/plain", bodyData: Data("Invalid entry".utf8))
+          return
+        }
+        let entry = entries[idx]
+        if entry.sourceKind == .localCache {
+          let fileUrl = resolveLocalOfflineUrl(relativePath: entry.path)
+          if let d = try? Data(contentsOf: fileUrl) {
+            let header = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"\(entry.name)\"\r\nContent-Length: \(d.count)\r\nConnection: close\r\n\r\n"
+            var pkt = Data(header.utf8)
+            pkt.append(d)
+            conn.send(content: pkt, completion: .contentProcessed { _ in conn.cancel() })
+            return
+          }
+        }
+        if let resolved = try? await appState.resolveFileStreamEndpoint(entry),
+           !resolved.url.isEmpty {
+          let redirectHeader = "HTTP/1.1 302 Found\r\nLocation: \(resolved.url)\r\nConnection: close\r\n\r\n"
+          conn.send(content: Data(redirectHeader.utf8), completion: .contentProcessed { _ in conn.cancel() })
+        } else {
+          sendHttpRawResponse(conn: conn, status: "404 Not Found", contentType: "text/plain", bodyData: Data("Unable to resolve download URL".utf8))
+        }
+      }
+      return
+    }
+
+    // 5. Push Subscription / 115 Cookie / Server Config (`POST /push`)
+    if method == "POST" && pathAndQuery.hasPrefix("/push") {
+      let bodyPart = String(data: bodyData, encoding: .utf8) ?? ""
+      let form = parseFormUrlEncoded(bodyPart)
+      let subNameInput = (form["sub_name"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+      let subInput = form["sub_url"] ?? ""
+      let cookieInput = form["cookie_115"] ?? ""
+      let serverInput = form["server_url"] ?? ""
+      let pwdInput = form["server_pwd"] ?? ""
+
+      Task { @MainActor in
+        var actions: [String] = []
+        let rawLines = subInput
+          .components(separatedBy: .newlines)
+          .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+          .filter { !$0.isEmpty }
+
+        if !rawLines.isEmpty {
+          var subIdsToRefresh: [String] = []
+          var rawNodeLines: [String] = []
+
+          for (idx, line) in rawLines.enumerated() {
+            let lower = line.lowercased()
+            if lower.hasPrefix("vmess://") || lower.hasPrefix("vless://") || lower.hasPrefix("ss://")
+                || lower.hasPrefix("trojan://") || lower.hasPrefix("hy2://") || lower.hasPrefix("hysteria2://")
+                || lower.hasPrefix("socks5://") {
+              rawNodeLines.append(line)
+            } else {
+              let name = rawLines.count > 1 && !subNameInput.isEmpty
+                ? "\(subNameInput) \(idx + 1)"
+                : subNameInput
+              if let sub = appState.upsertSubscription(name: name, url: line, enabled: true) {
+                subIdsToRefresh.append(sub.id)
+              }
+            }
+          }
+
+          if !subIdsToRefresh.isEmpty {
+            actions.append("\(subIdsToRefresh.count) 个代理订阅")
+            Task {
+              for sid in subIdsToRefresh {
+                await appState.refreshSubscription(sid, silent: false)
+              }
+            }
+          }
+          if !rawNodeLines.isEmpty {
+            actions.append("节点直链")
+            Task {
+              _ = await appState.importManualNodesFromText(rawNodeLines.joined(separator: "\n"))
+            }
+          }
+        }
+
+        if !cookieInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+          actions.append("115 Cookie")
+          Task {
+            await appState.save115Cookie(cookieInput)
+          }
+        }
+        if !serverInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+          appState.saveConfig(
+            newUrl: serverInput,
+            newSecret: pwdInput.isEmpty ? appState.authSecret : pwdInput,
+            adFilter: appState.enableAdFilter,
+            directPlayback: appState.preferDirectPlayback,
+            introSec: appState.skipIntroSeconds,
+            outroSec: appState.skipOutroSeconds
+          )
+          actions.append("服务器配置")
+          Task { await appState.bootstrapAll() }
+        }
+        let summary = actions.isEmpty ? "配置" : actions.joined(separator: "、")
+        appState.showToast("📱 已收到手机扫码推送的\(summary)，正在自动更新测速！")
+        let okHtml = buildLanPortalPage(appState: appState, pushedBanner: "✅ 已成功推送 \(summary) 到 Apple TV！")
+        sendHttpResponse(conn: conn, html: okHtml)
+      }
+      return
+    }
+
+    // Default: GET / -> Render full Apple TV LAN File Upload/Download + AList Mount + Subscription Web Portal
+    Task { @MainActor in
+      let html = buildLanPortalPage(appState: appState, pushedBanner: nil)
+      sendHttpResponse(conn: conn, html: html)
+    }
+  }
+
+  private nonisolated static func sendHttpRawResponse(
+    conn: NWConnection,
+    status: String,
+    contentType: String,
+    bodyData: Data
+  ) {
+    let header = "HTTP/1.1 \(status)\r\nContent-Type: \(contentType)\r\nContent-Length: \(bodyData.count)\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+    var respData = Data(header.utf8)
+    respData.append(bodyData)
+    conn.send(content: respData, completion: .contentProcessed { _ in
+      conn.cancel()
+    })
   }
 
   private nonisolated static func sendHttpResponse(conn: NWConnection, html: String) {
@@ -3409,69 +6478,209 @@ final class TvAppState: ObservableObject {
     return result
   }
 
-  private nonisolated static func buildLanWebHtml(pushedSuccess: Bool, existingSubsHtml: String) -> String {
-    let banner = pushedSuccess
-      ? "<div style='background:#184d30;border:1px solid #30d158;color:#fff;padding:14px 16px;border-radius:14px;margin-bottom:18px;font-weight:600;'>✅ 已成功添加到 Apple TV 多订阅列表！电视端正在自动拉取节点并测速。</div>"
+  @MainActor
+  private static func buildLanPortalPage(appState: TvAppState, pushedBanner: String?) -> String {
+    let mount = appState.activeStorageMount
+    let currentDir = appState.fileListing.path.isEmpty ? mount.rootPath : appState.fileListing.path
+    let existingSummary = appState.subscriptions
+      .map { "• \($0.name): \($0.maskedUrlSummary) (\($0.nodeCount) 节点)" }
+      .joined(separator: "<br>")
+    let filesRowsHtml: String = {
+      let files = appState.fileListing.entries.enumerated().filter { !$0.element.isDir }.prefix(40)
+      if files.isEmpty {
+        return "<div style='color:#7E869A;font-size:13px;padding:10px 0;'>当前目录暂无可下载文件</div>"
+      }
+      return files.map { (idx, entry) in
+        """
+        <div style='display:flex;justify-content:space-between;align-items:center;padding:9px 12px;border-bottom:1px solid #262B3A;font-size:13px;'>
+          <div style='overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:72%;color:#E5E9F2;'>📄 \(entry.name) <span style='color:#8892A8;'>(\(entry.formattedSize))</span></div>
+          <a href='/download-entry?idx=\(idx)' style='background:#2563EB;color:#fff;text-decoration:none;padding:5px 11px;border-radius:8px;font-weight:600;font-size:12px;'>下载到手机/电脑</a>
+        </div>
+        """
+      }.joined(separator: "\n")
+    }()
+
+    let bannerHtml = (pushedBanner != nil)
+      ? "<div style='background:#184d30;border:1px solid #30d158;color:#fff;padding:14px 16px;border-radius:14px;margin-bottom:18px;font-weight:600;'>\(pushedBanner!)</div>"
       : ""
-    let subListBox = existingSubsHtml.isEmpty
+
+    let subListBox = existingSummary.isEmpty
       ? ""
-      : "<div style='background:#11131A;border:1px solid #2B3042;border-radius:12px;padding:10px 12px;margin-bottom:14px;font-size:12px;color:#A5ADBA;line-height:1.6;'><strong style='color:#FFB340;'>电视端已配置的订阅源：</strong><br>\(existingSubsHtml)</div>"
+      : "<div style='background:#11131A;border:1px solid #2B3042;border-radius:12px;padding:10px 12px;margin-bottom:14px;font-size:12px;color:#A5ADBA;line-height:1.6;'><strong style='color:#FFB340;'>电视端已配置的订阅源：</strong><br>\(existingSummary)</div>"
+
     return """
     <!DOCTYPE html>
     <html lang="zh-CN">
     <head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-      <title>流光视频 · Apple TV 多订阅与配置推送</title>
+      <title>流光视频 · Apple TV 文件快传与远程挂载中心</title>
       <style>
         * { box-sizing: border-box; }
         body {
-          margin: 0; padding: 20px;
+          margin: 0; padding: 18px;
           background: #0B0C10; color: #F5F6FA;
           font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
         }
         .card {
-          max-width: 540px; margin: 0 auto;
+          max-width: 620px; margin: 0 auto 18px auto;
           background: #191C26; border: 1px solid #2E3446;
-          border-radius: 20px; padding: 22px;
+          border-radius: 20px; padding: 20px;
           box-shadow: 0 12px 32px rgba(0,0,0,0.45);
         }
-        h2 { margin: 0 0 6px 0; font-size: 21px; color: #FF9F0A; }
+        h2 { margin: 0 0 6px 0; font-size: 20px; color: #FF9F0A; }
         p.sub { margin: 0 0 14px 0; font-size: 13px; color: #9EA3B0; line-height: 1.45; }
-        label { display: block; font-size: 14px; font-weight: 600; margin: 12px 0 6px 0; color: #E2E6F0; }
-        textarea, input {
+        label { display: block; font-size: 13px; font-weight: 600; margin: 11px 0 5px 0; color: #E2E6F0; }
+        textarea, input, select {
           width: 100%; background: #11131A; color: #fff;
           border: 1px solid #343A4D; border-radius: 12px;
-          padding: 12px; font-size: 15px; outline: none;
+          padding: 11px; font-size: 14px; outline: none;
         }
-        textarea:focus, input:focus { border-color: #FF9F0A; }
+        textarea:focus, input:focus, select:focus { border-color: #FF9F0A; }
         button {
-          margin-top: 20px; width: 100%;
+          margin-top: 16px; width: 100%;
           background: linear-gradient(135deg, #FF9F0A, #FF7A00);
-          color: #fff; font-weight: 700; font-size: 16px;
-          border: none; border-radius: 14px; padding: 14px;
+          color: #fff; font-weight: 700; font-size: 15px;
+          border: none; border-radius: 14px; padding: 13px;
           cursor: pointer;
+        }
+        .dropzone {
+          border: 2px dashed #3B82F6; background: rgba(59,130,246,0.08);
+          border-radius: 16px; padding: 22px 14px; text-align: center;
+          cursor: pointer; transition: 0.2s;
+        }
+        .dropzone:hover { background: rgba(59,130,246,0.16); }
+        .prog-wrap {
+          margin-top: 14px; display: none;
+          background: #11131A; border: 1px solid #2E3446; border-radius: 12px; padding: 12px;
+        }
+        .prog-bar-bg {
+          width: 100%; height: 10px; background: #262B3A; border-radius: 6px; overflow: hidden; margin: 8px 0;
+        }
+        .prog-bar-fill {
+          height: 100%; width: 0%; background: linear-gradient(90deg, #3B82F6, #10B981); transition: width 0.1s;
         }
       </style>
     </head>
     <body>
+      \(bannerHtml)
       <div class="card">
-        <h2>📺 流光视频 · 多订阅与节点推送</h2>
-        <p class="sub">支持添加多个机场订阅（每行粘贴一个 https://、clash://、sub:// 订阅链接，或直接粘贴 vmess:// / vless:// / ss:// / trojan:// / hy2:// 节点链接），发送后将自动加入 Apple TV 订阅池并并发测速。</p>
-        \(banner)
-        \(subListBox)
-        <form method="POST" action="/push">
-          <label>1. 订阅备注名称（选填，例如：主力机场 / 专线订阅）</label>
-          <input type="text" name="sub_name" placeholder="不填则自动提取域名作为订阅名称" />
-          <label>2. 订阅链接或节点直链（支持一次粘贴多个，每行一个）</label>
-          <textarea name="sub_url" rows="4" placeholder="在此粘贴 https://... 订阅地址（可多行添加多个订阅）或 vmess:// / ss:// 节点链接"></textarea>
-          <label>3. 115 网盘 Cookie（选填）</label>
-          <input type="text" name="cookie_115" placeholder="UID=...; CID=...; SEID=..." />
-          <label>4. 流光服务端地址（选填）</label>
-          <input type="text" name="server_url" placeholder="例如 https://jp2.linsionwinwin.top:8081" />
-          <button type="submit">🚀 推送到 Apple TV 订阅列表并测速</button>
+        <h2>📂 1. 局域网文件上传与下载（Apple TV 实时同步显示进度）</h2>
+        <p class="sub">当前 Apple TV 正在浏览：<strong style="color:#60A5FA;">\(mount.name)</strong> · 目录 <code style="color:#FFB340;">\(currentDir.isEmpty ? "/" : currentDir)</code>。选择或拖拽文件后将直接上传至该目录，并在手机与电视屏幕上同时显示实时进度条！</p>
+        <div class="dropzone" onclick="document.getElementById('fileInput').click()">
+          <div style="font-size:28px;margin-bottom:6px;">⬆️</div>
+          <div style="font-weight:700;font-size:15px;color:#93C5FD;">点击选择文件 或 拖拽多个文件到此处上传到 Apple TV</div>
+          <div style="font-size:12px;color:#8892A8;margin-top:4px;">支持视频 (MP4/MKV/TS)、字幕 (SRT/ASS)、音频、播放列表 (M3U8)、图片等任意文件</div>
+          <input type="file" id="fileInput" multiple style="display:none" onchange="uploadFiles(this.files)" />
+        </div>
+        <div id="progWrap" class="prog-wrap">
+          <div id="progTitle" style="font-size:13px;font-weight:600;color:#E2E6F0;">准备上传...</div>
+          <div class="prog-bar-bg"><div id="progFill" class="prog-bar-fill"></div></div>
+          <div id="progDetail" style="font-size:12px;color:#9EA3B0;">0%</div>
+        </div>
+        <div style="margin-top:16px;">
+          <div style="font-size:13px;font-weight:700;color:#FFB340;margin-bottom:6px;">⬇️ 当前目录文件列表（点击可直接下载到手机/电脑）：</div>
+          <div style="background:#11131A;border:1px solid #2B3042;border-radius:12px;max-height:240px;overflow-y:auto;">
+            \(filesRowsHtml)
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>☁️ 2. 远程挂载 AList / OpenList / WebDAV 网盘到 Apple TV</h2>
+        <p class="sub">无需用遥控器逐字输入，在此填入 AList 或 WebDAV 地址后点击挂载，Apple TV 文件管理器将立即打开该网盘！</p>
+        <form method="POST" action="/mount-storage">
+          <label>存储类型</label>
+          <select name="kind">
+            <option value="alist">AList / OpenList (v3 API 原生挂载)</option>
+            <option value="webdav">WebDAV 标准网盘 (如 AList /dav、群晖、CloudDrive2、Nextcloud)</option>
+          </select>
+          <label>显示名称（例如：家庭 AList / 115 CloudDrive2）</label>
+          <input type="text" name="name" placeholder="例如：家庭 AList 媒体中心" />
+          <label>服务器地址（AList 填 http://IP:5244；WebDAV 填完整 http://IP:5244/dav）</label>
+          <input type="text" name="base_url" placeholder="http://192.168.1.10:5244" required />
+          <div style="display:flex;gap:10px;">
+            <div style="flex:1;">
+              <label>用户名（选填，游客留空）</label>
+              <input type="text" name="username" placeholder="admin" />
+            </div>
+            <div style="flex:1;">
+              <label>密码（选填）</label>
+              <input type="password" name="password" placeholder="密码" />
+            </div>
+          </div>
+          <div style="display:flex;gap:10px;">
+            <div style="flex:1;">
+              <label>默认初始目录</label>
+              <input type="text" name="root_path" value="/" placeholder="/" />
+            </div>
+            <div style="flex:1;">
+              <label>AList Token（选填，填账号密码可留空）</label>
+              <input type="text" name="token" placeholder="选填" />
+            </div>
+          </div>
+          <button type="submit">🔗 立即挂载并在 Apple TV 打开</button>
         </form>
       </div>
+
+      <div class="card">
+        <h2>📺 3. 多订阅、节点直链与 115 Cookie 推送</h2>
+        \(subListBox)
+        <form method="POST" action="/push">
+          <label>订阅备注名称（选填）</label>
+          <input type="text" name="sub_name" placeholder="不填则自动提取域名作为订阅名称" />
+          <label>订阅链接或节点直链（支持每行一个）</label>
+          <textarea name="sub_url" rows="3" placeholder="在此粘贴 https://... 订阅地址或 vmess:// / ss:// 节点链接"></textarea>
+          <label>115 网盘 Cookie（选填）</label>
+          <input type="text" name="cookie_115" placeholder="UID=...; CID=...; SEID=..." />
+          <label>流光服务端地址（选填）</label>
+          <input type="text" name="server_url" placeholder="例如 https://jp2.linsionwinwin.top:8081" />
+          <button type="submit">🚀 推送配置到 Apple TV</button>
+        </form>
+      </div>
+
+      <script>
+        async function uploadFiles(files) {
+          if (!files || !files.length) return;
+          const wrap = document.getElementById('progWrap');
+          const title = document.getElementById('progTitle');
+          const fill = document.getElementById('progFill');
+          const detail = document.getElementById('progDetail');
+          wrap.style.display = 'block';
+
+          for (let i = 0; i < files.length; i++) {
+            const file = files[i];
+            title.textContent = `正在上传 (${i + 1}/${files.length}): ${file.name}`;
+            fill.style.width = '0%';
+            const startMs = Date.now();
+
+            await new Promise((resolve) => {
+              const xhr = new XMLHttpRequest();
+              xhr.open('POST', '/upload-raw?name=' + encodeURIComponent(file.name), true);
+              xhr.upload.onprogress = (e) => {
+                if (e.lengthComputable) {
+                  const pct = ((e.loaded / e.total) * 100).toFixed(1);
+                  fill.style.width = pct + '%';
+                  const elapsed = Math.max(0.1, (Date.now() - startMs) / 1000);
+                  const mbps = (e.loaded / (1024 * 1024) / elapsed).toFixed(2);
+                  detail.textContent = `${pct}% · ${(e.loaded / (1024 * 1024)).toFixed(2)} MB / ${(e.total / (1024 * 1024)).toFixed(2)} MB · ${mbps} MB/s（Apple TV 屏幕正同步显示进度）`;
+                }
+              };
+              xhr.onload = () => {
+                fill.style.width = '100%';
+                detail.textContent = `✅ ${file.name} 上传完成！`;
+                resolve();
+              };
+              xhr.onerror = () => {
+                detail.textContent = `⚠️ ${file.name} 上传失败`;
+                resolve();
+              };
+              xhr.send(file);
+            });
+          }
+          setTimeout(() => { location.reload(); }, 900);
+        }
+      </script>
     </body>
     </html>
     """

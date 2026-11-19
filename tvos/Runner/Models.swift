@@ -10,6 +10,7 @@ enum TvMainSection: String, CaseIterable, Identifiable {
   case favorites = "收藏历史"
   case downloads = "下载嗅探"
   case mediaLibrary = "媒体库"
+  case music = "流光音乐"
   case proxy = "代理加速"
   case settings = "系统设置"
 
@@ -23,6 +24,7 @@ enum TvMainSection: String, CaseIterable, Identifiable {
     case .favorites: return "heart.text.square.fill"
     case .downloads: return "arrow.down.circle.fill"
     case .mediaLibrary: return "externaldrive.fill.badge.play"
+    case .music: return "opticaldisc.fill"
     case .proxy: return "network.badge.shield.half.filled"
     case .settings: return "gearshape.fill"
     }
@@ -326,6 +328,9 @@ struct TvResolvedPlayback: Hashable {
   let headers: [String: String]
   let parseVia: String
   let backendProxyPlayback: Bool
+  var isFlvHardwareStream: Bool = false
+  var flvPrimaryUrl: String = ""
+  var flvGatewayUrl: String = ""
 }
 
 // MARK: - Live TV Models
@@ -444,10 +449,233 @@ struct TvExtractedCandidate: Identifiable, Hashable {
   let headers: [String: String]
 }
 
-// MARK: - Server Media Library Models
+// MARK: - Server Media Library & Multi-Storage File Manager Models
+
+enum TvStorageSourceKind: String, Codable, CaseIterable, Hashable, Identifiable {
+  case server = "server"
+  case alist = "alist"
+  case webdav = "webdav"
+  case cloud115 = "cloud115"
+  case localCache = "localCache"
+
+  var id: String { rawValue }
+
+  var title: String {
+    switch self {
+    case .server: return "流光服务端"
+    case .alist: return "AList / OpenList"
+    case .webdav: return "WebDAV 远程盘"
+    case .cloud115: return "115 网盘直连"
+    case .localCache: return "本机离线缓存"
+    }
+  }
+
+  var icon: String {
+    switch self {
+    case .server: return "externaldrive.fill.badge.wifi"
+    case .alist: return "server.rack"
+    case .webdav: return "network.badge.shield.half.filled"
+    case .cloud115: return "icloud.fill"
+    case .localCache: return "appletv.fill"
+    }
+  }
+}
+
+struct TvStorageMount: Identifiable, Codable, Hashable {
+  var id: String
+  var name: String
+  var kind: TvStorageSourceKind
+  var baseUrl: String
+  var username: String
+  var password: String
+  var token: String
+  var rootPath: String
+  var enabled: Bool
+
+  init(
+    id: String = UUID().uuidString,
+    name: String,
+    kind: TvStorageSourceKind,
+    baseUrl: String = "",
+    username: String = "",
+    password: String = "",
+    token: String = "",
+    rootPath: String = "/",
+    enabled: Bool = true
+  ) {
+    self.id = id
+    self.name = name
+    self.kind = kind
+    self.baseUrl = baseUrl
+    self.username = username
+    self.password = password
+    self.token = token
+    self.rootPath = rootPath.isEmpty ? "/" : rootPath
+    self.enabled = enabled
+  }
+
+  var isBuiltIn: Bool {
+    kind == .server || kind == .cloud115 || kind == .localCache
+  }
+
+  var badgeTitle: String {
+    switch kind {
+    case .server: return "服务端"
+    case .alist: return "AList"
+    case .webdav: return "WebDAV"
+    case .cloud115: return "115网盘"
+    case .localCache: return "本机缓存"
+    }
+  }
+}
+
+enum TvFileTransferDirection: String, Codable, Hashable {
+  case upload = "upload"
+  case download = "download"
+
+  var label: String {
+    self == .upload ? "上传" : "下载"
+  }
+
+  var icon: String {
+    self == .upload ? "arrow.up.circle.fill" : "arrow.down.circle.fill"
+  }
+}
+
+enum TvFileTransferStatus: String, Codable, Hashable {
+  case running = "running"
+  case completed = "completed"
+  case failed = "failed"
+  case cancelled = "cancelled"
+
+  var label: String {
+    switch self {
+    case .running: return "进行中"
+    case .completed: return "已完成"
+    case .failed: return "失败"
+    case .cancelled: return "已取消"
+    }
+  }
+}
+
+struct TvFileTransferTask: Identifiable, Hashable {
+  let id: String
+  var name: String
+  var direction: TvFileTransferDirection
+  var sourceLabel: String
+  var targetLabel: String
+  var totalBytes: Int64
+  var transferredBytes: Int64
+  var speedBytesPerSec: Double
+  var status: TvFileTransferStatus
+  var detailMessage: String
+  var localSavedPath: String?
+  var createdAt: Date
+
+  var progress: Double {
+    guard totalBytes > 0 else {
+      return status == .completed ? 1.0 : 0.0
+    }
+    return min(1.0, max(0.0, Double(transferredBytes) / Double(totalBytes)))
+  }
+
+  var percentText: String {
+    String(format: "%.1f%%", progress * 100.0)
+  }
+
+  var formattedSpeed: String {
+    guard speedBytesPerSec > 0 else { return "0 KB/s" }
+    if speedBytesPerSec < 1024 * 1024 {
+      return String(format: "%.1f KB/s", speedBytesPerSec / 1024.0)
+    }
+    return String(format: "%.2f MB/s", speedBytesPerSec / (1024.0 * 1024.0))
+  }
+
+  var formattedBytesProgress: String {
+    let cur = Self.formatByteCount(transferredBytes)
+    if totalBytes > 0 {
+      return "\(cur) / \(Self.formatByteCount(totalBytes))"
+    }
+    return cur
+  }
+
+  static func formatByteCount(_ bytes: Int64) -> String {
+    if bytes < 1024 { return "\(max(0, bytes)) B" }
+    if bytes < 1024 * 1024 { return String(format: "%.1f KB", Double(bytes) / 1024.0) }
+    if bytes < 1024 * 1024 * 1024 { return String(format: "%.1f MB", Double(bytes) / (1024.0 * 1024.0)) }
+    return String(format: "%.2f GB", Double(bytes) / (1024.0 * 1024.0 * 1024.0))
+  }
+}
+
+enum TvFileSortOption: String, CaseIterable, Hashable {
+  case dateDesc = "dateDesc"
+  case nameAsc = "nameAsc"
+  case sizeDesc = "sizeDesc"
+  case typeAsc = "typeAsc"
+
+  var title: String {
+    switch self {
+    case .dateDesc: return "按修改时间"
+    case .nameAsc: return "按名称 A-Z"
+    case .sizeDesc: return "按文件大小"
+    case .typeAsc: return "按文件类型"
+    }
+  }
+
+  var icon: String {
+    switch self {
+    case .dateDesc: return "clock.arrow.circlepath"
+    case .nameAsc: return "textformat.abc"
+    case .sizeDesc: return "arrow.up.arrow.down.circle"
+    case .typeAsc: return "square.grid.2x2"
+    }
+  }
+}
+
+enum TvFileCategoryFilter: String, CaseIterable, Hashable {
+  case all = "all"
+  case video = "video"
+  case audio = "audio"
+  case image = "image"
+  case document = "document"
+
+  var title: String {
+    switch self {
+    case .all: return "全部"
+    case .video: return "视频"
+    case .audio: return "音频"
+    case .image: return "图片"
+    case .document: return "字幕/文档"
+    }
+  }
+}
+
+enum TvFileClipboardOperation: String, Hashable {
+  case copy = "copy"
+  case move = "move"
+}
+
+struct TvFileClipboardItem: Hashable {
+  let mountId: String
+  let sourceDirectory: String
+  let entries: [TvFileEntry]
+  let operation: TvFileClipboardOperation
+}
+
+struct TvSavedMusicFolderItem: Codable, Identifiable, Hashable {
+  var id: String { "\(mountId)::\(path)" }
+  var mountId: String
+  var mountName: String
+  var sourceKind: TvStorageSourceKind
+  var path: String
+  var title: String
+  var isArchive: Bool
+  var size: Int64
+  var pickcode115: String
+}
 
 struct TvFileEntry: Identifiable, Hashable {
-  var id: String { path }
+  var id: String { "\(mountId)::\(path)" }
   let name: String
   let path: String
   let size: Int64
@@ -455,25 +683,99 @@ struct TvFileEntry: Identifiable, Hashable {
   let isDir: Bool
   let isMp4: Bool
   let ext: String
+  var mountId: String = "builtin_server"
+  var sourceKind: TvStorageSourceKind = .server
+  var rawDownloadUrl: String = ""
+  var thumbUrl: String = ""
+  var pickcode115: String = ""
+  var fid115: String = ""
+  var cid115: String = ""
+
+  var archiveContainerPath: String = ""
+  var archiveContainerName: String = ""
+  var archiveInnerPath: String = ""
+  var archiveOffset: Int64 = 0
+  var archiveCompressedSize: Int64 = 0
+  var archiveCompressionMethod: Int = 0
+
+  var isInsideArchive: Bool {
+    !archiveContainerPath.isEmpty
+  }
+
+  var isStreamableMusicArchive: Bool {
+    if isDir { return false }
+    let e = normalizedExt
+    return [".zip", ".cbz", ".tar"].contains(e)
+  }
+
+  var normalizedExt: String {
+    let lower = ext.lowercased()
+    if !lower.isEmpty {
+      return lower.hasPrefix(".") ? lower : ".\(lower)"
+    }
+    let ns = (name as NSString).pathExtension.lowercased()
+    return ns.isEmpty ? "" : ".\(ns)"
+  }
+
+  var isVideo: Bool {
+    if isDir { return false }
+    let e = normalizedExt
+    return isMp4 || [".mp4", ".mkv", ".ts", ".m3u8", ".mov", ".flv", ".webm", ".avi", ".rmvb", ".wmv", ".m4v", ".iso"].contains(e)
+  }
+
+  var isAudio: Bool {
+    if isDir { return false }
+    let e = normalizedExt
+    return [".mp3", ".m4a", ".flac", ".wav", ".aac", ".ogg", ".ape", ".alac", ".opus", ".wma", ".dsf", ".dff", ".aiff", ".aif", ".amr", ".mid"].contains(e)
+  }
 
   var isPlayableVideo: Bool {
-    let lower = ext.lowercased()
-    return isMp4
-      || lower == ".mp4"
-      || lower == ".mkv"
-      || lower == ".ts"
-      || lower == ".m3u8"
-      || lower == ".mov"
-      || lower == ".flv"
-      || lower == ".webm"
-      || lower == ".avi"
-      || lower == ".mp3"
-      || lower == ".m4a"
-      || lower == ".flac"
+    isVideo || isAudio
+  }
+
+  var isImage: Bool {
+    if isDir { return false }
+    let e = normalizedExt
+    return [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic", ".tiff"].contains(e)
+  }
+
+  var isTextPreviewable: Bool {
+    if isDir { return false }
+    let e = normalizedExt
+    return [".txt", ".srt", ".ass", ".ssa", ".vtt", ".lrc", ".json", ".yaml", ".yml", ".m3u", ".m3u8", ".xml", ".nfo", ".log", ".md", ".conf", ".ini", ".sh", ".py", ".js", ".csv"].contains(e)
+  }
+
+  var isArchive: Bool {
+    if isDir { return false }
+    let e = normalizedExt
+    return [".zip", ".cbz", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz"].contains(e)
+  }
+
+  var iconName: String {
+    if isDir { return "folder.fill" }
+    if isVideo { return "film.fill" }
+    if isAudio { return "waveform.circle.fill" }
+    if isImage { return "photo.fill" }
+    if isTextPreviewable { return "doc.text.fill" }
+    if isArchive { return "doc.zipper" }
+    return "doc.fill"
+  }
+
+  var typeTagText: String {
+    if isDir { return "文件夹" }
+    let clean = normalizedExt.replacingOccurrences(of: ".", with: "").uppercased()
+    if !clean.isEmpty {
+      return isInsideArchive ? "\(clean) · 压缩包" : clean
+    }
+    if isVideo { return "VIDEO" }
+    if isAudio { return "AUDIO" }
+    if isImage { return "IMAGE" }
+    return "FILE"
   }
 
   var formattedSize: String {
     if isDir { return "文件夹" }
+    if size <= 0 { return "--" }
     if size < 1024 { return "\(size) B" }
     if size < 1024 * 1024 { return String(format: "%.1f KB", Double(size) / 1024.0) }
     if size < 1024 * 1024 * 1024 { return String(format: "%.1f MB", Double(size) / (1024.0 * 1024.0)) }
@@ -485,7 +787,19 @@ struct TvFileListing: Hashable {
   let path: String
   let parent: String
   let root: String
-  let entries: [TvFileEntry]
+  var entries: [TvFileEntry]
+  var totalCount: Int = 0
+  var currentPage: Int = 1
+
+  var hasMoreRemotePages: Bool {
+    totalCount > entries.count
+  }
+}
+
+struct TvCloudLrcLine: Identifiable, Hashable {
+  let id = UUID()
+  let timeSeconds: Double
+  let text: String
 }
 
 // MARK: - Telegram Models
@@ -893,6 +1207,9 @@ struct TvPlaybackRequest: Identifiable, Hashable {
   let episodeIndex: Int
   let liveChannel: TvLiveChannel?
   let liveUrlIndex: Int
+  var isFlvHardwareStream: Bool = false
+  var flvPrimaryUrl: String = ""
+  var flvGatewayUrl: String = ""
 }
 
 struct TvTelegramGallerySession: Identifiable, Hashable {

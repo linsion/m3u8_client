@@ -1626,6 +1626,15 @@ class ApiClient {
     // IPv6 literals or raw IPv4 OTT paths should be opened directly by libmpv
     if (host.contains(':')) return true;
     final pathLower = uri.path.toLowerCase();
+    // Douyu / Huya / YY redirect gateways (e.g. live.ottiptv.cc/douyu/123456) must NOT pre-open
+    // a dummy HTTP connection because their 302 CDN tickets are single-use; let libmpv follow the 302 directly!
+    if (pathLower.contains('/douyu/') ||
+        pathLower.contains('/huya/') ||
+        pathLower.contains('/yy/') ||
+        host.contains('ottiptv.cc') ||
+        host.contains('douyucdn')) {
+      return true;
+    }
     if (pathLower.endsWith('.m3u8') ||
         pathLower.endsWith('.flv') ||
         pathLower.endsWith('.ts') ||
@@ -1871,15 +1880,64 @@ class ApiClient {
     );
     final effectiveDirect =
         route == ScenarioRouteMode.serverRelay ? false : preferClientDirect;
+    final lowerClean = split.cleanUrl.toLowerCase();
+    final isFlvGateway = lowerClean.contains('ottiptv.cc') ||
+        lowerClean.contains('/douyu/') ||
+        lowerClean.contains('/huya/') ||
+        lowerClean.contains('/yy/') ||
+        lowerClean.contains('douyucdn');
     final mergedHeaders = <String, String>{
       ...source.defaultHeaders,
       if (channelHeaders != null) ...channelHeaders,
       ...split.headers,
     };
+    if (isFlvGateway) {
+      final curUa = (mergedHeaders['User-Agent'] ?? '').trim().toLowerCase();
+      if (curUa.isEmpty || curUa == 'okhttp/3.15') {
+        mergedHeaders['User-Agent'] = 'okHttp/Mod-1.5.0.0';
+      }
+    }
 
     if (effectiveDirect) {
+      var targetDirectUrl = split.cleanUrl;
+      final lowerPath = (Uri.tryParse(targetDirectUrl)?.path ?? '').toLowerCase();
+      final isStandardStream = lowerPath.endsWith('.m3u8') ||
+          lowerPath.endsWith('.ts') ||
+          lowerPath.contains('.m3u8/') ||
+          lowerPath.contains('/pltv/') ||
+          targetDirectUrl.contains('://[');
+      if (!source.isCustom && (!isStandardStream || isFlvGateway)) {
+        try {
+          final data = await _getJson(
+            '/api/tvbox/live/play',
+            query: {
+              'tvbox_source': source.sourceIndex.toString(),
+              'tvbox_live': source.liveIndex.toString(),
+              'url': split.cleanUrl,
+            },
+            timeout: const Duration(seconds: 5),
+          );
+          if (data is Map<String, dynamic>) {
+            final srvResolved = ResolvedPlayback.fromJson(data);
+            if (srvResolved.directUrl.isNotEmpty &&
+                !srvResolved.directUrl.contains('/api/vod/proxy')) {
+              final s2 = _splitInlineStreamHeaders(srvResolved.directUrl);
+              if (s2.cleanUrl.isNotEmpty) {
+                targetDirectUrl = s2.cleanUrl;
+              }
+              mergedHeaders.addAll(s2.headers);
+            }
+            srvResolved.headers.forEach((k, v) {
+              if (v.trim().isNotEmpty) {
+                mergedHeaders[k] = v.trim();
+              }
+            });
+          }
+        } catch (_) {}
+      }
+
       final redirectedUrl = await _resolveLiveStreamRedirectClient(
-        split.cleanUrl,
+        targetDirectUrl,
         mergedHeaders,
       );
       final dohResolved = await _resolveIpv6OrFakeIpIfNeeded(
@@ -1887,7 +1945,7 @@ class ApiClient {
         mergedHeaders,
       );
       final proxyUrl = buildServerVodProxyUrl(
-        split.cleanUrl,
+        targetDirectUrl,
         dohResolved.headers,
       );
       return ResolvedPlayback(

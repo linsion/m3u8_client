@@ -801,6 +801,184 @@ class DownloadTask {
   }
 }
 
+enum StorageSourceKind {
+  server('server', '流光服务端', '服务端'),
+  alist('alist', 'AList / OpenList', 'AList'),
+  webdav('webdav', 'WebDAV 远程盘', 'WebDAV'),
+  cloud115('cloud115', '115 网盘直连', '115网盘'),
+  localCache('localCache', '本机离线目录', '本机');
+
+  final String id;
+  final String title;
+  final String badge;
+  const StorageSourceKind(this.id, this.title, this.badge);
+
+  static StorageSourceKind fromId(String? raw) {
+    for (final k in StorageSourceKind.values) {
+      if (k.id == raw) return k;
+    }
+    return StorageSourceKind.server;
+  }
+}
+
+class StorageMount {
+  final String id;
+  final String name;
+  final StorageSourceKind kind;
+  final String baseUrl;
+  final String username;
+  final String password;
+  final String token;
+  final String rootPath;
+  final bool enabled;
+
+  const StorageMount({
+    required this.id,
+    required this.name,
+    required this.kind,
+    this.baseUrl = '',
+    this.username = '',
+    this.password = '',
+    this.token = '',
+    this.rootPath = '/',
+    this.enabled = true,
+  });
+
+  bool get isBuiltIn =>
+      kind == StorageSourceKind.server ||
+      kind == StorageSourceKind.cloud115 ||
+      kind == StorageSourceKind.localCache;
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'kind': kind.id,
+        'base_url': baseUrl,
+        'username': username,
+        'password': password,
+        'token': token,
+        'root_path': rootPath,
+        'enabled': enabled,
+      };
+
+  factory StorageMount.fromJson(Map<String, dynamic> json) {
+    final kind = StorageSourceKind.fromId(json['kind']?.toString());
+    final rawRoot = (json['root_path'] ?? '/').toString().trim();
+    return StorageMount(
+      id: (json['id'] ?? '').toString(),
+      name: (json['name'] ?? kind.title).toString(),
+      kind: kind,
+      baseUrl: (json['base_url'] ?? '').toString().trim(),
+      username: (json['username'] ?? '').toString().trim(),
+      password: (json['password'] ?? '').toString(),
+      token: (json['token'] ?? '').toString().trim(),
+      rootPath: rawRoot.isEmpty ? '/' : rawRoot,
+      enabled: json['enabled'] != false,
+    );
+  }
+}
+
+enum FileTransferDirection {
+  upload('upload', '上传'),
+  download('download', '下载');
+
+  final String id;
+  final String label;
+  const FileTransferDirection(this.id, this.label);
+}
+
+enum FileTransferStatus {
+  running('running', '进行中'),
+  completed('completed', '已完成'),
+  failed('failed', '失败'),
+  cancelled('cancelled', '已取消');
+
+  final String id;
+  final String label;
+  const FileTransferStatus(this.id, this.label);
+}
+
+class FileTransferTask {
+  final String id;
+  final String name;
+  final FileTransferDirection direction;
+  final String sourceLabel;
+  final String targetLabel;
+  int totalBytes;
+  int transferredBytes;
+  double speedBytesPerSec;
+  FileTransferStatus status;
+  String detailMessage;
+  String? localSavedPath;
+  final DateTime createdAt;
+  void Function()? onCancel;
+
+  FileTransferTask({
+    required this.id,
+    required this.name,
+    required this.direction,
+    required this.sourceLabel,
+    required this.targetLabel,
+    this.totalBytes = 0,
+    this.transferredBytes = 0,
+    this.speedBytesPerSec = 0,
+    this.status = FileTransferStatus.running,
+    this.detailMessage = '',
+    this.localSavedPath,
+    DateTime? createdAt,
+    this.onCancel,
+  }) : createdAt = createdAt ?? DateTime.now();
+
+  double get progress {
+    if (totalBytes <= 0) {
+      return status == FileTransferStatus.completed ? 1.0 : 0.0;
+    }
+    return (transferredBytes / totalBytes).clamp(0.0, 1.0);
+  }
+
+  String get percentText => '${(progress * 100).toStringAsFixed(1)}%';
+
+  String get formattedSpeed {
+    if (speedBytesPerSec <= 0) return '0 KB/s';
+    if (speedBytesPerSec < 1024 * 1024) {
+      return '${(speedBytesPerSec / 1024).toStringAsFixed(1)} KB/s';
+    }
+    return '${(speedBytesPerSec / (1024 * 1024)).toStringAsFixed(2)} MB/s';
+  }
+
+  String get formattedBytesProgress {
+    final cur = formatByteCount(transferredBytes);
+    if (totalBytes > 0) {
+      return '$cur / ${formatByteCount(totalBytes)}';
+    }
+    return cur;
+  }
+
+  static String formatByteCount(int bytes) {
+    final b = bytes < 0 ? 0 : bytes;
+    if (b < 1024) return '$b B';
+    if (b < 1024 * 1024) return '${(b / 1024).toStringAsFixed(1)} KB';
+    if (b < 1024 * 1024 * 1024) {
+      return '${(b / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '${(b / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+  }
+}
+
+class FileClipboardItem {
+  final String mountId;
+  final String sourceDirectory;
+  final List<FileEntry> entries;
+  final bool isMove;
+
+  const FileClipboardItem({
+    required this.mountId,
+    required this.sourceDirectory,
+    required this.entries,
+    required this.isMove,
+  });
+}
+
 class FileEntry {
   final String name;
   final String path;
@@ -809,6 +987,19 @@ class FileEntry {
   final bool isDir;
   final bool isMp4;
   final String ext;
+  final String mountId;
+  final StorageSourceKind sourceKind;
+  final String rawDownloadUrl;
+  final String thumbUrl;
+  final String pickcode115;
+  final String fid115;
+  final String cid115;
+  final String archiveContainerPath;
+  final String archiveContainerName;
+  final String archiveInnerPath;
+  final int archiveOffset;
+  final int archiveCompressedSize;
+  final int archiveCompressionMethod;
 
   const FileEntry({
     required this.name,
@@ -818,23 +1009,174 @@ class FileEntry {
     required this.isDir,
     required this.isMp4,
     required this.ext,
+    this.mountId = 'builtin_server',
+    this.sourceKind = StorageSourceKind.server,
+    this.rawDownloadUrl = '',
+    this.thumbUrl = '',
+    this.pickcode115 = '',
+    this.fid115 = '',
+    this.cid115 = '',
+    this.archiveContainerPath = '',
+    this.archiveContainerName = '',
+    this.archiveInnerPath = '',
+    this.archiveOffset = 0,
+    this.archiveCompressedSize = 0,
+    this.archiveCompressionMethod = 0,
   });
 
-  bool get isPlayableVideo {
-    final lower = ext.toLowerCase();
+  bool get isInsideArchive => archiveContainerPath.isNotEmpty;
+
+  String get normalizedExt {
+    final dotIdx = name.lastIndexOf('.');
+    if (dotIdx > 0 && dotIdx < name.length - 1) {
+      final fromName = name.substring(dotIdx).trim().toLowerCase();
+      if (fromName.length >= 2 && fromName.length <= 7) {
+        return fromName;
+      }
+    }
+    final lower = ext.trim().toLowerCase();
+    if (lower.isNotEmpty) {
+      return lower.startsWith('.') ? lower : '.$lower';
+    }
+    return '';
+  }
+
+  bool get isVideo {
+    if (isDir) return false;
+    final e = normalizedExt;
     return isMp4 ||
-        lower == '.mp4' ||
-        lower == '.mkv' ||
-        lower == '.ts' ||
-        lower == '.m3u8' ||
-        lower == '.mov' ||
-        lower == '.flv' ||
-        lower == '.webm' ||
-        lower == '.avi';
+        const {
+          '.mp4',
+          '.mkv',
+          '.ts',
+          '.m3u8',
+          '.mov',
+          '.flv',
+          '.webm',
+          '.avi',
+          '.rmvb',
+          '.wmv',
+          '.m4v',
+          '.iso',
+        }.contains(e);
+  }
+
+  bool get isAudio {
+    if (isDir) return false;
+    final e = normalizedExt;
+    return const {
+      '.mp3',
+      '.m4a',
+      '.flac',
+      '.wav',
+      '.wave',
+      '.aac',
+      '.ogg',
+      '.oga',
+      '.ape',
+      '.mac',
+      '.alac',
+      '.opus',
+      '.wma',
+      '.dsf',
+      '.dff',
+      '.aiff',
+      '.aif',
+      '.aifc',
+      '.wv',
+      '.tta',
+      '.tak',
+      '.ac3',
+      '.dts',
+      '.mka',
+      '.amr',
+      '.mid',
+    }.contains(e);
+  }
+
+  bool get isPlayableVideo => isVideo || isAudio;
+
+  bool get isImage {
+    if (isDir) return false;
+    final e = normalizedExt;
+    return const {
+      '.jpg',
+      '.jpeg',
+      '.png',
+      '.webp',
+      '.gif',
+      '.bmp',
+      '.heic',
+      '.tiff',
+    }.contains(e);
+  }
+
+  bool get isTextPreviewable {
+    if (isDir) return false;
+    final e = normalizedExt;
+    return const {
+      '.txt',
+      '.srt',
+      '.ass',
+      '.ssa',
+      '.vtt',
+      '.lrc',
+      '.json',
+      '.yaml',
+      '.yml',
+      '.m3u',
+      '.m3u8',
+      '.xml',
+      '.nfo',
+      '.log',
+      '.md',
+      '.conf',
+      '.ini',
+      '.sh',
+      '.py',
+      '.js',
+      '.csv',
+    }.contains(e);
+  }
+
+  bool get isArchive {
+    if (isDir) return false;
+    final e = normalizedExt;
+    return const {
+      '.zip',
+      '.cbz',
+      '.rar',
+      '.7z',
+      '.tar',
+      '.gz',
+      '.bz2',
+      '.xz',
+    }.contains(e);
+  }
+
+  bool get isStreamableMusicArchive {
+    if (isDir) return false;
+    final e = normalizedExt;
+    return const {
+      '.zip',
+      '.cbz',
+      '.tar',
+    }.contains(e);
+  }
+
+  String get typeTagText {
+    if (isDir) return '文件夹';
+    final clean = normalizedExt.replaceAll('.', '').toUpperCase();
+    if (clean.isNotEmpty) return clean;
+    if (isVideo) return 'VIDEO';
+    if (isAudio) return 'AUDIO';
+    if (isImage) return 'IMAGE';
+    return 'FILE';
   }
 
   String get formattedSize {
     if (isDir) return '文件夹';
+    if (size <= 0) return '--';
     if (size < 1024) return '$size B';
     if (size < 1024 * 1024) return '${(size / 1024).toStringAsFixed(1)} KB';
     if (size < 1024 * 1024 * 1024) {
@@ -852,6 +1194,8 @@ class FileEntry {
       isDir: json['is_dir'] == true,
       isMp4: json['is_mp4'] == true,
       ext: (json['ext'] ?? '').toString(),
+      mountId: 'builtin_server',
+      sourceKind: StorageSourceKind.server,
     );
   }
 }
@@ -1364,7 +1708,7 @@ class TelegramAttachment {
     if (m.startsWith('audio/')) return true;
     final lowerName = displayName.toLowerCase();
     return RegExp(
-      r'\.(mp3|m4a|aac|ogg|oga|opus|wav|flac|wma|ape|alac)$',
+      r'\.(mp3|m4a|aac|ogg|oga|opus|wav|wave|flac|wma|ape|mac|alac|aiff|aif|dsf|dff|wv|tta|mka)$',
     ).hasMatch(lowerName);
   }
 
@@ -1744,8 +2088,20 @@ class TelegramOutgoingFile {
     return mimeType.startsWith('audio/') ||
         lower.endsWith('.mp3') ||
         lower.endsWith('.m4a') ||
+        lower.endsWith('.aac') ||
         lower.endsWith('.wav') ||
+        lower.endsWith('.wave') ||
         lower.endsWith('.flac') ||
+        lower.endsWith('.ape') ||
+        lower.endsWith('.mac') ||
+        lower.endsWith('.alac') ||
+        lower.endsWith('.aiff') ||
+        lower.endsWith('.aif') ||
+        lower.endsWith('.wma') ||
+        lower.endsWith('.dsf') ||
+        lower.endsWith('.dff') ||
+        lower.endsWith('.wv') ||
+        lower.endsWith('.tta') ||
         lower.endsWith('.ogg') ||
         lower.endsWith('.opus');
   }

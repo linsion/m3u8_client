@@ -927,7 +927,8 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       );
       if (!mounted || attemptId != _playAttemptSessionId) return;
 
-      final shouldProxy = _useServerProxy || resolved.backendProxyPlayback;
+      final shouldProxy = _useServerProxy ||
+          (resolved.backendProxyPlayback && resolved.directUrl.isEmpty);
       setState(() {
         _resolvedPlayback = resolved;
         _isResolvingPlay = false;
@@ -1185,7 +1186,9 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       unawaited(
         _openResolvedStream(
           backupLine.resolved,
-          forceProxy: _useServerProxy || backupLine.resolved.backendProxyPlayback,
+          forceProxy: _useServerProxy ||
+              (backupLine.resolved.backendProxyPlayback &&
+                  backupLine.resolved.directUrl.isEmpty),
         ),
       );
       return;
@@ -1209,7 +1212,9 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
           setState(() => _resolvedPlayback = srvResolved);
           _openResolvedStream(
             srvResolved,
-            forceProxy: _useServerProxy || srvResolved.backendProxyPlayback,
+            forceProxy: _useServerProxy ||
+                (srvResolved.backendProxyPlayback &&
+                    srvResolved.directUrl.isEmpty),
           );
         }).catchError((_) {}),
       );
@@ -1248,20 +1253,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       return;
     }
 
-    // 4. Fallback to server proxy if not yet tried
-    if (!_useServerProxy &&
-        resolved != null &&
-        resolved.serverProxyUrl.isNotEmpty) {
-      setState(() => _useServerProxy = true);
-      _openResolvedStream(
-        resolved,
-        forceProxy: true,
-        bypassClientProxy: true,
-      );
-      return;
-    }
-
-    // 5. Try the next untested play line in `_detail.playGroups` if available
+    // 4. Try the next untested play line in `_detail.playGroups` if available (do NOT auto-switch to server relay)
     final detail = _detail;
     if (detail != null && currentEp != null && detail.playGroups.length > 1) {
       for (var i = 0; i < detail.playGroups.length; i++) {
@@ -1277,7 +1269,6 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
           );
           setState(() {
             _selectedGroupIndex = i;
-            _useServerProxy = !widget.appState.serverConfig.preferDirectPlayback;
           });
           _showAdToast('⚡ 当前线路不可用，正在尝试备用线路：${nextGrp.name}');
           _selectAndPlayEpisode(

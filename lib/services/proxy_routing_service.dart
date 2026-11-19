@@ -2403,6 +2403,14 @@ class LocalProxyTunnelBridge {
     String suffix = 'stream.bin';
     if (lower.contains('.m3u8')) {
       suffix = 'playlist.m3u8';
+    } else if (lower.contains('.flv') ||
+        lower.contains('douyucdn') ||
+        lower.contains('/douyu/') ||
+        lower.contains('/huya/') ||
+        lower.contains('/yy/') ||
+        lower.contains('huya.com') ||
+        lower.contains('yy.com')) {
+      suffix = 'live.flv';
     } else if (lower.contains('.ts')) {
       suffix = 'segment.ts';
     } else if (lower.contains('.mp4') ||
@@ -2857,6 +2865,7 @@ class LocalProxyTunnelBridge {
           try {
             final hc = _getOrCreateStreamRelayHttpClient(node);
             final req = await hc.getUrl(uri).timeout(timeout);
+            req.followRedirects = false;
             req.headers.set(
               'User-Agent',
               customHeaders['User-Agent'] ??
@@ -2873,6 +2882,41 @@ class LocalProxyTunnelBridge {
             }
             final resp = await req.close().timeout(timeout);
             sw.stop();
+            if ((resp.statusCode == 301 ||
+                    resp.statusCode == 302 ||
+                    resp.statusCode == 303 ||
+                    resp.statusCode == 307 ||
+                    resp.statusCode == 308) &&
+                resp.headers.value(HttpHeaders.locationHeader) != null) {
+              final loc =
+                  resp.headers.value(HttpHeaders.locationHeader)!.trim();
+              await resp.drain<void>().timeout(
+                    const Duration(milliseconds: 400),
+                    onTimeout: () {},
+                  );
+              if (loc.isNotEmpty) {
+                final redirectedUri = uri.resolve(loc);
+                final rLower = redirectedUri.toString().toLowerCase();
+                // If an overseas gateway (e.g. mursor.ottiptv.cc) redirects to a domestic Douyu/Huya/YY CDN (.flv),
+                // open the domestic CDN stream directly instead of routing the video stream through the proxy tunnel!
+                if (rLower.contains('.flv') ||
+                    rLower.contains('douyucdn') ||
+                    rLower.contains('huya.com') ||
+                    rLower.contains('yy.com')) {
+                  final directFollowed = await tryOpenDirect(
+                    redirectedUri,
+                    activeRange: activeRange,
+                  );
+                  if (directFollowed != null) return directFollowed;
+                }
+                return tryOpenWithNode(
+                  node,
+                  redirectedUri,
+                  activeRange: activeRange,
+                  timeout: timeout,
+                );
+              }
+            }
             if (resp.statusCode >= 200 && resp.statusCode < 400) {
               _onNodeFeedback?.call(
                 node.id,
@@ -3146,8 +3190,11 @@ class LocalProxyTunnelBridge {
         }
       }
 
-      // Stream binary segment (.ts, .m4s, .mp4, .key) directly to libmpv
+      // Stream binary segment (.ts, .m4s, .mp4, .flv, .key) directly to libmpv
       final contentTypeStr = resp.headers.value('content-type') ?? 'video/mp2t';
+      final isFlvPayload = contentTypeStr.toLowerCase().contains('flv') ||
+          currentUri.path.toLowerCase().endsWith('.flv') ||
+          (reqUri?.path.toLowerCase().endsWith('.flv') ?? false);
       final statusReason = resp.statusCode == 206 ? 'Partial Content' : 'OK';
       final respHeader = StringBuffer()
         ..write('HTTP/1.1 ${resp.statusCode} $statusReason\r\n')
@@ -3176,7 +3223,8 @@ class LocalProxyTunnelBridge {
         ),
       );
 
-      final shouldCacheSegment = (rangeHeader == null || rangeHeader.isEmpty) &&
+      final shouldCacheSegment = !isFlvPayload &&
+          (rangeHeader == null || rangeHeader.isEmpty) &&
           resp.statusCode == 200 &&
           segIndex != null &&
           resp.contentLength > 0 &&
@@ -3186,18 +3234,152 @@ class LocalProxyTunnelBridge {
       var lookaheadTriggeredForProxySeg = false;
       var streamedBytes = 0;
 
+      // On live HTTP-FLV streams (Douyu/Huya/YY), SCDN edge nodes often inject a stale cached
+      // timestamp (e.g. dts = 61,075,020 ms) on the initial Audio/Video sequence headers (`pktType == 0`)
+      // while actual live audio/video frames (`pktType == 1`) start at dts = 125,580,120 ms (+64,505 seconds!).
+      // Normalizing FLV tag timestamps in-flight ensures libmpv's `flvdec` demuxer starts at 0.000s with
+      // 100% continuous monotonic timestamps and zero A/V start_time desync!
+      final flvBuf = isFlvPayload ? BytesBuilder(copy: false) : null;
+      var flvHeaderParsed = false;
+      var flvPassThroughRaw = false;
+      var flvLastVideoRawDts = -1;
+      var flvNormVideoDts = 0;
+      var flvLastAudioRawDts = -1;
+      var flvNormAudioDts = 0;
+
+      Uint8List normalizeFlvChunk(List<int> incoming) {
+        if (!isFlvPayload || flvPassThroughRaw || flvBuf == null) {
+          return incoming is Uint8List ? incoming : Uint8List.fromList(incoming);
+        }
+        flvBuf.add(incoming);
+        final buf = flvBuf.takeBytes();
+        var cursor = 0;
+        final out = BytesBuilder(copy: false);
+
+        if (!flvHeaderParsed) {
+          if (buf.length < 13) {
+            flvBuf.add(buf);
+            return Uint8List(0);
+          }
+          if (buf[0] != 0x46 || buf[1] != 0x4C || buf[2] != 0x56) {
+            flvPassThroughRaw = true;
+            return buf;
+          }
+          final hdrOffset =
+              (buf[5] << 24) | (buf[6] << 16) | (buf[7] << 8) | buf[8];
+          final firstTagStart = hdrOffset + 4;
+          if (hdrOffset < 9 || hdrOffset > 1024) {
+            flvPassThroughRaw = true;
+            return buf;
+          }
+          if (buf.length < firstTagStart) {
+            flvBuf.add(buf);
+            return Uint8List(0);
+          }
+          out.add(Uint8List.sublistView(buf, 0, firstTagStart));
+          cursor = firstTagStart;
+          flvHeaderParsed = true;
+        }
+
+        while (cursor + 11 <= buf.length) {
+          final tagType = buf[cursor];
+          final dataSize = (buf[cursor + 1] << 16) |
+              (buf[cursor + 2] << 8) |
+              buf[cursor + 3];
+          if (dataSize < 0 || dataSize > 16 * 1024 * 1024) {
+            flvPassThroughRaw = true;
+            out.add(Uint8List.sublistView(buf, cursor));
+            cursor = buf.length;
+            break;
+          }
+          final totalTagBytes = 11 + dataSize + 4;
+          if (cursor + totalTagBytes > buf.length) {
+            break;
+          }
+
+          final rawDts = (buf[cursor + 4] << 16) |
+              (buf[cursor + 5] << 8) |
+              buf[cursor + 6] |
+              (buf[cursor + 7] << 24);
+          var outDts = 0;
+
+          if (tagType == 9 && dataSize >= 2) {
+            final pktType = buf[cursor + 12];
+            if (pktType == 0) {
+              outDts = flvLastVideoRawDts >= 0 ? flvNormVideoDts : 0;
+            } else {
+              if (flvLastVideoRawDts < 0) {
+                flvLastVideoRawDts = rawDts;
+                flvNormVideoDts = 0;
+              } else {
+                var delta = rawDts - flvLastVideoRawDts;
+                if (delta <= 0 || delta > 1500) {
+                  delta = 40;
+                }
+                flvLastVideoRawDts = rawDts;
+                flvNormVideoDts += delta;
+              }
+              outDts = flvNormVideoDts;
+            }
+          } else if (tagType == 8 && dataSize >= 2) {
+            final pktType = buf[cursor + 12];
+            if (pktType == 0) {
+              outDts = flvLastVideoRawDts >= 0 ? flvNormVideoDts : 0;
+            } else {
+              if (flvLastAudioRawDts < 0) {
+                flvLastAudioRawDts = rawDts;
+                flvNormAudioDts =
+                    flvLastVideoRawDts >= 0 ? flvNormVideoDts : 0;
+              } else {
+                var aDelta = rawDts - flvLastAudioRawDts;
+                if (aDelta <= 0 || aDelta > 1000) {
+                  aDelta = 21;
+                }
+                flvLastAudioRawDts = rawDts;
+                flvNormAudioDts += aDelta;
+                if (flvLastVideoRawDts >= 0 &&
+                    (flvNormAudioDts - flvNormVideoDts).abs() > 1000) {
+                  flvNormAudioDts = flvNormVideoDts;
+                }
+              }
+              outDts = flvNormAudioDts;
+            }
+          } else if (tagType == 18) {
+            outDts = flvLastVideoRawDts >= 0 ? flvNormVideoDts : 0;
+          } else {
+            outDts = flvLastVideoRawDts >= 0 ? flvNormVideoDts : 0;
+          }
+
+          buf[cursor + 4] = (outDts >> 16) & 0xFF;
+          buf[cursor + 5] = (outDts >> 8) & 0xFF;
+          buf[cursor + 6] = outDts & 0xFF;
+          buf[cursor + 7] = (outDts >> 24) & 0xFF;
+
+          out.add(Uint8List.sublistView(buf, cursor, cursor + totalTagBytes));
+          cursor += totalTagBytes;
+        }
+
+        if (cursor < buf.length) {
+          flvBuf.add(Uint8List.sublistView(buf, cursor));
+        }
+        return out.takeBytes();
+      }
+
       bool handleDownstreamChunk(List<int> chunk) {
         if (chunk.isEmpty) return true;
         recordDownstreamBytes(chunk.length);
         streamedBytes += chunk.length;
-        try {
-          client.add(chunk);
-        } catch (_) {
-          clientClosed = true;
-          unawaited(
-            resp.detachSocket().then((s) => s.destroy(), onError: (_) {}),
-          );
-          return false;
+        final toWrite = isFlvPayload ? normalizeFlvChunk(chunk) : chunk;
+        if (toWrite.isNotEmpty) {
+          try {
+            client.add(toWrite);
+          } catch (_) {
+            clientClosed = true;
+            unawaited(
+              resp.detachSocket().then((s) => s.destroy(), onError: (_) {}),
+            );
+            return false;
+          }
         }
         if (segmentAccumulator != null &&
             segmentAccumulator.length + chunk.length <= 8 * 1024 * 1024) {
@@ -5936,8 +6118,30 @@ class ProxyRoutingService extends ChangeNotifier {
     }
     final effective = resolveEffectiveRoute(scenario, targetUri: uri);
     if (effective != ScenarioRouteMode.proxyNode) {
+      final lowerTrimmed = trimmed.toLowerCase();
+      final isDirectFlvLive = scenario == RequestScenario.liveStream &&
+          (lowerTrimmed.contains('.flv') ||
+              lowerTrimmed.contains('douyucdn') ||
+              lowerTrimmed.contains('/douyu/') ||
+              lowerTrimmed.contains('/huya/') ||
+              lowerTrimmed.contains('/yy/') ||
+              lowerTrimmed.contains('huya.com') ||
+              lowerTrimmed.contains('yy.com') ||
+              lowerTrimmed.contains('ottiptv.cc'));
+      if (isDirectFlvLive &&
+          !uri.path.toLowerCase().startsWith('/api/vod/proxy')) {
+        final directPort = await _localBridge.ensureStarted();
+        if (directPort > 0) {
+          return _localBridge.buildStreamRelayUrl(
+            targetUrl: trimmed,
+            headers: headers,
+            cleanM3u8Ads: false,
+            forceDirect: true,
+          );
+        }
+      }
       if (scenario == RequestScenario.vodStream &&
-          trimmed.toLowerCase().contains('.m3u8') &&
+          lowerTrimmed.contains('.m3u8') &&
           !uri.path.toLowerCase().startsWith('/api/vod/proxy')) {
         final directPort = await _localBridge.ensureStarted();
         if (directPort > 0) {

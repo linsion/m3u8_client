@@ -24,6 +24,7 @@ import 'screens/vod_detail_player_screen.dart';
 import 'screens/vod_home_screen.dart';
 import 'theme.dart';
 import 'widgets/app_brand_logo.dart';
+import 'widgets/cloud_music_player.dart';
 import 'widgets/mobile_edge_swipe_back.dart';
 import 'widgets/source_picker_sheet.dart';
 import 'widgets/video_115_accelerate_button.dart';
@@ -53,13 +54,18 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   bool _isExitDialogShowing = false;
   final GlobalKey _sidebarContainerKey = GlobalKey();
   final Map<int, FocusNode> _sidebarTabFocusNodes = {
-    for (int i = 0; i <= 8; i++) i: FocusNode(debugLabel: 'SidebarTab_$i'),
+    for (int i = 0; i <= 9; i++) i: FocusNode(debugLabel: 'SidebarTab_$i'),
   };
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    widget.appState.onNavigateToTab = (idx) {
+      if (mounted) {
+        _selectTab(idx);
+      }
+    };
     widget.appState.onNavigateToTelegramTab = () {
       if (mounted) {
         _selectTab(5);
@@ -98,6 +104,9 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    if (widget.appState.onNavigateToTab != null) {
+      widget.appState.onNavigateToTab = null;
+    }
     if (widget.appState.onNavigateToTelegramTab != null) {
       widget.appState.onNavigateToTelegramTab = null;
     }
@@ -1272,6 +1281,12 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                       ),
                       const SizedBox(width: 4),
                       _buildTvNavTabButton(
+                        index: 9,
+                        icon: Icons.album_rounded,
+                        label: '流光音乐',
+                      ),
+                      const SizedBox(width: 4),
+                      _buildTvNavTabButton(
                         index: 2,
                         icon: Icons.downloading_rounded,
                         label: '下载',
@@ -1740,6 +1755,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       6 => (Icons.bolt_rounded, '代理加速与分流'),
       7 => (Icons.terminal_rounded, '系统终端命令行'),
       8 => (Icons.settings_outlined, '偏好与媒体源设置'),
+      9 => (Icons.album_rounded, '流光 Hi-Fi 云端音乐厅'),
       _ => (Icons.video_library_rounded, '流光视频'),
     };
     final isSubPage = _selectedIndex != 4;
@@ -2271,6 +2287,11 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                     label: '视频资料库',
                   ),
                   _buildSidebarItem(
+                    index: 9,
+                    icon: Icons.album_rounded,
+                    label: '流光音乐',
+                  ),
+                  _buildSidebarItem(
                     index: 5,
                     icon: Icons.send_rounded,
                     label: 'Telegram 会话',
@@ -2562,6 +2583,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       6 => '代理',
       7 => '终端',
       8 => '设置',
+      9 => '音乐',
       _ => '设置',
     };
 
@@ -3101,6 +3123,12 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                       subtitle: '已下载与云端归档视频',
                     ),
                     buildGridTile(
+                      tabIndex: 9,
+                      icon: Icons.album_rounded,
+                      title: '流光 Hi-Fi 音乐厅',
+                      subtitle: '115/AList/压缩包随机播放',
+                    ),
+                    buildGridTile(
                       tabIndex: 6,
                       icon: Icons.bolt_rounded,
                       title: '代理加速节点',
@@ -3438,6 +3466,8 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
         return TerminalScreen(appState: state);
       case 8:
         return SettingsScreen(appState: state);
+      case 9:
+        return CloudMusicStandaloneScreen(appState: state);
       default:
         return VodHomeScreen(appState: state);
     }

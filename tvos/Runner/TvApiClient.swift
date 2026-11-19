@@ -1,8 +1,12 @@
+import AVFoundation
+import AudioToolbox
 import CommonCrypto
+import CoreMedia
 import CryptoKit
 import Foundation
 import Network
 import Security
+import VideoToolbox
 
 // MARK: - Real-Time Network Traffic & Proxy Telemetry Monitor (1:1 Match with LocalProxyTunnelBridge + VideoProxyStatsDetailPanel)
 
@@ -170,6 +174,9 @@ final class TvLocalProxyTunnelServer: @unchecked Sendable {
   private let queue = DispatchQueue(label: "tv.liuguang.proxy.tunnel", qos: .userInitiated, attributes: .concurrent)
   private var activeNode: TvSubscriptionNode?
   private var activeCreds: TvParsedProxyNodeCredentials?
+  private var lastKnownNode: TvSubscriptionNode?
+  private var lastKnownCreds: TvParsedProxyNodeCredentials?
+  private var fallbackCredsPool: [TvParsedProxyNodeCredentials] = []
   private var proxyEnabled: Bool = false
   private var ipCache: [String: (snapshot: TvRealTimeProxyIpSnapshot, timestampMs: Int64)] = [:]
 
@@ -183,6 +190,10 @@ final class TvLocalProxyTunnelServer: @unchecked Sendable {
     lock.lock()
     self.activeNode = node
     self.activeCreds = parsed
+    if let node, let parsed {
+      self.lastKnownNode = node
+      self.lastKnownCreds = parsed
+    }
     self.proxyEnabled = enabled && (parsed != nil)
     lock.unlock()
     if let h = parsed?.host, !h.isEmpty {
@@ -190,6 +201,43 @@ final class TvLocalProxyTunnelServer: @unchecked Sendable {
         _ = Self.resolveRealEntryIpSync(h)
       }
     }
+  }
+
+  func seedFallbackNode(_ node: TvSubscriptionNode?, backupNodes: [TvSubscriptionNode] = []) {
+    startListenerIfNeeded()
+    let parsedPrimary = node.map { Self.parseCredentials(from: $0) }
+    var parsedPool: [TvParsedProxyNodeCredentials] = []
+    if let p = parsedPrimary {
+      parsedPool.append(p)
+    }
+    for n in backupNodes.prefix(8) where n.isSupportedByClientTunnel {
+      let c = Self.parseCredentials(from: n)
+      if !c.host.isEmpty && !parsedPool.contains(where: { $0.host == c.host && $0.port == c.port && $0.proto == c.proto }) {
+        parsedPool.append(c)
+      }
+    }
+    lock.lock()
+    if let node, let parsedPrimary {
+      self.lastKnownNode = node
+      self.lastKnownCreds = parsedPrimary
+    } else if self.lastKnownCreds == nil, let first = parsedPool.first {
+      self.lastKnownCreds = first
+    }
+    if !parsedPool.isEmpty {
+      self.fallbackCredsPool = parsedPool
+    }
+    lock.unlock()
+    if let h = parsedPrimary?.host, !h.isEmpty {
+      queue.async {
+        _ = Self.resolveRealEntryIpSync(h)
+      }
+    }
+  }
+
+  var hasAvailableTunnelNode: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return (activeCreds != nil || lastKnownCreds != nil || !fallbackCredsPool.isEmpty) && port > 0
   }
 
   var currentActiveNode: TvSubscriptionNode? {
@@ -204,12 +252,12 @@ final class TvLocalProxyTunnelServer: @unchecked Sendable {
     return proxyEnabled && activeCreds != nil && port > 0
   }
 
-  func proxyConnectionDictionary() -> [AnyHashable: Any]? {
+  func proxyConnectionDictionary(allowFallbackNode: Bool = false) -> [AnyHashable: Any]? {
     lock.lock()
-    let active = proxyEnabled && activeCreds != nil
+    let hasCreds = (proxyEnabled && activeCreds != nil) || (allowFallbackNode && (activeCreds != nil || lastKnownCreds != nil || !fallbackCredsPool.isEmpty))
     let p = Int(port)
     lock.unlock()
-    guard active, p > 0 else { return nil }
+    guard hasCreds, p > 0 else { return nil }
     return [
       kCFNetworkProxiesHTTPEnable as String: 1,
       kCFNetworkProxiesHTTPProxy as String: "127.0.0.1",
@@ -313,7 +361,7 @@ final class TvLocalProxyTunnelServer: @unchecked Sendable {
       }
 
       self.lock.lock()
-      let creds = self.proxyEnabled ? self.activeCreds : nil
+      let creds = (self.proxyEnabled ? self.activeCreds : nil) ?? self.lastKnownCreds ?? self.fallbackCredsPool.first
       self.lock.unlock()
 
       if isConnect {
@@ -454,16 +502,34 @@ final class TvLocalProxyTunnelServer: @unchecked Sendable {
   private func fallbackOrClose(
     client: NWConnection,
     upstream: NWConnection,
+    failedCreds: TvParsedProxyNodeCredentials? = nil,
     targetHost: String,
     targetPort: Int,
     initialPayload: Data
   ) {
     if Self.isProbeOnlyHost(targetHost) {
       closePair(client: client, upstream: upstream)
-    } else {
-      closePair(client: client, upstream: upstream, countDecrementOnly: true)
-      openDirectBridge(client: client, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
+      return
     }
+    closePair(client: client, upstream: upstream, countDecrementOnly: true)
+    if let failed = failedCreds {
+      lock.lock()
+      let nextAlt = fallbackCredsPool.first(where: { $0.host != failed.host || $0.port != failed.port })
+      if let alt = nextAlt {
+        // Rotate pool so dead primary isn't retried first on the very next request
+        fallbackCredsPool.removeAll(where: { $0.host == failed.host && $0.port == failed.port })
+        fallbackCredsPool.append(failed)
+        if lastKnownCreds?.host == failed.host && lastKnownCreds?.port == failed.port {
+          lastKnownCreds = alt
+        }
+      }
+      lock.unlock()
+      if let alt = nextAlt {
+        openTunnelAndBridge(client: client, creds: alt, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
+        return
+      }
+    }
+    openDirectBridge(client: client, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
   }
 
   private func openTrojanBridge(
@@ -514,7 +580,7 @@ final class TvLocalProxyTunnelServer: @unchecked Sendable {
           })
         }
       case .failed:
-        self.fallbackOrClose(client: client, upstream: upstream, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
+        self.fallbackOrClose(client: client, upstream: upstream, failedCreds: creds, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
       case .cancelled:
         self.closePair(client: client, upstream: upstream)
       default:
@@ -585,7 +651,7 @@ final class TvLocalProxyTunnelServer: @unchecked Sendable {
           })
         }
       case .failed:
-        self.fallbackOrClose(client: client, upstream: upstream, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
+        self.fallbackOrClose(client: client, upstream: upstream, failedCreds: creds, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
       case .cancelled:
         self.closePair(client: client, upstream: upstream)
       default:
@@ -677,7 +743,7 @@ final class TvLocalProxyTunnelServer: @unchecked Sendable {
           }
         })
       case .failed:
-        self.fallbackOrClose(client: client, upstream: upstream, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
+        self.fallbackOrClose(client: client, upstream: upstream, failedCreds: creds, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
       case .cancelled:
         self.closePair(client: client, upstream: upstream)
       default:
@@ -729,7 +795,7 @@ final class TvLocalProxyTunnelServer: @unchecked Sendable {
           }
         })
       case .failed:
-        self.fallbackOrClose(client: client, upstream: upstream, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
+        self.fallbackOrClose(client: client, upstream: upstream, failedCreds: creds, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
       case .cancelled:
         self.closePair(client: client, upstream: upstream)
       default:
@@ -797,7 +863,7 @@ final class TvLocalProxyTunnelServer: @unchecked Sendable {
           )
         })
       case .failed:
-        self.fallbackOrClose(client: client, upstream: upstream, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
+        self.fallbackOrClose(client: client, upstream: upstream, failedCreds: creds, targetHost: targetHost, targetPort: targetPort, initialPayload: initialPayload)
       case .cancelled:
         self.closePair(client: client, upstream: upstream)
       default:
@@ -1868,6 +1934,845 @@ actor TvHlsSegmentCacheActor {
   }
 }
 
+// MARK: - Zero-Copy Hardware VideoToolbox / AudioToolbox HTTP-FLV Direct Engine (AVSampleBufferDisplayLayer + AVSampleBufferAudioRenderer)
+// Bypasses AVPlayer's HLS/MPEG-TS demuxer completely for HTTP-FLV live streams (斗鱼一起看 / 虎牙一起看 / YY轮播),
+// feeding H.264/HEVC NALUs and AAC audio packets directly into tvOS hardware decoders with 0ms segment wait!
+
+final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+  let displayLayer = AVSampleBufferDisplayLayer()
+  let audioRenderer = AVSampleBufferAudioRenderer()
+  let synchronizer = AVSampleBufferRenderSynchronizer()
+
+  private let lock = NSLock()
+  private var buffer = Data()
+  private var cursor = 0
+  private var headerSkipped = false
+
+  private var videoFormatDesc: CMVideoFormatDescription? = nil
+  private var audioFormatDesc: CMAudioFormatDescription? = nil
+  private var nalLengthSize: Int = 4
+  private var videoCodecId: UInt8 = 0
+  private var cachedH264Sps: Data? = nil
+  private var cachedH264Pps: Data? = nil
+  private var cachedHevcParamSets: [Data] = []
+
+  private var lastVideoRawDtsMs: Int64 = -1
+  private var normVideoDtsMs: Int64 = 0
+  private var lastAudioRawDtsMs: Int64 = -1
+  private var normAudioDtsMs: Int64 = 0
+  private var audioSampleRate: Int32 = 48000
+  private var nextAudioSamplePts: Int64 = -1
+  private var renderedVideoFrameCount: Int = 0
+  private var reconnectAttempts: Int = 0
+  private var initialGatewayCandidate: (url: URL, headers: [String: String], useProxy: Bool)? = nil
+
+  private var hasStartedSynchronizer = false
+  private var hasRenderedFirstVideoFrame = false
+  private var lastFrameReceivedAt: Date = Date()
+
+  private var task: URLSessionDataTask?
+  private var session: URLSession?
+  private var isStopped = true
+  private var isPaused = false
+
+  private var candidates: [(url: URL, headers: [String: String], useProxy: Bool)] = []
+  private var candidateIndex: Int = 0
+
+  var onFirstFrameRendered: (@Sendable () -> Void)?
+  var onAllCandidatesFailed: (@Sendable () -> Void)?
+
+  override init() {
+    super.init()
+    displayLayer.videoGravity = .resizeAspect
+    synchronizer.addRenderer(displayLayer)
+    synchronizer.addRenderer(audioRenderer)
+  }
+
+  var isActivelyPlaying: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return !isStopped && !isPaused && hasRenderedFirstVideoFrame
+  }
+
+  var hasRecentFrames: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return !isStopped && hasRenderedFirstVideoFrame && Date().timeIntervalSince(lastFrameReceivedAt) < 12.0
+  }
+
+  func start(
+    primaryUrl: String,
+    primaryHeaders: [String: String],
+    gatewayUrl: String,
+    gatewayHeaders: [String: String],
+    serverProxyUrl: String,
+    serverAuthHeaders: [String: String],
+    forceProxyNode: Bool = false
+  ) {
+    stop()
+
+    var list: [(url: URL, headers: [String: String], useProxy: Bool)] = []
+    let hasProxyNode = TvLocalProxyTunnelServer.shared.hasAvailableTunnelNode
+    func addCandidate(_ urlStr: String, _ hdrs: [String: String], _ proxy: Bool) {
+      let clean = urlStr.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !clean.isEmpty, let u = URL(string: clean) else { return }
+      if !list.contains(where: { $0.url == u && $0.useProxy == proxy }) {
+        list.append((u, hdrs, proxy))
+      }
+    }
+
+    if forceProxyNode && hasProxyNode {
+      addCandidate(primaryUrl, primaryHeaders, true)
+      if gatewayUrl != primaryUrl {
+        addCandidate(gatewayUrl, gatewayHeaders, true)
+      }
+      addCandidate(primaryUrl, primaryHeaders, false)
+    } else {
+      addCandidate(primaryUrl, primaryHeaders, false)
+      if gatewayUrl != primaryUrl {
+        addCandidate(gatewayUrl, gatewayHeaders, false)
+      }
+      if hasProxyNode {
+        addCandidate(primaryUrl, primaryHeaders, true)
+        if gatewayUrl != primaryUrl {
+          addCandidate(gatewayUrl, gatewayHeaders, true)
+        }
+      }
+    }
+
+    guard !list.isEmpty else {
+      onAllCandidatesFailed?()
+      return
+    }
+
+    lock.lock()
+    self.isStopped = false
+    self.isPaused = false
+    self.candidates = list
+    self.candidateIndex = 0
+    self.hasStartedSynchronizer = false
+    self.hasRenderedFirstVideoFrame = false
+    self.renderedVideoFrameCount = 0
+    self.reconnectAttempts = 0
+    let gwClean = gatewayUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !gwClean.isEmpty, let gwU = URL(string: gwClean) {
+      self.initialGatewayCandidate = (gwU, gatewayHeaders, forceProxyNode && hasProxyNode)
+    } else {
+      self.initialGatewayCandidate = list.first
+    }
+    self.lastFrameReceivedAt = Date()
+    lock.unlock()
+
+    let first = list[0]
+    launchCandidate(url: first.url, headers: first.headers, useProxy: first.useProxy, preserveTimeline: false)
+  }
+
+  func pause() {
+    lock.lock()
+    isPaused = true
+    lock.unlock()
+    synchronizer.rate = 0.0
+  }
+
+  func resume() {
+    lock.lock()
+    let started = hasStartedSynchronizer
+    isPaused = false
+    lock.unlock()
+    if started {
+      synchronizer.rate = 1.0
+    }
+  }
+
+  func stop() {
+    lock.lock()
+    isStopped = true
+    isPaused = false
+    let t = task
+    let s = session
+    task = nil
+    session = nil
+    buffer.removeAll(keepingCapacity: false)
+    cursor = 0
+    headerSkipped = false
+    videoFormatDesc = nil
+    audioFormatDesc = nil
+    cachedH264Sps = nil
+    cachedH264Pps = nil
+    cachedHevcParamSets.removeAll()
+    lastVideoRawDtsMs = -1
+    normVideoDtsMs = 0
+    lastAudioRawDtsMs = -1
+    normAudioDtsMs = 0
+    nextAudioSamplePts = -1
+    renderedVideoFrameCount = 0
+    reconnectAttempts = 0
+    hasStartedSynchronizer = false
+    hasRenderedFirstVideoFrame = false
+    lock.unlock()
+
+    t?.cancel()
+    s?.invalidateAndCancel()
+    synchronizer.rate = 0.0
+    displayLayer.flushAndRemoveImage()
+    audioRenderer.flush()
+  }
+
+  private func launchCandidate(url: URL, headers: [String: String], useProxy: Bool, preserveTimeline: Bool = false) {
+    let cfg = URLSessionConfiguration.ephemeral
+    cfg.timeoutIntervalForRequest = useProxy ? 6.5 : 3.8
+    cfg.timeoutIntervalForResource = 7200
+    cfg.httpShouldSetCookies = true
+    if useProxy, let proxyDict = TvLocalProxyTunnelServer.shared.proxyConnectionDictionary(allowFallbackNode: true) {
+      cfg.connectionProxyDictionary = proxyDict
+    } else {
+      cfg.connectionProxyDictionary = [:]
+    }
+
+    let sess = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
+    var req = URLRequest(url: url)
+    req.httpMethod = "GET"
+    for (k, v) in headers where !v.isEmpty {
+      req.setValue(v, forHTTPHeaderField: k)
+    }
+    if req.value(forHTTPHeaderField: "User-Agent") == nil {
+      req.setValue("okHttp/Mod-1.5.0.0", forHTTPHeaderField: "User-Agent")
+    }
+    let t = sess.dataTask(with: req)
+
+    lock.lock()
+    guard !isStopped else {
+      lock.unlock()
+      sess.invalidateAndCancel()
+      return
+    }
+    let oldTask = self.task
+    let oldSess = self.session
+    self.buffer.removeAll(keepingCapacity: true)
+    self.cursor = 0
+    self.headerSkipped = false
+    self.lastVideoRawDtsMs = -1
+    self.lastAudioRawDtsMs = -1
+    self.renderedVideoFrameCount = 0
+    if !preserveTimeline {
+      self.videoFormatDesc = nil
+      self.audioFormatDesc = nil
+      self.cachedH264Sps = nil
+      self.cachedH264Pps = nil
+      self.cachedHevcParamSets.removeAll()
+      self.normVideoDtsMs = 0
+      self.normAudioDtsMs = 0
+      self.nextAudioSamplePts = -1
+      self.hasStartedSynchronizer = false
+    }
+    self.task = t
+    self.session = sess
+    lock.unlock()
+
+    oldTask?.cancel()
+    oldSess?.invalidateAndCancel()
+    if !preserveTimeline {
+      displayLayer.flush()
+      audioRenderer.flush()
+    }
+    t.resume()
+  }
+
+  private func advanceCandidateLocked(preserveTimeline: Bool = false) {
+    guard !isStopped else { return }
+    candidateIndex += 1
+    guard candidateIndex < candidates.count else {
+      if preserveTimeline, reconnectAttempts < 6, let gw = initialGatewayCandidate {
+        reconnectAttempts += 1
+        let useProxy = (reconnectAttempts % 2 == 0) && TvLocalProxyTunnelServer.shared.hasAvailableTunnelNode
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.15) { [weak self] in
+          self?.launchCandidate(url: gw.url, headers: gw.headers, useProxy: useProxy, preserveTimeline: true)
+        }
+        return
+      }
+      let cb = onAllCandidatesFailed
+      DispatchQueue.main.async {
+        cb?()
+      }
+      return
+    }
+    let next = candidates[candidateIndex]
+    DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.06) { [weak self] in
+      self?.launchCandidate(url: next.url, headers: next.headers, useProxy: next.useProxy, preserveTimeline: preserveTimeline)
+    }
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    didReceive challenge: URLAuthenticationChallenge,
+    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+  ) {
+    if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+       let trust = challenge.protectionSpace.serverTrust {
+      completionHandler(.useCredential, URLCredential(trust: trust))
+    } else {
+      completionHandler(.performDefaultHandling, nil)
+    }
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    willPerformHTTPRedirection response: HTTPURLResponse,
+    newRequest request: URLRequest,
+    completionHandler: @escaping (URLRequest?) -> Void
+  ) {
+    var req = request
+    lock.lock()
+    let curIdx = min(max(0, candidateIndex), max(0, candidates.count - 1))
+    let hdrs = candidates.isEmpty ? [:] : candidates[curIdx].headers
+    let wasUsingProxy = candidates.isEmpty ? false : candidates[curIdx].useProxy
+    lock.unlock()
+    for (k, v) in hdrs where !v.isEmpty {
+      req.setValue(v, forHTTPHeaderField: k)
+    }
+    if wasUsingProxy,
+       let target = req.url,
+       let host = target.host?.lowercased() {
+      let rLower = target.absoluteString.lowercased()
+      if host.contains("douyucdn") || host.contains("huya.com") || host.contains("yy.com") || rLower.contains(".flv") {
+        // Redirected from gateway (mursor.ottiptv.cc) via proxy to a domestic CDN .flv stream:
+        // try direct connection to the domestic CDN first, and keep proxy connection to the CDN as the very next fallback!
+        completionHandler(nil)
+        var followHeaders = hdrs
+        if let cookie = response.value(forHTTPHeaderField: "Set-Cookie"), !cookie.isEmpty, followHeaders["Cookie"] == nil {
+          followHeaders["Cookie"] = cookie
+        }
+        lock.lock()
+        let insertIdx = min(candidates.count, candidateIndex + 1)
+        candidates.insert((target, followHeaders, true), at: insertIdx)
+        candidates.insert((target, followHeaders, false), at: insertIdx)
+        advanceCandidateLocked()
+        lock.unlock()
+        return
+      }
+    }
+    completionHandler(req)
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    dataTask: URLSessionDataTask,
+    didReceive response: URLResponse,
+    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+  ) {
+    if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
+      completionHandler(.cancel)
+      lock.lock()
+      if dataTask === self.task {
+        advanceCandidateLocked()
+      }
+      lock.unlock()
+      return
+    }
+    completionHandler(.allow)
+  }
+
+  func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+    lock.lock()
+    guard !isStopped, task === self.task else {
+      lock.unlock()
+      return
+    }
+    // A live HTTP-FLV stream is continuous and should never complete while playing.
+    // If it ends early (error != nil or unexpected EOF after a short GOP burst), advance or seamless-reconnect!
+    let hadFirstFrame = hasRenderedFirstVideoFrame
+    advanceCandidateLocked(preserveTimeline: hadFirstFrame)
+    lock.unlock()
+  }
+
+  func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+    TvNetworkSpeedMonitor.shared.recordDownstreamBytes(data.count)
+    lock.lock()
+    defer { lock.unlock() }
+    guard !isStopped, dataTask === self.task else { return }
+    buffer.append(data)
+
+    if !headerSkipped {
+      if buffer.count - cursor >= 13 {
+        guard buffer[cursor] == 0x46, buffer[cursor + 1] == 0x4C, buffer[cursor + 2] == 0x56 else {
+          dataTask.cancel()
+          advanceCandidateLocked()
+          return
+        }
+        let h0 = Int(buffer[cursor + 5]) << 24
+        let h1 = Int(buffer[cursor + 6]) << 16
+        let h2 = Int(buffer[cursor + 7]) << 8
+        let h3 = Int(buffer[cursor + 8])
+        let headerOffset = h0 | h1 | h2 | h3
+        if headerOffset < 9 || headerOffset > 1024 {
+          dataTask.cancel()
+          advanceCandidateLocked()
+          return
+        }
+        if buffer.count - cursor >= headerOffset + 4 {
+          cursor += headerOffset + 4
+          headerSkipped = true
+        }
+      }
+      if !headerSkipped { return }
+    }
+
+    while buffer.count - cursor >= 11 {
+      let tagType = buffer[cursor]
+      let dataSize = (Int(buffer[cursor + 1]) << 16) | (Int(buffer[cursor + 2]) << 8) | Int(buffer[cursor + 3])
+      let totalNeeded = 11 + dataSize + 4
+      if buffer.count - cursor < totalNeeded { break }
+      let dtsLow = (Int(buffer[cursor + 4]) << 16) | (Int(buffer[cursor + 5]) << 8) | Int(buffer[cursor + 6])
+      let dtsExt = Int(buffer[cursor + 7]) << 24
+      let dtsMs = Int64(dtsLow | dtsExt)
+      let body = buffer.subdata(in: (cursor + 11)..<(cursor + 11 + dataSize))
+      cursor += totalNeeded
+      decodeFlvTagLocked(tagType: tagType, dtsMs: dtsMs, body: body)
+    }
+
+    if cursor > 262144 {
+      buffer.removeSubrange(0..<cursor)
+      cursor = 0
+    }
+  }
+
+  private static func splitAnnexBNalus(_ data: Data) -> [Data] {
+    var nalus: [Data] = []
+    let bytes = [UInt8](data)
+    let count = bytes.count
+    var start = -1
+    var i = 0
+    while i < count {
+      var scLen = 0
+      if i + 3 < count && bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 0 && bytes[i + 3] == 1 {
+        scLen = 4
+      } else if i + 2 < count && bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 1 {
+        scLen = 3
+      }
+      if scLen > 0 {
+        if start >= 0 && i > start {
+          nalus.append(Data(bytes[start..<i]))
+        }
+        start = i + scLen
+        i += scLen
+      } else {
+        i += 1
+      }
+    }
+    if start >= 0 && start < count {
+      nalus.append(Data(bytes[start..<count]))
+    }
+    return nalus
+  }
+
+  private static func convertAnnexBToLengthPrefixed(_ data: Data) -> Data {
+    packLengthPrefixedNalus(splitAnnexBNalus(data))
+  }
+
+  private static func packLengthPrefixedNalus(_ nalus: [Data]) -> Data {
+    var out = Data()
+    for n in nalus where !n.isEmpty {
+      let l = n.count
+      out.append(UInt8((l >> 24) & 0xFF))
+      out.append(UInt8((l >> 16) & 0xFF))
+      out.append(UInt8((l >> 8) & 0xFF))
+      out.append(UInt8(l & 0xFF))
+      out.append(n)
+    }
+    return out
+  }
+
+  private static func splitAvccNalus(_ data: Data, nalLengthSize: Int) -> [Data] {
+    var nalus: [Data] = []
+    var pos = 0
+    while pos + nalLengthSize <= data.count {
+      var len = 0
+      for i in 0..<nalLengthSize {
+        len = (len << 8) | Int(data[pos + i])
+      }
+      pos += nalLengthSize
+      guard len > 0, pos + len <= data.count else { break }
+      nalus.append(data.subdata(in: pos..<(pos + len)))
+      pos += len
+    }
+    return nalus
+  }
+
+  private static func createH264FormatDesc(sps: Data, pps: Data, nalLengthSize: Int) -> CMVideoFormatDescription? {
+    var fmt: CMFormatDescription? = nil
+    sps.withUnsafeBytes { spsRaw in
+      pps.withUnsafeBytes { ppsRaw in
+        guard let p0 = spsRaw.bindMemory(to: UInt8.self).baseAddress,
+              let p1 = ppsRaw.bindMemory(to: UInt8.self).baseAddress else { return }
+        let ptrs: [UnsafePointer<UInt8>] = [p0, p1]
+        let sizes: [Int] = [sps.count, pps.count]
+        _ = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+          allocator: kCFAllocatorDefault,
+          parameterSetCount: 2,
+          parameterSetPointers: ptrs,
+          parameterSetSizes: sizes,
+          nalUnitHeaderLength: Int32(nalLengthSize),
+          formatDescriptionOut: &fmt
+        )
+      }
+    }
+    return fmt
+  }
+
+  private static func createHevcFormatDesc(paramSets: [Data], nalLengthSize: Int) -> CMVideoFormatDescription? {
+    guard paramSets.count >= 3 else { return nil }
+    var fmt: CMFormatDescription? = nil
+    paramSets[0].withUnsafeBytes { r0 in
+      paramSets[1].withUnsafeBytes { r1 in
+        paramSets[2].withUnsafeBytes { r2 in
+          guard let p0 = r0.bindMemory(to: UInt8.self).baseAddress,
+                let p1 = r1.bindMemory(to: UInt8.self).baseAddress,
+                let p2 = r2.bindMemory(to: UInt8.self).baseAddress else { return }
+          let ptrs: [UnsafePointer<UInt8>] = [p0, p1, p2]
+          let sizes: [Int] = [paramSets[0].count, paramSets[1].count, paramSets[2].count]
+          _ = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+            allocator: kCFAllocatorDefault,
+            parameterSetCount: 3,
+            parameterSetPointers: ptrs,
+            parameterSetSizes: sizes,
+            nalUnitHeaderLength: Int32(nalLengthSize),
+            extensions: nil,
+            formatDescriptionOut: &fmt
+          )
+        }
+      }
+    }
+    return fmt
+  }
+
+  private func decodeFlvTagLocked(tagType: UInt8, dtsMs: Int64, body: Data) {
+    guard body.count >= 2 else { return }
+
+    if tagType == 9, body.count >= 5 {
+      let frameType = (body[0] >> 4) & 0x0F
+      let codecId = body[0] & 0x0F
+      guard codecId == 7 || codecId == 12 else { return } // 7 = H.264 (AVC), 12 = H.265 (HEVC)
+      self.videoCodecId = codecId
+      let pktType = body[1]
+      var cts = (Int(body[2]) << 16) | (Int(body[3]) << 8) | Int(body[4])
+      if (cts & 0x800000) != 0 { cts -= 0x1000000 }
+
+      if pktType == 0 {
+        if codecId == 7, body.count >= 11 {
+          nalLengthSize = Int(body[9] & 0x03) + 1
+          var pos = 10
+          let numSps = Int(body[pos] & 0x1F)
+          pos += 1
+          var spsList: [Data] = []
+          var ppsList: [Data] = []
+          for _ in 0..<numSps {
+            guard pos + 2 <= body.count else { break }
+            let len = (Int(body[pos]) << 8) | Int(body[pos + 1])
+            pos += 2
+            guard pos + len <= body.count else { break }
+            spsList.append(body.subdata(in: pos..<(pos + len)))
+            pos += len
+          }
+          if pos < body.count {
+            let numPps = Int(body[pos])
+            pos += 1
+            for _ in 0..<numPps {
+              guard pos + 2 <= body.count else { break }
+              let len = (Int(body[pos]) << 8) | Int(body[pos + 1])
+              pos += 2
+              guard pos + len <= body.count else { break }
+              ppsList.append(body.subdata(in: pos..<(pos + len)))
+              pos += len
+            }
+          }
+          if let sps = spsList.first, let pps = ppsList.first {
+            self.cachedH264Sps = sps
+            self.cachedH264Pps = pps
+            if let validFmt = Self.createH264FormatDesc(sps: sps, pps: pps, nalLengthSize: nalLengthSize) {
+              self.videoFormatDesc = validFmt
+            }
+          }
+        } else if codecId == 12, body.count > 5 {
+          let payload = body.subdata(in: 5..<body.count)
+          var paramSets: [Data] = []
+          if payload.count >= 4 && ((payload[0] == 0 && payload[1] == 0 && payload[2] == 0 && payload[3] == 1) || (payload[0] == 0 && payload[1] == 0 && payload[2] == 1)) {
+            nalLengthSize = 4
+            for n in Self.splitAnnexBNalus(payload) where !n.isEmpty {
+              let nType = (n[0] >> 1) & 0x3F
+              if nType == 32 || nType == 33 || nType == 34 {
+                paramSets.append(n)
+              }
+            }
+          } else if payload.count >= 23 {
+            nalLengthSize = Int(payload[21] & 0x03) + 1
+            let numArrays = Int(payload[22])
+            var pos = 23
+            for _ in 0..<numArrays {
+              guard pos + 3 <= payload.count else { break }
+              let numNalus = (Int(payload[pos + 1]) << 8) | Int(payload[pos + 2])
+              pos += 3
+              for _ in 0..<numNalus {
+                guard pos + 2 <= payload.count else { break }
+                let len = (Int(payload[pos]) << 8) | Int(payload[pos + 1])
+                pos += 2
+                guard pos + len <= payload.count else { break }
+                paramSets.append(payload.subdata(in: pos..<(pos + len)))
+                pos += len
+              }
+            }
+          }
+          if paramSets.count >= 3 {
+            self.cachedHevcParamSets = Array(paramSets.prefix(3))
+            if let validFmt = Self.createHevcFormatDesc(paramSets: self.cachedHevcParamSets, nalLengthSize: nalLengthSize) {
+              self.videoFormatDesc = validFmt
+            }
+          }
+        }
+      } else if pktType == 1, body.count > 5 {
+        let isKeyframe = (frameType == 1)
+        var rawPayload = body.subdata(in: 5..<body.count)
+        let isAnnexB = rawPayload.count >= 4 && ((rawPayload[0] == 0 && rawPayload[1] == 0 && rawPayload[2] == 0 && rawPayload[3] == 1) || (rawPayload[0] == 0 && rawPayload[1] == 0 && rawPayload[2] == 1))
+        if isAnnexB || videoFormatDesc == nil || isKeyframe {
+          let nalus = isAnnexB ? Self.splitAnnexBNalus(rawPayload) : Self.splitAvccNalus(rawPayload, nalLengthSize: nalLengthSize)
+          if codecId == 7 {
+            var updated = false
+            for n in nalus where !n.isEmpty {
+              let nType = n[0] & 0x1F
+              if nType == 7 {
+                cachedH264Sps = n
+                updated = true
+              } else if nType == 8 {
+                cachedH264Pps = n
+                updated = true
+              }
+            }
+            if (updated || videoFormatDesc == nil), let sps = cachedH264Sps, let pps = cachedH264Pps {
+              if let validFmt = Self.createH264FormatDesc(sps: sps, pps: pps, nalLengthSize: isAnnexB ? 4 : nalLengthSize) {
+                self.videoFormatDesc = validFmt
+              }
+            }
+          } else if codecId == 12 {
+            var vps: Data? = cachedHevcParamSets.count >= 1 ? cachedHevcParamSets[0] : nil
+            var sps: Data? = cachedHevcParamSets.count >= 2 ? cachedHevcParamSets[1] : nil
+            var pps: Data? = cachedHevcParamSets.count >= 3 ? cachedHevcParamSets[2] : nil
+            var updated = false
+            for n in nalus where !n.isEmpty {
+              let nType = (n[0] >> 1) & 0x3F
+              if nType == 32 { vps = n; updated = true }
+              else if nType == 33 { sps = n; updated = true }
+              else if nType == 34 { pps = n; updated = true }
+            }
+            if (updated || videoFormatDesc == nil), let v = vps, let s = sps, let p = pps {
+              cachedHevcParamSets = [v, s, p]
+              if let validFmt = Self.createHevcFormatDesc(paramSets: cachedHevcParamSets, nalLengthSize: isAnnexB ? 4 : nalLengthSize) {
+                self.videoFormatDesc = validFmt
+              }
+            }
+          }
+          if isAnnexB {
+            rawPayload = Self.packLengthPrefixedNalus(nalus)
+          }
+        }
+        guard let fmt = videoFormatDesc else { return }
+
+        if lastVideoRawDtsMs < 0 {
+          guard isKeyframe else { return }
+          lastVideoRawDtsMs = dtsMs
+          if hasStartedSynchronizer && normVideoDtsMs > 0 {
+            normVideoDtsMs += 40
+          } else {
+            normVideoDtsMs = 0
+          }
+        } else {
+          var delta = dtsMs - lastVideoRawDtsMs
+          if delta <= 0 || delta > 1200 {
+            delta = 40
+          }
+          lastVideoRawDtsMs = dtsMs
+          normVideoDtsMs += delta
+        }
+        let clampedCts = Int64(max(-500, min(1500, cts)))
+        let ptsMs = max(0, normVideoDtsMs + clampedCts)
+
+        let framePayload = rawPayload
+        let len = framePayload.count
+        guard len > 4 else { return }
+
+        var blockBuf: CMBlockBuffer? = nil
+        guard CMBlockBufferCreateWithMemoryBlock(
+          allocator: kCFAllocatorDefault,
+          memoryBlock: nil,
+          blockLength: len,
+          blockAllocator: kCFAllocatorDefault,
+          customBlockSource: nil,
+          offsetToData: 0,
+          dataLength: len,
+          flags: 0,
+          blockBufferOut: &blockBuf
+        ) == kCMBlockBufferNoErr, let bb = blockBuf else { return }
+
+        framePayload.withUnsafeBytes { rawPtr in
+          if let base = rawPtr.baseAddress {
+            _ = CMBlockBufferReplaceDataBytes(
+              with: base,
+              blockBuffer: bb,
+              offsetIntoDestination: 0,
+              dataLength: len
+            )
+          }
+        }
+
+        var timing = CMSampleTimingInfo(
+          duration: CMTime(value: 40, timescale: 1000),
+          presentationTimeStamp: CMTime(value: ptsMs, timescale: 1000),
+          decodeTimeStamp: CMTime(value: normVideoDtsMs, timescale: 1000)
+        )
+        var sampleBuf: CMSampleBuffer? = nil
+        guard CMSampleBufferCreateReady(
+          allocator: kCFAllocatorDefault,
+          dataBuffer: bb,
+          formatDescription: fmt,
+          sampleCount: 1,
+          sampleTimingEntryCount: 1,
+          sampleTimingArray: &timing,
+          sampleSizeEntryCount: 1,
+          sampleSizeArray: [len],
+          sampleBufferOut: &sampleBuf
+        ) == noErr, let sb = sampleBuf else { return }
+
+        if displayLayer.status == .failed {
+          displayLayer.flush()
+        }
+        displayLayer.enqueue(sb)
+        renderedVideoFrameCount += 1
+        lastFrameReceivedAt = Date()
+
+        if !hasStartedSynchronizer {
+          hasStartedSynchronizer = true
+          if !isPaused {
+            synchronizer.setRate(1.0, time: CMTime(value: 0, timescale: 1000))
+          }
+        }
+        if !hasRenderedFirstVideoFrame {
+          hasRenderedFirstVideoFrame = true
+          let cb = onFirstFrameRendered
+          DispatchQueue.main.async {
+            cb?()
+          }
+        }
+      }
+    } else if tagType == 8, body.count >= 2 {
+      let soundFmt = (body[0] >> 4) & 0x0F
+      guard soundFmt == 10 else { return } // AAC
+      let pktType = body[1]
+      if pktType == 0, body.count >= 4 {
+        let asc = body.subdata(in: 2..<body.count)
+        let b0 = asc[0], b1 = asc[1]
+        let freqIdx = Int(((b0 & 0x07) << 1) | ((b1 >> 7) & 0x01))
+        var chanCfg = Int((b1 >> 3) & 0x0F)
+        if chanCfg <= 0 || chanCfg > 8 { chanCfg = 2 }
+        let sampleRates: [Float64] = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350]
+        let sr = (freqIdx < sampleRates.count) ? sampleRates[freqIdx] : 44100.0
+        self.audioSampleRate = Int32(sr)
+        var asbd = AudioStreamBasicDescription(
+          mSampleRate: sr,
+          mFormatID: kAudioFormatMPEG4AAC,
+          mFormatFlags: 0,
+          mBytesPerPacket: 0,
+          mFramesPerPacket: 1024,
+          mBytesPerFrame: 0,
+          mChannelsPerFrame: UInt32(chanCfg),
+          mBitsPerChannel: 0,
+          mReserved: 0
+        )
+        var fmt: CMAudioFormatDescription? = nil
+        asc.withUnsafeBytes { rawPtr in
+          if let base = rawPtr.baseAddress {
+            _ = CMAudioFormatDescriptionCreate(
+              allocator: kCFAllocatorDefault,
+              asbd: &asbd,
+              layoutSize: 0,
+              layout: nil,
+              magicCookieSize: asc.count,
+              magicCookie: base,
+              extensions: nil,
+              formatDescriptionOut: &fmt
+            )
+          }
+        }
+        if let validFmt = fmt {
+          self.audioFormatDesc = validFmt
+        }
+      } else if pktType == 1, body.count > 2, let fmt = audioFormatDesc, lastVideoRawDtsMs >= 0 {
+        let sr = max(8000, Int64(audioSampleRate))
+        if lastAudioRawDtsMs < 0 {
+          lastAudioRawDtsMs = dtsMs
+          normAudioDtsMs = normVideoDtsMs
+          if nextAudioSamplePts < 0 {
+            nextAudioSamplePts = (max(0, normVideoDtsMs) * sr) / 1000
+          }
+        } else {
+          var aDelta = dtsMs - lastAudioRawDtsMs
+          if aDelta <= 0 || aDelta > 800 {
+            aDelta = 21
+          }
+          lastAudioRawDtsMs = dtsMs
+          normAudioDtsMs += aDelta
+          let currentAudioMs = (nextAudioSamplePts * 1000) / sr
+          if abs(currentAudioMs - normVideoDtsMs) > 1200 {
+            normAudioDtsMs = normVideoDtsMs
+            nextAudioSamplePts = (max(0, normVideoDtsMs) * sr) / 1000
+          }
+        }
+        let samplePts = max(0, nextAudioSamplePts)
+        nextAudioSamplePts = samplePts + 1024
+        let rawAac = body.subdata(in: 2..<body.count)
+        let len = rawAac.count
+        guard len > 0 else { return }
+
+        var blockBuf: CMBlockBuffer? = nil
+        guard CMBlockBufferCreateWithMemoryBlock(
+          allocator: kCFAllocatorDefault,
+          memoryBlock: nil,
+          blockLength: len,
+          blockAllocator: kCFAllocatorDefault,
+          customBlockSource: nil,
+          offsetToData: 0,
+          dataLength: len,
+          flags: 0,
+          blockBufferOut: &blockBuf
+        ) == kCMBlockBufferNoErr, let bb = blockBuf else { return }
+
+        rawAac.withUnsafeBytes { rawPtr in
+          if let base = rawPtr.baseAddress {
+            _ = CMBlockBufferReplaceDataBytes(
+              with: base,
+              blockBuffer: bb,
+              offsetIntoDestination: 0,
+              dataLength: len
+            )
+          }
+        }
+
+        var pktDesc = AudioStreamPacketDescription(mStartOffset: 0, mVariableFramesInPacket: 0, mDataByteSize: UInt32(len))
+        var sampleBuf: CMSampleBuffer? = nil
+        guard CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+          allocator: kCFAllocatorDefault,
+          dataBuffer: bb,
+          formatDescription: fmt,
+          sampleCount: 1,
+          presentationTimeStamp: CMTime(value: samplePts, timescale: audioSampleRate),
+          packetDescriptions: &pktDesc,
+          sampleBufferOut: &sampleBuf
+        ) == noErr, let sb = sampleBuf else { return }
+
+        audioRenderer.enqueue(sb)
+      }
+    }
+  }
+}
+
 // MARK: - Real-Time HTTP-FLV to MPEG-TS / HLS Remuxer (for 斗鱼一起看 / 虎牙一起看 / YY轮播 & FLV Live Streams on tvOS AVPlayer)
 
 final class TvFlvToTsRemuxer {
@@ -1885,7 +2790,11 @@ final class TvFlvToTsRemuxer {
 
   private(set) var currentSegment = Data()
   private var currentSegmentStartDts: Int64 = -1
-  private var baseDts90k: Int64 = -1
+  private var lastVideoRawDtsMs: Int64 = -1
+  private var normalizedVideoDts90k: Int64 = 90_000
+  private var lastAudioRawDtsMs: Int64 = -1
+  private var normalizedAudioPts90k: Int64 = 90_000
+  private var hasEmittedFirstSegment: Bool = false
 
   func resetSegment(atDts dts90k: Int64) {
     currentSegment.removeAll(keepingCapacity: true)
@@ -1909,8 +2818,24 @@ final class TvFlvToTsRemuxer {
         if adtsChanCfg == 0 { adtsChanCfg = 2 }
         adtsProfile = (objType == 5 || objType == 29) ? 1 : max(0, min(3, objType - 1))
         hasAudioConfig = true
-      } else if pktType == 1, hasAudioConfig, body.count > 2, currentSegmentStartDts >= 0, baseDts90k >= 0 {
-        let relDts90k = max(currentSegmentStartDts, dtsMs * 90 - baseDts90k + 90_000)
+      } else if pktType == 1, hasAudioConfig, body.count > 2, currentSegmentStartDts >= 0, lastVideoRawDtsMs >= 0 {
+        // Normalize audio PTS monotonically and keep it locked within 1.0s of normalizedVideoDts90k
+        // (Douyu/Huya SCDN nodes often send stale sequence header timestamps or 31,900,000 ms DTS jumps)
+        if lastAudioRawDtsMs < 0 {
+          lastAudioRawDtsMs = dtsMs
+          normalizedAudioPts90k = normalizedVideoDts90k
+        } else {
+          var aDeltaMs = dtsMs - lastAudioRawDtsMs
+          if aDeltaMs <= 0 || aDeltaMs > 800 {
+            aDeltaMs = 21
+          }
+          lastAudioRawDtsMs = dtsMs
+          normalizedAudioPts90k += aDeltaMs * 90
+          if abs(normalizedAudioPts90k - normalizedVideoDts90k) > 90_000 {
+            normalizedAudioPts90k = normalizedVideoDts90k
+          }
+        }
+        let relDts90k = max(currentSegmentStartDts, normalizedAudioPts90k)
         let rawAac = body.subdata(in: 2..<body.count)
         let frameLen = rawAac.count + 7
         var adts = Data(count: 7)
@@ -1967,25 +2892,36 @@ final class TvFlvToTsRemuxer {
         }
       } else if pktType == 1, body.count > 5, !spsPpsAnnexB.isEmpty {
         let isKeyframe = (frameType == 1)
-        let rawDts90k = dtsMs * 90
-        // Initialize baseDts90k ONLY on the first real video keyframe (sequence headers often have dtsMs=0 while live frames start at 46,000,000+ ms)
-        if baseDts90k < 0 {
+        // Normalize video DTS via bounded frame-to-frame deltas so any 31,900,000 ms SCDN timestamp jump
+        // or timestamp wraparound is clamped to a clean 40ms (25fps) increment!
+        if lastVideoRawDtsMs < 0 {
           guard isKeyframe else { return }
-          baseDts90k = rawDts90k
-        } else if rawDts90k < baseDts90k {
-          baseDts90k = rawDts90k
+          lastVideoRawDtsMs = dtsMs
+          normalizedVideoDts90k = 90_000
+        } else {
+          var vDeltaMs = dtsMs - lastVideoRawDtsMs
+          if vDeltaMs <= 0 || vDeltaMs > 1200 {
+            vDeltaMs = 40
+          }
+          lastVideoRawDtsMs = dtsMs
+          normalizedVideoDts90k += vDeltaMs * 90
         }
-        let relDts90k = max(0, rawDts90k - baseDts90k) + 90_000
-        let relPts90k = max(0, relDts90k + Int64(cts) * 90)
+        let clampedCts = max(-500, min(1500, cts))
+        let relDts90k = normalizedVideoDts90k
+        let relPts90k = max(0, relDts90k + Int64(clampedCts) * 90)
 
         if currentSegmentStartDts < 0 {
           guard isKeyframe else { return }
           resetSegment(atDts: relDts90k)
         } else {
           let durSec = Double(relDts90k - currentSegmentStartDts) / 90_000.0
-          // Emit ~2.0s TS segments even when Douyu/Huya Together-Watch uses 8s–10s GOPs so AVPlayer starts playback in ~1.5s without timing out
-          if ((isKeyframe && durSec >= 1.2) || durSec >= 2.0) && !currentSegment.isEmpty {
-            onSegmentReady(currentSegment, durSec)
+          // Emit the first two TS segments at ~1.0s each so `/flv_live.m3u8` has >= 2 segments ready within ~2.0s
+          // (tvOS AVPlayer requires >= 2 segments in a live HLS playlist before entering `.readyToPlay`),
+          // and subsequent segments at ~1.6s even when Douyu/Huya uses 8s–10s GOPs.
+          let targetSegDur = hasEmittedFirstSegment ? 1.6 : 1.0
+          if ((isKeyframe && durSec >= 0.85) || durSec >= targetSegDur) && !currentSegment.isEmpty {
+            hasEmittedFirstSegment = true
+            onSegmentReady(currentSegment, max(0.5, min(durSec, 6.0)))
             resetSegment(atDts: relDts90k)
           }
         }
@@ -2216,12 +3152,27 @@ final class TvLiveFlvSession: NSObject, URLSessionDataDelegate, @unchecked Senda
     launchRequest(url: url, headers: headers)
   }
 
-  private func launchRequest(url: URL, headers: [String: String]) {
+  private func launchRequest(url: URL, headers: [String: String], forceDirect: Bool = false, forceProxy: Bool = false) {
     let cfg = URLSessionConfiguration.ephemeral
-    cfg.timeoutIntervalForRequest = 14
+    cfg.timeoutIntervalForRequest = forceProxy ? 7.5 : 4.2
     cfg.timeoutIntervalForResource = 7200
     cfg.httpShouldSetCookies = true
-    if let proxyDict = TvLocalProxyTunnelServer.shared.proxyConnectionDictionary() {
+    let urlLower = url.absoluteString.lowercased()
+    let isDomesticCdn = !forceProxy && (
+      forceDirect
+      || TvLocalHlsProxyServer.isDomesticOrLocalUrl(urlLower)
+      || urlLower.contains("douyucdn")
+      || urlLower.contains("douyu")
+      || urlLower.contains("huya.com")
+      || urlLower.contains("msstatic.com")
+      || urlLower.contains("yy.com")
+      || urlLower.contains(".flv")
+    )
+    if forceProxy, let proxyDict = TvLocalProxyTunnelServer.shared.proxyConnectionDictionary(allowFallbackNode: true) {
+      cfg.connectionProxyDictionary = proxyDict
+    } else if !isDomesticCdn,
+              TvLocalProxyTunnelServer.shared.isProxyActive,
+              let proxyDict = TvLocalProxyTunnelServer.shared.proxyConnectionDictionary() {
       cfg.connectionProxyDictionary = proxyDict
     }
     let sess = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
@@ -2229,6 +3180,9 @@ final class TvLiveFlvSession: NSObject, URLSessionDataDelegate, @unchecked Senda
     req.httpMethod = "GET"
     for (k, v) in headers where !v.isEmpty {
       req.setValue(v, forHTTPHeaderField: k)
+    }
+    if req.value(forHTTPHeaderField: "User-Agent") == nil {
+      req.setValue("okHttp/Mod-1.5.0.0", forHTTPHeaderField: "User-Agent")
     }
     let t = sess.dataTask(with: req)
     lock.lock()
@@ -2242,6 +3196,7 @@ final class TvLiveFlvSession: NSObject, URLSessionDataDelegate, @unchecked Senda
     self.buffer.removeAll(keepingCapacity: true)
     self.cursor = 0
     self.headerSkipped = false
+    self.remuxer = TvFlvToTsRemuxer()
     self.task = t
     self.session = sess
     lock.unlock()
@@ -2251,15 +3206,79 @@ final class TvLiveFlvSession: NSObject, URLSessionDataDelegate, @unchecked Senda
   }
 
   private func scheduleRetryLocked() {
-    guard !isStopped, retryCount < 2 else { return }
+    guard !isStopped, retryCount < 4 else { return }
     retryCount += 1
     let attempt = retryCount
-    let useFallback = (attempt >= 2 && fallbackUrl != nil && fallbackUrl != initialUrl)
-    guard let nextUrl = useFallback ? fallbackUrl : initialUrl else { return }
-    let nextHeaders = useFallback ? fallbackHeaders : initialHeaders
-    DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.15) { [weak self] in
+    let hasDistinctFallback = (fallbackUrl != nil && fallbackUrl != initialUrl)
+    // Attempt 1: If direct connection to initialUrl timed out (e.g. overseas SCDN IP 183.239.202.x:8080 unreachable from local ISP)
+    // and we have a client proxy tunnel node available, immediately try initialUrl via the proxy tunnel (1:1 match with Flutter's LocalProxyTunnelBridge)!
+    // Attempt 2: Try fallbackUrl (e.g. mursor.ottiptv.cc gateway) directly.
+    // Attempt 3: Try fallbackUrl via proxy tunnel (which auto-switches to direct on 301/302 redirect to domestic CDN!).
+    // Attempt 4: Final direct retry on initialUrl.
+    let nextUrl: URL
+    let nextHeaders: [String: String]
+    let useProxy: Bool
+    let useForceDirect: Bool
+
+    switch attempt {
+    case 1:
+      if TvLocalProxyTunnelServer.shared.hasAvailableTunnelNode {
+        nextUrl = initialUrl ?? fallbackUrl!
+        nextHeaders = initialHeaders
+        useProxy = true
+        useForceDirect = false
+      } else if hasDistinctFallback, let fb = fallbackUrl {
+        nextUrl = fb
+        nextHeaders = fallbackHeaders
+        useProxy = false
+        useForceDirect = true
+      } else if let initUrl = initialUrl {
+        nextUrl = initUrl
+        nextHeaders = initialHeaders
+        useProxy = false
+        useForceDirect = true
+      } else {
+        return
+      }
+    case 2:
+      if hasDistinctFallback, let fb = fallbackUrl {
+        nextUrl = fb
+        nextHeaders = fallbackHeaders
+        useProxy = false
+        useForceDirect = true
+      } else if let initUrl = initialUrl {
+        nextUrl = initUrl
+        nextHeaders = initialHeaders
+        useProxy = TvLocalProxyTunnelServer.shared.hasAvailableTunnelNode
+        useForceDirect = !useProxy
+      } else {
+        return
+      }
+    case 3:
+      if hasDistinctFallback, let fb = fallbackUrl, TvLocalProxyTunnelServer.shared.hasAvailableTunnelNode {
+        nextUrl = fb
+        nextHeaders = fallbackHeaders
+        useProxy = true
+        useForceDirect = false
+      } else if let initUrl = initialUrl {
+        nextUrl = initUrl
+        nextHeaders = initialHeaders
+        useProxy = false
+        useForceDirect = true
+      } else {
+        return
+      }
+    default:
+      guard let initUrl = initialUrl else { return }
+      nextUrl = initUrl
+      nextHeaders = initialHeaders
+      useProxy = false
+      useForceDirect = true
+    }
+
+    DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.08) { [weak self] in
       guard let self else { return }
-      self.launchRequest(url: nextUrl, headers: nextHeaders)
+      self.launchRequest(url: nextUrl, headers: nextHeaders, forceDirect: useForceDirect, forceProxy: useProxy)
     }
   }
 
@@ -2311,10 +3330,36 @@ final class TvLiveFlvSession: NSObject, URLSessionDataDelegate, @unchecked Senda
   ) {
     var req = request
     lock.lock()
-    let ua = initialHeaders["User-Agent"] ?? initialHeaders["user-agent"] ?? ""
+    let hdrs = initialHeaders
     lock.unlock()
-    if !ua.isEmpty {
-      req.setValue(ua, forHTTPHeaderField: "User-Agent")
+    for (k, v) in hdrs where !v.isEmpty {
+      req.setValue(v, forHTTPHeaderField: k)
+    }
+    if let redirectedHost = req.url?.host,
+       let target = req.url {
+      let rLower = target.absoluteString.lowercased()
+      if TvLocalHlsProxyServer.isDomesticOrLocalUrl(rLower)
+          || redirectedHost.lowercased().contains("douyucdn")
+          || redirectedHost.lowercased().contains("huya.com")
+          || redirectedHost.lowercased().contains("yy.com")
+          || rLower.contains(".flv") {
+        // Redirected from gateway (e.g. mursor.ottiptv.cc) to a domestic Douyu/Huya CDN stream:
+        // update initialUrl to the resolved CDN URL and connect directly first (with automatic proxy fallback on retry)!
+        completionHandler(nil)
+        var followHeaders = hdrs
+        if let cookie = response.value(forHTTPHeaderField: "Set-Cookie"), !cookie.isEmpty, followHeaders["Cookie"] == nil {
+          followHeaders["Cookie"] = cookie
+        }
+        lock.lock()
+        self.initialUrl = target
+        self.initialHeaders = followHeaders
+        self.retryCount = 0
+        lock.unlock()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+          self?.launchRequest(url: target, headers: followHeaders, forceDirect: true, forceProxy: false)
+        }
+        return
+      }
     }
     completionHandler(req)
   }
@@ -2385,8 +3430,8 @@ final class TvLiveFlvSession: NSObject, URLSessionDataDelegate, @unchecked Senda
         let seq = self.nextSeq
         self.nextSeq += 1
         self.segments.append((seq: seq, dur: dur, data: segData))
-        if self.segments.count > 8 {
-          self.segments.removeFirst(self.segments.count - 8)
+        if self.segments.count > 12 {
+          self.segments.removeFirst(self.segments.count - 12)
         }
       }
     }
@@ -2432,6 +3477,32 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     cachedProxyUrlSession = fresh
     cachedProxyPort = curPort
     return fresh
+  }
+
+  nonisolated static func isDomesticOrLocalUrl(_ urlStr: String) -> Bool {
+    let lower = urlStr.lowercased()
+    return lower.contains("115.com")
+      || lower.contains("115cdn")
+      || lower.contains("115vod")
+      || lower.contains("anxia.com")
+      || lower.contains("baidupcs")
+      || lower.contains("aliyundrive")
+      || lower.contains("alipan")
+      || lower.contains("://192.168.")
+      || lower.contains("://10.")
+      || lower.contains("://172.")
+      || lower.contains("://127.0.0.1")
+      || lower.contains("://localhost")
+      || lower.contains(".local")
+  }
+
+  /// Domestic cloud drives (115 / Baidu / Aliyun) and local LAN storage (AList / WebDAV) bind download tickets to domestic/local IP
+  /// and must bypass the overseas proxy tunnel (`directUrlSession`).
+  private func preferredSession(for targetUrl: String) -> URLSession {
+    if Self.isDomesticOrLocalUrl(targetUrl) {
+      return directUrlSession
+    }
+    return urlSession
   }
 
   private init() {
@@ -2524,7 +3595,11 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
   /// Prepares a local 127.0.0.1 resilient chunked MP4 proxy URL (`/tg_video.mp4`) for `/api/telegram/video`, `/api/telegram/file-content`, and 115 CDN direct streams.
   /// Fetches upstream video in bounded 2 MB (`2_097_152` byte) HTTP Range requests with 4x automatic retries and 1-chunk lookahead prefetching,
   /// preventing single-request 100-300 MB HTTP connections from timing out or stalling mid-video on Apple TV.
-  func prepareTelegramVideoProxyUrl(remoteUrl: String, headers: [String: String]) -> String {
+  func prepareTelegramVideoProxyUrl(
+    remoteUrl: String,
+    headers: [String: String],
+    extHint: String = ".mp4"
+  ) -> String {
     startListenerIfNeeded()
     tgLock.lock()
     var cleanHeaders: [String: String] = [:]
@@ -2542,10 +3617,36 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     }
     tgLock.unlock()
     guard port > 0 else { return remoteUrl }
+    var cleanExt = extHint.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if cleanExt.isEmpty {
+      let pathExt = ((URL(string: remoteUrl)?.path ?? "") as NSString).pathExtension.lowercased()
+      if !pathExt.isEmpty && pathExt.count <= 5 {
+        cleanExt = ".\(pathExt)"
+      }
+    }
+    if cleanExt.isEmpty || !cleanExt.hasPrefix(".") {
+      cleanExt = cleanExt.isEmpty ? ".mp4" : ".\(cleanExt)"
+    }
     var allowed = CharacterSet.urlQueryAllowed
     allowed.remove(charactersIn: "&+=?#")
     let enc = remoteUrl.addingPercentEncoding(withAllowedCharacters: allowed) ?? remoteUrl
-    return "http://127.0.0.1:\(port)/tg_video.mp4?u=\(enc)"
+    return "http://127.0.0.1:\(port)/tg_video\(cleanExt)?u=\(enc)"
+  }
+
+  private static func inferMediaMimeType(pathOrUrl: String) -> String? {
+    let lower = pathOrUrl.lowercased()
+    if lower.hasSuffix(".mp3") { return "audio/mpeg" }
+    if lower.hasSuffix(".flac") { return "audio/flac" }
+    if lower.hasSuffix(".wav") { return "audio/wav" }
+    if lower.hasSuffix(".m4a") || lower.hasSuffix(".alac") { return "audio/mp4" }
+    if lower.hasSuffix(".aac") { return "audio/aac" }
+    if lower.hasSuffix(".ogg") || lower.hasSuffix(".opus") { return "audio/ogg" }
+    if lower.hasSuffix(".aiff") || lower.hasSuffix(".aif") { return "audio/aiff" }
+    if lower.hasSuffix(".wma") { return "audio/x-ms-wma" }
+    if lower.hasSuffix(".ape") { return "audio/x-ape" }
+    if lower.hasSuffix(".mp4") || lower.hasSuffix(".m4v") { return "video/mp4" }
+    if lower.hasSuffix(".mov") { return "video/quicktime" }
+    return nil
   }
 
   private func getTgHeadersAndMeta(
@@ -2649,17 +3750,21 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
         sendResponse(conn: conn, status: "404 Not Found", contentType: "text/plain", body: Data(), isHead: method == "HEAD")
         return
       }
-      for _ in 0..<120 {
-        if !flvSession.snapshotSegments().isEmpty { break }
+    // Wait up to 22 seconds (`220 * 100ms`) for the first 2 segments so that if direct connection times out (4.2s)
+      // and switches to the client proxy node fallback, `/flv_live.m3u8` still returns `200 OK` without premature `502 Bad Gateway`!
+      for tick in 0..<220 {
+        let count = flvSession.snapshotSegments().count
+        if count >= 2 || (count >= 1 && tick >= 120) { break }
         try? await Task.sleep(nanoseconds: 100_000_000)
       }
-      let segs = flvSession.snapshotSegments()
-      guard !segs.isEmpty else {
+      let allSegs = flvSession.snapshotSegments()
+      guard !allSegs.isEmpty else {
         sendResponse(conn: conn, status: "502 Bad Gateway", contentType: "text/plain", body: Data(), isHead: method == "HEAD")
         return
       }
+      let segs = Array(allSegs.suffix(5))
       let firstSeq = segs.first?.seq ?? 1
-      let maxDur = Int(ceil(segs.map { $0.dur }.max() ?? 10.0)) + 1
+      let maxDur = max(2, Int(ceil(segs.map { $0.dur }.max() ?? 2.0)))
       let localPort = self.port
       var m3u8 = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:\(maxDur)\n#EXT-X-MEDIA-SEQUENCE:\(firstSeq)\n"
       for seg in segs {
@@ -2731,7 +3836,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
        !targetUrl.isEmpty {
       let cfg = await store.currentConfig()
       let activeGen = genParam ?? cfg.gen
-      let sessionRef = self.urlSession
+      let sessionRef = self.preferredSession(for: targetUrl)
       let data = await store.fetchOrJoinSegment(url: targetUrl, gen: activeGen) { urlStr, hdrs in
         await Self.downloadSegmentMultiRange(urlStr: urlStr, headers: hdrs, session: sessionRef)
       }
@@ -2764,11 +3869,12 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       return
     }
 
-    if path == "/tg_video.mp4",
+    if path.hasPrefix("/tg_video"),
        let targetUrl = comp?.queryItems?.first(where: { $0.name == "u" })?.value,
        !targetUrl.isEmpty {
       await streamTelegramVideoChunked(
         targetUrl: targetUrl,
+        requestPath: path,
         method: method,
         rangeHeader: rangeHeader,
         conn: conn
@@ -2779,10 +3885,11 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     sendResponse(conn: conn, status: "404 Not Found", contentType: "text/plain", body: Data(), isHead: method == "HEAD")
   }
 
-  /// Streams a remote Telegram video (`/api/telegram/video`) over local loopback in bounded 2 MB (`2_097_152` byte) chunks
+  /// Streams a remote Telegram video or 115/AList media file over local loopback in bounded 2 MB (`2_097_152` byte) chunks
   /// with 4x automatic retry per chunk, 256 KB header caching, and 1-chunk lookahead prefetching.
   private func streamTelegramVideoChunked(
     targetUrl: String,
+    requestPath: String = "/tg_video.mp4",
     method: String,
     rangeHeader: String?,
     conn: NWConnection
@@ -2797,6 +3904,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     var meta = snapshot.meta
 
     // 1. Probe and cache first 256 KB (`bytes=0-262143`) + total file size so AVPlayer's initial `bytes=0-1` and `moov` probes complete in 0ms
+    let primarySession = preferredSession(for: targetUrl)
     if meta == nil {
       for attempt in 0..<3 {
         var req = URLRequest(url: u)
@@ -2806,12 +3914,21 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
           req.setValue(v, forHTTPHeaderField: k)
         }
         req.setValue("bytes=0-262143", forHTTPHeaderField: "Range")
-        if let (d, r) = try? await urlSession.data(for: req),
+        let sess = attempt == 0 ? primarySession : directUrlSession
+        if let (d, r) = try? await sess.data(for: req),
            let h = r as? HTTPURLResponse,
            (h.statusCode == 206 || h.statusCode == 200),
            !d.isEmpty {
           TvNetworkSpeedMonitor.shared.recordDownstreamBytes(d.count)
-          let ct = h.value(forHTTPHeaderField: "Content-Type") ?? "video/mp4"
+          let rawCt = (h.value(forHTTPHeaderField: "Content-Type") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+          let ct: String
+          if rawCt.isEmpty || rawCt.lowercased().contains("octet-stream") || rawCt.lowercased().contains("force-download") {
+            ct = Self.inferMediaMimeType(pathOrUrl: requestPath)
+              ?? Self.inferMediaMimeType(pathOrUrl: u.path)
+              ?? "video/mp4"
+          } else {
+            ct = rawCt
+          }
           var totalSize: Int64 = Int64(d.count)
           if let cr = h.value(forHTTPHeaderField: "Content-Range") ?? h.value(forHTTPHeaderField: "content-range"),
              let slash = cr.lastIndex(of: "/"),
@@ -2974,6 +4091,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     end: Int64
   ) async -> Data? {
     let expected = Int(end - start + 1)
+    let primarySession = preferredSession(for: url.absoluteString)
     for attempt in 0..<4 {
       if Task.isCancelled { return nil }
       var req = URLRequest(url: url)
@@ -2983,17 +4101,16 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
         req.setValue(v, forHTTPHeaderField: k)
       }
       req.setValue("bytes=\(start)-\(end)", forHTTPHeaderField: "Range")
-      if let (d, r) = try? await urlSession.data(for: req),
+      let sess = attempt == 0 ? primarySession : directUrlSession
+      if let (d, r) = try? await sess.data(for: req),
          let h = r as? HTTPURLResponse,
-         (h.statusCode == 206 || h.statusCode == 200),
+         (h.statusCode == 206 || (start == 0 && h.statusCode == 200)),
          !d.isEmpty {
         TvNetworkSpeedMonitor.shared.recordDownstreamBytes(d.count)
         if d.count == expected {
           return d
         } else if d.count > expected {
           return d.subdata(in: 0..<expected)
-        } else if attempt >= 2 {
-          return d
         }
       }
       try? await Task.sleep(nanoseconds: UInt64((attempt + 1) * 250_000_000))
@@ -3024,11 +4141,12 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     }
     guard var (text, finalUrl) = playlistFetch else { return nil }
 
-    // If this is a master playlist (#EXT-X-STREAM-INF), follow the first variant media playlist immediately
+    // If this is a master playlist (#EXT-X-STREAM-INF), follow the highest-quality variant media playlist immediately
     if text.contains("#EXT-X-STREAM-INF") {
-      let lines = text.components(separatedBy: .newlines)
-      if let variantLine = lines.map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) }).first(where: { !$0.isEmpty && !$0.hasPrefix("#") }),
-         let variantUrl = URL(string: variantLine, relativeTo: finalUrl)?.absoluteURL,
+      let lines = text.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      let variants = lines.filter { !$0.isEmpty && !$0.hasPrefix("#") }
+      if let bestVariant = variants.last ?? variants.first,
+         let variantUrl = URL(string: bestVariant, relativeTo: finalUrl)?.absoluteURL,
          let childFetch = await fetchRawPlaylist(urlStr: variantUrl.absoluteString, headers: cfg.headers) {
         text = childFetch.text
         finalUrl = childFetch.finalUrl
@@ -3039,35 +4157,68 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     let lines = text.components(separatedBy: .newlines)
     var headerLines: [String] = ["#EXTM3U", "#EXT-X-VERSION:3"]
     var targetDurationLine = "#EXT-X-TARGETDURATION:10"
-    var parsedSegments: [(inf: String, url: String)] = []
+    var parsedSegments: [(inf: String, url: String, discontinuity: Bool)] = []
     var pendingInf: String? = nil
+    var pendingDiscontinuity = false
+    var hasEndListTag = false
+    var isExplicitVodTag = false
 
     for raw in lines {
       let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
       if t.isEmpty { continue }
-      if t.uppercased().hasPrefix("#EXT-X-TARGETDURATION") {
+      let upper = t.uppercased()
+      if upper.hasPrefix("#EXT-X-TARGETDURATION") {
         targetDurationLine = t
-      } else if t.uppercased().hasPrefix("#EXT-X-KEY") || t.uppercased().hasPrefix("#EXT-X-MAP") {
+      } else if upper.hasPrefix("#EXT-X-PLAYLIST-TYPE:VOD") {
+        isExplicitVodTag = true
+      } else if upper.hasPrefix("#EXT-X-ENDLIST") {
+        hasEndListTag = true
+      } else if upper.hasPrefix("#EXT-X-DISCONTINUITY") && !upper.hasPrefix("#EXT-X-DISCONTINUITY-SEQUENCE") {
+        pendingDiscontinuity = true
+      } else if upper.hasPrefix("#EXT-X-KEY") || upper.hasPrefix("#EXT-X-MAP") {
         headerLines.append(Self.rewriteAttributeUri(in: t, baseUrl: finalUrl))
-      } else if t.uppercased().hasPrefix("#EXTINF") {
+      } else if upper.hasPrefix("#EXTINF") {
         pendingInf = t
       } else if !t.hasPrefix("#") {
         let absSegUrl = URL(string: t, relativeTo: finalUrl)?.absoluteURL.absoluteString ?? t
-        parsedSegments.append((inf: pendingInf ?? "#EXTINF:10.0,", url: absSegUrl))
+        parsedSegments.append((inf: pendingInf ?? "#EXTINF:10.0,", url: absSegUrl, discontinuity: pendingDiscontinuity))
         pendingInf = nil
+        pendingDiscontinuity = false
       }
     }
 
-    let window = await store.mergeSlidingSegments(newSegments: parsedSegments, forGen: activeGen)
+    var allowed = CharacterSet.urlQueryAllowed
+    allowed.remove(charactersIn: "&+=?#")
+    let localPort = self.port
+
+    // CRITICAL DISTINCTION:
+    // - For VOD / finite playlists (`#EXT-X-ENDLIST` or `#EXT-X-PLAYLIST-TYPE:VOD` or >15 segments, such as 115 / AList movies),
+    //   we MUST preserve ALL segments in exact sequential order (`0..<count`) and emit `#EXT-X-ENDLIST` so AVPlayer displays the exact full movie duration and plays sequentially!
+    // - ONLY for genuine live TV streams (<=15 segments without `#EXT-X-ENDLIST`) do we use the 6-segment live sliding window (`mergeSlidingSegments`).
+    let isVodPlaylist = hasEndListTag || isExplicitVodTag || parsedSegments.count > 15
+    if isVodPlaylist {
+      headerLines.append("#EXT-X-PLAYLIST-TYPE:VOD")
+      headerLines.append(targetDurationLine)
+      headerLines.append("#EXT-X-MEDIA-SEQUENCE:0")
+      for seg in parsedSegments {
+        if seg.discontinuity {
+          headerLines.append("#EXT-X-DISCONTINUITY")
+        }
+        headerLines.append(seg.inf)
+        let enc = seg.url.addingPercentEncoding(withAllowedCharacters: allowed) ?? seg.url
+        headerLines.append("http://127.0.0.1:\(localPort)/seg.ts?gen=\(activeGen)&u=\(enc)")
+      }
+      headerLines.append("#EXT-X-ENDLIST")
+      return headerLines.joined(separator: "\n") + "\n"
+    }
+
+    let simpleSegments = parsedSegments.map { (inf: $0.inf, url: $0.url) }
+    let window = await store.mergeSlidingSegments(newSegments: simpleSegments, forGen: activeGen)
     guard !window.isEmpty else { return text }
 
     let firstSeq = window.first?.seq ?? 1
     headerLines.append(targetDurationLine)
     headerLines.append("#EXT-X-MEDIA-SEQUENCE:\(firstSeq)")
-
-    var allowed = CharacterSet.urlQueryAllowed
-    allowed.remove(charactersIn: "&+=?#")
-    let localPort = self.port
 
     for seg in window {
       headerLines.append(seg.infLine)
@@ -3077,7 +4228,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
 
     // Sequentially prefetch up to the first 3 segments so 100% of multi-range bandwidth goes to the current segment first
     let urlsToPrefetch = Array(window.prefix(3).map { $0.absoluteUrl })
-    let sessionRef = self.urlSession
+    let sessionRef = self.preferredSession(for: activeStreamUrl)
     let storeRef = self.store
     let pTask = Task {
       for segUrl in urlsToPrefetch {
@@ -3097,11 +4248,12 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     guard let u = URL(string: urlStr) else { return nil }
     var req = URLRequest(url: u)
     req.httpMethod = "GET"
-    req.timeoutInterval = 4.0
+    req.timeoutInterval = 8.0
     for (k, v) in headers where !v.isEmpty {
       req.setValue(v, forHTTPHeaderField: k)
     }
-    guard let (data, resp) = try? await urlSession.data(for: req),
+    let sess = preferredSession(for: urlStr)
+    guard let (data, resp) = try? await sess.data(for: req),
           let http = resp as? HTTPURLResponse,
           (200..<300).contains(http.statusCode),
           let finalUrl = resp.url,
@@ -3112,8 +4264,8 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     return (text, finalUrl)
   }
 
-  /// Downloads a `.ts` segment using 8 parallel HTTP Range requests (`HTTP 206 Partial Content`) when supported,
-  /// multiplying per-connection throttled CDN speeds (110 KB/s -> 650+ KB/s) so 3-4 MB HD segments finish in ~3s.
+  /// Downloads a `.ts` segment using 8 parallel HTTP Range requests (`HTTP 206 Partial Content`) when supported on throttled overseas IPTV CDNs,
+  /// while using a direct single-connection GET for domestic 115 / LAN servers that disallow multi-range splitting.
   private static func downloadSegmentMultiRange(
     urlStr: String,
     headers: [String: String],
@@ -3121,75 +4273,78 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
   ) async -> Data? {
     guard let u = URL(string: urlStr) else { return nil }
 
-    var totalLength = 0
-    var supportsRange = false
-    do {
-      var headReq = URLRequest(url: u)
-      headReq.httpMethod = "HEAD"
-      headReq.timeoutInterval = 2.5
-      for (k, v) in headers where !v.isEmpty {
-        headReq.setValue(v, forHTTPHeaderField: k)
-      }
-      let (_, resp) = try await session.data(for: headReq)
-      if let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) {
-        totalLength = Int(resp.expectedContentLength)
-        let acceptRanges = (http.value(forHTTPHeaderField: "Accept-Ranges") ?? http.value(forHTTPHeaderField: "accept-ranges") ?? "").lowercased()
-        supportsRange = acceptRanges.contains("bytes") || totalLength > 300_000
-      }
-    } catch {}
+    // Domestic cloud drives (115) & local LAN servers are already fast on a single connection and reject 8-way Range splitting on .ts segments
+    if !isDomesticOrLocalUrl(urlStr) {
+      var totalLength = 0
+      var supportsRange = false
+      do {
+        var headReq = URLRequest(url: u)
+        headReq.httpMethod = "HEAD"
+        headReq.timeoutInterval = 2.5
+        for (k, v) in headers where !v.isEmpty {
+          headReq.setValue(v, forHTTPHeaderField: k)
+        }
+        let (_, resp) = try await session.data(for: headReq)
+        if let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) {
+          totalLength = Int(resp.expectedContentLength)
+          let acceptRanges = (http.value(forHTTPHeaderField: "Accept-Ranges") ?? http.value(forHTTPHeaderField: "accept-ranges") ?? "").lowercased()
+          supportsRange = acceptRanges.contains("bytes")
+        }
+      } catch {}
 
-    if totalLength > 320_000 && supportsRange {
-      let parts = 8
-      let chunkSize = (totalLength + parts - 1) / parts
-      let multiResult: Data? = await withTaskGroup(of: (Int, Data?)?.self) { group in
-        for i in 0..<parts {
-          let start = i * chunkSize
-          let end = min(totalLength - 1, (i + 1) * chunkSize - 1)
-          if start > end { continue }
-          group.addTask {
-            for attempt in 0..<2 {
-              if Task.isCancelled { return nil }
-              var rReq = URLRequest(url: u)
-              rReq.httpMethod = "GET"
-              rReq.timeoutInterval = attempt == 0 ? 5.5 : 7.0
-              for (k, v) in headers where !v.isEmpty {
-                rReq.setValue(v, forHTTPHeaderField: k)
+      if totalLength > 320_000 && supportsRange {
+        let parts = 8
+        let chunkSize = (totalLength + parts - 1) / parts
+        let multiResult: Data? = await withTaskGroup(of: (Int, Data?)?.self) { group in
+          for i in 0..<parts {
+            let start = i * chunkSize
+            let end = min(totalLength - 1, (i + 1) * chunkSize - 1)
+            if start > end { continue }
+            group.addTask {
+              for attempt in 0..<2 {
+                if Task.isCancelled { return nil }
+                var rReq = URLRequest(url: u)
+                rReq.httpMethod = "GET"
+                rReq.timeoutInterval = attempt == 0 ? 5.5 : 7.0
+                for (k, v) in headers where !v.isEmpty {
+                  rReq.setValue(v, forHTTPHeaderField: k)
+                }
+                rReq.setValue("bytes=\(start)-\(end)", forHTTPHeaderField: "Range")
+                if let (d, r) = try? await session.data(for: rReq),
+                   let h = r as? HTTPURLResponse,
+                   h.statusCode == 206,
+                   d.count == (end - start + 1) {
+                  TvNetworkSpeedMonitor.shared.recordDownstreamBytes(d.count)
+                  return (i, d)
+                }
               }
-              rReq.setValue("bytes=\(start)-\(end)", forHTTPHeaderField: "Range")
-              if let (d, r) = try? await session.data(for: rReq),
-                 let h = r as? HTTPURLResponse,
-                 h.statusCode == 206,
-                 d.count == (end - start + 1) {
-                TvNetworkSpeedMonitor.shared.recordDownstreamBytes(d.count)
-                return (i, d)
-              }
+              return (i, nil)
             }
-            return (i, nil)
           }
+
+          var chunks = Array<Data?>(repeating: nil, count: parts)
+          for await item in group {
+            guard let (idx, d) = item, let validChunk = d else {
+              group.cancelAll()
+              return nil
+            }
+            chunks[idx] = validChunk
+          }
+          var combined = Data(capacity: totalLength)
+          for c in chunks {
+            guard let c = c else { return nil }
+            combined.append(c)
+          }
+          return combined.count == totalLength ? combined : nil
         }
 
-        var chunks = Array<Data?>(repeating: nil, count: parts)
-        for await item in group {
-          guard let (idx, d) = item, let validChunk = d else {
-            group.cancelAll()
-            return nil
-          }
-          chunks[idx] = validChunk
+        if let fastData = multiResult {
+          return fastData
         }
-        var combined = Data(capacity: totalLength)
-        for c in chunks {
-          guard let c = c else { return nil }
-          combined.append(c)
-        }
-        return combined.count == totalLength ? combined : nil
-      }
-
-      if let fastData = multiResult {
-        return fastData
       }
     }
 
-    // Fallback: standard single-connection GET
+    // Standard single-connection GET
     var getReq = URLRequest(url: u)
     getReq.httpMethod = "GET"
     getReq.timeoutInterval = 12
@@ -3930,9 +5085,14 @@ final class TvApiClient {
         serverProxy = buildServerProxyUrl(targetUrl: direct, headers: headers)
       }
 
-      var backendProxy = (dict["force_proxy"] as? Bool) == true || forceServerRelay
-      if let cfg = dict["player_config"] as? [String: Any], (cfg["backend_proxy_playback"] as? Bool) == true {
-        backendProxy = true
+      var backendProxy = forceServerRelay
+      if !backendProxy, direct.isEmpty {
+        if (dict["force_proxy"] as? Bool) == true {
+          backendProxy = true
+        } else if let cfg = dict["player_config"] as? [String: Any],
+                  (cfg["backend_proxy_playback"] as? Bool) == true {
+          backendProxy = true
+        }
       }
 
       return TvResolvedPlayback(
@@ -4500,8 +5660,7 @@ final class TvApiClient {
         for (k, v) in headers where !v.trimmingCharacters(in: .whitespaces).isEmpty {
           req.setValue(v, forHTTPHeaderField: k)
         }
-        let (bytes, response) = try await noRedirectSession.bytes(for: req)
-        bytes.task.cancel()
+        let (_, response) = try await noRedirectSession.data(for: req)
         guard let http = response as? HTTPURLResponse else { break }
         let code = http.statusCode
         if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308),
@@ -4532,14 +5691,27 @@ final class TvApiClient {
 
     func buildHeaders(for inlineHeaders: [String: String], urlHint: String) -> [String: String] {
       let lowerUrl = urlHint.lowercased()
-      let defaultUa = (lowerUrl.contains("ottiptv.cc") || lowerUrl.contains("/douyu/") || lowerUrl.contains("/huya/") || lowerUrl.contains("/yy/"))
-        ? "okHttp/Mod-1.5.0.0"
-        : "okhttp/3.15"
+      let isFlvGateway = lowerUrl.contains("ottiptv.cc")
+        || lowerUrl.contains("/douyu/")
+        || lowerUrl.contains("/huya/")
+        || lowerUrl.contains("/yy/")
+        || lowerUrl.contains("douyucdn")
+      let defaultUa = isFlvGateway ? "okHttp/Mod-1.5.0.0" : "okhttp/3.15"
       var h: [String: String] = ["User-Agent": defaultUa]
       if let src = source {
-        for (k, v) in src.defaultHeaders where !v.isEmpty { h[k] = v }
+        for (k, v) in src.defaultHeaders where !v.isEmpty {
+          if isFlvGateway && k.lowercased() == "user-agent" && v.lowercased() == "okhttp/3.15" {
+            continue
+          }
+          h[k] = v
+        }
       }
-      for (k, v) in channel.headers where !v.isEmpty { h[k] = v }
+      for (k, v) in channel.headers where !v.isEmpty {
+        if isFlvGateway && k.lowercased() == "user-agent" && v.lowercased() == "okhttp/3.15" {
+          continue
+        }
+        h[k] = v
+      }
       for (k, v) in inlineHeaders where !v.isEmpty { h[k] = v }
       return h
     }
@@ -4547,10 +5719,99 @@ final class TvApiClient {
     var mergedHeaders = buildHeaders(for: split.headers, urlHint: split.cleanUrl)
     var directCleanUrl = split.cleanUrl
     let lowerInitial = directCleanUrl.lowercased()
-    let isKnownFlvGateway = lowerInitial.contains("/douyu/")
+    var isKnownFlvGateway = lowerInitial.contains("/douyu/")
       || lowerInitial.contains("/huya/")
       || lowerInitial.contains("/yy/")
+      || lowerInitial.contains("ottiptv.cc")
+      || lowerInitial.contains("douyucdn")
       || lowerInitial.contains(".flv")
+
+    // For FLV gateways (e.g. mursor.ottiptv.cc/douyu/...), first try resolving the 301/302 Location directly
+    // from the Apple TV's own IP/ISP so Douyu/Huya GSLB assigns a CDN node optimal for the client's network!
+    var clientResolvedFlvUrl = ""
+    if !forceServerRelay && isKnownFlvGateway && !lowerInitial.contains(".flv") {
+      if let gUrl = URL(string: split.cleanUrl) {
+        var req = URLRequest(url: gUrl)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 1.8
+        for (k, v) in mergedHeaders where !v.isEmpty {
+          req.setValue(v, forHTTPHeaderField: k)
+        }
+        if let (_, resp) = try? await noRedirectSession.data(for: req),
+           let http = resp as? HTTPURLResponse,
+           (http.statusCode == 301 || http.statusCode == 302 || http.statusCode == 303 || http.statusCode == 307 || http.statusCode == 308),
+           let loc = (http.value(forHTTPHeaderField: "Location") ?? http.value(forHTTPHeaderField: "location"))?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !loc.isEmpty,
+           let nextUrl = URL(string: loc, relativeTo: gUrl)?.absoluteURL {
+          clientResolvedFlvUrl = nextUrl.absoluteString
+          directCleanUrl = clientResolvedFlvUrl
+        }
+        // If direct TLS handshake to mursor.ottiptv.cc was reset/timed out by ISP, resolve the 301/302 Location via the client's local proxy node if available!
+        if clientResolvedFlvUrl.isEmpty,
+           let proxyDict = TvLocalProxyTunnelServer.shared.proxyConnectionDictionary(allowFallbackNode: true) {
+          let pCfg = URLSessionConfiguration.ephemeral
+          pCfg.timeoutIntervalForRequest = 2.5
+          pCfg.timeoutIntervalForResource = 3.2
+          pCfg.connectionProxyDictionary = proxyDict
+          let proxiedNoRedir = URLSession(configuration: pCfg, delegate: NoRedirectSessionDelegate(), delegateQueue: nil)
+          defer { proxiedNoRedir.finishTasksAndInvalidate() }
+          if let (_, resp) = try? await proxiedNoRedir.data(for: req),
+             let http = resp as? HTTPURLResponse,
+             (http.statusCode == 301 || http.statusCode == 302 || http.statusCode == 303 || http.statusCode == 307 || http.statusCode == 308),
+             let loc = (http.value(forHTTPHeaderField: "Location") ?? http.value(forHTTPHeaderField: "location"))?.trimmingCharacters(in: .whitespacesAndNewlines),
+             !loc.isEmpty,
+             let nextUrl = URL(string: loc, relativeTo: gUrl)?.absoluteURL {
+            clientResolvedFlvUrl = nextUrl.absoluteString
+            directCleanUrl = clientResolvedFlvUrl
+          }
+        }
+      }
+    }
+
+    // If this is a TVBox live source and the URL is a gateway (or Douyu/Huya/YY room link),
+    // ask `/api/tvbox/live/play` for the exact headers/UA and resolved URL (as primary when client redirect didn't resolve, or as fallback!).
+    let lowerInitialPath = (URL(string: directCleanUrl)?.path ?? "").lowercased()
+    let isStandardM3u8OrTs = lowerInitialPath.hasSuffix(".m3u8")
+      || lowerInitialPath.hasSuffix(".ts")
+      || lowerInitialPath.contains(".m3u8/")
+      || lowerInitialPath.contains("/pltv/")
+      || directCleanUrl.contains("://[")
+
+    if ((!isStandardM3u8OrTs || isKnownFlvGateway) && clientResolvedFlvUrl.isEmpty) || forceServerRelay {
+      let srcIdx = source?.sourceIndex ?? 0
+      let liveIdx: Int = {
+        if let s = source, !s.isCustom { return s.liveIndex }
+        if lowerInitial.contains("/douyu/") { return 5 }
+        if lowerInitial.contains("/huya/") { return 4 }
+        if lowerInitial.contains("/yy/") { return 6 }
+        return 0
+      }()
+      let query = [
+        URLQueryItem(name: "tvbox_source", value: String(srcIdx)),
+        URLQueryItem(name: "tvbox_live", value: String(liveIdx)),
+        URLQueryItem(name: "url", value: split.cleanUrl),
+      ]
+      if let endpoint = makeEndpointUrl("/api/tvbox/live/play", queryItems: query),
+         let dict = try? await requestJson(url: endpoint, timeout: 5) as? [String: Any] {
+        let resolvedDirect = Self.stringValue(dict["direct_url"], fallback: Self.stringValue(dict["url"]))
+        if !resolvedDirect.isEmpty && !resolvedDirect.contains("/api/vod/proxy") {
+          let s2 = Self.splitUrlAndInlineHeaders(resolvedDirect)
+          if !s2.cleanUrl.isEmpty, clientResolvedFlvUrl.isEmpty {
+            directCleanUrl = s2.cleanUrl
+          }
+          for (k, v) in s2.headers where !v.isEmpty { mergedHeaders[k] = v }
+        }
+        if let hMap = (dict["headers"] as? [String: Any]) ?? (dict["header"] as? [String: Any]) {
+          for (k, v) in hMap {
+            let sv = Self.stringValue(v)
+            if !sv.isEmpty { mergedHeaders[k] = sv }
+          }
+        }
+      }
+      if directCleanUrl.lowercased().contains(".flv") || directCleanUrl.lowercased().contains("douyucdn") {
+        isKnownFlvGateway = true
+      }
+    }
 
     if !forceServerRelay && !directCleanUrl.isEmpty && !isKnownFlvGateway {
       let primaryRes = await resolveAndVerifyM3u8Url(initialUrl: directCleanUrl, headers: mergedHeaders, timeout: 2.8)
@@ -4616,62 +5877,25 @@ final class TvApiClient {
       }
     }
 
-    let lowerPath = (URL(string: directCleanUrl)?.path ?? "").lowercased()
-    let isAlreadyMediaStream = isKnownFlvGateway
-      || lowerPath.hasSuffix(".m3u8")
-      || lowerPath.hasSuffix(".ts")
-      || lowerPath.hasSuffix(".flv")
-      || lowerPath.contains(".m3u8/")
-      || lowerPath.contains("/pltv/")
-      || directCleanUrl.contains("://[")
-
-    // If it's a non-media gateway URL (e.g. .php?id=...) or forceServerRelay is requested for non-FLV streams, check /api/tvbox/live/play
-    if !isKnownFlvGateway && (!isAlreadyMediaStream || forceServerRelay), let src = source, !src.isCustom {
-      let query = [
-        URLQueryItem(name: "tvbox_source", value: String(src.sourceIndex)),
-        URLQueryItem(name: "tvbox_live", value: String(src.liveIndex)),
-        URLQueryItem(name: "url", value: split.cleanUrl),
-      ]
-      if let endpoint = makeEndpointUrl("/api/tvbox/live/play", queryItems: query),
-         let dict = try? await requestJson(url: endpoint, timeout: 6) as? [String: Any] {
-        let resolvedDirect = Self.stringValue(dict["direct_url"], fallback: Self.stringValue(dict["url"]))
-        if !resolvedDirect.isEmpty {
-          let s2 = Self.splitUrlAndInlineHeaders(resolvedDirect)
-          if !s2.cleanUrl.isEmpty { directCleanUrl = s2.cleanUrl }
-          for (k, v) in s2.headers where !v.isEmpty { mergedHeaders[k] = v }
-        }
-        if let hMap = (dict["headers"] as? [String: Any]) ?? (dict["header"] as? [String: Any]) {
-          for (k, v) in hMap {
-            let sv = Self.stringValue(v)
-            if !sv.isEmpty { mergedHeaders[k] = sv }
-          }
-        }
-      }
-    }
-
-    let proxyUrl = buildServerProxyUrl(targetUrl: split.cleanUrl, headers: mergedHeaders)
+    let proxyUrl = buildServerProxyUrl(targetUrl: directCleanUrl, headers: mergedHeaders)
     let isFlvStream = isKnownFlvGateway || directCleanUrl.lowercased().contains(".flv")
 
     if isFlvStream {
       let preferDirectFlv = !forceServerRelay
-      let flvTarget = preferDirectFlv ? split.cleanUrl : proxyUrl
-      let flvHeaders = preferDirectFlv ? mergedHeaders : authHeaders
-      let flvFallback = preferDirectFlv ? proxyUrl : split.cleanUrl
-      let flvFallbackHeaders = preferDirectFlv ? authHeaders : mergedHeaders
-      if let localFlvHlsUrl = await TvLocalHlsProxyServer.shared.prepareFlvProxyPlaylistUrl(
-        targetUrl: flvTarget,
-        headers: flvHeaders,
-        fallbackUrl: flvFallback,
-        fallbackHeaders: flvFallbackHeaders
-      ) {
-        return TvResolvedPlayback(
-          directUrl: localFlvHlsUrl,
-          serverProxyUrl: localFlvHlsUrl,
-          headers: mergedHeaders,
-          parseVia: preferDirectFlv ? "本地FLV实时转封装" : "服务端代理+FLV转封装",
-          backendProxyPlayback: !preferDirectFlv
-        )
-      }
+      let flvTarget = preferDirectFlv ? directCleanUrl : proxyUrl
+      // Do NOT pre-open `TvLocalHlsProxyServer.shared.prepareFlvProxyPlaylistUrl` here!
+      // `TvDirectFlvHardwareEngine` renders FLV directly via `AVSampleBufferDisplayLayer`, and opening a parallel
+      // `TvLiveFlvSession` to the same single-use `wsAuth` Douyu/Huya FLV URL causes the CDN to kick the second connection.
+      return TvResolvedPlayback(
+        directUrl: flvTarget,
+        serverProxyUrl: proxyUrl,
+        headers: mergedHeaders,
+        parseVia: preferDirectFlv ? "硬件FLV直连" : "服务端代理+硬件FLV",
+        backendProxyPlayback: !preferDirectFlv,
+        isFlvHardwareStream: true,
+        flvPrimaryUrl: flvTarget,
+        flvGatewayUrl: split.cleanUrl
+      )
     }
 
     let needsProxyFirst = forceServerRelay
@@ -4871,7 +6095,7 @@ final class TvApiClient {
     return result
   }
 
-  // MARK: - 6. Server Media Library (/api/files)
+  // MARK: - 6. Server Media Library (/api/files) & Multi-Storage (AList / WebDAV / 115 / Local Cache)
 
   func fetchFiles(path: String = "") async throws -> TvFileListing {
     var query: [URLQueryItem] = []
@@ -4891,7 +6115,9 @@ final class TvApiClient {
         modTime: Self.stringValue(item["mod_time"]),
         isDir: (item["is_dir"] as? Bool) == true,
         isMp4: (item["is_mp4"] as? Bool) == true,
-        ext: Self.stringValue(item["ext"])
+        ext: Self.stringValue(item["ext"]),
+        mountId: "builtin_server",
+        sourceKind: .server
       )
     }
     return TvFileListing(
@@ -4904,6 +6130,73 @@ final class TvApiClient {
 
   func buildFileStreamUrl(path: String) -> String {
     makeEndpointUrl("/api/files/open", queryItems: [URLQueryItem(name: "path", value: path)])?.absoluteString ?? ""
+  }
+
+  func buildFileDownloadUrl(path: String) -> String {
+    makeEndpointUrl("/api/files/download", queryItems: [URLQueryItem(name: "path", value: path)])?.absoluteString
+      ?? buildFileStreamUrl(path: path)
+  }
+
+  func fetchFilePreviewText(urlStr: String, headers: [String: String] = [:], maxBytes: Int = 65536) async throws -> String {
+    guard let u = URL(string: urlStr) else {
+      throw NSError(domain: "TvApiClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "无效的文件预览地址"])
+    }
+    func buildRequest(withRange: Bool) -> URLRequest {
+      var req = URLRequest(url: u)
+      req.timeoutInterval = 14
+      if withRange {
+        req.setValue("bytes=0-\(max(1024, maxBytes - 1))", forHTTPHeaderField: "Range")
+      }
+      if urlStr.hasPrefix(baseUrl), !authSecret.isEmpty {
+        req.setValue("Bearer \(authSecret)", forHTTPHeaderField: "Authorization")
+        req.setValue(authSecret, forHTTPHeaderField: "X-Auth-Secret")
+      }
+      for (k, v) in headers where !v.isEmpty {
+        req.setValue(v, forHTTPHeaderField: k)
+      }
+      return req
+    }
+
+    var fetchedData: Data? = nil
+    if let (d, resp) = try? await session.data(for: buildRequest(withRange: true)),
+       let http = resp as? HTTPURLResponse,
+       (200..<300).contains(http.statusCode),
+       !d.isEmpty {
+      fetchedData = d
+    } else {
+      let (d, _) = try await session.data(for: buildRequest(withRange: false))
+      fetchedData = d
+    }
+
+    let data = fetchedData ?? Data()
+    let slice = data.count > maxBytes ? data.prefix(maxBytes) : data[...]
+    if let utf8 = String(data: Data(slice), encoding: .utf8) {
+      return utf8
+    }
+    if let gbk = String(data: Data(slice), encoding: String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue)))) {
+      return gbk
+    }
+    return String(decoding: slice, as: UTF8.self)
+  }
+
+  func fetchFilePreviewImageData(urlStr: String, headers: [String: String] = [:]) async -> Data? {
+    guard let u = URL(string: urlStr) else { return nil }
+    var req = URLRequest(url: u)
+    req.timeoutInterval = 18
+    if urlStr.hasPrefix(baseUrl), !authSecret.isEmpty {
+      req.setValue("Bearer \(authSecret)", forHTTPHeaderField: "Authorization")
+      req.setValue(authSecret, forHTTPHeaderField: "X-Auth-Secret")
+    }
+    for (k, v) in headers where !v.isEmpty {
+      req.setValue(v, forHTTPHeaderField: k)
+    }
+    if let (data, resp) = try? await imageSession.data(for: req),
+       let http = resp as? HTTPURLResponse,
+       (200..<300).contains(http.statusCode),
+       !data.isEmpty {
+      return data
+    }
+    return nil
   }
 
   func convertFileToMp4(path: String) async throws {
@@ -4929,6 +6222,71 @@ final class TvApiClient {
   func deleteFile(path: String) async throws {
     guard let endpoint = makeEndpointUrl("/api/files", queryItems: [URLQueryItem(name: "path", value: path)]) else { return }
     _ = try await requestJson(url: endpoint, method: "DELETE")
+  }
+
+  /// Uploads raw file data to the backend server directory:
+  /// 1) Tries `POST /api/files/upload?path=<dir>&name=<filename>` or multipart `/api/files/upload`
+  /// 2) If backend is an older version without `/api/files/upload`, automatically falls back to saving on Apple TV local HTTP server and triggering `POST /api/download` so the backend server pulls it!
+  func uploadDataToServerDirectory(
+    fileData: Data,
+    fileName: String,
+    targetDir: String,
+    lanBaseUrl: String? = nil,
+    onProgress: @escaping @Sendable (Int64, Int64) -> Void
+  ) async throws {
+    let totalBytes = Int64(fileData.count)
+    onProgress(0, totalBytes)
+    if let endpoint = makeEndpointUrl(
+      "/api/files/upload",
+      queryItems: [
+        URLQueryItem(name: "path", value: targetDir),
+        URLQueryItem(name: "name", value: fileName)
+      ]
+    ) {
+      let boundary = "----TvUploadBoundary\(Int(Date().timeIntervalSince1970 * 1000))"
+      var body = Data()
+      body.append(Data("--\(boundary)\r\n".utf8))
+      body.append(Data("Content-Disposition: form-data; name=\"path\"\r\n\r\n\(targetDir)\r\n".utf8))
+      body.append(Data("--\(boundary)\r\n".utf8))
+      body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"\(fileName)\"\r\n".utf8))
+      body.append(Data("Content-Type: application/octet-stream\r\n\r\n".utf8))
+      body.append(fileData)
+      body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+
+      var req = URLRequest(url: endpoint)
+      req.httpMethod = "POST"
+      req.timeoutInterval = 300
+      req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+      if !authSecret.isEmpty {
+        req.setValue("Bearer \(authSecret)", forHTTPHeaderField: "Authorization")
+        req.setValue(authSecret, forHTTPHeaderField: "X-Auth-Secret")
+      }
+      if let (_, resp) = try? await TvStreamingHttpTransfer.shared.upload(
+        request: req,
+        data: body,
+        logicalTotalBytes: totalBytes,
+        onProgress: onProgress
+      ),
+      let http = resp as? HTTPURLResponse,
+      (200..<300).contains(http.statusCode) {
+        onProgress(totalBytes, totalBytes)
+        return
+      }
+    }
+
+    // Fallback: if `/api/files/upload` is not supported on backend, save to local staging and trigger `/api/download` if LAN reachable
+    if let lan = lanBaseUrl, !lan.isEmpty {
+      let encodedName = fileName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? fileName
+      let pullUrl = "\(lan)/local-cache/\(encodedName)"
+      _ = try await createDownloadTask(url: pullUrl, name: fileName)
+      onProgress(totalBytes, totalBytes)
+      return
+    }
+    throw NSError(
+      domain: "TvApiClient",
+      code: -404,
+      userInfo: [NSLocalizedDescriptionKey: "当前服务端暂未开启 /api/files/upload 直传接口，文件已自动存入本机离线缓存或请挂载 AList/WebDAV 上传"]
+    )
   }
 
   // MARK: - 7. 115 Cloud Drive & Server Settings & Proxy
@@ -5038,7 +6396,8 @@ final class TvApiClient {
     subId: String,
     subName: String
   ) async -> SubscriptionFetchResult {
-    guard let url = URL(string: urlStr.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+    let trimmedUrl = urlStr.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let url = URL(string: trimmedUrl) else {
       return SubscriptionFetchResult(
         nodes: [],
         uploadBytes: nil,
@@ -5049,13 +6408,60 @@ final class TvApiClient {
       )
     }
 
+    var candidateSessions: [(sess: URLSession, targetUrl: URL, extraHeaders: [String: String], ua: String)] = []
+    if let proxyDict = TvLocalProxyTunnelServer.shared.proxyConnectionDictionary(allowFallbackNode: true) {
+      let pCfg = URLSessionConfiguration.ephemeral
+      pCfg.timeoutIntervalForRequest = 6.5
+      pCfg.timeoutIntervalForResource = 12
+      pCfg.connectionProxyDictionary = proxyDict
+      let proxiedSess = URLSession(configuration: pCfg, delegate: InsecureSessionDelegate(), delegateQueue: nil)
+      candidateSessions.append((proxiedSess, url, [:], "v2rayNG/1.8.19"))
+    }
+    let dCfg = URLSessionConfiguration.ephemeral
+    dCfg.timeoutIntervalForRequest = 5.5
+    dCfg.timeoutIntervalForResource = 10
+    dCfg.connectionProxyDictionary = [:]
+    let directSess = URLSession(configuration: dCfg, delegate: InsecureSessionDelegate(), delegateQueue: nil)
+    candidateSessions.append((directSess, url, [:], "v2rayNG/1.8.19"))
+    candidateSessions.append((directSess, url, [:], "Clash.Meta/v1.18.1"))
+
+    let rCfg = URLSessionConfiguration.ephemeral
+    rCfg.timeoutIntervalForRequest = 10
+    rCfg.timeoutIntervalForResource = 16
+    rCfg.connectionProxyDictionary = [:]
+    let relaySess = URLSession(configuration: rCfg, delegate: InsecureSessionDelegate(), delegateQueue: nil)
+    for ua in ["v2rayNG/1.8.19", "Clash.Meta/v1.18.1"] {
+      let relayStr = buildServerProxyUrl(targetUrl: trimmedUrl, headers: ["User-Agent": ua])
+      if let relayUrl = URL(string: relayStr) {
+        var relayHdrs = authHeaders
+        if !authSecret.isEmpty {
+          relayHdrs["Authorization"] = "Bearer \(authSecret)"
+          relayHdrs["X-Auth-Secret"] = authSecret
+        }
+        candidateSessions.append((relaySess, relayUrl, relayHdrs, ua))
+      }
+    }
+
+    var uniqueSessionsToClose: [URLSession] = [directSess, relaySess]
+    if let first = candidateSessions.first?.sess, first !== directSess && first !== relaySess {
+      uniqueSessionsToClose.append(first)
+    }
+    defer {
+      for s in uniqueSessionsToClose {
+        s.finishTasksAndInvalidate()
+      }
+    }
+
     var lastErr: String = "拉取订阅为空"
-    for ua in ["v2rayNG/1.8.19", "Clash.Meta/v1.18.1", "ClashforWindows/0.20.39"] {
+    for cand in candidateSessions {
       do {
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 14
-        req.setValue(ua, forHTTPHeaderField: "User-Agent")
-        let (data, resp) = try await session.data(for: req)
+        var req = URLRequest(url: cand.targetUrl)
+        req.timeoutInterval = 10
+        req.setValue(cand.ua, forHTTPHeaderField: "User-Agent")
+        for (k, v) in cand.extraHeaders where !v.isEmpty {
+          req.setValue(v, forHTTPHeaderField: k)
+        }
+        let (data, resp) = try await cand.sess.data(for: req)
         var upload: Int64? = nil
         var download: Int64? = nil
         var total: Int64? = nil
@@ -6146,7 +7552,9 @@ final class TvLocal115DirectClient {
   var requestHeaders: [String: String] {
     var h: [String: String] = [
       "User-Agent": Self.browserUserAgent,
-      "Accept": "application/json, text/plain, */*"
+      "Accept": "application/json, text/plain, */*",
+      "Referer": "https://115.com/",
+      "Origin": "https://115.com"
     ]
     let ck = savedCookie
     if !ck.isEmpty {
@@ -6159,14 +7567,21 @@ final class TvLocal115DirectClient {
     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return "" }
     var kvMap: [String: String] = [:]
+    var extraPairs: [String] = []
+    let coreKeys: Set<String> = ["UID", "CID", "SEID", "KID"]
     for part in trimmed.components(separatedBy: ";") {
       let p = part.trimmingCharacters(in: .whitespacesAndNewlines)
       let kv = p.components(separatedBy: "=")
       if kv.count >= 2 {
-        let k = kv[0].trimmingCharacters(in: .whitespaces).uppercased()
+        let origK = kv[0].trimmingCharacters(in: .whitespaces)
+        let upperK = origK.uppercased()
         let v = kv.dropFirst().joined(separator: "=").trimmingCharacters(in: .whitespaces)
-        if !k.isEmpty && !v.isEmpty {
-          kvMap[k] = v
+        if !upperK.isEmpty && !v.isEmpty {
+          if coreKeys.contains(upperK) {
+            kvMap[upperK] = v
+          } else {
+            extraPairs.append("\(origK)=\(v)")
+          }
         }
       }
     }
@@ -6176,6 +7591,7 @@ final class TvLocal115DirectClient {
         ordered.append("\(k)=\(v)")
       }
     }
+    ordered.append(contentsOf: extraPairs)
     return ordered.isEmpty ? trimmed : ordered.joined(separator: "; ")
   }
 
@@ -6272,7 +7688,8 @@ final class TvLocal115DirectClient {
   }
 
   private func exchangeQrCodeForCookie(uid: String) async -> (cookie: String, userName: String)? {
-    for app in ["web", "tv", "mac", "ios", "android"] {
+    // Prefer "tv" / "ios" / "android" / "mac" before "web" so Apple TV session does not conflict with Web browsers or AList "web" cookies
+    for app in ["tv", "ios", "android", "mac", "web"] {
       guard let u = URL(string: "https://passportapi.115.com/app/1.0/\(app)/1.0/login/qrcode") else { continue }
       var req = URLRequest(url: u)
       req.httpMethod = "POST"
@@ -6462,10 +7879,13 @@ final class TvLocal115DirectClient {
          let decryptedData = TvM115Crypto.decode(input: encryptedPayload, key: key),
          let resultDict = try? JSONSerialization.jsonObject(with: decryptedData) as? [String: Any] {
         for (_, val) in resultDict {
-          if let info = val as? [String: Any],
-             let urlObj = info["url"] as? [String: Any] {
-            let cdnUrl = TvApiClient.stringValue(urlObj["url"])
-            if cdnUrl.hasPrefix("http") {
+          if let info = val as? [String: Any] {
+            if let urlObj = info["url"] as? [String: Any] {
+              let cdnUrl = TvApiClient.stringValue(urlObj["url"])
+              if cdnUrl.hasPrefix("http") {
+                return cdnUrl
+              }
+            } else if let cdnUrl = info["url"] as? String, cdnUrl.hasPrefix("http") {
               return cdnUrl
             }
           }
@@ -6486,32 +7906,100 @@ final class TvLocal115DirectClient {
         if fileUrl.hasPrefix("http") {
           return fileUrl
         }
+        if let dataObj = root["data"] as? [String: Any] {
+          let nestedUrl = TvApiClient.stringValue(dataObj["file_url"], fallback: TvApiClient.stringValue(dataObj["url"]))
+          if nestedUrl.hasPrefix("http") {
+            return nestedUrl
+          }
+        }
       }
     }
 
     // 3. Fallback 2: `webapi.115.com/files/video?pickcode=...`
-    if let vidUrl = URL(string: "https://webapi.115.com/files/video?pickcode=\(pickcode)") {
-      var req = URLRequest(url: vidUrl)
-      req.timeoutInterval = 10
+    if let hlsUrl = await resolvePickcodeHlsM3u8Url(pickcode: pickcode) {
+      return hlsUrl
+    }
+
+    return nil
+  }
+
+  /// Resolves 115's official cloud transcode HLS `.m3u8` stream URL (`webapi.115.com/files/video?pickcode=...`),
+  /// essential for playing non-MP4 containers (`.mkv`, `.avi`, `.rmvb`, `.wmv`, `.flv`, `.ts`) on tvOS `AVPlayer`.
+  func resolvePickcodeHlsM3u8Url(pickcode: String) async -> String? {
+    guard !pickcode.isEmpty,
+          let vidUrl = URL(string: "https://webapi.115.com/files/video?pickcode=\(pickcode)") else {
+      return nil
+    }
+    var req = URLRequest(url: vidUrl)
+    req.timeoutInterval = 12
+    for (k, v) in requestHeaders {
+      req.setValue(v, forHTTPHeaderField: k)
+    }
+    if let (data, _) = try? await session.data(for: req),
+       let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+      if let urls = (root["video_urls"] as? [[String: Any]]) ?? (root["video_url"] as? [[String: Any]]),
+         !urls.isEmpty {
+        let sorted = urls.sorted {
+          TvApiClient.intValue($0["definition"], fallback: 0) > TvApiClient.intValue($1["definition"], fallback: 0)
+        }
+        for candidate in sorted {
+          let u = TvApiClient.stringValue(candidate["url"])
+          if u.hasPrefix("http") {
+            return u
+          }
+        }
+      }
+      let directVideoUrl = TvApiClient.stringValue(root["video_url"])
+      if directVideoUrl.hasPrefix("http") {
+        return directVideoUrl
+      }
+      if let dataDict = root["data"] as? [String: Any] {
+        let nested = TvApiClient.stringValue(dataDict["video_url"], fallback: TvApiClient.stringValue(dataDict["url"]))
+        if nested.hasPrefix("http") {
+          return nested
+        }
+      }
+    }
+    return nil
+  }
+
+  /// Resolves a full-resolution original image URL for a 115 image file via `webapi.115.com/files/image?pickcode=...`,
+  /// falling back to `resolvePickcodeStreamUrl` so Apple TV image preview always displays crystal-clear 4K/original images instead of 100x100 icons.
+  func resolvePickcodeImageUrl(pickcode: String) async -> String? {
+    guard !pickcode.isEmpty else { return nil }
+    if let imgEndpoint = URL(string: "https://webapi.115.com/files/image?pickcode=\(pickcode)") {
+      var req = URLRequest(url: imgEndpoint)
+      req.timeoutInterval = 12
       for (k, v) in requestHeaders {
         req.setValue(v, forHTTPHeaderField: k)
       }
       if let (data, _) = try? await session.data(for: req),
-         let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-        let directVideoUrl = TvApiClient.stringValue(root["video_url"])
-        if directVideoUrl.hasPrefix("http") {
-          return directVideoUrl
-        }
-        if let urls = root["video_url"] as? [[String: Any]],
-           let best = urls.last {
-          let u = TvApiClient.stringValue(best["url"])
+         let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+         let dataDict = root["data"] as? [String: Any] {
+        for key in ["origin_url", "source_url", "url", "file_url"] {
+          let u = TvApiClient.stringValue(dataDict[key])
           if u.hasPrefix("http") {
             return u
           }
         }
       }
     }
+    return await resolvePickcodeStreamUrl(pickcode: pickcode)
+  }
 
+  func fetch115ImageData(urlStr: String) async -> Data? {
+    guard let u = URL(string: urlStr) else { return nil }
+    var req = URLRequest(url: u)
+    req.timeoutInterval = 18
+    for (k, v) in requestHeaders {
+      req.setValue(v, forHTTPHeaderField: k)
+    }
+    if let (data, resp) = try? await session.data(for: req),
+       let http = resp as? HTTPURLResponse,
+       (200..<300).contains(http.statusCode),
+       !data.isEmpty {
+      return data
+    }
     return nil
   }
 
@@ -6527,5 +8015,1025 @@ final class TvLocal115DirectClient {
       }
     }
     return s.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  // MARK: - 115 Cloud Drive File Manager Directory Browser & File Operations
+
+  private var cidParentMap: [String: String] = ["0": ""]
+  private var cidNameMap: [String: String] = ["0": "115根目录"]
+
+  func registerFolder(cid: String, parentCid: String, name: String) {
+    guard !cid.isEmpty else { return }
+    cidParentMap[cid] = parentCid
+    if !name.isEmpty {
+      cidNameMap[cid] = name
+    }
+  }
+
+  func parentCid(for cid: String) -> String {
+    if cid.isEmpty || cid == "0" || cid == "/" { return "" }
+    return cidParentMap[cid] ?? "0"
+  }
+
+  func list115Directory(
+    cid: String,
+    mountId: String = "builtin_115",
+    page: Int = 1,
+    perPage: Int = 100
+  ) async throws -> TvFileListing {
+    guard hasLocalCookie else {
+      throw NSError(domain: "TvLocal115", code: 401, userInfo: [NSLocalizedDescriptionKey: "请先扫码或输入 Cookie 登录 115 网盘账号"])
+    }
+    let cleanCid = (cid.isEmpty || cid == "/") ? "0" : cid
+    let safeLimit = max(20, min(115, perPage))
+    let offset = max(0, (page - 1) * safeLimit)
+    let candidateUrls: [String] = [
+      "https://webapi.115.com/files?aid=1&cid=\(cleanCid)&o=user_ptime&asc=0&offset=\(offset)&limit=\(safeLimit)&show_dir=1&format=json",
+      "https://aps.115.com/natsort/files.php?aid=1&cid=\(cleanCid)&o=file_name&asc=1&offset=\(offset)&limit=\(safeLimit)&show_dir=1&natsort=1&format=json",
+      "https://webapi.115.com/files?aid=1&cid=\(cleanCid)&o=user_ptime&asc=0&offset=\(offset)&limit=40&show_dir=1&format=json",
+      "https://proapi.115.com/android/2.0/ufile/files?aid=1&cid=\(cleanCid)&o=user_ptime&asc=0&offset=\(offset)&limit=\(safeLimit)&show_dir=1"
+    ]
+
+    var root: [String: Any] = [:]
+    var rawItems: [[String: Any]] = []
+    var anyStateOk = false
+
+    for urlStr in candidateUrls {
+      guard let listUrl = URL(string: urlStr) else { continue }
+      var req = URLRequest(url: listUrl)
+      req.timeoutInterval = 15
+      for (k, v) in requestHeaders {
+        req.setValue(v, forHTTPHeaderField: k)
+      }
+      if let (data, _) = try? await session.data(for: req),
+         let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        if root.isEmpty {
+          root = dict
+        }
+        let stateVal = dict["state"]
+        let isStateOk = (stateVal as? Bool) == true || TvApiClient.intValue(stateVal, fallback: 0) == 1
+        let errNo = TvApiClient.intValue(dict["errNo"], fallback: TvApiClient.intValue(dict["errno"], fallback: TvApiClient.intValue(dict["errCode"], fallback: 0)))
+        if isStateOk {
+          anyStateOk = true
+          root = dict
+        }
+        if let arr = (dict["data"] as? [Any])?.compactMap({ $0 as? [String: Any] }) {
+          if !arr.isEmpty {
+            root = dict
+            rawItems = arr
+            anyStateOk = true
+            break
+          } else if isStateOk && errNo == 0 {
+            // Genuinely empty directory with state == true and errNo == 0
+            root = dict
+            rawItems = []
+            break
+          }
+        }
+      }
+    }
+
+    if rawItems.isEmpty && !anyStateOk {
+      let errNo = TvApiClient.intValue(root["errNo"], fallback: TvApiClient.intValue(root["errno"], fallback: TvApiClient.intValue(root["errCode"], fallback: 0)))
+      let errMsg = TvApiClient.stringValue(root["error"], fallback: TvApiClient.stringValue(root["msg"]))
+      if errNo == 99 || errNo == 990001 || errMsg.contains("登录") {
+        // Clear expired/kicked cookie so UI immediately shows the 115 QR login button
+        self.savedCookie = ""
+        throw NSError(
+          domain: "TvLocal115",
+          code: 401,
+          userInfo: [NSLocalizedDescriptionKey: "115 网盘登录已过期或被其他设备/AList顶下线，请点击「立即扫码登录 115 网盘」重新授权"]
+        )
+      }
+      if !errMsg.isEmpty {
+        throw NSError(
+          domain: "TvLocal115",
+          code: errNo != 0 ? errNo : -1,
+          userInfo: [NSLocalizedDescriptionKey: "115 接口返回：\(errMsg) (code \(errNo))"]
+        )
+      }
+    }
+
+    // Parse 115 path array if returned (`path: [{name: ..., cid: ...}]`)
+    var resolvedParent = parentCid(for: cleanCid)
+    if let pathArr = (root["path"] as? [Any])?.compactMap({ $0 as? [String: Any] }), !pathArr.isEmpty {
+      var prevCid = ""
+      for seg in pathArr {
+        let scid = TvApiClient.stringValue(seg["cid"], fallback: "0")
+        let sname = TvApiClient.stringValue(seg["name"], fallback: "目录")
+        if !prevCid.isEmpty && scid != prevCid {
+          cidParentMap[scid] = prevCid
+        }
+        cidNameMap[scid] = sname
+        prevCid = scid
+      }
+      if pathArr.count >= 2 {
+        resolvedParent = TvApiClient.stringValue(pathArr[pathArr.count - 2]["cid"], fallback: "0")
+      } else if cleanCid != "0" {
+        resolvedParent = "0"
+      } else {
+        resolvedParent = ""
+      }
+    }
+
+    var entries: [TvFileEntry] = []
+    let df = DateFormatter()
+    df.dateFormat = "yyyy-MM-dd HH:mm"
+
+    for item in rawItems {
+      let fid = TvApiClient.stringValue(item["fid"], fallback: TvApiClient.stringValue(item["file_id"])).trimmingCharacters(in: .whitespacesAndNewlines)
+      let itemCid = TvApiClient.stringValue(item["cid"], fallback: TvApiClient.stringValue(item["category_id"])).trimmingCharacters(in: .whitespacesAndNewlines)
+      let hasValidFid = !fid.isEmpty && fid != "0"
+      let isDir = !hasValidFid && !itemCid.isEmpty && itemCid != "0"
+      let name = TvApiClient.stringValue(
+        item["n"],
+        fallback: TvApiClient.stringValue(
+          item["ns"],
+          fallback: TvApiClient.stringValue(
+            item["fn"],
+            fallback: TvApiClient.stringValue(item["file_name"], fallback: "未命名")
+          )
+        )
+      )
+      let rawSizeStr = TvApiClient.stringValue(item["s"], fallback: TvApiClient.stringValue(item["fs"], fallback: "0"))
+      let size = Int64(rawSizeStr) ?? Int64(TvApiClient.intValue(item["s"], fallback: 0))
+      let pickcode = TvApiClient.stringValue(item["pc"], fallback: TvApiClient.stringValue(item["pick_code"])).trimmingCharacters(in: .whitespacesAndNewlines)
+      let ico = TvApiClient.stringValue(item["ico"]).lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+      let nameExt = (name as NSString).pathExtension.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+      let rawExt = !ico.isEmpty ? ico : nameExt
+      let is115Video = TvApiClient.intValue(item["iv"], fallback: 0) == 1 || item["vdi"] != nil
+      let ext: String
+      if isDir {
+        ext = ""
+      } else if !rawExt.isEmpty {
+        ext = ".\(rawExt)"
+      } else if is115Video {
+        ext = ".mp4"
+      } else {
+        ext = ""
+      }
+      let ts = TvApiClient.intValue(item["te"], fallback: TvApiClient.intValue(item["tp"], fallback: TvApiClient.intValue(item["t"], fallback: 0)))
+      let modStr = ts > 100000 ? df.string(from: Date(timeIntervalSince1970: TimeInterval(ts))) : TvApiClient.stringValue(item["te"])
+      let thumb = TvApiClient.stringValue(item["u"])
+      let entryPath = isDir ? itemCid : (hasValidFid ? fid : pickcode)
+      if isDir {
+        registerFolder(cid: itemCid, parentCid: cleanCid, name: name)
+      }
+      entries.append(
+        TvFileEntry(
+          name: name,
+          path: entryPath,
+          size: size,
+          modTime: modStr,
+          isDir: isDir,
+          isMp4: ext == ".mp4" || (is115Video && ext.isEmpty),
+          ext: ext,
+          mountId: mountId,
+          sourceKind: .cloud115,
+          rawDownloadUrl: "",
+          thumbUrl: thumb,
+          pickcode115: pickcode,
+          fid115: isDir ? itemCid : fid,
+          cid115: isDir ? itemCid : cleanCid
+        )
+      )
+    }
+
+    let totalCount = max(entries.count, TvApiClient.intValue(root["count"], fallback: entries.count))
+    return TvFileListing(
+      path: cleanCid,
+      parent: cleanCid == "0" ? "" : resolvedParent,
+      root: "0",
+      entries: entries,
+      totalCount: totalCount,
+      currentPage: page
+    )
+  }
+
+  func create115Folder(parentCid: String, name: String) async throws {
+    guard hasLocalCookie,
+          let u = URL(string: "https://webapi.115.com/files/add") else { return }
+    let pid = (parentCid.isEmpty || parentCid == "/") ? "0" : parentCid
+    var req = URLRequest(url: u)
+    req.httpMethod = "POST"
+    req.timeoutInterval = 12
+    for (k, v) in requestHeaders {
+      req.setValue(v, forHTTPHeaderField: k)
+    }
+    req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+    let encodedName = name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? name
+    req.httpBody = "pid=\(pid)&cname=\(encodedName)".data(using: .utf8)
+    _ = try await session.data(for: req)
+  }
+
+  func rename115File(fid: String, newName: String) async throws {
+    guard hasLocalCookie,
+          let u = URL(string: "https://webapi.115.com/files/batch_rename") else { return }
+    var req = URLRequest(url: u)
+    req.httpMethod = "POST"
+    req.timeoutInterval = 12
+    for (k, v) in requestHeaders {
+      req.setValue(v, forHTTPHeaderField: k)
+    }
+    req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+    let encodedName = newName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? newName
+    req.httpBody = "files_new_name[\(fid)]=\(encodedName)".data(using: .utf8)
+    _ = try await session.data(for: req)
+  }
+
+  func delete115File(fid: String, parentCid: String) async throws {
+    guard hasLocalCookie,
+          let u = URL(string: "https://rb.115.com/2.0/rb/delete") else { return }
+    let pid = (parentCid.isEmpty || parentCid == "/") ? "0" : parentCid
+    var req = URLRequest(url: u)
+    req.httpMethod = "POST"
+    req.timeoutInterval = 12
+    for (k, v) in requestHeaders {
+      req.setValue(v, forHTTPHeaderField: k)
+    }
+    req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+    req.httpBody = "pid=\(pid)&fid[0]=\(fid)&ignore_warn=1".data(using: .utf8)
+    _ = try await session.data(for: req)
+  }
+}
+
+// MARK: - Streaming Upload & Download Engine with Real-Time Progress Callbacks
+
+final class TvStreamingHttpTransfer: NSObject, URLSessionTaskDelegate, URLSessionDataDelegate, @unchecked Sendable {
+  static let shared = TvStreamingHttpTransfer()
+
+  private final class ActiveContext: @unchecked Sendable {
+    let onProgress: @Sendable (Int64, Int64) -> Void
+    let logicalTotalBytes: Int64
+    var expectedBytes: Int64 = 0
+    var receivedBytes: Int64 = 0
+    var fileHandle: FileHandle?
+    var destFileUrl: URL?
+    var responseData = Data()
+    var response: URLResponse?
+    var continuation: CheckedContinuation<(Data, URLResponse), Error>?
+    var lastReportTime: TimeInterval = 0
+
+    init(
+      logicalTotalBytes: Int64 = 0,
+      destFileUrl: URL? = nil,
+      onProgress: @escaping @Sendable (Int64, Int64) -> Void
+    ) {
+      self.logicalTotalBytes = logicalTotalBytes
+      self.destFileUrl = destFileUrl
+      self.onProgress = onProgress
+    }
+  }
+
+  private let lock = NSLock()
+  private var contexts: [Int: ActiveContext] = [:]
+  private var activeTasks: [String: URLSessionTask] = [:]
+  private lazy var transferSession: URLSession = {
+    let cfg = URLSessionConfiguration.ephemeral
+    cfg.timeoutIntervalForRequest = 60
+    cfg.timeoutIntervalForResource = 7200
+    return URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
+  }()
+
+  func cancelTransfer(id: String) {
+    lock.lock()
+    let task = activeTasks.removeValue(forKey: id)
+    lock.unlock()
+    task?.cancel()
+  }
+
+  func upload(
+    transferId: String = UUID().uuidString,
+    request: URLRequest,
+    data: Data,
+    logicalTotalBytes: Int64 = 0,
+    onProgress: @escaping @Sendable (Int64, Int64) -> Void
+  ) async throws -> (Data, URLResponse) {
+    let total = logicalTotalBytes > 0 ? logicalTotalBytes : Int64(data.count)
+    return try await withCheckedThrowingContinuation { cont in
+      let task = transferSession.uploadTask(with: request, from: data)
+      let ctx = ActiveContext(logicalTotalBytes: total, onProgress: onProgress)
+      ctx.continuation = cont
+      lock.lock()
+      contexts[task.taskIdentifier] = ctx
+      activeTasks[transferId] = task
+      lock.unlock()
+      task.resume()
+    }
+  }
+
+  func downloadToFile(
+    transferId: String,
+    request: URLRequest,
+    destinationUrl: URL,
+    expectedSizeHint: Int64 = 0,
+    onProgress: @escaping @Sendable (Int64, Int64) -> Void
+  ) async throws -> URL {
+    let fm = FileManager.default
+    let parentDir = destinationUrl.deletingLastPathComponent()
+    try? fm.createDirectory(at: parentDir, withIntermediateDirectories: true)
+    if fm.fileExists(atPath: destinationUrl.path) {
+      try? fm.removeItem(at: destinationUrl)
+    }
+    fm.createFile(atPath: destinationUrl.path, contents: nil)
+    let handle = try FileHandle(forWritingTo: destinationUrl)
+
+    _ = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(Data, URLResponse), Error>) in
+      let task = transferSession.dataTask(with: request)
+      let ctx = ActiveContext(logicalTotalBytes: expectedSizeHint, destFileUrl: destinationUrl, onProgress: onProgress)
+      ctx.fileHandle = handle
+      ctx.expectedBytes = expectedSizeHint
+      ctx.continuation = cont
+      lock.lock()
+      contexts[task.taskIdentifier] = ctx
+      activeTasks[transferId] = task
+      lock.unlock()
+      task.resume()
+    }
+    return destinationUrl
+  }
+
+  // URLSession Delegates
+  func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    didSendBodyData bytesSent: Int64,
+    totalBytesSent: Int64,
+    totalBytesExpectedToSend: Int64
+  ) {
+    lock.lock()
+    let ctx = contexts[task.taskIdentifier]
+    lock.unlock()
+    guard let ctx = ctx else { return }
+    let total = ctx.logicalTotalBytes > 0 ? ctx.logicalTotalBytes : max(totalBytesExpectedToSend, totalBytesSent)
+    let clampedSent = min(total, totalBytesSent)
+    let now = Date().timeIntervalSince1970
+    if now - ctx.lastReportTime >= 0.12 || clampedSent >= total {
+      ctx.lastReportTime = now
+      ctx.onProgress(clampedSent, total)
+    }
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    dataTask: URLSessionDataTask,
+    didReceive response: URLResponse,
+    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+  ) {
+    lock.lock()
+    let ctx = contexts[dataTask.taskIdentifier]
+    lock.unlock()
+    if let ctx = ctx {
+      ctx.response = response
+      if response.expectedContentLength > 0 {
+        ctx.expectedBytes = response.expectedContentLength
+      }
+      if let http = response as? HTTPURLResponse, !(200..<400).contains(http.statusCode) {
+        completionHandler(.allow)
+        return
+      }
+    }
+    completionHandler(.allow)
+  }
+
+  func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+    lock.lock()
+    let ctx = contexts[dataTask.taskIdentifier]
+    lock.unlock()
+    guard let ctx = ctx else { return }
+    if let fh = ctx.fileHandle {
+      try? fh.write(contentsOf: data)
+      ctx.receivedBytes += Int64(data.count)
+      let total = max(ctx.expectedBytes, ctx.logicalTotalBytes)
+      let now = Date().timeIntervalSince1970
+      if now - ctx.lastReportTime >= 0.12 || (total > 0 && ctx.receivedBytes >= total) {
+        ctx.lastReportTime = now
+        ctx.onProgress(ctx.receivedBytes, total)
+      }
+    } else {
+      ctx.responseData.append(data)
+    }
+  }
+
+  func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+    lock.lock()
+    let ctx = contexts.removeValue(forKey: task.taskIdentifier)
+    activeTasks = activeTasks.filter { $0.value.taskIdentifier != task.taskIdentifier }
+    lock.unlock()
+    guard let ctx = ctx else { return }
+    try? ctx.fileHandle?.close()
+    if let error = error {
+      if let dest = ctx.destFileUrl {
+        try? FileManager.default.removeItem(at: dest)
+      }
+      ctx.continuation?.resume(throwing: error)
+      return
+    }
+    let resp = ctx.response ?? task.response ?? URLResponse()
+    if let http = resp as? HTTPURLResponse, !(200..<400).contains(http.statusCode) {
+      if let dest = ctx.destFileUrl {
+        try? FileManager.default.removeItem(at: dest)
+      }
+      let msg = String(data: ctx.responseData, encoding: .utf8) ?? "HTTP \(http.statusCode)"
+      ctx.continuation?.resume(
+        throwing: NSError(
+          domain: "TvStreamingHttpTransfer",
+          code: http.statusCode,
+          userInfo: [NSLocalizedDescriptionKey: "传输返回 HTTP \(http.statusCode): \(msg.prefix(120))"]
+        )
+      )
+      return
+    }
+    if ctx.fileHandle != nil {
+      let total = max(ctx.receivedBytes, max(ctx.expectedBytes, ctx.logicalTotalBytes))
+      ctx.onProgress(ctx.receivedBytes, total)
+    }
+    ctx.continuation?.resume(returning: (ctx.responseData, resp))
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    didReceive challenge: URLAuthenticationChallenge,
+    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+  ) {
+    if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+       let trust = challenge.protectionSpace.serverTrust {
+      completionHandler(.useCredential, URLCredential(trust: trust))
+    } else {
+      completionHandler(.performDefaultHandling, nil)
+    }
+  }
+}
+
+// MARK: - AList / OpenList v3 & Standard WebDAV Remote Storage Client
+
+final class TvRemoteStorageClient: @unchecked Sendable {
+  static let shared = TvRemoteStorageClient()
+
+  private let session: URLSession
+  private let lock = NSLock()
+  private var cachedAlistTokens: [String: String] = [:]
+
+  private init() {
+    let cfg = URLSessionConfiguration.ephemeral
+    cfg.timeoutIntervalForRequest = 20
+    cfg.timeoutIntervalForResource = 120
+    self.session = URLSession(configuration: cfg, delegate: InsecureSessionDelegate(), delegateQueue: nil)
+  }
+
+  static func normalizePath(_ raw: String) -> String {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.isEmpty || trimmed == "/" { return "/" }
+    var p = trimmed.hasPrefix("/") ? trimmed : "/\(trimmed)"
+    while p.count > 1 && p.hasSuffix("/") {
+      p.removeLast()
+    }
+    return p
+  }
+
+  static func parentPath(of path: String) -> String {
+    let norm = normalizePath(path)
+    if norm == "/" { return "" }
+    let parent = (norm as NSString).deletingLastPathComponent
+    return parent.isEmpty ? "/" : parent
+  }
+
+  static func joinPath(_ dir: String, _ name: String) -> String {
+    let normDir = normalizePath(dir)
+    let cleanName = name.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    if normDir == "/" {
+      return "/\(cleanName)"
+    }
+    return "\(normDir)/\(cleanName)"
+  }
+
+  private static func cleanBaseUrl(_ raw: String) -> String {
+    var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !s.lowercased().hasPrefix("http://") && !s.lowercased().hasPrefix("https://") {
+      s = "http://\(s)"
+    }
+    while s.hasSuffix("/") {
+      s.removeLast()
+    }
+    return s
+  }
+
+  // MARK: 1. AList / OpenList v3 Protocol
+
+  private func getCachedAlistToken(_ mountId: String) -> String? {
+    lock.lock()
+    defer { lock.unlock() }
+    return cachedAlistTokens[mountId]
+  }
+
+  private func setCachedAlistToken(_ token: String, for mountId: String) {
+    lock.lock()
+    defer { lock.unlock() }
+    cachedAlistTokens[mountId] = token
+  }
+
+  func resolveAlistToken(for mount: TvStorageMount, forceRefresh: Bool = false) async throws -> String {
+    let explicitToken = mount.token.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !explicitToken.isEmpty && !forceRefresh {
+      return explicitToken
+    }
+    if let cached = getCachedAlistToken(mount.id), !cached.isEmpty, !forceRefresh {
+      return cached
+    }
+    let user = mount.username.trimmingCharacters(in: .whitespacesAndNewlines)
+    let pass = mount.password
+    if user.isEmpty && pass.isEmpty {
+      return "" // Guest access
+    }
+    let base = Self.cleanBaseUrl(mount.baseUrl)
+    guard let loginUrl = URL(string: "\(base)/api/auth/login") else {
+      throw NSError(domain: "TvAList", code: -1, userInfo: [NSLocalizedDescriptionKey: "AList 地址格式无效"])
+    }
+    var req = URLRequest(url: loginUrl)
+    req.httpMethod = "POST"
+    req.timeoutInterval = 15
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = try JSONSerialization.data(withJSONObject: [
+      "username": user,
+      "password": pass
+    ])
+    let (data, _) = try await session.data(for: req)
+    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+      throw NSError(domain: "TvAList", code: -2, userInfo: [NSLocalizedDescriptionKey: "AList 登录响应解析失败"])
+    }
+    let code = TvApiClient.intValue(root["code"], fallback: 500)
+    if code != 200 {
+      let msg = TvApiClient.stringValue(root["message"], fallback: "AList 登录失败 (code \(code))")
+      throw NSError(domain: "TvAList", code: code, userInfo: [NSLocalizedDescriptionKey: msg])
+    }
+    let dataDict = (root["data"] as? [String: Any]) ?? [:]
+    let token = TvApiClient.stringValue(dataDict["token"])
+    setCachedAlistToken(token, for: mount.id)
+    return token
+  }
+
+  private func alistJsonRequest(
+    mount: TvStorageMount,
+    endpointPath: String,
+    body: [String: Any]
+  ) async throws -> [String: Any] {
+    let base = Self.cleanBaseUrl(mount.baseUrl)
+    guard let url = URL(string: "\(base)\(endpointPath)") else {
+      throw NSError(domain: "TvAList", code: -1, userInfo: [NSLocalizedDescriptionKey: "无效的 AList 接口地址"])
+    }
+    let token = try await resolveAlistToken(for: mount)
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.timeoutInterval = 20
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    if !token.isEmpty {
+      req.setValue(token, forHTTPHeaderField: "Authorization")
+    }
+    req.httpBody = try JSONSerialization.data(withJSONObject: body)
+    let (data, _) = try await session.data(for: req)
+    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+      throw NSError(domain: "TvAList", code: -2, userInfo: [NSLocalizedDescriptionKey: "无法解析 AList JSON 响应"])
+    }
+    let code = TvApiClient.intValue(root["code"], fallback: 200)
+    if code == 401 && (!mount.username.isEmpty || !mount.password.isEmpty) {
+      let freshToken = try await resolveAlistToken(for: mount, forceRefresh: true)
+      var retryReq = req
+      retryReq.setValue(freshToken, forHTTPHeaderField: "Authorization")
+      let (retryData, _) = try await session.data(for: retryReq)
+      if let retryRoot = try? JSONSerialization.jsonObject(with: retryData) as? [String: Any] {
+        return retryRoot
+      }
+    }
+    if code != 200 {
+      let msg = TvApiClient.stringValue(root["message"], fallback: "AList 请求失败 (\(code))")
+      throw NSError(domain: "TvAList", code: code, userInfo: [NSLocalizedDescriptionKey: msg])
+    }
+    return root
+  }
+
+  func listAlistDirectory(
+    mount: TvStorageMount,
+    path: String,
+    page: Int = 1,
+    perPage: Int = 250
+  ) async throws -> TvFileListing {
+    let effectivePath = path.isEmpty ? Self.normalizePath(mount.rootPath) : Self.normalizePath(path)
+    let safePage = max(1, page)
+    let safePerPage = max(50, min(500, perPage))
+    let root = try await alistJsonRequest(
+      mount: mount,
+      endpointPath: "/api/fs/list",
+      body: [
+        "path": effectivePath,
+        "password": "",
+        "page": safePage,
+        "per_page": safePerPage,
+        "refresh": false
+      ]
+    )
+    let dataDict = (root["data"] as? [String: Any]) ?? [:]
+    let rawContent = (dataDict["content"] as? [Any])?.compactMap { $0 as? [String: Any] } ?? []
+    let totalRemote = TvApiClient.intValue(dataDict["total"], fallback: rawContent.count)
+    let base = Self.cleanBaseUrl(mount.baseUrl)
+    var entries: [TvFileEntry] = []
+    entries.reserveCapacity(min(rawContent.count, safePerPage))
+
+    for item in rawContent.prefix(safePerPage) {
+      let name = TvApiClient.stringValue(item["name"])
+      guard !name.isEmpty else { continue }
+      let isDir = (item["is_dir"] as? Bool) == true
+      let sizeStr = TvApiClient.stringValue(item["size"], fallback: "0")
+      let size = Int64(sizeStr) ?? Int64(TvApiClient.intValue(item["size"], fallback: 0))
+      let rawMod = TvApiClient.stringValue(item["modified"])
+      let modTime = rawMod.count > 16 ? String(rawMod.prefix(16)).replacingOccurrences(of: "T", with: " ") : rawMod
+      let sign = TvApiClient.stringValue(item["sign"])
+      let thumb = TvApiClient.stringValue(item["thumb"])
+      let itemPath = Self.joinPath(effectivePath, name)
+      let ext = isDir ? "" : ".\((name as NSString).pathExtension.lowercased())"
+      var directDownload = ""
+      if !isDir {
+        let encodedPath = itemPath.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? itemPath
+        directDownload = sign.isEmpty ? "\(base)/d\(encodedPath)" : "\(base)/d\(encodedPath)?sign=\(sign)"
+      }
+      entries.append(
+        TvFileEntry(
+          name: name,
+          path: itemPath,
+          size: size,
+          modTime: modTime,
+          isDir: isDir,
+          isMp4: ext == ".mp4",
+          ext: ext,
+          mountId: mount.id,
+          sourceKind: .alist,
+          rawDownloadUrl: directDownload,
+          thumbUrl: thumb
+        )
+      )
+    }
+
+    return TvFileListing(
+      path: effectivePath,
+      parent: Self.parentPath(of: effectivePath),
+      root: Self.normalizePath(mount.rootPath),
+      entries: entries,
+      totalCount: max(totalRemote, entries.count),
+      currentPage: safePage
+    )
+  }
+
+  func resolveAlistDirectUrl(mount: TvStorageMount, path: String, fallbackUrl: String = "") async throws -> String {
+    let info = try await resolveAlistStreamInfo(mount: mount, path: path, fallbackUrl: fallbackUrl)
+    return info.url
+  }
+
+  /// Resolves an AList file's direct stream URL, required upstream HTTP headers (e.g. `115Browser` User-Agent / Cookie from `data["header"]`),
+  /// and AList `/d/<path>?sign=...` server proxy fallback URL.
+  func resolveAlistStreamInfo(
+    mount: TvStorageMount,
+    path: String,
+    fallbackUrl: String = ""
+  ) async throws -> (url: String, headers: [String: String], alistProxyUrl: String) {
+    let root = try await alistJsonRequest(
+      mount: mount,
+      endpointPath: "/api/fs/get",
+      body: [
+        "path": Self.normalizePath(path),
+        "password": ""
+      ]
+    )
+    let dataDict = (root["data"] as? [String: Any]) ?? [:]
+    let rawUrl = TvApiClient.stringValue(dataDict["raw_url"])
+    let sign = TvApiClient.stringValue(dataDict["sign"])
+    let base = Self.cleanBaseUrl(mount.baseUrl)
+    let norm = Self.normalizePath(path)
+    let encodedPath = norm.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? norm
+    let alistProxyUrl: String = {
+      if !sign.isEmpty {
+        return "\(base)/d\(encodedPath)?sign=\(sign)"
+      }
+      if !fallbackUrl.isEmpty {
+        return fallbackUrl
+      }
+      return "\(base)/d\(encodedPath)"
+    }()
+
+    var extractedHeaders: [String: String] = [:]
+    if let hDict = (dataDict["header"] as? [String: Any]) ?? (dataDict["headers"] as? [String: Any]) {
+      for (k, v) in hDict {
+        if let arr = v as? [Any], let first = arr.first {
+          let sv = TvApiClient.stringValue(first)
+          if !sv.isEmpty { extractedHeaders[k] = sv }
+        } else {
+          let sv = TvApiClient.stringValue(v)
+          if !sv.isEmpty { extractedHeaders[k] = sv }
+        }
+      }
+    }
+
+    let primaryUrl = rawUrl.hasPrefix("http") ? rawUrl : alistProxyUrl
+    if primaryUrl.lowercased().contains("115cdn") || primaryUrl.lowercased().contains("115.com") {
+      if extractedHeaders["User-Agent"] == nil && extractedHeaders["user-agent"] == nil {
+        extractedHeaders["User-Agent"] = TvLocal115DirectClient.browserUserAgent
+      }
+    }
+    return (url: primaryUrl, headers: extractedHeaders, alistProxyUrl: alistProxyUrl)
+  }
+
+  func createAlistFolder(mount: TvStorageMount, parentPath: String, name: String) async throws {
+    let fullPath = Self.joinPath(parentPath, name)
+    _ = try await alistJsonRequest(
+      mount: mount,
+      endpointPath: "/api/fs/mkdir",
+      body: ["path": fullPath]
+    )
+  }
+
+  func renameAlistEntry(mount: TvStorageMount, path: String, newName: String) async throws {
+    _ = try await alistJsonRequest(
+      mount: mount,
+      endpointPath: "/api/fs/rename",
+      body: [
+        "path": Self.normalizePath(path),
+        "name": newName
+      ]
+    )
+  }
+
+  func deleteAlistEntries(mount: TvStorageMount, dirPath: String, names: [String]) async throws {
+    _ = try await alistJsonRequest(
+      mount: mount,
+      endpointPath: "/api/fs/remove",
+      body: [
+        "dir": Self.normalizePath(dirPath),
+        "names": names
+      ]
+    )
+  }
+
+  func copyOrMoveAlistEntries(
+    mount: TvStorageMount,
+    srcDir: String,
+    dstDir: String,
+    names: [String],
+    isMove: Bool
+  ) async throws {
+    _ = try await alistJsonRequest(
+      mount: mount,
+      endpointPath: isMove ? "/api/fs/move" : "/api/fs/copy",
+      body: [
+        "src_dir": Self.normalizePath(srcDir),
+        "dst_dir": Self.normalizePath(dstDir),
+        "names": names
+      ]
+    )
+  }
+
+  func uploadToAlist(
+    transferId: String,
+    mount: TvStorageMount,
+    targetDir: String,
+    fileName: String,
+    fileData: Data,
+    onProgress: @escaping @Sendable (Int64, Int64) -> Void
+  ) async throws {
+    let base = Self.cleanBaseUrl(mount.baseUrl)
+    guard let putUrl = URL(string: "\(base)/api/fs/put") else {
+      throw NSError(domain: "TvAList", code: -1, userInfo: [NSLocalizedDescriptionKey: "无效的 AList 上传地址"])
+    }
+    let token = try await resolveAlistToken(for: mount)
+    let destPath = Self.joinPath(targetDir, fileName)
+    let encodedPath = destPath.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? destPath
+
+    var req = URLRequest(url: putUrl)
+    req.httpMethod = "PUT"
+    req.timeoutInterval = 3600
+    if !token.isEmpty {
+      req.setValue(token, forHTTPHeaderField: "Authorization")
+    }
+    req.setValue(encodedPath, forHTTPHeaderField: "File-Path")
+    req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+    req.setValue("\(fileData.count)", forHTTPHeaderField: "Content-Length")
+
+    let (respData, _) = try await TvStreamingHttpTransfer.shared.upload(
+      transferId: transferId,
+      request: req,
+      data: fileData,
+      logicalTotalBytes: Int64(fileData.count),
+      onProgress: onProgress
+    )
+    if let root = try? JSONSerialization.jsonObject(with: respData) as? [String: Any] {
+      let code = TvApiClient.intValue(root["code"], fallback: 200)
+      if code != 200 {
+        let msg = TvApiClient.stringValue(root["message"], fallback: "AList 上传失败 (\(code))")
+        throw NSError(domain: "TvAList", code: code, userInfo: [NSLocalizedDescriptionKey: msg])
+      }
+    }
+  }
+
+  // MARK: 2. Standard WebDAV Protocol (Compatible with AList WebDAV, Synology, Nextcloud, rclone, CloudDrive2)
+
+  func webdavAuthHeaders(for mount: TvStorageMount) -> [String: String] {
+    var headers: [String: String] = [:]
+    if !mount.username.isEmpty || !mount.password.isEmpty {
+      let raw = "\(mount.username):\(mount.password)"
+      let b64 = Data(raw.utf8).base64EncodedString()
+      headers["Authorization"] = "Basic \(b64)"
+    } else if !mount.token.isEmpty {
+      headers["Authorization"] = "Bearer \(mount.token)"
+    }
+    return headers
+  }
+
+  func buildWebdavUrl(mount: TvStorageMount, path: String, isDirectory: Bool = false) -> URL? {
+    let base = Self.cleanBaseUrl(mount.baseUrl)
+    let norm = Self.normalizePath(path)
+    let segments = norm.split(separator: "/").map { seg in
+      String(seg).addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String(seg)
+    }
+    let joined = segments.isEmpty ? "/" : "/\(segments.joined(separator: "/"))"
+    let suffix = (isDirectory && !joined.hasSuffix("/")) ? "\(joined)/" : joined
+    return URL(string: "\(base)\(suffix)")
+  }
+
+  func listWebdavDirectory(mount: TvStorageMount, path: String) async throws -> TvFileListing {
+    let effectivePath = path.isEmpty ? Self.normalizePath(mount.rootPath) : Self.normalizePath(path)
+    guard let url = buildWebdavUrl(mount: mount, path: effectivePath, isDirectory: true) else {
+      throw NSError(domain: "TvWebDAV", code: -1, userInfo: [NSLocalizedDescriptionKey: "WebDAV 地址格式无效"])
+    }
+    var req = URLRequest(url: url)
+    req.httpMethod = "PROPFIND"
+    req.timeoutInterval = 20
+    req.setValue("1", forHTTPHeaderField: "Depth")
+    req.setValue("application/xml; charset=utf-8", forHTTPHeaderField: "Content-Type")
+    for (k, v) in webdavAuthHeaders(for: mount) {
+      req.setValue(v, forHTTPHeaderField: k)
+    }
+    let (data, resp) = try await session.data(for: req)
+    if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+      throw NSError(domain: "TvWebDAV", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "WebDAV 连接失败 (HTTP \(http.statusCode))"])
+    }
+    let xmlStr = String(data: data, encoding: .utf8) ?? ""
+    let basePathOnServer = URL(string: Self.cleanBaseUrl(mount.baseUrl))?.path ?? ""
+    let entries = Self.parseWebdavPropfindXml(
+      xml: xmlStr,
+      mount: mount,
+      currentPath: effectivePath,
+      serverBasePrefix: basePathOnServer
+    )
+    return TvFileListing(
+      path: effectivePath,
+      parent: Self.parentPath(of: effectivePath),
+      root: Self.normalizePath(mount.rootPath),
+      entries: entries
+    )
+  }
+
+  private static func parseWebdavPropfindXml(
+    xml: String,
+    mount: TvStorageMount,
+    currentPath: String,
+    serverBasePrefix: String
+  ) -> [TvFileEntry] {
+    var entries: [TvFileEntry] = []
+    let pattern = "<(?:[a-zA-Z0-9]+:)?response[^>]*>([\\s\\S]*?)</(?:[a-zA-Z0-9]+:)?response>"
+    guard let respRegex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+      return entries
+    }
+    let nsXml = xml as NSString
+    let matches = respRegex.matches(in: xml, range: NSRange(location: 0, length: nsXml.length))
+    let normCurrent = normalizePath(currentPath)
+
+    func extractTag(_ block: String, tag: String) -> String {
+      let p = "<(?:[a-zA-Z0-9]+:)?\(tag)[^>]*>([\\s\\S]*?)</(?:[a-zA-Z0-9]+:)?\(tag)>"
+      guard let rx = try? NSRegularExpression(pattern: p, options: [.caseInsensitive]),
+            let m = rx.firstMatch(in: block, range: NSRange(location: 0, length: (block as NSString).length)),
+            m.numberOfRanges >= 2 else {
+        return ""
+      }
+      return (block as NSString).substring(with: m.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    for m in matches where m.numberOfRanges >= 2 {
+      let block = nsXml.substring(with: m.range(at: 1))
+      let rawHref = extractTag(block, tag: "href")
+      guard !rawHref.isEmpty else { continue }
+      let decodedHref: String = {
+        if let u = URL(string: rawHref) {
+          return u.path.removingPercentEncoding ?? u.path
+        }
+        return rawHref.removingPercentEncoding ?? rawHref
+      }()
+      var relativePath = decodedHref
+      let cleanPrefix = serverBasePrefix.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+      if !cleanPrefix.isEmpty {
+        let prefixWithSlash = "/\(cleanPrefix)"
+        if relativePath.hasPrefix(prefixWithSlash) {
+          relativePath = String(relativePath.dropFirst(prefixWithSlash.count))
+        }
+      }
+      let normHrefPath = normalizePath(relativePath)
+      if normHrefPath == normCurrent {
+        continue // Skip the current folder itself
+      }
+      let isDir = block.range(of: "collection", options: .caseInsensitive) != nil || decodedHref.hasSuffix("/")
+      let displayName = extractTag(block, tag: "displayname").removingPercentEncoding
+        ?? (normHrefPath as NSString).lastPathComponent
+      let name = displayName.isEmpty ? (normHrefPath as NSString).lastPathComponent : displayName
+      guard !name.isEmpty else { continue }
+      let sizeStr = extractTag(block, tag: "getcontentlength")
+      let size = Int64(sizeStr) ?? 0
+      let modTime = extractTag(block, tag: "getlastmodified")
+      let ext = isDir ? "" : ".\((name as NSString).pathExtension.lowercased())"
+      let directUrl = TvRemoteStorageClient.shared.buildWebdavUrl(mount: mount, path: normHrefPath, isDirectory: isDir)?.absoluteString ?? ""
+
+      entries.append(
+        TvFileEntry(
+          name: name,
+          path: normHrefPath,
+          size: size,
+          modTime: modTime,
+          isDir: isDir,
+          isMp4: ext == ".mp4",
+          ext: ext,
+          mountId: mount.id,
+          sourceKind: .webdav,
+          rawDownloadUrl: directUrl
+        )
+      )
+    }
+    return entries
+  }
+
+  func createWebdavFolder(mount: TvStorageMount, parentPath: String, name: String) async throws {
+    let fullPath = Self.joinPath(parentPath, name)
+    guard let url = buildWebdavUrl(mount: mount, path: fullPath, isDirectory: true) else { return }
+    var req = URLRequest(url: url)
+    req.httpMethod = "MKCOL"
+    req.timeoutInterval = 15
+    for (k, v) in webdavAuthHeaders(for: mount) {
+      req.setValue(v, forHTTPHeaderField: k)
+    }
+    _ = try await session.data(for: req)
+  }
+
+  func deleteWebdavEntry(mount: TvStorageMount, path: String, isDir: Bool = false) async throws {
+    guard let url = buildWebdavUrl(mount: mount, path: path, isDirectory: isDir) else { return }
+    var req = URLRequest(url: url)
+    req.httpMethod = "DELETE"
+    req.timeoutInterval = 15
+    for (k, v) in webdavAuthHeaders(for: mount) {
+      req.setValue(v, forHTTPHeaderField: k)
+    }
+    _ = try await session.data(for: req)
+  }
+
+  func moveOrCopyWebdavEntry(
+    mount: TvStorageMount,
+    srcPath: String,
+    dstPath: String,
+    isMove: Bool
+  ) async throws {
+    guard let srcUrl = buildWebdavUrl(mount: mount, path: srcPath),
+          let dstUrl = buildWebdavUrl(mount: mount, path: dstPath) else { return }
+    var req = URLRequest(url: srcUrl)
+    req.httpMethod = isMove ? "MOVE" : "COPY"
+    req.timeoutInterval = 20
+    req.setValue(dstUrl.absoluteString, forHTTPHeaderField: "Destination")
+    req.setValue("T", forHTTPHeaderField: "Overwrite")
+    for (k, v) in webdavAuthHeaders(for: mount) {
+      req.setValue(v, forHTTPHeaderField: k)
+    }
+    _ = try await session.data(for: req)
+  }
+
+  func uploadToWebdav(
+    transferId: String,
+    mount: TvStorageMount,
+    targetDir: String,
+    fileName: String,
+    fileData: Data,
+    onProgress: @escaping @Sendable (Int64, Int64) -> Void
+  ) async throws {
+    let destPath = Self.joinPath(targetDir, fileName)
+    guard let putUrl = buildWebdavUrl(mount: mount, path: destPath) else {
+      throw NSError(domain: "TvWebDAV", code: -1, userInfo: [NSLocalizedDescriptionKey: "无效的 WebDAV 上传地址"])
+    }
+    var req = URLRequest(url: putUrl)
+    req.httpMethod = "PUT"
+    req.timeoutInterval = 3600
+    for (k, v) in webdavAuthHeaders(for: mount) {
+      req.setValue(v, forHTTPHeaderField: k)
+    }
+    req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+    req.setValue("\(fileData.count)", forHTTPHeaderField: "Content-Length")
+
+    _ = try await TvStreamingHttpTransfer.shared.upload(
+      transferId: transferId,
+      request: req,
+      data: fileData,
+      logicalTotalBytes: Int64(fileData.count),
+      onProgress: onProgress
+    )
   }
 }

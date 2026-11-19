@@ -7,6 +7,7 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../models/models.dart';
 import 'api_client.dart';
 
 /// 1:1 port of `github.com/deadblue/elevengo/internal/crypto/m115`
@@ -545,7 +546,7 @@ class Local115DirectService extends ChangeNotifier {
   Future<({String cookie, String userName})?> _exchangeQrCodeForCookie(
     String uid,
   ) async {
-    for (final app in const ['web', 'tv', 'mac', 'ios', 'android']) {
+    for (final app in const ['tv', 'ios', 'android', 'mac', 'web']) {
       try {
         final uri = Uri.parse(
           'https://passportapi.115.com/app/1.0/$app/1.0/login/qrcode',
@@ -772,6 +773,14 @@ class Local115DirectService extends ChangeNotifier {
         if (fileUrl.startsWith('http')) {
           return fileUrl;
         }
+        final dataObj = root['data'];
+        if (dataObj is Map<String, dynamic>) {
+          final nestedUrl =
+              (dataObj['file_url'] ?? dataObj['url'] ?? '').toString().trim();
+          if (nestedUrl.startsWith('http')) {
+            return nestedUrl;
+          }
+        }
       }
     } catch (_) {}
 
@@ -781,12 +790,9 @@ class Local115DirectService extends ChangeNotifier {
           Uri.parse('https://webapi.115.com/files/video?pickcode=$pickcode');
       final root = await _getJson(vidUri, timeout: const Duration(seconds: 10));
       if (root is Map<String, dynamic>) {
-        final directVideoUrl = (root['video_url'] ?? '').toString().trim();
-        if (directVideoUrl.startsWith('http')) {
-          return directVideoUrl;
-        }
-        if (root['video_url'] is List && (root['video_url'] as List).isNotEmpty) {
-          final last = (root['video_url'] as List).last;
+        final listCandidate = root['video_urls'] ?? root['video_url'];
+        if (listCandidate is List && listCandidate.isNotEmpty) {
+          final last = listCandidate.last;
           if (last is Map<String, dynamic>) {
             final u = (last['url'] ?? '').toString().trim();
             if (u.startsWith('http')) {
@@ -794,26 +800,80 @@ class Local115DirectService extends ChangeNotifier {
             }
           }
         }
+        final directVideoUrl = (root['video_url'] ?? '').toString().trim();
+        if (directVideoUrl.startsWith('http')) {
+          return directVideoUrl;
+        }
       }
     } catch (_) {}
 
     return null;
   }
 
-  /// Wraps a 115 CDN URL in a local loopback HTTP proxy (`http://127.0.0.1:<port>/115_stream.mp4?u=...`)
-  /// so that every Range request (and any 302 redirect) carries the exact `115Browser` User-Agent and Cookie headers.
+  /// Wraps a 115 CDN URL in a local loopback HTTP proxy (`http://127.0.0.1:<port>/115_stream.<ext>?u=...`)
+  /// so that every Range request (and any 302 redirect) carries the exact `115Browser` User-Agent and Cookie headers
+  /// and exposes the proper audio/video MIME Content-Type for AVPlayer / media_kit.
   Future<String> wrapWithLocal115HeaderProxy(
     String remoteUrl,
-    Map<String, String> headers,
-  ) async {
+    Map<String, String> headers, {
+    String extHint = '',
+  }) async {
     await _ensureLocalProxyStarted();
     if (_proxyPort <= 0) return remoteUrl;
     if (_headersByUrl.length > 64) {
       _headersByUrl.clear();
     }
     _headersByUrl[remoteUrl] = Map<String, String>.from(headers);
+    String cleanExt = extHint.trim().toLowerCase();
+    if (cleanExt.isEmpty) {
+      final pathPart = Uri.tryParse(remoteUrl)?.path.toLowerCase() ?? '';
+      final dot = pathPart.lastIndexOf('.');
+      if (dot > 0 && pathPart.length - dot <= 6) {
+        cleanExt = pathPart.substring(dot);
+      }
+    }
+    if (cleanExt.isEmpty || !cleanExt.startsWith('.')) {
+      cleanExt = cleanExt.isEmpty ? '.mp4' : '.$cleanExt';
+    }
     final enc = Uri.encodeQueryComponent(remoteUrl);
-    return 'http://127.0.0.1:$_proxyPort/115_stream.mp4?u=$enc';
+    return 'http://127.0.0.1:$_proxyPort/115_stream$cleanExt?u=$enc';
+  }
+
+  static String? _inferMimeTypeFromPath(String pathLower) {
+    if (pathLower.endsWith('.mp3')) return 'audio/mpeg';
+    if (pathLower.endsWith('.flac')) return 'audio/flac';
+    if (pathLower.endsWith('.wav') || pathLower.endsWith('.wave')) {
+      return 'audio/wav';
+    }
+    if (pathLower.endsWith('.ape') || pathLower.endsWith('.mac')) {
+      return 'audio/x-ape';
+    }
+    if (pathLower.endsWith('.m4a') || pathLower.endsWith('.alac')) {
+      return 'audio/mp4';
+    }
+    if (pathLower.endsWith('.aac')) return 'audio/aac';
+    if (pathLower.endsWith('.ogg') ||
+        pathLower.endsWith('.oga') ||
+        pathLower.endsWith('.opus')) {
+      return 'audio/ogg';
+    }
+    if (pathLower.endsWith('.aiff') ||
+        pathLower.endsWith('.aif') ||
+        pathLower.endsWith('.aifc')) {
+      return 'audio/aiff';
+    }
+    if (pathLower.endsWith('.wma')) return 'audio/x-ms-wma';
+    if (pathLower.endsWith('.dsf')) return 'audio/x-dsf';
+    if (pathLower.endsWith('.dff')) return 'audio/x-dff';
+    if (pathLower.endsWith('.wv')) return 'audio/x-wavpack';
+    if (pathLower.endsWith('.tta')) return 'audio/x-tta';
+    if (pathLower.endsWith('.tak')) return 'audio/x-tak';
+    if (pathLower.endsWith('.mka')) return 'audio/x-matroska';
+    if (pathLower.endsWith('.mp4') || pathLower.endsWith('.m4v')) {
+      return 'video/mp4';
+    }
+    if (pathLower.endsWith('.mov')) return 'video/quicktime';
+    return null;
   }
 
   Future<void> _ensureLocalProxyStarted() async {
@@ -865,6 +925,17 @@ class Local115DirectService extends ChangeNotifier {
         final val = upstreamResp.headers.value(headerName);
         if (val != null && val.isNotEmpty) {
           req.response.headers.set(headerName, val);
+        }
+      }
+      final upstreamCt =
+          (upstreamResp.headers.value('content-type') ?? '').toLowerCase();
+      if (upstreamCt.isEmpty ||
+          upstreamCt.contains('octet-stream') ||
+          upstreamCt.contains('application/force-download')) {
+        final inferred = _inferMimeTypeFromPath(req.uri.path.toLowerCase()) ??
+            _inferMimeTypeFromPath(uri.path.toLowerCase());
+        if (inferred != null) {
+          req.response.headers.set('content-type', inferred);
         }
       }
       req.response.headers.set('Access-Control-Allow-Origin', '*');
@@ -1165,5 +1236,238 @@ class Local115DirectService extends ChangeNotifier {
       }
     }
     return s.toLowerCase().trim();
+  }
+
+  // MARK: - 115 Cloud Drive Directory Browser & File Operations for Multi-Storage File Manager
+
+  final Map<String, String> _cidParentMap = {'0': ''};
+  final Map<String, String> _cidNameMap = {'0': '115根目录'};
+
+  String parentCidFor(String cid) {
+    if (cid.isEmpty || cid == '0' || cid == '/') return '';
+    return _cidParentMap[cid] ?? '0';
+  }
+
+  Future<FileDirectoryListing> list115Directory({
+    required String cid,
+    String mountId = 'builtin_115',
+  }) async {
+    await ensureInitialized();
+    if (!hasLocalCookie) {
+      throw const ApiException('请先扫码或使用 Cookie 登录 115 网盘账号');
+    }
+    final cleanCid = (cid.isEmpty || cid == '/') ? '0' : cid;
+    final candidateUrls = <String>[
+      'https://webapi.115.com/files?aid=1&cid=$cleanCid&o=user_ptime&asc=0&offset=0&limit=100&show_dir=1&format=json',
+      'https://aps.115.com/natsort/files.php?aid=1&cid=$cleanCid&o=file_name&asc=1&offset=0&limit=100&show_dir=1&natsort=1&format=json',
+      'https://webapi.115.com/files?aid=1&cid=$cleanCid&o=user_ptime&asc=0&offset=0&limit=40&show_dir=1&format=json',
+      'https://proapi.115.com/android/2.0/ufile/files?aid=1&cid=$cleanCid&o=user_ptime&asc=0&offset=0&limit=100&show_dir=1',
+    ];
+
+    Map<String, dynamic>? root;
+    List<dynamic>? rawItems;
+    bool anyStateOk = false;
+    for (final urlStr in candidateUrls) {
+      try {
+        final res = await _getJson(
+          Uri.parse(urlStr),
+          timeout: const Duration(seconds: 15),
+        );
+        if (res is Map<String, dynamic>) {
+          root ??= res;
+          final stateVal = res['state'];
+          final isStateOk = stateVal == true ||
+              (int.tryParse((stateVal ?? 0).toString()) ?? 0) == 1;
+          final errNo = int.tryParse(
+                (res['errNo'] ?? res['errno'] ?? res['errCode'] ?? 0)
+                    .toString(),
+              ) ??
+              0;
+          if (isStateOk) {
+            anyStateOk = true;
+            root = res;
+          }
+          if (res['data'] is List) {
+            final arr = res['data'] as List;
+            if (arr.isNotEmpty) {
+              root = res;
+              rawItems = arr;
+              anyStateOk = true;
+              break;
+            } else if (isStateOk && errNo == 0) {
+              root = res;
+              rawItems = const [];
+              break;
+            }
+          }
+        }
+      } catch (_) {}
+    }
+
+    if ((rawItems == null || rawItems.isEmpty) && !anyStateOk && root != null) {
+      final errNo = int.tryParse(
+            (root['errNo'] ?? root['errno'] ?? root['errCode'] ?? 0).toString(),
+          ) ??
+          0;
+      final errMsg = (root['error'] ?? root['msg'] ?? '').toString().trim();
+      if (errNo == 99 || errNo == 990001 || errMsg.contains('登录')) {
+        await clearCookie();
+        throw const ApiException('115 网盘登录已过期或被其他设备/AList顶下线，请重新扫码登录');
+      }
+      if (errMsg.isNotEmpty) {
+        throw ApiException('115 接口返回：$errMsg (code $errNo)');
+      }
+    }
+
+    if (root == null) {
+      return FileDirectoryListing(
+        path: cleanCid,
+        parent: parentCidFor(cleanCid),
+        root: '0',
+        entries: const [],
+      );
+    }
+
+    var resolvedParent = parentCidFor(cleanCid);
+    final pathArr = root['path'];
+    if (pathArr is List && pathArr.isNotEmpty) {
+      var prevCid = '';
+      for (final seg in pathArr) {
+        if (seg is Map<String, dynamic>) {
+          final scid = (seg['cid'] ?? '0').toString();
+          final sname = (seg['name'] ?? '目录').toString();
+          if (prevCid.isNotEmpty && scid != prevCid) {
+            _cidParentMap[scid] = prevCid;
+          }
+          _cidNameMap[scid] = sname;
+          prevCid = scid;
+        }
+      }
+      if (pathArr.length >= 2) {
+        final pen = pathArr[pathArr.length - 2];
+        if (pen is Map<String, dynamic>) {
+          resolvedParent = (pen['cid'] ?? '0').toString();
+        }
+      } else if (cleanCid != '0') {
+        resolvedParent = '0';
+      } else {
+        resolvedParent = '';
+      }
+    }
+
+    final entries = <FileEntry>[];
+    if (rawItems != null) {
+      for (final item in rawItems) {
+        if (item is! Map<String, dynamic>) continue;
+        final fid = (item['fid'] ?? '').toString().trim();
+        final itemCid = (item['cid'] ?? '').toString().trim();
+        final hasValidFid = fid.isNotEmpty && fid != '0';
+        final isDir = !hasValidFid && itemCid.isNotEmpty && itemCid != '0';
+        final name = (item['n'] ?? item['ns'] ?? item['fn'] ?? '未命名').toString();
+        final size = int.tryParse((item['s'] ?? item['fs'] ?? 0).toString()) ?? 0;
+        final pickcode =
+            (item['pc'] ?? item['pick_code'] ?? '').toString().trim();
+        final ico = (item['ico'] ?? '').toString().toLowerCase().trim().replaceAll('.', '');
+        final is115Video =
+            (int.tryParse((item['iv'] ?? 0).toString()) ?? 0) == 1 ||
+            item['vdi'] != null;
+        String ext = '';
+        if (!isDir) {
+          final dot = name.lastIndexOf('.');
+          if (dot > 0 && dot < name.length - 1) {
+            ext = name.substring(dot).toLowerCase();
+          } else if (ico.isNotEmpty) {
+            ext = '.$ico';
+          } else if (is115Video) {
+            ext = '.mp4';
+          }
+        }
+        final ts = int.tryParse(
+              (item['te'] ?? item['tp'] ?? item['t'] ?? 0).toString(),
+            ) ??
+            0;
+        String modStr = (item['te'] ?? '').toString();
+        if (ts > 100000) {
+          final dt = DateTime.fromMillisecondsSinceEpoch(ts * 1000);
+          modStr =
+              '${dt.year}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')} '
+              '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+        }
+        final thumb = (item['u'] ?? '').toString();
+        final entryPath = isDir ? itemCid : (hasValidFid ? fid : pickcode);
+        if (isDir) {
+          _cidParentMap[itemCid] = cleanCid;
+          _cidNameMap[itemCid] = name;
+        }
+        entries.add(
+          FileEntry(
+            name: name,
+            path: entryPath,
+            size: size,
+            modTime: modStr,
+            isDir: isDir,
+            isMp4: ext == '.mp4' || (is115Video && ext.isEmpty),
+            ext: ext,
+            mountId: mountId,
+            sourceKind: StorageSourceKind.cloud115,
+            thumbUrl: thumb,
+            pickcode115: pickcode,
+            fid115: isDir ? itemCid : fid,
+            cid115: isDir ? itemCid : cleanCid,
+          ),
+        );
+      }
+    }
+
+    return FileDirectoryListing(
+      path: cleanCid,
+      parent: cleanCid == '0' ? '' : resolvedParent,
+      root: '0',
+      entries: entries,
+    );
+  }
+
+  Future<void> create115Folder({
+    required String parentCid,
+    required String name,
+  }) async {
+    await ensureInitialized();
+    if (!hasLocalCookie) return;
+    final pid = (parentCid.isEmpty || parentCid == '/') ? '0' : parentCid;
+    final body =
+        'pid=${Uri.encodeQueryComponent(pid)}&cname=${Uri.encodeQueryComponent(name)}';
+    await _postFormJson(
+      Uri.parse('https://webapi.115.com/files/add'),
+      body: body,
+    );
+  }
+
+  Future<void> rename115File({
+    required String fid,
+    required String newName,
+  }) async {
+    await ensureInitialized();
+    if (!hasLocalCookie) return;
+    final body =
+        'files_new_name[$fid]=${Uri.encodeQueryComponent(newName)}';
+    await _postFormJson(
+      Uri.parse('https://webapi.115.com/files/batch_rename'),
+      body: body,
+    );
+  }
+
+  Future<void> delete115File({
+    required String fid,
+    required String parentCid,
+  }) async {
+    await ensureInitialized();
+    if (!hasLocalCookie) return;
+    final pid = (parentCid.isEmpty || parentCid == '/') ? '0' : parentCid;
+    final body =
+        'pid=${Uri.encodeQueryComponent(pid)}&fid[0]=${Uri.encodeQueryComponent(fid)}&ignore_warn=1';
+    await _postFormJson(
+      Uri.parse('https://rb.115.com/2.0/rb/delete'),
+      body: body,
+    );
   }
 }

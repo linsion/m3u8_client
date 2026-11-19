@@ -646,7 +646,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         style: TextStyle(fontSize: 13),
                       ),
                       subtitle: Text(
-                        '开启后优先由本地播放器直连源站，失败时自动回退至服务端代理中转',
+                        '开启后优先由本地播放器直连源站（不自动回退至服务端代理中转）',
                         style: TextStyle(
                           fontSize: 12,
                           color: VideoPlatformTheme.textMuted,

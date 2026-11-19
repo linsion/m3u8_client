@@ -91,14 +91,37 @@ jobs:
         run: |
           BUILD_NAME="${VERSION_TAG#v}"
           BUILD_NUM=$((100 + GITHUB_RUN_NUMBER))
-          xcodebuild -project tvos/Runner.xcodeproj -target Runner -sdk appletvos -configuration Release \
+          TVOS_APP_PATH="$GITHUB_WORKSPACE/build/tvos/Build/Products/Release-appletvos/Runner.app"
+          if ! xcodebuild -project tvos/Runner.xcodeproj -target Runner -sdk appletvos -configuration Release \
             MARKETING_VERSION="$BUILD_NAME" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
             SYMROOT="$GITHUB_WORKSPACE/build/tvos/Build/Products" \
             OBJROOT="$GITHUB_WORKSPACE/build/tvos/Build/Intermediates.noindex" \
-            CODE_SIGNING_ALLOWED=NO build
+            CODE_SIGNING_ALLOWED=NO build; then
+            TVOS_SDK_PATH="$(xcrun --sdk appletvos --show-sdk-path)"
+            mkdir -p "$TVOS_APP_PATH"
+            cp -f tvos/Runner/AppIcon.png tvos/Runner/TopShelfWide.png "$TVOS_APP_PATH/" 2>/dev/null || true
+            cp -f tvos/Runner/Info.plist "$TVOS_APP_PATH/Info.plist"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable Runner" "$TVOS_APP_PATH/Info.plist" || true
+            /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.linsion.m3u8Client.tvos" "$TVOS_APP_PATH/Info.plist" || true
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${BUILD_NAME}" "$TVOS_APP_PATH/Info.plist" || true
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUM}" "$TVOS_APP_PATH/Info.plist" || true
+            printf "APPL????" > "$TVOS_APP_PATH/PkgInfo"
+            xcrun --sdk appletvos swiftc \
+              -O -whole-module-optimization \
+              -sdk "$TVOS_SDK_PATH" \
+              -target arm64-apple-tvos16.0 \
+              -module-name Runner \
+              -enable-bare-slash-regex \
+              tvos/Runner/Models.swift \
+              tvos/Runner/TvApiClient.swift \
+              tvos/Runner/TvAppState.swift \
+              tvos/Runner/TvPlayerView.swift \
+              tvos/Runner/AppDelegate.swift \
+              -o "$TVOS_APP_PATH/Runner"
+          fi
           IPA_STAGE="$(mktemp -d)"
           mkdir -p "$IPA_STAGE/Payload"
-          cp -R "$GITHUB_WORKSPACE/build/tvos/Build/Products/Release-appletvos/Runner.app" "$IPA_STAGE/Payload/Runner.app"
+          cp -R "$TVOS_APP_PATH" "$IPA_STAGE/Payload/Runner.app"
           codesign --force --sign - --timestamp=none "$IPA_STAGE/Payload/Runner.app"
           (cd "$IPA_STAGE" && zip -qry "$GITHUB_WORKSPACE/dist/LiuguangVideo-tvOS-${VERSION_TAG}-unsigned.ipa" Payload)
           unzip -t "$GITHUB_WORKSPACE/dist/LiuguangVideo-tvOS-${VERSION_TAG}-unsigned.ipa" >/dev/null

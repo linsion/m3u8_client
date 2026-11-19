@@ -834,7 +834,7 @@ struct TvVideoDownloadSpeedBadge: View {
     let elapsedSec = min(max(Double(nowMs - lastSampleTimeMs) / 1000.0, 0.2), 5.0)
     lastSampleTimeMs = nowMs
 
-    let isPlaying = (player.timeControlStatus == .playing || player.rate > 0)
+    let isPlaying = (player.timeControlStatus == .playing || player.rate > 0 || TvNetworkSpeedMonitor.shared.recentDownstreamBytesPerSecond > 1024)
     let isWaiting = (player.timeControlStatus == .waitingToPlayAtSpecifiedRate || isBuffering)
 
     var curPosSec = player.currentTime().seconds
@@ -1253,6 +1253,8 @@ struct TvPlayerModalView: View {
 
   @FocusState private var focusedField: PlayerFocusField?
   @State private var player: AVPlayer = AVPlayer()
+  @State private var flvEngine: TvDirectFlvHardwareEngine = TvDirectFlvHardwareEngine()
+  @State private var isUsingDirectFlvEngine: Bool = false
   @State private var isPlaying: Bool = true
   @State private var userWantsToPlay: Bool = true
   @State private var isBuffering: Bool = true
@@ -1293,12 +1295,21 @@ struct TvPlayerModalView: View {
       Color.black.ignoresSafeArea()
 
       // 1. Video Layer (Does NOT hijack Siri Remote focus, allowing all overlay buttons to be focused!)
-      TvRawAVPlayerLayerView(
-        player: player,
-        videoGravity: aspectFill ? .resizeAspectFill : .resizeAspect
-      )
-      .ignoresSafeArea()
-      .allowsHitTesting(false)
+      if isUsingDirectFlvEngine {
+        TvDirectFlvHardwareLayerView(
+          engine: flvEngine,
+          videoGravity: aspectFill ? .resizeAspectFill : .resizeAspect
+        )
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+      } else {
+        TvRawAVPlayerLayerView(
+          player: player,
+          videoGravity: aspectFill ? .resizeAspectFill : .resizeAspect
+        )
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+      }
 
       // Buffering, 115 Cloud Acceleration Progress, or Seek HUD
       if appState.is115Accelerating {
@@ -1852,8 +1863,13 @@ struct TvPlayerModalView: View {
     }
     .onReceive(autoHideTick) { now in
       guard !appState.isAppInBackground else { return }
-      // 1. Poll AVPlayerItem status on MainActor without KVO / captured struct snapshots
-      if let curItem = player.currentItem {
+      // 1. Poll AVPlayerItem or TvDirectFlvHardwareEngine status on MainActor without KVO / captured struct snapshots
+      if isUsingDirectFlvEngine {
+        if flvEngine.isActivelyPlaying {
+          if isBuffering { isBuffering = false }
+          if !isPlaying && userWantsToPlay { isPlaying = true }
+        }
+      } else if let curItem = player.currentItem {
         switch curItem.status {
         case .readyToPlay:
           if !didPerformResumeSeek {
@@ -1863,7 +1879,17 @@ struct TvPlayerModalView: View {
               player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
             }
             if userWantsToPlay {
-              player.playImmediately(atRate: playbackRate)
+              if request.isLive {
+                player.play()
+              } else {
+                player.playImmediately(atRate: playbackRate)
+              }
+            }
+          } else if userWantsToPlay && request.isLive {
+            if player.timeControlStatus != .playing && player.rate == 0 {
+              player.play()
+            } else if isBuffering && player.timeControlStatus == .playing && player.rate > 0 {
+              isBuffering = false
             }
           } else if userWantsToPlay && !request.isLive {
             let stalledFor = now.timeIntervalSince(lastProgressAdvanceAt)
@@ -1893,21 +1919,21 @@ struct TvPlayerModalView: View {
         case .failed:
           if !didFallbackToProxy,
              !request.backupProxyUrl.isEmpty,
-             request.backupProxyUrl != request.streamUrl {
+             request.backupProxyUrl != request.streamUrl,
+             !request.backupProxyUrl.contains("/api/vod/proxy") {
             didFallbackToProxy = true
-            usingServerProxy = true
             startPlayerItem(urlStr: request.backupProxyUrl, resumeAt: positionSec)
           } else {
             isBuffering = false
           }
         default:
-          let timeoutLimit: TimeInterval = request.isLive ? 12.0 : 7.5
+          let timeoutLimit: TimeInterval = request.isLive ? 12.0 : 8.5
           if !didFallbackToProxy,
              !request.backupProxyUrl.isEmpty,
              request.backupProxyUrl != request.streamUrl,
+             !request.backupProxyUrl.contains("/api/vod/proxy"),
              now.timeIntervalSince(streamStartedAt) >= timeoutLimit {
             didFallbackToProxy = true
-            usingServerProxy = true
             startPlayerItem(urlStr: request.backupProxyUrl)
           }
         }
@@ -2058,7 +2084,8 @@ struct TvPlayerModalView: View {
     let sc: TvRequestScenario = request.isLive ? .liveStream : .vodStream
     appState.activateScenarioProxyTunnel(for: sc)
     let eff = appState.resolveEffectiveRoute(for: sc)
-    let useRelay = forceProxy || (eff == .serverRelay)
+    let isLocalLoopbackStream = request.streamUrl.contains("127.0.0.1:") || request.streamUrl.hasPrefix("file://")
+    let useRelay = forceProxy || (eff == .serverRelay && !isLocalLoopbackStream)
     didFallbackToProxy = useRelay
     usingServerProxy = useRelay
     didPerformResumeSeek = false
@@ -2071,7 +2098,44 @@ struct TvPlayerModalView: View {
       ? request.backupProxyUrl
       : request.streamUrl
 
-    if eff == .proxyNode && !baseTargetUrl.contains("127.0.0.1:") {
+    if request.isFlvHardwareStream {
+      cleanupPlayer()
+      isUsingDirectFlvEngine = true
+      isBuffering = true
+      userWantsToPlay = true
+      isPlaying = true
+      flvEngine.onFirstFrameRendered = {
+        Task { @MainActor in
+          self.isBuffering = false
+          self.isPlaying = true
+        }
+      }
+      flvEngine.onAllCandidatesFailed = {
+        Task { @MainActor in
+          self.isBuffering = false
+        }
+      }
+      let primaryTarget = useRelay
+        ? request.backupProxyUrl
+        : (request.flvPrimaryUrl.isEmpty ? baseTargetUrl : request.flvPrimaryUrl)
+      let primaryHeaders = useRelay ? appState.api.authHeaders : request.headers
+      let gatewayTarget = useRelay ? "" : request.flvGatewayUrl
+      flvEngine.start(
+        primaryUrl: primaryTarget,
+        primaryHeaders: primaryHeaders,
+        gatewayUrl: gatewayTarget,
+        gatewayHeaders: request.headers,
+        serverProxyUrl: request.backupProxyUrl,
+        serverAuthHeaders: appState.api.authHeaders,
+        forceProxyNode: (eff == .proxyNode && !useRelay)
+      )
+      return
+    }
+    isUsingDirectFlvEngine = false
+
+    if eff == .proxyNode
+        && !baseTargetUrl.contains("127.0.0.1:")
+        && !TvLocalHlsProxyServer.isDomesticOrLocalUrl(baseTargetUrl) {
       if baseTargetUrl.lowercased().contains(".m3u8") {
         Task {
           if let proxiedHls = await TvLocalHlsProxyServer.shared.prepareProxyPlaylistUrl(
@@ -2085,7 +2149,7 @@ struct TvPlayerModalView: View {
           }
         }
         return
-      } else if baseTargetUrl.hasPrefix("http") {
+      } else if baseTargetUrl.contains("/api/telegram/") {
         let proxiedMp4 = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
           remoteUrl: baseTargetUrl,
           headers: request.headers
@@ -2117,15 +2181,16 @@ struct TvPlayerModalView: View {
 
     var options: [String: Any] = [:]
     let effectiveHeaders = overrideHeaders ?? (using115Direct ? active115Headers : request.headers)
-    if !effectiveHeaders.isEmpty && !url.isFileURL {
+    let isLocalLoopback = urlStr.contains("127.0.0.1:")
+    if !effectiveHeaders.isEmpty && !url.isFileURL && !isLocalLoopback {
       options["AVURLAssetHTTPHeaderFieldsKey"] = effectiveHeaders
     }
     let asset = AVURLAsset(url: url, options: options)
     let item = AVPlayerItem(asset: asset)
-    item.preferredForwardBufferDuration = request.isLive ? 1.5 : 45
+    item.preferredForwardBufferDuration = request.isLive ? 2.5 : 45
 
     player.replaceCurrentItem(with: item)
-    player.automaticallyWaitsToMinimizeStalling = !request.isLive
+    player.automaticallyWaitsToMinimizeStalling = true
     let initialSeek = resumeAt ?? (!request.isLive && request.resumeSeconds > 3 ? request.resumeSeconds : 0)
     if initialSeek > 1 && !request.isLive {
       didPerformResumeSeek = true
@@ -2133,6 +2198,8 @@ struct TvPlayerModalView: View {
       player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak player] _ in
         player?.playImmediately(atRate: playbackRate)
       }
+    } else if request.isLive {
+      player.play()
     } else {
       player.playImmediately(atRate: playbackRate)
     }
@@ -2235,6 +2302,18 @@ struct TvPlayerModalView: View {
   }
 
   private func togglePlayPause() {
+    if isUsingDirectFlvEngine {
+      if userWantsToPlay && isPlaying {
+        userWantsToPlay = false
+        isPlaying = false
+        flvEngine.pause()
+      } else {
+        userWantsToPlay = true
+        isPlaying = true
+        flvEngine.resume()
+      }
+      return
+    }
     if userWantsToPlay && player.rate > 0 {
       userWantsToPlay = false
       isPlaying = false
@@ -2243,7 +2322,11 @@ struct TvPlayerModalView: View {
       userWantsToPlay = true
       isPlaying = true
       lastProgressAdvanceAt = Date()
-      player.playImmediately(atRate: playbackRate)
+      if request.isLive {
+        player.play()
+      } else {
+        player.playImmediately(atRate: playbackRate)
+      }
     }
   }
 
@@ -2265,6 +2348,8 @@ struct TvPlayerModalView: View {
   }
 
   private func cleanupPlayer() {
+    flvEngine.stop()
+    isUsingDirectFlvEngine = false
     if let token = timeObserverToken {
       player.removeTimeObserver(token)
       timeObserverToken = nil
@@ -3478,6 +3563,48 @@ struct TvRawAVPlayerLayerView: UIViewRepresentable {
   final class PlayerUIView: UIView {
     override static var layerClass: AnyClass { AVPlayerLayer.self }
     var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+  }
+}
+
+struct TvDirectFlvHardwareLayerView: UIViewRepresentable {
+  let engine: TvDirectFlvHardwareEngine
+  let videoGravity: AVLayerVideoGravity
+
+  func makeUIView(context: Context) -> FlvHardwareUIView {
+    let view = FlvHardwareUIView()
+    view.attach(engine: engine, videoGravity: videoGravity)
+    return view
+  }
+
+  func updateUIView(_ uiView: FlvHardwareUIView, context: Context) {
+    uiView.attach(engine: engine, videoGravity: videoGravity)
+  }
+
+  final class FlvHardwareUIView: UIView {
+    private weak var attachedLayer: AVSampleBufferDisplayLayer?
+
+    func attach(engine: TvDirectFlvHardwareEngine, videoGravity: AVLayerVideoGravity) {
+      let dl = engine.displayLayer
+      dl.videoGravity = videoGravity
+      if attachedLayer !== dl || dl.superlayer !== self.layer {
+        dl.removeFromSuperlayer()
+        self.layer.addSublayer(dl)
+        attachedLayer = dl
+      }
+      CATransaction.begin()
+      CATransaction.setDisableActions(true)
+      dl.frame = self.bounds
+      CATransaction.commit()
+    }
+
+    override func layoutSubviews() {
+      super.layoutSubviews()
+      guard let dl = attachedLayer else { return }
+      CATransaction.begin()
+      CATransaction.setDisableActions(true)
+      dl.frame = self.bounds
+      CATransaction.commit()
+    }
   }
 }
 

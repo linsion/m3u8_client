@@ -13,11 +13,12 @@ import 'ui/theme.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   MediaKit.ensureInitialized();
-  FocusManager.instance.highlightStrategy =
-      FocusHighlightStrategy.alwaysTraditional;
 
   final appState = AppState();
   await appState.initialize();
+  FocusManager.instance.highlightStrategy = appState.tvMode
+      ? FocusHighlightStrategy.alwaysTraditional
+      : FocusHighlightStrategy.automatic;
 
   runApp(M3u8VideoClientApp(appState: appState));
 }
@@ -73,10 +74,15 @@ class M3u8VideoClientApp extends StatelessWidget {
               appState: appState,
               child: content,
             );
-            if (!appState.tvMode) return content;
+            final mq = MediaQuery.of(context);
             return MediaQuery(
-              data: MediaQuery.of(context).copyWith(
-                textScaler: const TextScaler.linear(1.06),
+              data: mq.copyWith(
+                textScaler: appState.tvMode
+                    ? const TextScaler.linear(1.06)
+                    : mq.textScaler.clamp(
+                        minScaleFactor: 0.85,
+                        maxScaleFactor: 1.05,
+                      ),
               ),
               child: content,
             );

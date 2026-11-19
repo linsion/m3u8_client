@@ -550,9 +550,144 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
     final active = _proxySvc.activeNode;
     final statusMsg = _proxySvc.lastStatusMessage;
     final isErr = _proxySvc.lastStatusIsError;
+    final isCompact = MediaQuery.sizeOf(context).width < 680;
+
+    final switchBadge = Container(
+      padding: EdgeInsets.symmetric(
+        horizontal: isCompact ? 8 : 10,
+        vertical: 3,
+      ),
+      decoration: BoxDecoration(
+        color: enabled
+            ? VideoPlatformTheme.accent.withValues(alpha: 0.16)
+            : VideoPlatformTheme.bgCard,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(
+          color: enabled
+              ? VideoPlatformTheme.accent
+              : VideoPlatformTheme.borderSubtle,
+        ),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SizedBox(
+            height: 24,
+            child: Switch(
+              value: enabled,
+              activeColor: VideoPlatformTheme.accent,
+              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              onChanged: (v) => _proxySvc.setProxyEnabled(v),
+            ),
+          ),
+          const SizedBox(width: 5),
+          Text(
+            enabled ? '代理已开启' : '代理已关闭',
+            style: TextStyle(
+              fontSize: 12.5,
+              fontWeight: FontWeight.w700,
+              color: enabled
+                  ? VideoPlatformTheme.accent
+                  : VideoPlatformTheme.textSecondary,
+            ),
+          ),
+        ],
+      ),
+    );
+
+    final modeSegmented = Container(
+      padding: const EdgeInsets.all(2),
+      decoration: BoxDecoration(
+        color: VideoPlatformTheme.bgCard,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: VideoPlatformTheme.borderSubtle),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _buildModeSegmentButton(
+            selected: mode == ProxySelectionMode.autoFastest,
+            icon: Icons.flash_on_rounded,
+            label: isCompact ? '自动最快' : '自动切换最快',
+            onTap: () => _proxySvc.setSelectionMode(
+              ProxySelectionMode.autoFastest,
+            ),
+          ),
+          _buildModeSegmentButton(
+            selected: mode == ProxySelectionMode.manual,
+            icon: Icons.touch_app_rounded,
+            label: isCompact ? '手动指定' : '手动指定代理',
+            onTap: () => _proxySvc.setSelectionMode(
+              ProxySelectionMode.manual,
+            ),
+          ),
+        ],
+      ),
+    );
+
+    final activeNodeWidget = active != null
+        ? Container(
+            padding: const EdgeInsets.symmetric(
+              horizontal: 10,
+              vertical: 6,
+            ),
+            decoration: BoxDecoration(
+              color: VideoPlatformTheme.bgCard,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: VideoPlatformTheme.borderSubtle),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  mode == ProxySelectionMode.autoFastest
+                      ? Icons.bolt_rounded
+                      : Icons.lock_outline_rounded,
+                  size: 15,
+                  color: enabled
+                      ? VideoPlatformTheme.accent
+                      : VideoPlatformTheme.textMuted,
+                ),
+                const SizedBox(width: 5),
+                Flexible(
+                  child: Text(
+                    '${mode == ProxySelectionMode.autoFastest ? "智能防抖" : "手动锁定"}：${active.displayTitle}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: VideoPlatformTheme.textPrimary,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                _buildLatencyBadge(
+                  active.latencyMs,
+                  speedLabel: active.speedLabel,
+                ),
+              ],
+            ),
+          )
+        : Text(
+            statusMsg.isNotEmpty
+                ? statusMsg
+                : '点击下方「立即更新」获取良心云节点并自动选出最快代理',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: 12,
+              color: isErr
+                  ? VideoPlatformTheme.danger
+                  : VideoPlatformTheme.textSecondary,
+            ),
+          );
 
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+      padding: EdgeInsets.symmetric(
+        horizontal: isCompact ? 12 : 18,
+        vertical: isCompact ? 8 : 12,
+      ),
       decoration: BoxDecoration(
         gradient: LinearGradient(
           begin: Alignment.topLeft,
@@ -568,192 +703,118 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
           bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
         ),
       ),
-      child: Wrap(
-        spacing: 14,
-        runSpacing: 10,
-        crossAxisAlignment: WrapCrossAlignment.center,
-        alignment: WrapAlignment.spaceBetween,
-        children: [
-          // Left: Master Switch + Active Node Badge
-          Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                decoration: BoxDecoration(
-                  color: enabled
-                      ? VideoPlatformTheme.accent.withValues(alpha: 0.16)
-                      : VideoPlatformTheme.bgCard,
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(
-                    color: enabled
-                        ? VideoPlatformTheme.accent
-                        : VideoPlatformTheme.borderSubtle,
-                  ),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
+      child: isCompact
+          ? Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  alignment: WrapAlignment.spaceBetween,
                   children: [
-                    SizedBox(
-                      height: 24,
-                      child: Switch(
-                        value: enabled,
-                        activeColor: VideoPlatformTheme.accent,
-                        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                        onChanged: (v) => _proxySvc.setProxyEnabled(v),
-                      ),
+                    switchBadge,
+                    modeSegmented,
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(child: activeNodeWidget),
+                    const SizedBox(width: 8),
+                    OutlinedButton.icon(
+                      onPressed:
+                          _proxySvc.isTestingNodes || _proxySvc.nodes.isEmpty
+                              ? null
+                              : () => _proxySvc.testAllNodesLatency(),
+                      icon: _proxySvc.isTestingNodes
+                          ? const SizedBox(
+                              width: 13,
+                              height: 13,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.speed_rounded, size: 15),
+                      label: Text(_proxySvc.isTestingNodes ? '测速中' : '测速'),
                     ),
                     const SizedBox(width: 6),
-                    Text(
-                      enabled ? '代理已开启' : '代理已关闭',
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w700,
-                        color: enabled
-                            ? VideoPlatformTheme.accent
-                            : VideoPlatformTheme.textSecondary,
+                    FilledButton.icon(
+                      onPressed: _proxySvc.isUpdatingSubscriptions
+                          ? null
+                          : () => _proxySvc.refreshAllSubscriptions(),
+                      icon: _proxySvc.isUpdatingSubscriptions
+                          ? const SizedBox(
+                              width: 13,
+                              height: 13,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            )
+                          : const Icon(Icons.sync_rounded, size: 15),
+                      label: Text(
+                        _proxySvc.isUpdatingSubscriptions ? '更新中' : '更新订阅',
                       ),
                     ),
                   ],
                 ),
-              ),
-              const SizedBox(width: 12),
-              if (active != null)
-                Flexible(
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 10,
-                      vertical: 6,
-                    ),
-                    decoration: BoxDecoration(
-                      color: VideoPlatformTheme.bgCard,
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: VideoPlatformTheme.borderSubtle),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          mode == ProxySelectionMode.autoFastest
-                              ? Icons.bolt_rounded
-                              : Icons.lock_outline_rounded,
-                          size: 15,
-                          color: enabled
-                              ? VideoPlatformTheme.accent
-                              : VideoPlatformTheme.textMuted,
-                        ),
-                        const SizedBox(width: 5),
-                        Flexible(
-                          child: Text(
-                            '${mode == ProxySelectionMode.autoFastest ? "智能防抖(卡顿自动换)" : "手动锁定"}：${active.displayTitle}',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: 12.5,
-                              fontWeight: FontWeight.w600,
-                              color: VideoPlatformTheme.textPrimary,
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        _buildLatencyBadge(
-                          active.latencyMs,
-                          speedLabel: active.speedLabel,
-                        ),
-                      ],
-                    ),
-                  ),
-                )
-              else
-                Flexible(
-                  child: Text(
-                    statusMsg.isNotEmpty
-                        ? statusMsg
-                        : '点击下方「立即更新订阅」获取良心云节点并自动选出最快代理',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: isErr
-                          ? VideoPlatformTheme.danger
-                          : VideoPlatformTheme.textSecondary,
-                    ),
-                  ),
-                ),
-            ],
-          ),
-
-          // Right: Selection Mode Switcher (Auto Fastest vs Manual) + Speed Test
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            children: [
-              // Manual vs Auto-Fastest Segmented Toggle
-              Container(
-                padding: const EdgeInsets.all(2),
-                decoration: BoxDecoration(
-                  color: VideoPlatformTheme.bgCard,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: VideoPlatformTheme.borderSubtle),
-                ),
-                child: Row(
+              ],
+            )
+          : Wrap(
+              spacing: 14,
+              runSpacing: 10,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              alignment: WrapAlignment.spaceBetween,
+              children: [
+                Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    _buildModeSegmentButton(
-                      selected: mode == ProxySelectionMode.autoFastest,
-                      icon: Icons.flash_on_rounded,
-                      label: '自动切换最快',
-                      onTap: () => _proxySvc.setSelectionMode(
-                        ProxySelectionMode.autoFastest,
-                      ),
+                    switchBadge,
+                    const SizedBox(width: 12),
+                    Flexible(child: activeNodeWidget),
+                  ],
+                ),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    modeSegmented,
+                    OutlinedButton.icon(
+                      onPressed:
+                          _proxySvc.isTestingNodes || _proxySvc.nodes.isEmpty
+                              ? null
+                              : () => _proxySvc.testAllNodesLatency(),
+                      icon: _proxySvc.isTestingNodes
+                          ? const SizedBox(
+                              width: 14,
+                              height: 14,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.speed_rounded, size: 16),
+                      label: Text(_proxySvc.isTestingNodes ? '测速中...' : '测速选优'),
                     ),
-                    _buildModeSegmentButton(
-                      selected: mode == ProxySelectionMode.manual,
-                      icon: Icons.touch_app_rounded,
-                      label: '手动指定代理',
-                      onTap: () => _proxySvc.setSelectionMode(
-                        ProxySelectionMode.manual,
+                    FilledButton.icon(
+                      onPressed: _proxySvc.isUpdatingSubscriptions
+                          ? null
+                          : () => _proxySvc.refreshAllSubscriptions(),
+                      icon: _proxySvc.isUpdatingSubscriptions
+                          ? const SizedBox(
+                              width: 14,
+                              height: 14,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            )
+                          : const Icon(Icons.sync_rounded, size: 16),
+                      label: Text(
+                        _proxySvc.isUpdatingSubscriptions ? '更新中...' : '更新订阅',
                       ),
                     ),
                   ],
                 ),
-              ),
-              OutlinedButton.icon(
-                onPressed: _proxySvc.isTestingNodes || _proxySvc.nodes.isEmpty
-                    ? null
-                    : () => _proxySvc.testAllNodesLatency(),
-                icon: _proxySvc.isTestingNodes
-                    ? const SizedBox(
-                        width: 14,
-                        height: 14,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Icon(Icons.speed_rounded, size: 16),
-                label: Text(_proxySvc.isTestingNodes ? '测速中...' : '测速选优'),
-              ),
-              FilledButton.icon(
-                onPressed: _proxySvc.isUpdatingSubscriptions
-                    ? null
-                    : () => _proxySvc.refreshAllSubscriptions(),
-                icon: _proxySvc.isUpdatingSubscriptions
-                    ? const SizedBox(
-                        width: 14,
-                        height: 14,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: Colors.white,
-                        ),
-                      )
-                    : const Icon(Icons.sync_rounded, size: 16),
-                label: Text(
-                  _proxySvc.isUpdatingSubscriptions ? '更新中...' : '更新订阅',
-                ),
-              ),
-            ],
-          ),
-        ],
-      ),
+              ],
+            ),
     );
   }
 
@@ -785,6 +846,7 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
               label,
               style: TextStyle(
                 fontSize: 12,
+                height: 1.2,
                 fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
                 color:
                     selected ? Colors.white : VideoPlatformTheme.textSecondary,
@@ -890,6 +952,7 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
               label,
               style: TextStyle(
                 fontSize: 12.5,
+                height: 1.2,
                 fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
                 color: selected
                     ? VideoPlatformTheme.accent
@@ -907,13 +970,14 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
   // ---------------------------------------------------------------------------
 
   Widget _buildSubscriptionsAndNodesTab() {
+    final isCompact = MediaQuery.sizeOf(context).width < 680;
     return SingleChildScrollView(
-      padding: const EdgeInsets.all(18),
+      padding: EdgeInsets.all(isCompact ? 12 : 18),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           _buildSubscriptionsSectionCard(),
-          const SizedBox(height: 18),
+          SizedBox(height: isCompact ? 12 : 18),
           _buildNodesSectionCard(),
         ],
       ),
@@ -922,10 +986,78 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
 
   Widget _buildSubscriptionsSectionCard() {
     final subs = _proxySvc.subscriptions;
+    final isCompact = MediaQuery.sizeOf(context).width < 680;
+
+    final titleRow = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(
+          Icons.rss_feed_rounded,
+          size: 18,
+          color: VideoPlatformTheme.accent,
+        ),
+        const SizedBox(width: 8),
+        Text(
+          '代理订阅源管理',
+          style: TextStyle(
+            fontSize: 14.5,
+            fontWeight: FontWeight.w700,
+            color: VideoPlatformTheme.textPrimary,
+          ),
+        ),
+        const SizedBox(width: 8),
+        Container(
+          padding: const EdgeInsets.symmetric(
+            horizontal: 7,
+            vertical: 2,
+          ),
+          decoration: BoxDecoration(
+            color: VideoPlatformTheme.accent.withValues(alpha: 0.14),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Text(
+            '${subs.length} 个订阅',
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+              color: VideoPlatformTheme.accent,
+            ),
+          ),
+        ),
+      ],
+    );
+
+    final actionButtons = Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        if (Platform.isAndroid || Platform.isIOS)
+          FilledButton.tonalIcon(
+            onPressed: _showQrScanAddSubscriptionSheet,
+            icon: const Icon(Icons.qr_code_scanner_rounded, size: 15),
+            label: const Text('扫码添加'),
+          ),
+        OutlinedButton.icon(
+          onPressed: () => _showUpsertSubscriptionDialog(),
+          icon: const Icon(Icons.add_link_rounded, size: 15),
+          label: const Text('新增订阅链接'),
+        ),
+        OutlinedButton.icon(
+          onPressed: _showPasteImportDialog,
+          icon: const Icon(Icons.content_paste_go_rounded, size: 15),
+          label: const Text('粘贴导入节点'),
+        ),
+        OutlinedButton.icon(
+          onPressed: () => _loadServerProxyConfig(syncToClient: true),
+          icon: const Icon(Icons.dns_outlined, size: 15),
+          label: const Text('同步服务端节点'),
+        ),
+      ],
+    );
 
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(16),
+      padding: EdgeInsets.all(isCompact ? 12 : 16),
       decoration: BoxDecoration(
         color: VideoPlatformTheme.bgElevated,
         borderRadius: BorderRadius.circular(10),
@@ -934,79 +1066,18 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Wrap(
-            spacing: 10,
-            runSpacing: 8,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            alignment: WrapAlignment.spaceBetween,
-            children: [
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    Icons.rss_feed_rounded,
-                    size: 18,
-                    color: VideoPlatformTheme.accent,
-                  ),
-                  const SizedBox(width: 8),
-                  Text(
-                    '代理订阅源管理',
-                    style: TextStyle(
-                      fontSize: 14.5,
-                      fontWeight: FontWeight.w700,
-                      color: VideoPlatformTheme.textPrimary,
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 7,
-                      vertical: 2,
-                    ),
-                    decoration: BoxDecoration(
-                      color: VideoPlatformTheme.accent.withValues(alpha: 0.14),
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                    child: Text(
-                      '${subs.length} 个订阅',
-                      style: TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.w600,
-                        color: VideoPlatformTheme.accent,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: [
-                  if (Platform.isAndroid || Platform.isIOS)
-                    FilledButton.tonalIcon(
-                      onPressed: _showQrScanAddSubscriptionSheet,
-                      icon: const Icon(Icons.qr_code_scanner_rounded, size: 16),
-                      label: const Text('扫码添加'),
-                    ),
-                  OutlinedButton.icon(
-                    onPressed: () => _showUpsertSubscriptionDialog(),
-                    icon: const Icon(Icons.add_link_rounded, size: 16),
-                    label: const Text('新增订阅链接'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: _showPasteImportDialog,
-                    icon: const Icon(Icons.content_paste_go_rounded, size: 15),
-                    label: const Text('粘贴导入节点'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: () => _loadServerProxyConfig(syncToClient: true),
-                    icon: const Icon(Icons.dns_outlined, size: 15),
-                    label: const Text('同步服务端节点'),
-                  ),
-                ],
-              ),
-            ],
-          ),
+          if (isCompact) ...[
+            titleRow,
+            const SizedBox(height: 10),
+            actionButtons,
+          ] else
+            Row(
+              children: [
+                titleRow,
+                const Spacer(),
+                Flexible(child: actionButtons),
+              ],
+            ),
           const SizedBox(height: 12),
           if (subs.isEmpty)
             Container(
@@ -1073,12 +1144,13 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
     final badgeBgColor = VideoPlatformTheme.isDark
         ? VideoPlatformTheme.bgElevated
         : VideoPlatformTheme.bgHover;
+    final isCompact = MediaQuery.sizeOf(context).width < 680;
 
     return Container(
       key: ValueKey('sub_tile_${sub.id}'),
       width: double.infinity,
       margin: const EdgeInsets.only(bottom: 10),
-      padding: const EdgeInsets.all(14),
+      padding: EdgeInsets.all(isCompact ? 12 : 14),
       decoration: BoxDecoration(
         color: tileBgColor,
         borderRadius: BorderRadius.circular(8),
@@ -1142,32 +1214,36 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
                   ),
                 ),
               ),
-              const SizedBox(width: 8),
-              FilledButton.tonalIcon(
-                onPressed: isUpdatingThis
-                    ? null
-                    : () => _proxySvc.refreshSubscription(sub.id),
-                icon: isUpdatingThis
-                    ? const SizedBox(
-                        width: 13,
-                        height: 13,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Icon(Icons.refresh_rounded, size: 15),
-                label: Text(isUpdatingThis ? '拉取中' : '立即更新'),
-              ),
-              IconButton(
-                onPressed: () => _showUpsertSubscriptionDialog(sub),
-                icon: const Icon(Icons.edit_outlined, size: 17),
-              ),
-              IconButton(
-                onPressed: () => _proxySvc.deleteSubscription(sub.id),
-                icon: Icon(
-                  Icons.delete_outline_rounded,
-                  size: 17,
-                  color: VideoPlatformTheme.textMuted,
+              if (!isCompact) ...[
+                const SizedBox(width: 8),
+                FilledButton.tonalIcon(
+                  onPressed: isUpdatingThis
+                      ? null
+                      : () => _proxySvc.refreshSubscription(sub.id),
+                  icon: isUpdatingThis
+                      ? const SizedBox(
+                          width: 13,
+                          height: 13,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.refresh_rounded, size: 15),
+                  label: Text(isUpdatingThis ? '拉取中' : '立即更新'),
                 ),
-              ),
+                IconButton(
+                  tooltip: '编辑订阅',
+                  onPressed: () => _showUpsertSubscriptionDialog(sub),
+                  icon: const Icon(Icons.edit_outlined, size: 17),
+                ),
+                IconButton(
+                  tooltip: '删除订阅',
+                  onPressed: () => _proxySvc.deleteSubscription(sub.id),
+                  icon: Icon(
+                    Icons.delete_outline_rounded,
+                    size: 17,
+                    color: VideoPlatformTheme.textMuted,
+                  ),
+                ),
+              ],
             ],
           ),
           const SizedBox(height: 6),
@@ -1230,6 +1306,41 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
               ),
             ],
           ),
+          if (isCompact) ...[
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                FilledButton.tonalIcon(
+                  onPressed: isUpdatingThis
+                      ? null
+                      : () => _proxySvc.refreshSubscription(sub.id),
+                  icon: isUpdatingThis
+                      ? const SizedBox(
+                          width: 13,
+                          height: 13,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.refresh_rounded, size: 15),
+                  label: Text(isUpdatingThis ? '拉取中...' : '立即更新'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: () => _showUpsertSubscriptionDialog(sub),
+                  icon: const Icon(Icons.edit_outlined, size: 15),
+                  label: const Text('编辑订阅'),
+                ),
+                OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: VideoPlatformTheme.danger,
+                  ),
+                  onPressed: () => _proxySvc.deleteSubscription(sub.id),
+                  icon: const Icon(Icons.delete_outline_rounded, size: 15),
+                  label: const Text('删除'),
+                ),
+              ],
+            ),
+          ],
           if (ratio != null && trafficText.isNotEmpty) ...[
             const SizedBox(height: 8),
             Row(
@@ -1287,6 +1398,7 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
 
   Widget _buildNodesSectionCard() {
     final allNodes = _proxySvc.nodes;
+    final isCompact = MediaQuery.sizeOf(context).width < 680;
     final filtered = allNodes.where((n) {
       if (_protocolFilter != 'all' &&
           n.protocol.toLowerCase() != _protocolFilter) {
@@ -1315,8 +1427,62 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
     final activeNodeId = _proxySvc.activeNode?.id;
     final fastestNodeId = _proxySvc.fastestNode?.id;
 
+    final titleRow = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(
+          Icons.public_rounded,
+          size: 18,
+          color: VideoPlatformTheme.accent,
+        ),
+        const SizedBox(width: 8),
+        Text(
+          '代理节点列表',
+          style: TextStyle(
+            fontSize: 14.5,
+            fontWeight: FontWeight.w700,
+            color: VideoPlatformTheme.textPrimary,
+          ),
+        ),
+        const SizedBox(width: 8),
+        Text(
+          '(${filtered.length} / ${allNodes.length})',
+          style: TextStyle(
+            fontSize: 12,
+            color: VideoPlatformTheme.textMuted,
+          ),
+        ),
+      ],
+    );
+
+    final actionButtons = Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        OutlinedButton.icon(
+          onPressed: _proxySvc.isTestingNodes || allNodes.isEmpty
+              ? null
+              : () => _proxySvc.testAllNodesLatency(),
+          icon: const Icon(Icons.bolt_rounded, size: 15),
+          label: const Text('全部测速'),
+        ),
+        OutlinedButton.icon(
+          onPressed: allNodes.any((n) => n.isTimeout)
+              ? () => _proxySvc.removeUnreachableNodes()
+              : null,
+          icon: const Icon(Icons.cleaning_services_outlined, size: 15),
+          label: const Text('清理超时'),
+        ),
+        FilledButton.tonalIcon(
+          onPressed: () => _showManualNodeDialog(),
+          icon: const Icon(Icons.add_rounded, size: 15),
+          label: const Text('手动新增节点'),
+        ),
+      ],
+    );
+
     return Container(
-      padding: const EdgeInsets.all(16),
+      padding: EdgeInsets.all(isCompact ? 12 : 16),
       decoration: BoxDecoration(
         color: VideoPlatformTheme.bgElevated,
         borderRadius: BorderRadius.circular(10),
@@ -1326,66 +1492,18 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           // Header + Action Buttons
-          Wrap(
-            spacing: 10,
-            runSpacing: 10,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            alignment: WrapAlignment.spaceBetween,
-            children: [
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    Icons.public_rounded,
-                    size: 18,
-                    color: VideoPlatformTheme.accent,
-                  ),
-                  const SizedBox(width: 8),
-                  Text(
-                    '代理节点列表',
-                    style: TextStyle(
-                      fontSize: 14.5,
-                      fontWeight: FontWeight.w700,
-                      color: VideoPlatformTheme.textPrimary,
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Text(
-                    '(${filtered.length} / ${allNodes.length})',
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: VideoPlatformTheme.textMuted,
-                    ),
-                  ),
-                ],
-              ),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: [
-                  OutlinedButton.icon(
-                    onPressed: _proxySvc.isTestingNodes || allNodes.isEmpty
-                        ? null
-                        : () => _proxySvc.testAllNodesLatency(),
-                    icon: const Icon(Icons.bolt_rounded, size: 16),
-                    label: const Text('全部测速'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: allNodes.any((n) => n.isTimeout)
-                        ? () => _proxySvc.removeUnreachableNodes()
-                        : null,
-                    icon: const Icon(Icons.cleaning_services_outlined, size: 15),
-                    label: const Text('清理超时'),
-                  ),
-                  FilledButton.tonalIcon(
-                    onPressed: () => _showManualNodeDialog(),
-                    icon: const Icon(Icons.add_rounded, size: 16),
-                    label: const Text('手动新增节点'),
-                  ),
-                ],
-              ),
-            ],
-          ),
+          if (isCompact) ...[
+            titleRow,
+            const SizedBox(height: 10),
+            actionButtons,
+          ] else
+            Row(
+              children: [
+                titleRow,
+                const Spacer(),
+                Flexible(child: actionButtons),
+              ],
+            ),
           const SizedBox(height: 12),
 
           // Filter & Search Bar
@@ -1395,8 +1513,8 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
             crossAxisAlignment: WrapCrossAlignment.center,
             children: [
               SizedBox(
-                width: 240,
-                height: 34,
+                width: isCompact ? double.infinity : 240,
+                height: 36,
                 child: TextField(
                   controller: _nodeSearchCtrl,
                   onChanged: (v) => setState(() => _nodeSearchQuery = v.trim()),
@@ -1471,7 +1589,7 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
           if (filtered.isEmpty)
             Container(
               width: double.infinity,
-              padding: const EdgeInsets.symmetric(vertical: 36, horizontal: 20),
+              padding: const EdgeInsets.symmetric(vertical: 32, horizontal: 16),
               decoration: BoxDecoration(
                 color: VideoPlatformTheme.bgCard,
                 borderRadius: BorderRadius.circular(8),
@@ -1498,6 +1616,8 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
                     const SizedBox(height: 14),
                     Wrap(
                       spacing: 10,
+                      runSpacing: 8,
+                      alignment: WrapAlignment.center,
                       children: [
                         FilledButton.icon(
                           onPressed: () => _proxySvc.refreshAllSubscriptions(),
@@ -1955,6 +2075,7 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
   ) {
     final effective = _proxySvc.resolveEffectiveRoute(scenario);
     final targetNode = _proxySvc.resolveNodeForScenario(scenario);
+    final isCompact = MediaQuery.sizeOf(context).width < 680;
 
     String effectiveLabel;
     Color effectiveColor;
@@ -1974,9 +2095,30 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
         break;
     }
 
+    final effectiveBadge = Container(
+      padding: const EdgeInsets.symmetric(
+        horizontal: 9,
+        vertical: 4,
+      ),
+      decoration: BoxDecoration(
+        color: effectiveColor.withValues(alpha: 0.14),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Text(
+        effectiveLabel,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: TextStyle(
+          fontSize: 11.5,
+          fontWeight: FontWeight.w600,
+          color: effectiveColor,
+        ),
+      ),
+    );
+
     return Container(
       margin: const EdgeInsets.only(bottom: 12),
-      padding: const EdgeInsets.all(16),
+      padding: EdgeInsets.all(isCompact ? 12 : 16),
       decoration: BoxDecoration(
         color: VideoPlatformTheme.bgElevated,
         borderRadius: BorderRadius.circular(10),
@@ -2024,26 +2166,16 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
                   ],
                 ),
               ),
-              Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 9,
-                  vertical: 4,
-                ),
-                decoration: BoxDecoration(
-                  color: effectiveColor.withValues(alpha: 0.14),
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                child: Text(
-                  effectiveLabel,
-                  style: TextStyle(
-                    fontSize: 11.5,
-                    fontWeight: FontWeight.w600,
-                    color: effectiveColor,
-                  ),
-                ),
-              ),
+              if (!isCompact) ...[
+                const SizedBox(width: 8),
+                Flexible(child: effectiveBadge),
+              ],
             ],
           ),
+          if (isCompact) ...[
+            const SizedBox(height: 8),
+            effectiveBadge,
+          ],
           const SizedBox(height: 12),
           Wrap(
             spacing: 8,
@@ -2071,55 +2203,65 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
               if (rule.mode != ScenarioRouteMode.direct &&
                   rule.mode != ScenarioRouteMode.serverRelay &&
                   allNodes.isNotEmpty) ...[
-                const SizedBox(width: 8),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10),
-                  decoration: BoxDecoration(
-                    color: VideoPlatformTheme.bgCard,
-                    borderRadius: BorderRadius.circular(6),
-                    border: Border.all(color: VideoPlatformTheme.borderSubtle),
+                ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxWidth: isCompact ? 310 : 380,
                   ),
-                  child: DropdownButtonHideUnderline(
-                    child: DropdownButton<String>(
-                      value: (rule.specificNodeId != null &&
-                              allNodes.any((n) => n.id == rule.specificNodeId))
-                          ? rule.specificNodeId!
-                          : '__global__',
-                      dropdownColor: VideoPlatformTheme.bgElevated,
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: VideoPlatformTheme.textPrimary,
-                      ),
-                      items: [
-                        DropdownMenuItem(
-                          value: '__global__',
-                          child: Text(
-                            '节点：跟随全局 (${_proxySvc.selectionMode == ProxySelectionMode.autoFastest ? "自动最快" : (_proxySvc.activeNode?.displayTitle ?? "默认")})',
-                          ),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    decoration: BoxDecoration(
+                      color: VideoPlatformTheme.bgCard,
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(color: VideoPlatformTheme.borderSubtle),
+                    ),
+                    child: DropdownButtonHideUnderline(
+                      child: DropdownButton<String>(
+                        isExpanded: true,
+                        value: (rule.specificNodeId != null &&
+                                allNodes
+                                    .any((n) => n.id == rule.specificNodeId))
+                            ? rule.specificNodeId!
+                            : '__global__',
+                        dropdownColor: VideoPlatformTheme.bgElevated,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: VideoPlatformTheme.textPrimary,
                         ),
-                        ...allNodes.map(
-                          (n) => DropdownMenuItem(
-                            value: n.id,
+                        items: [
+                          DropdownMenuItem(
+                            value: '__global__',
                             child: Text(
-                              '专属节点：${n.displayTitle} (${n.latencyLabel})',
+                              '节点：跟随全局 (${_proxySvc.selectionMode == ProxySelectionMode.autoFastest ? "自动最快" : (_proxySvc.activeNode?.displayTitle ?? "默认")})',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
                             ),
                           ),
-                        ),
-                      ],
-                      onChanged: (val) {
-                        if (val == null) return;
-                        if (val == '__global__') {
-                          _proxySvc.updateScenarioRule(
-                            scenario,
-                            clearSpecificNode: true,
-                          );
-                        } else {
-                          _proxySvc.updateScenarioRule(
-                            scenario,
-                            specificNodeId: val,
-                          );
-                        }
-                      },
+                          ...allNodes.map(
+                            (n) => DropdownMenuItem(
+                              value: n.id,
+                              child: Text(
+                                '专属节点：${n.displayTitle} (${n.latencyLabel})',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ),
+                        ],
+                        onChanged: (val) {
+                          if (val == null) return;
+                          if (val == '__global__') {
+                            _proxySvc.updateScenarioRule(
+                              scenario,
+                              clearSpecificNode: true,
+                            );
+                          } else {
+                            _proxySvc.updateScenarioRule(
+                              scenario,
+                              specificNodeId: val,
+                            );
+                          }
+                        },
+                      ),
                     ),
                   ),
                 ),
@@ -2145,22 +2287,35 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
       );
     }
 
+    final isCompact = MediaQuery.sizeOf(context).width < 680;
+
     return Column(
       children: [
         Container(
-          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+          width: double.infinity,
+          padding: EdgeInsets.symmetric(
+            horizontal: isCompact ? 12 : 18,
+            vertical: 10,
+          ),
           decoration: BoxDecoration(
             color: VideoPlatformTheme.bgCard,
             border: Border(
               bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
             ),
           ),
-          child: Row(
+          child: Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            alignment: WrapAlignment.spaceBetween,
             children: [
-              Expanded(
+              ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxWidth: isCompact ? 340 : 480,
+                ),
                 child: Text(
                   _serverStatusMessage,
-                  maxLines: 1,
+                  maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
                     fontSize: 12,
@@ -2172,23 +2327,26 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
                   ),
                 ),
               ),
-              const SizedBox(width: 8),
-              OutlinedButton.icon(
-                onPressed: () => _loadServerProxyConfig(syncToClient: true),
-                icon: const Icon(Icons.download_done_rounded, size: 15),
-                label: const Text('导入到客户端节点池'),
-              ),
-              const SizedBox(width: 8),
-              OutlinedButton.icon(
-                onPressed: _isLoadingServer ? null : _loadServerProxyConfig,
-                icon: const Icon(Icons.refresh, size: 16),
-                label: const Text('刷新状态'),
-              ),
-              const SizedBox(width: 8),
-              FilledButton.icon(
-                onPressed: _isSavingServer ? null : _saveAndApplyAll,
-                icon: const Icon(Icons.save_outlined, size: 16),
-                label: Text(_isSavingServer ? '正在应用...' : '保存并应用'),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  OutlinedButton.icon(
+                    onPressed: () => _loadServerProxyConfig(syncToClient: true),
+                    icon: const Icon(Icons.download_done_rounded, size: 15),
+                    label: const Text('导入到客户端节点池'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _isLoadingServer ? null : _loadServerProxyConfig,
+                    icon: const Icon(Icons.refresh, size: 15),
+                    label: const Text('刷新状态'),
+                  ),
+                  FilledButton.icon(
+                    onPressed: _isSavingServer ? null : _saveAndApplyAll,
+                    icon: const Icon(Icons.save_outlined, size: 15),
+                    label: Text(_isSavingServer ? '正在应用...' : '保存并应用'),
+                  ),
+                ],
               ),
             ],
           ),
@@ -2656,117 +2814,133 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
                     : VideoPlatformTheme.borderSubtle,
               ),
             ),
-            child: Row(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Switch(
-                  value: s.enabled,
-                  activeColor: VideoPlatformTheme.accent,
-                  onChanged: (val) {
-                    setState(() {
-                      _services[index] = s.copyWith(enabled: val);
-                      if (_editingId == s.id) _enabled = val;
-                      _isServerDirty = true;
-                      _serverStatusMessage =
-                          '“${s.name}”将在点击“保存并应用”后${val ? "启动" : "停止"}';
-                    });
-                  },
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
+                Row(
+                  children: [
+                    Switch(
+                      value: s.enabled,
+                      activeColor: VideoPlatformTheme.accent,
+                      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      onChanged: (val) {
+                        setState(() {
+                          _services[index] = s.copyWith(enabled: val);
+                          if (_editingId == s.id) _enabled = val;
+                          _isServerDirty = true;
+                          _serverStatusMessage =
+                              '“${s.name}”将在点击“保存并应用”后${val ? "启动" : "停止"}';
+                        });
+                      },
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 6,
-                              vertical: 2,
-                            ),
-                            decoration: BoxDecoration(
-                              color: VideoPlatformTheme.bgCard,
-                              borderRadius: BorderRadius.circular(4),
-                              border: Border.all(
-                                color: VideoPlatformTheme.borderStrong,
+                          Row(
+                            children: [
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 6,
+                                  vertical: 2,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: VideoPlatformTheme.bgCard,
+                                  borderRadius: BorderRadius.circular(4),
+                                  border: Border.all(
+                                    color: VideoPlatformTheme.borderStrong,
+                                  ),
+                                ),
+                                child: Text(
+                                  s.protocolLabel,
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                    color: VideoPlatformTheme.accent,
+                                  ),
+                                ),
                               ),
-                            ),
-                            child: Text(
-                              s.protocolLabel,
-                              style: TextStyle(
-                                fontSize: 11,
-                                fontWeight: FontWeight.w600,
-                                color: VideoPlatformTheme.accent,
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  s.name,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.w600,
+                                    color: VideoPlatformTheme.textPrimary,
+                                  ),
+                                ),
                               ),
+                            ],
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            '监听地址：${s.listenHost}:${s.port}',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: VideoPlatformTheme.textSecondary,
                             ),
                           ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              s.name,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontSize: 14,
-                                fontWeight: FontWeight.w600,
-                                color: VideoPlatformTheme.textPrimary,
-                              ),
+                          const SizedBox(height: 2),
+                          Text(
+                            _formatRuntimeStatus(s, runtime),
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: hasError
+                                  ? VideoPlatformTheme.danger
+                                  : (isRunning
+                                      ? VideoPlatformTheme.success
+                                      : VideoPlatformTheme.textMuted),
                             ),
                           ),
                         ],
                       ),
-                      const SizedBox(height: 4),
-                      Text(
-                        '监听地址：${s.listenHost}:${s.port}',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: VideoPlatformTheme.textSecondary,
-                        ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  alignment: WrapAlignment.end,
+                  children: [
+                    OutlinedButton(
+                      onPressed: _testingServiceId == s.id
+                          ? null
+                          : () => _testSingleService(s),
+                      child: Text(_testingServiceId == s.id ? '检测中...' : '检测状态'),
+                    ),
+                    OutlinedButton.icon(
+                      icon: const Icon(Icons.qr_code_rounded, size: 15),
+                      label: const Text('分享'),
+                      onPressed: () => _showShareProxyDialog(s),
+                    ),
+                    OutlinedButton.icon(
+                      icon: const Icon(Icons.edit_outlined, size: 15),
+                      label: const Text('编辑'),
+                      onPressed: () => _resetEditor(s),
+                    ),
+                    OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: VideoPlatformTheme.danger,
                       ),
-                      const SizedBox(height: 2),
-                      Text(
-                        _formatRuntimeStatus(s, runtime),
-                        style: TextStyle(
-                          fontSize: 11,
-                          color: hasError
-                              ? VideoPlatformTheme.danger
-                              : (isRunning
-                                  ? VideoPlatformTheme.success
-                                  : VideoPlatformTheme.textMuted),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                TextButton(
-                  onPressed: _testingServiceId == s.id
-                      ? null
-                      : () => _testSingleService(s),
-                  child: Text(_testingServiceId == s.id ? '检测中...' : '状态'),
-                ),
-                IconButton(
-                  icon: const Icon(Icons.qr_code_rounded, size: 18),
-                  onPressed: () => _showShareProxyDialog(s),
-                ),
-                IconButton(
-                  icon: const Icon(Icons.edit_outlined, size: 18),
-                  onPressed: () => _resetEditor(s),
-                ),
-                IconButton(
-                  icon: Icon(
-                    Icons.delete_outline,
-                    size: 18,
-                    color: VideoPlatformTheme.textMuted,
-                  ),
-                  onPressed: () {
-                    setState(() {
-                      _services.removeWhere((item) => item.id == s.id);
-                      _statuses.remove(s.id);
-                      if (_editingId == s.id) _applyEditorFields(null);
-                      _isServerDirty = true;
-                      _serverStatusMessage =
-                          '已从列表移除“${s.name}”，请点击“保存并应用”停止监听';
-                    });
-                  },
+                      icon: const Icon(Icons.delete_outline, size: 15),
+                      label: const Text('删除'),
+                      onPressed: () {
+                        setState(() {
+                          _services.removeWhere((item) => item.id == s.id);
+                          _statuses.remove(s.id);
+                          if (_editingId == s.id) _applyEditorFields(null);
+                          _isServerDirty = true;
+                          _serverStatusMessage =
+                              '已从列表移除“${s.name}”，请点击“保存并应用”停止监听';
+                        });
+                      },
+                    ),
+                  ],
                 ),
               ],
             ),
@@ -2839,25 +3013,38 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
               Expanded(
                 flex: 2,
                 child: DropdownButtonFormField<String>(
+                  isExpanded: true,
                   value: _protocol,
                   dropdownColor: VideoPlatformTheme.bgElevated,
                   decoration: const InputDecoration(labelText: '代理协议'),
                   items: const [
                     DropdownMenuItem(
                       value: 'http',
-                      child: Text('HTTP (支持 CONNECT)'),
+                      child: Text(
+                        'HTTP (支持 CONNECT)',
+                        overflow: TextOverflow.ellipsis,
+                      ),
                     ),
                     DropdownMenuItem(
                       value: 'socks5',
-                      child: Text('SOCKS5 (兼容 HTTP)'),
+                      child: Text(
+                        'SOCKS5 (兼容 HTTP)',
+                        overflow: TextOverflow.ellipsis,
+                      ),
                     ),
                     DropdownMenuItem(
                       value: 'ss',
-                      child: Text('Shadowsocks (SS)'),
+                      child: Text(
+                        'Shadowsocks (SS)',
+                        overflow: TextOverflow.ellipsis,
+                      ),
                     ),
                     DropdownMenuItem(
                       value: 'trojan',
-                      child: Text('Trojan (TCP/TLS)'),
+                      child: Text(
+                        'Trojan (TCP/TLS)',
+                        overflow: TextOverflow.ellipsis,
+                      ),
                     ),
                   ],
                   onChanged: (val) {
@@ -2968,6 +3155,7 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
           if (isSs) ...[
             const SizedBox(height: 12),
             DropdownButtonFormField<String>(
+              isExpanded: true,
               value: _cipher,
               dropdownColor: VideoPlatformTheme.bgElevated,
               decoration: const InputDecoration(
@@ -3127,8 +3315,10 @@ class _UpsertSubscriptionDialogState extends State<_UpsertSubscriptionDialog> {
   @override
   Widget build(BuildContext context) {
     final existing = widget.existing;
+    final isCompact = MediaQuery.sizeOf(context).width < 560;
     return AlertDialog(
       backgroundColor: VideoPlatformTheme.bgElevated,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 16),
       title: Row(
         children: [
           Icon(
@@ -3195,6 +3385,7 @@ class _UpsertSubscriptionDialogState extends State<_UpsertSubscriptionDialog> {
                         style: TextStyle(fontSize: 11.5),
                       ),
                       onPressed: () async {
+                        FocusManager.instance.primaryFocus?.unfocus();
                         final raw = await _qrScannerChannel
                             .invokeMethod<String>('scanCamera');
                         if (!mounted || raw == null || raw.trim().isEmpty) {
@@ -3224,6 +3415,7 @@ class _UpsertSubscriptionDialogState extends State<_UpsertSubscriptionDialog> {
                         style: TextStyle(fontSize: 11.5),
                       ),
                       onPressed: () async {
+                        FocusManager.instance.primaryFocus?.unfocus();
                         final raw = await _qrScannerChannel
                             .invokeMethod<String>('scanGallery');
                         if (!mounted || raw == null || raw.trim().isEmpty) {
@@ -3261,41 +3453,72 @@ class _UpsertSubscriptionDialogState extends State<_UpsertSubscriptionDialog> {
                 ],
               ),
               const SizedBox(height: 12),
-              Row(
-                children: [
-                  Expanded(
-                    child: DropdownButtonFormField<int>(
-                      value: [0, 6, 12, 24, 72].contains(_autoHours)
-                          ? _autoHours
-                          : 12,
-                      dropdownColor: VideoPlatformTheme.bgElevated,
-                      decoration: const InputDecoration(
-                        labelText: '自动更新周期',
-                      ),
-                      items: const [
-                        DropdownMenuItem(value: 6, child: Text('每 6 小时更新')),
-                        DropdownMenuItem(value: 12, child: Text('每 12 小时更新')),
-                        DropdownMenuItem(value: 24, child: Text('每 24 小时更新')),
-                        DropdownMenuItem(value: 72, child: Text('每 3 天更新')),
-                        DropdownMenuItem(value: 0, child: Text('仅手动更新')),
-                      ],
-                      onChanged: (v) {
-                        if (v != null) setState(() => _autoHours = v);
-                      },
-                    ),
+              if (isCompact) ...[
+                DropdownButtonFormField<int>(
+                  isExpanded: true,
+                  value: [0, 6, 12, 24, 72].contains(_autoHours)
+                      ? _autoHours
+                      : 12,
+                  dropdownColor: VideoPlatformTheme.bgElevated,
+                  decoration: const InputDecoration(
+                    labelText: '自动更新周期',
                   ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: TextField(
-                      controller: _uaCtrl,
-                      decoration: const InputDecoration(
-                        labelText: '自定义 User-Agent (可选)',
-                        hintText: '默认自动轮询 Clash / v2rayNG',
+                  items: const [
+                    DropdownMenuItem(value: 6, child: Text('每 6 小时更新')),
+                    DropdownMenuItem(value: 12, child: Text('每 12 小时更新')),
+                    DropdownMenuItem(value: 24, child: Text('每 24 小时更新')),
+                    DropdownMenuItem(value: 72, child: Text('每 3 天更新')),
+                    DropdownMenuItem(value: 0, child: Text('仅手动更新')),
+                  ],
+                  onChanged: (v) {
+                    if (v != null) setState(() => _autoHours = v);
+                  },
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _uaCtrl,
+                  decoration: const InputDecoration(
+                    labelText: '自定义 User-Agent (可选)',
+                    hintText: '默认自动轮询 Clash / v2rayNG',
+                  ),
+                ),
+              ] else
+                Row(
+                  children: [
+                    Expanded(
+                      child: DropdownButtonFormField<int>(
+                        isExpanded: true,
+                        value: [0, 6, 12, 24, 72].contains(_autoHours)
+                            ? _autoHours
+                            : 12,
+                        dropdownColor: VideoPlatformTheme.bgElevated,
+                        decoration: const InputDecoration(
+                          labelText: '自动更新周期',
+                        ),
+                        items: const [
+                          DropdownMenuItem(value: 6, child: Text('每 6 小时更新')),
+                          DropdownMenuItem(value: 12, child: Text('每 12 小时更新')),
+                          DropdownMenuItem(value: 24, child: Text('每 24 小时更新')),
+                          DropdownMenuItem(value: 72, child: Text('每 3 天更新')),
+                          DropdownMenuItem(value: 0, child: Text('仅手动更新')),
+                        ],
+                        onChanged: (v) {
+                          if (v != null) setState(() => _autoHours = v);
+                        },
                       ),
                     ),
-                  ),
-                ],
-              ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: TextField(
+                        controller: _uaCtrl,
+                        decoration: const InputDecoration(
+                          labelText: '自定义 User-Agent (可选)',
+                          hintText: '默认自动轮询 Clash / v2rayNG',
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
               const SizedBox(height: 8),
               SwitchListTile(
                 contentPadding: EdgeInsets.zero,
@@ -3351,6 +3574,7 @@ class _PasteImportNodesDialogState extends State<_PasteImportNodesDialog> {
   Widget build(BuildContext context) {
     return AlertDialog(
       backgroundColor: VideoPlatformTheme.bgElevated,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 16),
       title: Row(
         children: [
           Icon(
@@ -3386,7 +3610,7 @@ class _PasteImportNodesDialogState extends State<_PasteImportNodesDialog> {
               const SizedBox(height: 10),
               TextField(
                 controller: _textCtrl,
-                maxLines: 8,
+                maxLines: 7,
                 decoration: InputDecoration(
                   hintText:
                       'ss://...\ntrojan://...\nvmess://...\n或粘贴 Clash proxies: 配置片段',
@@ -3409,7 +3633,7 @@ class _PasteImportNodesDialogState extends State<_PasteImportNodesDialog> {
             }
           },
           icon: const Icon(Icons.paste_rounded, size: 15),
-          label: const Text('从剪贴板粘贴'),
+          label: const Text('粘贴剪贴板'),
         ),
         TextButton(
           onPressed: () {
@@ -3426,7 +3650,7 @@ class _PasteImportNodesDialogState extends State<_PasteImportNodesDialog> {
             Navigator.of(context).pop(raw);
           },
           icon: const Icon(Icons.check_rounded, size: 16),
-          label: const Text('解析并导入'),
+          label: const Text('解析导入'),
         ),
       ],
     );
@@ -3496,6 +3720,7 @@ class _ManualProxyNodeDialogState extends State<_ManualProxyNodeDialog> {
 
     return AlertDialog(
       backgroundColor: VideoPlatformTheme.bgElevated,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 16),
       title: Text(
         existing == null ? '手动新增代理节点' : '编辑代理节点 · ${existing.name}',
         maxLines: 1,
@@ -3524,6 +3749,7 @@ class _ManualProxyNodeDialogState extends State<_ManualProxyNodeDialog> {
                   Expanded(
                     flex: 2,
                     child: DropdownButtonFormField<String>(
+                      isExpanded: true,
                       value: [
                         'socks5',
                         'http',
@@ -3542,31 +3768,31 @@ class _ManualProxyNodeDialogState extends State<_ManualProxyNodeDialog> {
                       items: const [
                         DropdownMenuItem(
                           value: 'socks5',
-                          child: Text('SOCKS5'),
+                          child: Text('SOCKS5', overflow: TextOverflow.ellipsis),
                         ),
                         DropdownMenuItem(
                           value: 'http',
-                          child: Text('HTTP'),
+                          child: Text('HTTP', overflow: TextOverflow.ellipsis),
                         ),
                         DropdownMenuItem(
                           value: 'https',
-                          child: Text('HTTPS'),
+                          child: Text('HTTPS', overflow: TextOverflow.ellipsis),
                         ),
                         DropdownMenuItem(
                           value: 'ss',
-                          child: Text('Shadowsocks'),
+                          child: Text('SS', overflow: TextOverflow.ellipsis),
                         ),
                         DropdownMenuItem(
                           value: 'trojan',
-                          child: Text('Trojan'),
+                          child: Text('Trojan', overflow: TextOverflow.ellipsis),
                         ),
                         DropdownMenuItem(
                           value: 'vmess',
-                          child: Text('VMess'),
+                          child: Text('VMess', overflow: TextOverflow.ellipsis),
                         ),
                         DropdownMenuItem(
                           value: 'vless',
-                          child: Text('VLESS'),
+                          child: Text('VLESS', overflow: TextOverflow.ellipsis),
                         ),
                       ],
                       onChanged: (v) {
@@ -3639,6 +3865,7 @@ class _ManualProxyNodeDialogState extends State<_ManualProxyNodeDialog> {
               if (isSs) ...[
                 const SizedBox(height: 12),
                 DropdownButtonFormField<String>(
+                  isExpanded: true,
                   value: widget.ssCiphers.contains(_cipher)
                       ? _cipher
                       : 'aes-256-gcm',
