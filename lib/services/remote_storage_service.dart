@@ -261,6 +261,20 @@ class RemoteStorageService {
     String path, {
     String fallbackUrl = '',
   }) async {
+    final info = await resolveAlistStreamInfo(
+      mount,
+      path,
+      fallbackUrl: fallbackUrl,
+    );
+    return info.url;
+  }
+
+  Future<({String url, Map<String, String> headers, String alistProxyUrl})>
+      resolveAlistStreamInfo(
+    StorageMount mount,
+    String path, {
+    String fallbackUrl = '',
+  }) async {
     final norm = normalizePath(path);
     final root = await _alistJsonRequest(
       mount,
@@ -268,22 +282,58 @@ class RemoteStorageService {
       {'path': norm, 'password': ''},
     );
     final data = root['data'];
-    if (data is Map<String, dynamic>) {
-      final rawUrl = (data['raw_url'] ?? '').toString().trim();
-      if (rawUrl.startsWith('http')) {
-        return rawUrl;
-      }
-      final sign = (data['sign'] ?? '').toString().trim();
-      final base = cleanBaseUrl(mount.baseUrl);
-      final encodedPath = norm.split('/').map(Uri.encodeComponent).join('/');
-      if (sign.isNotEmpty) {
-        return '$base/d$encodedPath?sign=${Uri.encodeQueryComponent(sign)}';
-      }
-    }
-    if (fallbackUrl.isNotEmpty) return fallbackUrl;
     final base = cleanBaseUrl(mount.baseUrl);
     final encodedPath = norm.split('/').map(Uri.encodeComponent).join('/');
-    return '$base/d$encodedPath';
+    String rawUrl = '';
+    String sign = '';
+    final extractedHeaders = <String, String>{};
+
+    if (data is Map<String, dynamic>) {
+      rawUrl = (data['raw_url'] ?? '').toString().trim();
+      sign = (data['sign'] ?? '').toString().trim();
+      final rawHdr = data['header'] ?? data['headers'];
+      if (rawHdr is Map) {
+        rawHdr.forEach((k, v) {
+          final key = k.toString().trim();
+          if (key.isEmpty) return;
+          if (v is List && v.isNotEmpty) {
+            final sep = key.toLowerCase() == 'cookie' ? '; ' : ', ';
+            final sv = v
+                .map((e) => (e ?? '').toString().trim())
+                .where((s) => s.isNotEmpty)
+                .join(sep);
+            if (sv.isNotEmpty) extractedHeaders[key] = sv;
+          } else if (v != null) {
+            final sv = v.toString().trim();
+            if (sv.isNotEmpty) extractedHeaders[key] = sv;
+          }
+        });
+      }
+    }
+
+    final String alistProxyUrl;
+    if (sign.isNotEmpty) {
+      alistProxyUrl = '$base/d$encodedPath?sign=${Uri.encodeQueryComponent(sign)}';
+    } else if (fallbackUrl.isNotEmpty) {
+      alistProxyUrl = fallbackUrl;
+    } else {
+      alistProxyUrl = '$base/d$encodedPath';
+    }
+
+    final primaryUrl = rawUrl.startsWith('http') ? rawUrl : alistProxyUrl;
+    final lowerUrl = primaryUrl.toLowerCase();
+    if (lowerUrl.contains('115cdn') || lowerUrl.contains('115.com')) {
+      if (!extractedHeaders.keys
+          .any((k) => k.toLowerCase() == 'user-agent')) {
+        extractedHeaders['User-Agent'] =
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 115Browser/27.0.5.7';
+      }
+    }
+    return (
+      url: primaryUrl,
+      headers: extractedHeaders,
+      alistProxyUrl: alistProxyUrl,
+    );
   }
 
   Future<void> createAlistFolder(

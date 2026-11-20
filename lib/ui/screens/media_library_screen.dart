@@ -424,14 +424,14 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
           subtitle: '流光服务端 · ${entry.formattedSize}',
         );
       case StorageSourceKind.alist:
-        final url = await RemoteStorageService.instance.resolveAlistDirectUrl(
+        final info = await RemoteStorageService.instance.resolveAlistStreamInfo(
           mount,
           entry.path,
           fallbackUrl: entry.rawDownloadUrl,
         );
         return (
-          url: url,
-          headers: const <String, String>{},
+          url: info.url,
+          headers: info.headers,
           subtitle: '${mount.name} · ${entry.formattedSize}',
         );
       case StorageSourceKind.webdav:
@@ -448,12 +448,30 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
         if (entry.pickcode115.isEmpty) {
           throw const ApiException('缺少 115 pickcode');
         }
-        final directUrl = await Local115DirectService.instance
+        final ext = entry.normalizedExt;
+        final needsHlsTranscode = const {
+          '.f4v',
+          '.flv',
+          '.mkv',
+          '.avi',
+          '.rmvb',
+          '.wmv',
+          '.ts',
+          '.webm',
+          '.iso',
+        }.contains(ext);
+        String? directUrl;
+        if (needsHlsTranscode) {
+          directUrl = await Local115DirectService.instance
+              .resolvePickcodeHlsM3u8Url(entry.pickcode115);
+        }
+        directUrl ??= await Local115DirectService.instance
             .resolvePickcodeStreamUrl(entry.pickcode115);
         if (directUrl == null || directUrl.isEmpty) {
           throw const ApiException('无法解析 115 直链，请确认 115 登录状态');
         }
-        final headers = Local115DirectService.instance.requestHeaders;
+        final headers =
+            Local115DirectService.instance.requestHeadersForUrl(directUrl);
         return (
           url: directUrl,
           headers: headers,
@@ -537,13 +555,13 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
         final resolved = await _resolveEntryEndpoint(entry);
         String playUrl = resolved.url;
         Map<String, String> playHeaders = resolved.headers;
-        if (entry.sourceKind == StorageSourceKind.cloud115 &&
-            !playUrl.toLowerCase().contains('.m3u8')) {
+        if (entry.sourceKind == StorageSourceKind.cloud115) {
+          final isHls = playUrl.toLowerCase().contains('.m3u8');
           playUrl = await Local115DirectService.instance
               .wrapWithLocal115HeaderProxy(
                 playUrl,
                 playHeaders,
-                extHint: entry.normalizedExt,
+                extHint: isHls ? '.m3u8' : entry.normalizedExt,
               );
           playHeaders = const {};
         }

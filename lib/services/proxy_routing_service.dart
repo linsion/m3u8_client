@@ -2237,6 +2237,86 @@ class _UpstreamTunnel {
   });
 }
 
+class _TelegramLiveStitchBlock {
+  final int index;
+  final int startOffset;
+  final Uint8List buffer;
+  int expectedLength;
+  int availableEnd;
+  bool failed = false;
+  int readers = 0;
+  void Function()? cancelTransfer;
+  Completer<void> _changed = Completer<void>();
+
+  _TelegramLiveStitchBlock(
+    this.index,
+    this.expectedLength, {
+    this.startOffset = 0,
+  }) : buffer = Uint8List(expectedLength - startOffset),
+       availableEnd = startOffset;
+
+  bool get complete => availableEnd == expectedLength;
+
+  void append(List<int> bytes, int count) {
+    final start = availableEnd - startOffset;
+    buffer.setRange(start, start + count, bytes);
+    availableEnd += count;
+    _notify();
+  }
+
+  void cancel() {
+    if (failed) return;
+    failed = true;
+    cancelTransfer?.call();
+    _notify();
+  }
+
+  void _notify() {
+    _changed.complete();
+    _changed = Completer<void>();
+  }
+
+  Future<void> waitForData(int offset) async {
+    while (availableEnd <= offset && !failed && !complete) {
+      await _changed.future;
+    }
+  }
+}
+
+typedef _TelegramSessionKey = ({String url, String headers, String route});
+
+class _TelegramParallelStitchSession {
+  final Uri uri;
+  final Map<String, String> headers;
+  final List<ProxyNode?> routes;
+  final Map<int, _TelegramLiveStitchBlock> blocks = {};
+  final Set<_TelegramLiveStitchBlock> transfers = {};
+  final Set<Socket> readers = {};
+
+  int totalSize = 0;
+  String contentType = 'application/octet-stream';
+  Future<bool>? metadata;
+  bool rangeUnsupported = false;
+  bool closed = false;
+  int routeIndex = 0;
+  int playhead = 0;
+  int playheadOffset = 0;
+  int playheadEnd = 0;
+  Socket? playheadReader;
+  Timer? idleTimer;
+
+  _TelegramParallelStitchSession(this.uri, this.headers, this.routes);
+
+  void close() {
+    closed = true;
+    idleTimer?.cancel();
+    for (final block in transfers) {
+      block.cancel();
+    }
+    blocks.clear();
+  }
+}
+
 /// Local loopback HTTP proxy bridge (`127.0.0.1:<ephemeralPort>`) that allows
 /// Dart `HttpClient` and `media_kit` (`libmpv`) to transparently tunnel through
 /// HTTP, HTTPS, SOCKS5, Trojan (with SNI), VLESS (WS/TCP), and Shadowsocks AEAD proxy nodes,
@@ -2248,7 +2328,7 @@ class LocalProxyTunnelBridge {
   final void Function(String nodeId, {required bool success, int? rttMs})?
       _onNodeFeedback;
 
-  final Map<String, HttpClient> _streamRelayClientsByNodeId =
+  final Map<String, HttpClient> _streamRelayClients =
       <String, HttpClient>{};
   HttpClient? _directRelayHttpClient;
 
@@ -2258,6 +2338,20 @@ class LocalProxyTunnelBridge {
   static const int _maxPrefetchCacheSegments = 24;
   static const int _maxPrefetchCacheBytes = 48 * 1024 * 1024;
 
+  static const int _tgBlockSize = 2 * 1024 * 1024;
+  static const int _tgMaxWorkersPerSession = 3;
+  static const int _tgLookaheadBlocks = 8;
+  static const int _tgMaxBehindBlocks = 2;
+  static final _contentRangePattern = RegExp(r'^bytes (\d+)-(\d+)/(\d+)$');
+  final _tgStitchSessions = <_TelegramSessionKey, _TelegramParallelStitchSession>{};
+  final _clientCleanups = <Socket, void Function()>{};
+  final _clientDisconnectHandlers = <Socket, void Function()>{};
+
+  Future<int>? _bridgeStart;
+  int _listenerGeneration = 0;
+  int _prefetchGeneration = 0;
+  final _cancelPrefetches = <void Function()>{};
+  String? _playlistScope;
   List<String> _playlistSegmentUrls = <String>[];
   final Map<String, int> _playlistSegmentIndexMap = <String, int>{};
   final LinkedHashMap<String, ({Uint8List bytes, String contentType, int timestampMs})>
@@ -2357,14 +2451,34 @@ class LocalProxyTunnelBridge {
     return totalBytes / 1.5;
   }
 
-  void resetSessionState() {
-    winningNodeForSession = null;
+  void _clearPlaylistPrefetch() {
+    _prefetchGeneration++;
+    for (final cancel in _cancelPrefetches) {
+      cancel();
+    }
+    _playlistScope = null;
+    _playlistSegmentUrls = [];
+    _playlistSegmentIndexMap.clear();
     _initialPrefetchTimer?.cancel();
     _initialPrefetchTimer = null;
     _pendingPrefetchQueue.clear();
     _inFlightSegmentFetches.clear();
     _prefetchedSegmentCache.clear();
     _prefetchedCacheTotalBytes = 0;
+  }
+
+  void resetSessionState({bool force = false}) {
+    _clearPlaylistPrefetch();
+    for (final session in _tgStitchSessions.values.toList()) {
+      // Active players may belong to another scenario. Their sockets release
+      // the old route when they reopen or exit.
+      if (force || session.readers.isEmpty) session.close();
+    }
+    _tgStitchSessions.removeWhere((_, session) => session.closed);
+    for (final hc in _streamRelayClients.values) {
+      hc.close(force: force);
+    }
+    _streamRelayClients.clear();
   }
 
   static String _stripAdsInBackgroundIsolate(Map<String, String> payload) {
@@ -2434,97 +2548,125 @@ class LocalProxyTunnelBridge {
     return 'http://127.0.0.1:$p/__m3u8_proxy__/$suffix?${qp.toString()}';
   }
 
-  Future<int> ensureStarted() async {
-    if (_serverSocket != null) return _serverSocket!.port;
+  Future<int> ensureStarted() {
+    if (_serverSocket != null) return Future.value(_serverSocket!.port);
+    return _bridgeStart ??= _startListener(_listenerGeneration);
+  }
+
+  Future<int> _startListener(int generation) async {
     try {
-      _serverSocket = await ServerSocket.bind(
-        InternetAddress.loopbackIPv4,
-        0,
-        shared: true,
-      );
-      _serverSocket!.listen(
-        _handleClientSocket,
-        onError: (_) {},
-        cancelOnError: false,
-      );
-      return _serverSocket!.port;
+      final socket = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      if (generation != _listenerGeneration) {
+        await socket.close();
+        return 0;
+      }
+      _serverSocket = socket;
+      socket.listen(_handleClientSocket, onError: (_) {});
+      return socket.port;
     } catch (_) {
       return 0;
+    } finally {
+      if (generation == _listenerGeneration) _bridgeStart = null;
     }
   }
 
   Future<void> stop() async {
-    final s = _serverSocket;
+    final socket = _serverSocket;
     _serverSocket = null;
-    _initialPrefetchTimer?.cancel();
-    _initialPrefetchTimer = null;
-    _pendingPrefetchQueue.clear();
-    _inFlightSegmentFetches.clear();
-    _prefetchedSegmentCache.clear();
-    _prefetchedCacheTotalBytes = 0;
-    for (final hc in _streamRelayClientsByNodeId.values) {
-      try {
-        hc.close(force: true);
-      } catch (_) {}
+    _listenerGeneration++;
+    final starting = _bridgeStart;
+    _bridgeStart = null;
+    for (final cleanup in _clientCleanups.values.toList()) {
+      cleanup();
     }
-    _streamRelayClientsByNodeId.clear();
-    try {
-      _directRelayHttpClient?.close(force: true);
-    } catch (_) {}
+    resetSessionState(force: true);
+    _directRelayHttpClient?.close(force: true);
     _directRelayHttpClient = null;
-    try {
-      await s?.close();
-    } catch (_) {}
+    await socket?.close();
+    await starting;
   }
 
   HttpClient _getOrCreateDirectRelayHttpClient() {
     if (_directRelayHttpClient != null) {
       return _directRelayHttpClient!;
     }
-    final hc = HttpClient()
-      ..idleTimeout = const Duration(seconds: 45)
-      ..maxConnectionsPerHost = 12
-      ..badCertificateCallback = (cert, host, port) => true;
+    final hc =
+        HttpClient()
+          ..idleTimeout = const Duration(seconds: 12)
+          ..connectionTimeout = const Duration(seconds: 6)
+          ..maxConnectionsPerHost = 12
+          ..badCertificateCallback = (cert, host, port) => true;
     _directRelayHttpClient = hc;
     return hc;
   }
 
+  static String _relayNodeKey(ProxyNode node) => jsonEncode([
+    node.id,
+    node.protocol,
+    node.server,
+    node.port,
+    node.username,
+    node.password,
+    node.cipher,
+    node.sni,
+    node.skipCertVerify,
+    node.network,
+    node.wsPath,
+    node.wsHost,
+    node.tls,
+    node.rawUri,
+  ]);
+
   HttpClient _getOrCreateStreamRelayHttpClient(ProxyNode node) {
-    final existing = _streamRelayClientsByNodeId[node.id];
+    final key = _relayNodeKey(node);
+    final existing = _streamRelayClients.remove(key);
     if (existing != null) {
+      _streamRelayClients[key] = existing;
       return existing;
     }
-    if (_streamRelayClientsByNodeId.length >= 6) {
-      final oldestKey = _streamRelayClientsByNodeId.keys.first;
-      final removed = _streamRelayClientsByNodeId.remove(oldestKey);
+    if (_streamRelayClients.length >= 6) {
+      final oldestKey = _streamRelayClients.keys.first;
+      final removed = _streamRelayClients.remove(oldestKey);
       try {
         removed?.close(force: false);
       } catch (_) {}
     }
 
-    final hc = HttpClient()
-      ..idleTimeout = const Duration(seconds: 45)
-      ..maxConnectionsPerHost = 8
-      ..badCertificateCallback = (cert, host, port) => true;
+    final hc =
+        HttpClient()
+          ..idleTimeout = const Duration(seconds: 12)
+          ..connectionTimeout = const Duration(seconds: 5)
+          ..maxConnectionsPerHost = 8
+          ..badCertificateCallback = (cert, host, port) => true;
 
     hc.connectionFactory = (Uri uri, String? proxyHost, int? proxyPort) async {
       final isHttps = uri.scheme == 'https';
       final targetPort = uri.hasPort ? uri.port : (isHttps ? 443 : 80);
+      Socket? pendingSocket;
+      var cancelled = false;
       final socketFuture = _openPooledProxySocket(
+        onSocket: (socket) {
+          pendingSocket = socket;
+          if (cancelled) socket.destroy();
+        },
         node: node,
         targetHost: uri.host,
         targetPort: targetPort,
         isHttps: isHttps,
         timeout: const Duration(milliseconds: 7000),
       );
-      return ConnectionTask.fromSocket(socketFuture, () {});
+      return ConnectionTask.fromSocket(socketFuture, () {
+        cancelled = true;
+        pendingSocket?.destroy();
+      });
     };
 
-    _streamRelayClientsByNodeId[node.id] = hc;
+    _streamRelayClients[key] = hc;
     return hc;
   }
 
   static Future<Socket> _openPooledProxySocket({
+    required void Function(Socket) onSocket,
     required ProxyNode node,
     required String targetHost,
     required int targetPort,
@@ -2534,20 +2676,33 @@ class LocalProxyTunnelBridge {
     lastActiveTunnelNode = node;
     totalTunnelRequests++;
     final pairServer = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
-    final srvFuture = pairServer.first;
-    final clientSide = await Socket.connect(
-      InternetAddress.loopbackIPv4,
-      pairServer.port,
-      timeout: timeout,
+    final srvFuture = pairServer.first.then<Socket?>(
+      (socket) => socket,
+      onError: (Object _, StackTrace __) => null,
     );
+    Socket? connectingSocket;
+    final Socket srvSide;
     try {
-      clientSide.setOption(SocketOption.tcpNoDelay, true);
-    } catch (_) {}
-
-    final srvSide = await srvFuture.timeout(timeout);
-    try {
-      srvSide.setOption(SocketOption.tcpNoDelay, true);
-    } catch (_) {}
+      connectingSocket = await Socket.connect(
+        InternetAddress.loopbackIPv4,
+        pairServer.port,
+        timeout: timeout,
+      );
+      onSocket(connectingSocket);
+      final accepted = await srvFuture.timeout(timeout);
+      if (accepted == null) {
+        throw const SocketException('Relay listener closed');
+      }
+      srvSide = accepted;
+    } catch (_) {
+      connectingSocket?.destroy();
+      rethrow;
+    } finally {
+      await pairServer.close();
+    }
+    final clientSide = connectingSocket;
+    clientSide.setOption(SocketOption.tcpNoDelay, true);
+    srvSide.setOption(SocketOption.tcpNoDelay, true);
 
     activeTunnelConnections++;
     var connectionClosed = false;
@@ -2564,9 +2719,6 @@ class LocalProxyTunnelBridge {
       activeTunnel?.close();
       try {
         srvSide.destroy();
-      } catch (_) {}
-      try {
-        pairServer.close();
       } catch (_) {}
     }
 
@@ -2632,11 +2784,17 @@ class LocalProxyTunnelBridge {
     );
 
     if (isHttps) {
-      return SecureSocket.secure(
-        clientSide,
-        host: targetHost,
-        onBadCertificate: (_) => true,
-      ).timeout(timeout);
+      try {
+        return await SecureSocket.secure(
+          clientSide,
+          host: targetHost,
+          onBadCertificate: (_) => true,
+        ).timeout(timeout);
+      } catch (_) {
+        clientSide.destroy();
+        closeAll();
+        rethrow;
+      }
     }
     return clientSide;
   }
@@ -2704,27 +2862,30 @@ class LocalProxyTunnelBridge {
       final cleanAds = reqUri?.queryParameters['clean'] == '1';
       final forceDirect = reqUri?.queryParameters['direct'] == '1';
       final explicitNodeId = reqUri?.queryParameters['nid']?.trim() ?? '';
+      final isHead = rawHttpHeaderLines.first.toUpperCase().startsWith('HEAD ');
       final candidateNodes = <ProxyNode>[];
       if (!forceDirect) {
-        final fallbacks = _resolveFallbackNodes?.call() ?? const <ProxyNode>[];
-        if (explicitNodeId.isNotEmpty) {
-          for (final fb in fallbacks) {
-            if (fb.id == explicitNodeId) {
-              candidateNodes.add(fb);
-              break;
-            }
-          }
-        }
         final primary = _resolveDefaultNode();
-        if (primary != null && !candidateNodes.any((n) => n.id == primary.id)) {
-          candidateNodes.add(primary);
+        final fallbacks = _resolveFallbackNodes?.call() ?? const <ProxyNode>[];
+        final available = {
+          if (primary != null) primary.id: primary,
+          for (final node in fallbacks) node.id: node,
+        };
+        final explicit = available[explicitNodeId];
+        if (explicit != null) candidateNodes.add(explicit);
+        for (final node in available.values) {
+          if (candidateNodes.length >= 3) break;
+          if (node.id != explicit?.id) candidateNodes.add(node);
         }
-        for (final fb in fallbacks) {
-          if (!candidateNodes.any((n) => n.id == fb.id)) {
-            candidateNodes.add(fb);
-            if (candidateNodes.length >= 3) break;
-          }
-        }
+      }
+      final primary = candidateNodes.firstOrNull;
+      final route = primary == null ? 'direct' : _relayNodeKey(primary);
+      final playlistScope = jsonEncode([route, customHeaders]);
+      final prefetchGeneration = _prefetchGeneration;
+
+
+      Future<void> discardResponse(HttpClientResponse resp) async {
+        await resp.listen(null, onError: (Object _) {}).cancel();
       }
 
       Future<void> finishClientResponse() async {
@@ -2746,7 +2907,9 @@ class LocalProxyTunnelBridge {
       // Defer scheduling lookahead prefetch (`segIndex + 1..N`) until either a cache hit
       // or after the active segment has streamed its initial keyframe bytes (>= 128KB),
       // so the segment currently needed by `libmpv` gets 100% exclusive bandwidth!
-      final segIndex = _playlistSegmentIndexMap[targetUrl];
+      final segIndex = _playlistScope == playlistScope
+          ? _playlistSegmentIndexMap[targetUrl]
+          : null;
       if (segIndex != null) {
         _initialPrefetchTimer?.cancel();
         _initialPrefetchTimer = null;
@@ -2762,18 +2925,16 @@ class LocalProxyTunnelBridge {
 
       // 2. Check if this segment was already prefetched into memory by our
       // concurrent background worker threads, or is currently in-flight!
-      if (rangeHeader == null || rangeHeader.isEmpty) {
+      if (!isHead && segIndex != null && rangeHeader == null) {
         final cached = _prefetchedSegmentCache[targetUrl];
         if (cached != null) {
-          if (segIndex != null) {
-            _scheduleLookaheadPrefetch(
-              fromIndex: segIndex + 1,
-              count: forceDirect ? prefetchLookaheadCount : 4,
-              customHeaders: customHeaders,
-              forceDirect: forceDirect,
-              candidateNodes: candidateNodes,
-            );
-          }
+          _scheduleLookaheadPrefetch(
+            fromIndex: segIndex + 1,
+            count: forceDirect ? prefetchLookaheadCount : 4,
+            customHeaders: customHeaders,
+            forceDirect: forceDirect,
+            candidateNodes: candidateNodes,
+          );
           final respHeader = StringBuffer()
             ..write('HTTP/1.1 200 OK\r\n')
             ..write('Content-Type: ${cached.contentType}\r\n')
@@ -2789,17 +2950,18 @@ class LocalProxyTunnelBridge {
 
         final inFlight = _inFlightSegmentFetches[targetUrl];
         if (inFlight != null) {
-          final awaited = await inFlight;
-          if (awaited != null) {
-            if (segIndex != null) {
-              _scheduleLookaheadPrefetch(
-                fromIndex: segIndex + 1,
-                count: forceDirect ? 4 : 2,
-                customHeaders: customHeaders,
-                forceDirect: forceDirect,
-                candidateNodes: candidateNodes,
-              );
-            }
+          final awaited = await inFlight.timeout(
+            const Duration(milliseconds: 180),
+            onTimeout: () => null,
+          );
+          if (awaited != null && prefetchGeneration == _prefetchGeneration) {
+            _scheduleLookaheadPrefetch(
+              fromIndex: segIndex + 1,
+              count: forceDirect ? 4 : 2,
+              customHeaders: customHeaders,
+              forceDirect: forceDirect,
+              candidateNodes: candidateNodes,
+            );
             final respHeader = StringBuffer()
               ..write('HTTP/1.1 200 OK\r\n')
               ..write('Content-Type: ${awaited.contentType}\r\n')
@@ -2815,38 +2977,93 @@ class LocalProxyTunnelBridge {
         }
       }
 
+      final pendingRequests = <void Function()>{};
+      void cancelPendingRequests() {
+        for (final cancel in pendingRequests) {
+          cancel();
+        }
+      }
+
+      Future<HttpClientResponse> requestUpstream(
+        HttpClient hc,
+        Uri uri,
+        Duration timeout, {
+        required bool followRedirects,
+        String? activeRange,
+      }) async {
+        HttpClientRequest? pending;
+        var cancelled = false;
+        void cancel() {
+          cancelled = true;
+          pending?.abort();
+        }
+
+        pendingRequests.add(cancel);
+        try {
+          final req = await hc
+              .openUrl(isHead ? 'HEAD' : 'GET', uri)
+              .then((req) {
+                if (cancelled) {
+                  unawaited(
+                    req.done.then<void>((_) {}, onError: (Object _) {}),
+                  );
+                  req.abort();
+                }
+                return req;
+              })
+              .timeout(timeout);
+          if (cancelled) throw const HttpException('Player disconnected');
+          pending = req;
+          req.followRedirects = followRedirects;
+          req.headers.set(
+            HttpHeaders.userAgentHeader,
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36',
+          );
+          req.headers.set(HttpHeaders.acceptHeader, '*/*');
+          customHeaders.forEach((name, value) {
+            if (name.toLowerCase() != HttpHeaders.hostHeader) {
+              req.headers.set(name, value);
+            }
+          });
+          req.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
+          if (activeRange != null && activeRange.isNotEmpty) {
+            req.headers.set(HttpHeaders.rangeHeader, activeRange);
+          }
+          final response = await req.close().timeout(timeout);
+          if (cancelled || !_clientCleanups.containsKey(client)) {
+            await discardResponse(response);
+            throw const HttpException('Player disconnected');
+          }
+          return response;
+        } catch (_) {
+          cancel();
+          rethrow;
+        } finally {
+          pendingRequests.remove(cancel);
+        }
+      }
+
       Future<({HttpClientResponse resp, Uri finalUri, HttpClient hc})?>
-          tryOpenDirect(
+      tryOpenDirect(
         Uri uri, {
         String? activeRange,
-        Duration timeout = const Duration(milliseconds: 3200),
+        Duration timeout = const Duration(milliseconds: 8000),
       }) async {
         for (var attempt = 0; attempt < 2; attempt++) {
+          if (!_clientCleanups.containsKey(client)) return null;
           try {
             final hc = _getOrCreateDirectRelayHttpClient();
-            final req = await hc.getUrl(uri).timeout(timeout);
-            req.headers.set(
-              'User-Agent',
-              customHeaders['User-Agent'] ??
-                  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+            final resp = await requestUpstream(
+              hc,
+              uri,
+              timeout,
+              followRedirects: true,
+              activeRange: activeRange,
             );
-            req.headers.set('Accept', '*/*');
-            customHeaders.forEach((k, v) {
-              if (k.toLowerCase() != 'host') {
-                req.headers.set(k, v);
-              }
-            });
-            if (activeRange != null && activeRange.isNotEmpty) {
-              req.headers.set('Range', activeRange);
-            }
-            final resp = await req.close().timeout(timeout);
             if (resp.statusCode >= 200 && resp.statusCode < 400) {
               return (resp: resp, finalUri: uri, hc: hc);
             }
-            await resp.drain<void>().timeout(
-                  const Duration(milliseconds: 600),
-                  onTimeout: () {},
-                );
+            await discardResponse(resp);
             return null;
           } catch (_) {}
         }
@@ -2854,33 +3071,25 @@ class LocalProxyTunnelBridge {
       }
 
       Future<({HttpClientResponse resp, Uri finalUri, HttpClient hc})?>
-          tryOpenWithNode(
+      tryOpenWithNode(
         ProxyNode node,
         Uri uri, {
         String? activeRange,
+        int redirectsRemaining = 5,
         Duration timeout = const Duration(milliseconds: 4200),
       }) async {
         for (var attempt = 0; attempt < 2; attempt++) {
+          if (!_clientCleanups.containsKey(client)) return null;
           final sw = Stopwatch()..start();
           try {
             final hc = _getOrCreateStreamRelayHttpClient(node);
-            final req = await hc.getUrl(uri).timeout(timeout);
-            req.followRedirects = false;
-            req.headers.set(
-              'User-Agent',
-              customHeaders['User-Agent'] ??
-                  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+            final resp = await requestUpstream(
+              hc,
+              uri,
+              timeout,
+              followRedirects: false,
+              activeRange: activeRange,
             );
-            req.headers.set('Accept', '*/*');
-            customHeaders.forEach((k, v) {
-              if (k.toLowerCase() != 'host') {
-                req.headers.set(k, v);
-              }
-            });
-            if (activeRange != null && activeRange.isNotEmpty) {
-              req.headers.set('Range', activeRange);
-            }
-            final resp = await req.close().timeout(timeout);
             sw.stop();
             if ((resp.statusCode == 301 ||
                     resp.statusCode == 302 ||
@@ -2890,11 +3099,8 @@ class LocalProxyTunnelBridge {
                 resp.headers.value(HttpHeaders.locationHeader) != null) {
               final loc =
                   resp.headers.value(HttpHeaders.locationHeader)!.trim();
-              await resp.drain<void>().timeout(
-                    const Duration(milliseconds: 400),
-                    onTimeout: () {},
-                  );
-              if (loc.isNotEmpty) {
+              await discardResponse(resp);
+              if (loc.isNotEmpty && redirectsRemaining > 0) {
                 final redirectedUri = uri.resolve(loc);
                 final rLower = redirectedUri.toString().toLowerCase();
                 // If an overseas gateway (e.g. mursor.ottiptv.cc) redirects to a domestic Douyu/Huya/YY CDN (.flv),
@@ -2909,10 +3115,11 @@ class LocalProxyTunnelBridge {
                   );
                   if (directFollowed != null) return directFollowed;
                 }
-                return tryOpenWithNode(
+                return await tryOpenWithNode(
                   node,
                   redirectedUri,
                   activeRange: activeRange,
+                  redirectsRemaining: redirectsRemaining - 1,
                   timeout: timeout,
                 );
               }
@@ -2923,13 +3130,9 @@ class LocalProxyTunnelBridge {
                 success: true,
                 rttMs: sw.elapsedMilliseconds,
               );
-              winningNodeForSession = node;
               return (resp: resp, finalUri: uri, hc: hc);
             }
-            await resp.drain<void>().timeout(
-                  const Duration(milliseconds: 600),
-                  onTimeout: () {},
-                );
+            await discardResponse(resp);
             _onNodeFeedback?.call(node.id, success: false);
             return null;
           } catch (_) {
@@ -2942,41 +3145,21 @@ class LocalProxyTunnelBridge {
       }
 
       Future<({HttpClientResponse resp, Uri finalUri, HttpClient hc})?>
-          openTargetUri(
-        Uri uri, {
-        ProxyNode? preferredNode,
-        String? overrideRange,
-      }) async {
+      openTargetUri(Uri uri, {String? overrideRange}) async {
         final activeRange = overrideRange ?? rangeHeader;
         if (forceDirect) {
-          final directRes = await tryOpenDirect(uri, activeRange: activeRange);
-          if (directRes != null) return directRes;
-          // If direct connection failed and user has a default proxy node configured,
-          // automatically try the proxy node so blocked overseas streams still play!
-          final fallbackNode = _resolveDefaultNode();
-          if (fallbackNode != null) {
-            return tryOpenWithNode(
-              fallbackNode,
-              uri,
-              activeRange: activeRange,
-              timeout: const Duration(milliseconds: 3500),
-            );
-          }
-          return null;
+          return tryOpenDirect(uri, activeRange: activeRange);
         }
 
-        final nodesToTry = preferredNode != null
-            ? <ProxyNode>[
-                preferredNode,
-                ...candidateNodes.where((n) => n.id != preferredNode.id),
-              ]
-            : candidateNodes;
+        final nodesToTry = candidateNodes;
 
         // Happy-Eyeballs fast race when opening a stream for the first time:
         // if primary node takes > 1100ms, race the second candidate node in parallel!
-        if (winningNodeForSession == null && nodesToTry.length >= 2) {
-          final winnerCompleter = Completer<
-              ({HttpClientResponse resp, Uri finalUri, HttpClient hc})?>();
+        if (nodesToTry.length >= 2 && segIndex == null) {
+          final winnerCompleter =
+              Completer<
+                ({HttpClientResponse resp, Uri finalUri, HttpClient hc})?
+              >();
           var pendingCount = 2;
           Timer? staggerTimer;
 
@@ -2990,13 +3173,8 @@ class LocalProxyTunnelBridge {
               return;
             }
             if (res != null && winnerCompleter.isCompleted) {
-              // Drain losing parallel response cleanly
-              unawaited(
-                res.resp.drain<void>().timeout(
-                      const Duration(milliseconds: 500),
-                      onTimeout: () {},
-                    ),
-              );
+              // Release the losing response without reading the rest of its body.
+              unawaited(discardResponse(res.resp));
             }
             if (pendingCount <= 0 && !winnerCompleter.isCompleted) {
               winnerCompleter.complete(null);
@@ -3036,7 +3214,8 @@ class LocalProxyTunnelBridge {
             );
             if (res != null) return res;
           }
-          return null;
+          // Last-resort fallback: if all candidate proxy nodes failed or were blocked by a domestic VOD CDN, try direct connection
+          return await tryOpenDirect(uri, activeRange: activeRange);
         }
 
         for (final node in nodesToTry) {
@@ -3047,10 +3226,33 @@ class LocalProxyTunnelBridge {
           );
           if (res != null) return res;
         }
-        return null;
+        // Last-resort fallback: if all candidate proxy nodes failed or were blocked by a domestic VOD CDN, try direct connection
+        return await tryOpenDirect(uri, activeRange: activeRange);
       }
 
+      final path = targetUri.path.toLowerCase();
+      if (path.endsWith('/api/telegram/video') ||
+          path.endsWith('/api/telegram/file-content')) {
+        final handled = await _handleTelegramBlockCachedStream(
+          client: client,
+          key: (url: targetUrl, headers: encodedHeaders, route: route),
+          targetUri: targetUri,
+          customHeaders: customHeaders,
+          rangeHeader: rangeHeader,
+          isHead: isHead,
+          candidateNodes: candidateNodes,
+          finishClientResponse: finishClientResponse,
+        );
+        if (handled) return;
+      }
+
+      if (!_clientCleanups.containsKey(client)) return;
+      _clientDisconnectHandlers[client] = cancelPendingRequests;
       final opened = await openTargetUri(targetUri);
+      if (!_clientCleanups.containsKey(client)) {
+        if (opened != null) await discardResponse(opened.resp);
+        return;
+      }
       if (opened == null) {
         client.add(latin1.encode('HTTP/1.1 502 Bad Gateway\r\n\r\n'));
         await finishClientResponse();
@@ -3060,7 +3262,7 @@ class LocalProxyTunnelBridge {
       final resp = opened.resp;
       var currentUri = opened.finalUri;
       final mime = resp.headers.contentType?.mimeType.toLowerCase() ?? '';
-      final isLikelyM3u8 =
+      final isLikelyM3u8 = !isHead &&
           (resp.contentLength <= 0 || resp.contentLength <= 2 * 1024 * 1024) &&
           (currentUri.path.toLowerCase().endsWith('.m3u8') ||
               (reqUri?.path.toLowerCase().endsWith('.m3u8') ?? false) ||
@@ -3070,6 +3272,19 @@ class LocalProxyTunnelBridge {
       Uint8List? preBufferedBinaryChunk;
       StreamIterator<List<int>>? activeStreamIterator;
 
+      if (isHead) {
+        final headers = StringBuffer('HTTP/1.1 ${resp.statusCode} ${resp.reasonPhrase}\r\n');
+        for (final name in ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
+          final value = resp.headers.value(name);
+          if (value != null) headers.write('$name: $value\r\n');
+        }
+        headers.write('Connection: close\r\n\r\n');
+        client.add(latin1.encode(headers.toString()));
+        await resp.drain<void>();
+        await finishClientResponse();
+        return;
+      }
+
       if (isLikelyM3u8 && resp.statusCode == 200) {
         final m3u8Buf = BytesBuilder(copy: false);
         var verifiedM3u8Header = false;
@@ -3077,6 +3292,10 @@ class LocalProxyTunnelBridge {
         final iter = StreamIterator<List<int>>(
           resp.timeout(const Duration(seconds: 8)),
         );
+        _clientDisconnectHandlers[client] = () {
+          cancelPendingRequests();
+          unawaited(iter.cancel());
+        };
         try {
           while (await iter.moveNext()) {
             final chunk = iter.current;
@@ -3106,6 +3325,7 @@ class LocalProxyTunnelBridge {
           }
         }
 
+        if (!_clientCleanups.containsKey(client)) return;
         if (!abortedAsBinaryStream && m3u8Buf.length > 0) {
           final rawBytes = m3u8Buf.takeBytes();
           var text = utf8.decode(rawBytes, allowMalformed: true);
@@ -3118,7 +3338,6 @@ class LocalProxyTunnelBridge {
               if (variantUri == null) break;
               final nextOpened = await openTargetUri(
                 variantUri,
-                preferredNode: winningNodeForSession,
               );
               if (nextOpened == null) break;
               final nextBuf = BytesBuilder(copy: false);
@@ -3166,6 +3385,8 @@ class LocalProxyTunnelBridge {
               cleanAds: cleanAds,
               forceDirect: forceDirect,
               candidateNodes: candidateNodes,
+              playlistScope: playlistScope,
+              enablePrefetch: prefetchGeneration == _prefetchGeneration,
             );
             final outBytes = utf8.encode(rewrittenM3u8);
             final respHeader = StringBuffer()
@@ -3216,12 +3437,13 @@ class LocalProxyTunnelBridge {
       client.add(latin1.encode(respHeader.toString()));
 
       var clientClosed = false;
-      unawaited(
-        client.done.then(
-          (_) => clientClosed = true,
-          onError: (_) => clientClosed = true,
-        ),
-      );
+      final body = activeStreamIterator ??
+          StreamIterator<List<int>>(resp.timeout(const Duration(seconds: 45)));
+      _clientDisconnectHandlers[client] = () {
+        clientClosed = true;
+        cancelPendingRequests();
+        unawaited(body.cancel());
+      };
 
       final shouldCacheSegment = !isFlvPayload &&
           (rangeHeader == null || rangeHeader.isEmpty) &&
@@ -3365,27 +3587,20 @@ class LocalProxyTunnelBridge {
         return out.takeBytes();
       }
 
-      bool handleDownstreamChunk(List<int> chunk) {
-        if (chunk.isEmpty) return true;
+      Future<void> handleDownstreamChunk(List<int> chunk) async {
+        if (chunk.isEmpty) return;
         recordDownstreamBytes(chunk.length);
         streamedBytes += chunk.length;
         final toWrite = isFlvPayload ? normalizeFlvChunk(chunk) : chunk;
         if (toWrite.isNotEmpty) {
-          try {
-            client.add(toWrite);
-          } catch (_) {
-            clientClosed = true;
-            unawaited(
-              resp.detachSocket().then((s) => s.destroy(), onError: (_) {}),
-            );
-            return false;
-          }
+          client.add(toWrite);
+          await client.flush();
         }
         if (segmentAccumulator != null &&
             segmentAccumulator.length + chunk.length <= 8 * 1024 * 1024) {
           segmentAccumulator.add(chunk);
         }
-        if (segIndex != null &&
+        if (prefetchGeneration == _prefetchGeneration && segIndex != null &&
             !lookaheadTriggeredForProxySeg &&
             (streamedBytes >= 256 * 1024 ||
                 (resp.contentLength > 0 &&
@@ -3399,38 +3614,20 @@ class LocalProxyTunnelBridge {
             candidateNodes: candidateNodes,
           );
         }
-        return true;
       }
 
-      if (preBufferedBinaryChunk != null && preBufferedBinaryChunk.isNotEmpty) {
-        handleDownstreamChunk(preBufferedBinaryChunk);
-      }
-
-      if (activeStreamIterator != null) {
-        while (!clientClosed && await activeStreamIterator.moveNext()) {
-          if (!handleDownstreamChunk(activeStreamIterator.current)) {
-            break;
-          }
+      try {
+        if (preBufferedBinaryChunk != null) {
+          await handleDownstreamChunk(preBufferedBinaryChunk);
         }
-        if (clientClosed) {
-          unawaited(
-            resp.detachSocket().then((s) => s.destroy(), onError: (_) {}),
-          );
+        while (!clientClosed && await body.moveNext()) {
+          await handleDownstreamChunk(body.current);
         }
-      } else {
-        await for (final chunk in resp.timeout(const Duration(seconds: 45))) {
-          if (clientClosed) {
-            unawaited(
-              resp.detachSocket().then((s) => s.destroy(), onError: (_) {}),
-            );
-            break;
-          }
-          if (!handleDownstreamChunk(chunk)) {
-            break;
-          }
-        }
+      } finally {
+        await body.cancel();
       }
       if (!clientClosed &&
+          prefetchGeneration == _prefetchGeneration &&
           segIndex != null &&
           !lookaheadTriggeredForProxySeg) {
         _scheduleLookaheadPrefetch(
@@ -3442,8 +3639,9 @@ class LocalProxyTunnelBridge {
         );
       }
       if (!clientClosed &&
+          prefetchGeneration == _prefetchGeneration &&
           segmentAccumulator != null &&
-          segmentAccumulator.length > 0) {
+          segmentAccumulator.length == resp.contentLength) {
         _storePrefetchedSegment(
           targetUrl,
           segmentAccumulator.takeBytes(),
@@ -3456,7 +3654,447 @@ class LocalProxyTunnelBridge {
     }
   }
 
-  ProxyNode? winningNodeForSession;
+  Future<bool> _handleTelegramBlockCachedStream({
+    required Socket client,
+    required _TelegramSessionKey key,
+    required Uri targetUri,
+    required Map<String, String> customHeaders,
+    required String? rangeHeader,
+    required bool isHead,
+    required List<ProxyNode> candidateNodes,
+    required Future<void> Function() finishClientResponse,
+  }) async {
+    if (!_tgStitchSessions.containsKey(key) && _tgStitchSessions.length >= 3) {
+      for (final oldKey in _tgStitchSessions.keys.toList()) {
+        final old = _tgStitchSessions[oldKey]!;
+        if (old.readers.isEmpty) {
+          _tgStitchSessions.remove(oldKey);
+          old.close();
+          break;
+        }
+      }
+    }
+    final session = _tgStitchSessions.putIfAbsent(
+      key,
+      () => _TelegramParallelStitchSession(targetUri, customHeaders, [
+        ...candidateNodes,
+        null,
+      ]),
+    );
+    session.idleTimer?.cancel();
+    session.readers.add(client);
+
+    void releaseReader() {
+      if (!session.readers.remove(client)) return;
+      if (session.playheadReader == client) {
+        session.playheadReader = null;
+        for (final block in session.transfers) {
+          if (!block.complete && block.readers == 0) block.cancel();
+        }
+      }
+      if (session.readers.isNotEmpty || session.closed) return;
+      for (final block in session.transfers) {
+        if (!block.complete) block.cancel();
+      }
+      session.idleTimer = Timer(const Duration(seconds: 5), () {
+        if (identical(_tgStitchSessions[key], session)) {
+          _tgStitchSessions.remove(key);
+        }
+        session.close();
+      });
+    }
+
+    _clientDisconnectHandlers[client] = releaseReader;
+    try {
+      session.metadata ??= _loadTelegramMetadata(session);
+      final hasMetadata = await session.metadata!;
+      if (!session.readers.contains(client)) return true;
+      if (!hasMetadata || session.closed) {
+        if (session.rangeUnsupported && !session.closed) return false;
+        client.add(
+          latin1.encode(
+            'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n',
+          ),
+        );
+        await finishClientResponse();
+        return true;
+      }
+
+      final range = _resolveTelegramRange(rangeHeader, session.totalSize);
+      if (range == null) {
+        client.add(
+          latin1.encode(
+            'HTTP/1.1 416 Range Not Satisfiable\r\n'
+            'Content-Range: bytes */${session.totalSize}\r\n'
+            'Content-Length: 0\r\nConnection: close\r\n\r\n',
+          ),
+        );
+        await finishClientResponse();
+        return true;
+      }
+
+      final contentLength = range.end - range.start + 1;
+      final partial = rangeHeader != null;
+      final responseHeaders =
+          StringBuffer()
+            ..write(
+              partial
+                  ? 'HTTP/1.1 206 Partial Content\r\n'
+                  : 'HTTP/1.1 200 OK\r\n',
+            )
+            ..write('Content-Type: ${session.contentType}\r\n')
+            ..write('Content-Length: $contentLength\r\n')
+            ..write('Accept-Ranges: bytes\r\n');
+      if (partial) {
+        responseHeaders.write(
+          'Content-Range: bytes ${range.start}-${range.end}/${session.totalSize}\r\n',
+        );
+      }
+      responseHeaders.write(
+        'Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n',
+      );
+      client.add(latin1.encode(responseHeaders.toString()));
+
+      if (!isHead) {
+        // An open-ended read can be a seek near EOF. Suffix and short bounded
+        // reads may probe metadata while a different connection is playing.
+        final followsPlayback =
+            !partial ||
+            rangeHeader.trim().endsWith('-') ||
+            contentLength > 2 * _tgBlockSize;
+        if (followsPlayback) {
+          session.playheadReader = client;
+          session.playheadEnd = range.end ~/ _tgBlockSize;
+        }
+        var cursor = range.start;
+        while (cursor <= range.end &&
+            session.readers.contains(client) &&
+            !session.closed) {
+          final index = cursor ~/ _tgBlockSize;
+          final blockStart = index * _tgBlockSize;
+          final startOffset = cursor - blockStart;
+          if (session.playheadReader == client) {
+            session.playhead = index;
+            session.playheadOffset = startOffset;
+            if (cursor == range.start) _trimTelegramStitchBlocks(session);
+          }
+          final block = _ensureTelegramStitchBlock(
+            session,
+            index,
+            startOffset: startOffset,
+            prioritizeOffset:
+                followsPlayback && cursor == range.start && startOffset > 0,
+            preserveLaterBlock: !followsPlayback,
+          );
+          block.readers++;
+          if (session.playheadReader == client) {
+            _pumpTelegramStitchSession(session);
+          }
+          try {
+            final sliceEnd = min(
+              block.expectedLength,
+              range.end - blockStart + 1,
+            );
+            var offset = startOffset;
+            while (offset < sliceEnd &&
+                session.readers.contains(client) &&
+                !session.closed) {
+              await block.waitForData(offset);
+              if (!session.readers.contains(client) || session.closed) {
+                return true;
+              }
+              final availableEnd = min(sliceEnd, block.availableEnd);
+              if (availableEnd <= offset) break;
+              client.add(
+                Uint8List.sublistView(
+                  block.buffer,
+                  offset - block.startOffset,
+                  availableEnd - block.startOffset,
+                ),
+              );
+              cursor += availableEnd - offset;
+              offset = availableEnd;
+              if (session.playheadReader == client) {
+                _pumpTelegramStitchSession(session);
+              }
+              await client.flush();
+            }
+            if (offset < sliceEnd) break;
+          } finally {
+            block.readers--;
+            if (block.readers == 0 &&
+                session.blocks[index] != block &&
+                !block.complete) {
+              block.cancel();
+            }
+            if (session.playheadReader == client) {
+              _pumpTelegramStitchSession(session);
+            }
+          }
+        }
+      }
+      await finishClientResponse();
+      return true;
+    } finally {
+      _clientDisconnectHandlers.remove(client);
+      releaseReader();
+    }
+  }
+
+  static ({int start, int end})? _resolveTelegramRange(
+    String? header,
+    int size,
+  ) {
+    if (header == null) return (start: 0, end: size - 1);
+    final match = RegExp(
+      r'^bytes=(\d*)-(\d*)$',
+      caseSensitive: false,
+    ).firstMatch(header.trim());
+    if (match == null) return null;
+    final startText = match[1]!;
+    final endText = match[2]!;
+    if (startText.isEmpty) {
+      final suffix = int.tryParse(endText);
+      if (suffix == null || suffix <= 0) return null;
+      return (start: max(0, size - suffix), end: size - 1);
+    }
+    final start = int.tryParse(startText);
+    final end = endText.isEmpty ? size - 1 : int.tryParse(endText);
+    if (start == null || end == null || start >= size || end < start) {
+      return null;
+    }
+    return (start: start, end: min(end, size - 1));
+  }
+
+  Future<bool> _loadTelegramMetadata(
+    _TelegramParallelStitchSession session,
+  ) async {
+    final block = _TelegramLiveStitchBlock(0, _tgBlockSize);
+    final ready = Completer<bool>();
+    session.blocks[0] = block;
+    session.transfers.add(block);
+    unawaited(_downloadTelegramBlock(session, block, metadataReady: ready));
+    final result = await ready.future;
+    if (!result && !session.rangeUnsupported) session.metadata = null;
+    return result;
+  }
+
+  _TelegramLiveStitchBlock _ensureTelegramStitchBlock(
+    _TelegramParallelStitchSession session,
+    int index, {
+    int startOffset = 0,
+    bool prioritizeOffset = false,
+    bool preserveLaterBlock = false,
+  }) {
+    final existing = session.blocks[index];
+    if (existing != null &&
+        !existing.failed &&
+        startOffset >= existing.startOffset &&
+        (!prioritizeOffset ||
+            existing.startOffset == startOffset ||
+            existing.availableEnd > startOffset)) {
+      return existing;
+    }
+    final length = min(_tgBlockSize, session.totalSize - index * _tgBlockSize);
+    final block = _TelegramLiveStitchBlock(
+      index,
+      length,
+      startOffset: startOffset,
+    );
+    // A bounded probe before a cached suffix should leave that suffix available.
+    if (!preserveLaterBlock ||
+        existing == null ||
+        existing.failed ||
+        startOffset >= existing.startOffset) {
+      if (existing != null && existing.readers == 0 && !existing.complete) {
+        existing.cancel();
+      }
+      session.blocks[index] = block;
+    }
+    session.transfers.add(block);
+    unawaited(_downloadTelegramBlock(session, block));
+    return block;
+  }
+
+  int _trimTelegramStitchBlocks(_TelegramParallelStitchSession session) {
+    final last = (session.totalSize - 1) ~/ _tgBlockSize;
+    final maxAhead = min(
+      session.playheadEnd,
+      session.playhead + _tgLookaheadBlocks,
+    );
+    session.blocks.removeWhere((index, block) {
+      if (block.readers > 0 ||
+          index == session.playhead ||
+          (index > session.playhead && index <= maxAhead) ||
+          (block.complete &&
+              (index == 0 ||
+                  index == last ||
+                  (index >= session.playhead - _tgMaxBehindBlocks &&
+                      index < session.playhead)))) {
+        return false;
+      }
+      block.cancel();
+      return true;
+    });
+    return maxAhead;
+  }
+
+  void _pumpTelegramStitchSession(_TelegramParallelStitchSession session) {
+    if (session.closed ||
+        session.playheadReader == null ||
+        session.totalSize <= 0) {
+      return;
+    }
+    final maxAhead = _trimTelegramStitchBlocks(session);
+    final current = session.blocks[session.playhead];
+    if (current == null ||
+        current.startOffset > session.playheadOffset ||
+        current.availableEnd <
+            min(session.playheadOffset + 65536, current.expectedLength)) {
+      return;
+    }
+    for (var index = session.playhead + 1; index <= maxAhead; index++) {
+      if (session.transfers.length >= _tgMaxWorkersPerSession) return;
+      final block = session.blocks[index];
+      if (block == null || (block.complete && block.startOffset > 0)) {
+        _ensureTelegramStitchBlock(session, index);
+      }
+    }
+  }
+
+  Future<void> _downloadTelegramBlock(
+    _TelegramParallelStitchSession session,
+    _TelegramLiveStitchBlock block, {
+    Completer<bool>? metadataReady,
+  }) async {
+    try {
+      final routes = session.routes;
+      final firstRoute = session.routeIndex;
+      for (var attempt = 0; attempt <= routes.length; attempt++) {
+        if (block.failed || block.complete || session.closed) break;
+        final routeIndex = (firstRoute + attempt) % routes.length;
+        final node = routes[routeIndex];
+        final hc =
+            node == null
+                ? _getOrCreateDirectRelayHttpClient()
+                : _getOrCreateStreamRelayHttpClient(node);
+        final start = block.index * _tgBlockSize + block.availableEnd;
+        final end = block.index * _tgBlockSize + block.expectedLength - 1;
+        final timeout = Duration(seconds: node == null ? 6 : 4);
+        HttpClientRequest? request;
+        StreamIterator<List<int>>? body;
+        var cancelled = false;
+        block.cancelTransfer = () {
+          cancelled = true;
+          request?.abort();
+          unawaited(body?.cancel() ?? Future<void>.value());
+        };
+        try {
+          final req = await hc
+              .getUrl(session.uri)
+              .then((req) {
+                if (cancelled) {
+                  unawaited(
+                    req.done.then<void>((_) {}, onError: (Object _) {}),
+                  );
+                  req.abort();
+                }
+                return req;
+              })
+              .timeout(
+                timeout,
+                onTimeout: () {
+                  cancelled = true;
+                  throw TimeoutException('Opening Telegram media');
+                },
+              );
+          if (cancelled) break;
+          request = req;
+          session.headers.forEach((name, value) {
+            if (name.toLowerCase() != HttpHeaders.hostHeader) {
+              req.headers.set(name, value);
+            }
+          });
+          req.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
+          req.headers.set(HttpHeaders.rangeHeader, 'bytes=$start-$end');
+          final response = await req.close().timeout(
+            timeout,
+            onTimeout: () {
+              req.abort();
+              throw TimeoutException('Opening Telegram media range');
+            },
+          );
+          if (cancelled) {
+            await response.listen(null, onError: (Object _) {}).cancel();
+            break;
+          }
+          if (response.statusCode == HttpStatus.ok && session.totalSize == 0) {
+            session.rangeUnsupported = true;
+            await response.listen(null, onError: (Object _) {}).cancel();
+            break;
+          }
+          final match = _contentRangePattern.firstMatch(
+            response.headers.value(HttpHeaders.contentRangeHeader) ?? '',
+          );
+          if (response.statusCode != HttpStatus.partialContent ||
+              match == null) {
+            await response.listen(null, onError: (Object _) {}).cancel();
+            continue;
+          }
+          final actualStart = int.tryParse(match[1]!);
+          final actualEnd = int.tryParse(match[2]!);
+          final total = int.tryParse(match[3]!);
+          if (actualStart != start ||
+              actualEnd == null ||
+              actualEnd < start ||
+              actualEnd > end ||
+              total == null ||
+              total <= actualEnd ||
+              (session.totalSize != 0 && total != session.totalSize)) {
+            await response.listen(null, onError: (Object _) {}).cancel();
+            continue;
+          }
+          if (session.totalSize == 0) {
+            session.totalSize = total;
+            session.contentType =
+                response.headers.value(HttpHeaders.contentTypeHeader) ??
+                (session.uri.path.endsWith('/video')
+                    ? 'video/mp4'
+                    : 'application/octet-stream');
+            block.expectedLength = min(total, _tgBlockSize);
+            metadataReady?.complete(true);
+          }
+          body = StreamIterator(response);
+          var remaining = actualEnd - start + 1;
+          while (!block.failed &&
+              await body.moveNext().timeout(const Duration(seconds: 8))) {
+            final chunk = body.current;
+            final count = min(remaining, chunk.length);
+            if (count <= 0) continue;
+            recordDownstreamBytes(count);
+            block.append(chunk, count);
+            remaining -= count;
+            session.routeIndex = routeIndex;
+          }
+          // A server may cap Range responses. Continue on the same route
+          // when the advertised range arrived in full.
+          if (!block.failed && !block.complete && remaining == 0) attempt--;
+        } catch (_) {
+          // Resume at the first missing byte on the next route.
+        } finally {
+          block.cancelTransfer = null;
+          await body?.cancel();
+        }
+      }
+    } finally {
+      if (!block.complete) block.cancel();
+      if (metadataReady != null && !metadataReady.isCompleted) {
+        metadataReady.complete(false);
+      }
+      session.transfers.remove(block);
+      _pumpTelegramStitchSession(session);
+    }
+  }
 
   void _registerPlaylistSegments(List<String> segmentUrls) {
     if (segmentUrls.isEmpty) return;
@@ -3533,16 +4171,20 @@ class LocalProxyTunnelBridge {
         continue;
       }
       _activePrefetchWorkers++;
+      final generation = _prefetchGeneration;
       final future = _prefetchSingleSegment(
         url: task.url,
         customHeaders: task.headers,
         forceDirect: task.forceDirect,
         candidateNodes: task.candidateNodes,
+        generation: generation,
       );
       _inFlightSegmentFetches[task.url] = future;
       unawaited(
         future.whenComplete(() {
-          _inFlightSegmentFetches.remove(task.url);
+          if (identical(_inFlightSegmentFetches[task.url], future)) {
+            _inFlightSegmentFetches.remove(task.url);
+          }
           if (_activePrefetchWorkers > 0) {
             _activePrefetchWorkers--;
           }
@@ -3557,119 +4199,85 @@ class LocalProxyTunnelBridge {
     required Map<String, String> customHeaders,
     required bool forceDirect,
     required List<ProxyNode> candidateNodes,
+    required int generation,
   }) async {
     final uri = Uri.tryParse(url);
-    if (uri == null || uri.host.isEmpty || _serverSocket == null) return null;
-
-    Future<HttpClientResponse?> openPrefetchRequest({
-      String? byteRange,
-    }) async {
-      if (forceDirect) {
-        try {
-          final hc = _getOrCreateDirectRelayHttpClient();
-          final req = await hc.getUrl(uri).timeout(
-                const Duration(milliseconds: 6500),
-              );
-          req.headers.set(
-            'User-Agent',
-            customHeaders['User-Agent'] ??
-                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-          );
-          req.headers.set('Accept', '*/*');
-          customHeaders.forEach((k, v) {
-            if (k.toLowerCase() != 'host') {
-              req.headers.set(k, v);
-            }
-          });
-          if (byteRange != null) {
-            req.headers.set('Range', byteRange);
-          }
-          final resp = await req.close().timeout(
-                const Duration(milliseconds: 6500),
-              );
-          if (resp.statusCode >= 200 && resp.statusCode < 300) {
-            return resp;
-          }
-          await resp.drain<void>().timeout(
-                const Duration(milliseconds: 800),
-                onTimeout: () {},
-              );
-        } catch (_) {}
-        return null;
+    if (uri == null || uri.host.isEmpty) return null;
+    final routes = forceDirect ? <ProxyNode?>[null] : [...candidateNodes, null];
+    for (final node in routes) {
+      if (generation != _prefetchGeneration || !isRunning) return null;
+      HttpClientRequest? request;
+      StreamIterator<List<int>>? body;
+      const timeout = Duration(seconds: 6);
+      var cancelled = false;
+      void cancel() {
+        cancelled = true;
+        request?.abort();
+        if (body != null) unawaited(body.cancel());
       }
 
-      final nodes = winningNodeForSession != null
-          ? <ProxyNode>[
-              winningNodeForSession!,
-              ...candidateNodes.where((n) => n.id != winningNodeForSession!.id),
-            ]
-          : candidateNodes;
-      for (final node in nodes) {
-        try {
-          final hc = _getOrCreateStreamRelayHttpClient(node);
-          final req = await hc.getUrl(uri).timeout(
-                const Duration(milliseconds: 6500),
-              );
-          req.headers.set(
-            'User-Agent',
-            customHeaders['User-Agent'] ??
-                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-          );
-          req.headers.set('Accept', '*/*');
-          customHeaders.forEach((k, v) {
-            if (k.toLowerCase() != 'host') {
-              req.headers.set(k, v);
-            }
-          });
-          if (byteRange != null) {
-            req.headers.set('Range', byteRange);
+      _cancelPrefetches.add(cancel);
+      try {
+        final hc =
+            node == null
+                ? _getOrCreateDirectRelayHttpClient()
+                : _getOrCreateStreamRelayHttpClient(node);
+        final openedRequest = await hc
+            .getUrl(uri)
+            .then((req) {
+              if (cancelled) {
+                unawaited(req.done.then<void>((_) {}, onError: (Object _) {}));
+                req.abort();
+              }
+              return req;
+            })
+            .timeout(timeout);
+        if (cancelled) return null;
+        request = openedRequest;
+        customHeaders.forEach((name, value) {
+          if (name.toLowerCase() != HttpHeaders.hostHeader) {
+            openedRequest.headers.set(name, value);
           }
-          final resp = await req.close().timeout(
-                const Duration(milliseconds: 6500),
-              );
-          if (resp.statusCode >= 200 && resp.statusCode < 300) {
-            return resp;
-          }
-          await resp.drain<void>().timeout(
-                const Duration(milliseconds: 800),
-                onTimeout: () {},
-              );
-        } catch (_) {}
-      }
-      return null;
-    }
-
-    try {
-      final resp = await openPrefetchRequest();
-      if (resp == null) return null;
-      final contentType = resp.headers.value('content-type') ?? 'video/mp2t';
-      final totalLen = resp.contentLength;
-
-      if (totalLen > 10 * 1024 * 1024) {
-        await resp.drain<void>().timeout(
-              const Duration(milliseconds: 500),
-              onTimeout: () {},
-            );
-        return null;
-      }
-
-      final builder = BytesBuilder(copy: false);
-      await for (final chunk in resp.timeout(const Duration(seconds: 12))) {
-        if (chunk.isNotEmpty) {
-          recordDownstreamBytes(chunk.length);
-          builder.add(chunk);
-          if (builder.length > 10 * 1024 * 1024) {
-            return null;
-          }
+        });
+        openedRequest.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
+        final response = await openedRequest.close().timeout(timeout);
+        const maxBytes = 8 * 1024 * 1024;
+        if (cancelled ||
+            response.statusCode != HttpStatus.ok ||
+            response.contentLength > maxBytes) {
+          await response.listen(null, onError: (Object _) {}).cancel();
+          continue;
         }
+        final contentType =
+            response.headers.value(HttpHeaders.contentTypeHeader) ??
+            'video/mp2t';
+        final builder = BytesBuilder(copy: false);
+        body = StreamIterator(response.timeout(timeout));
+        while (!cancelled && await body.moveNext()) {
+          final chunk = body.current;
+          recordDownstreamBytes(chunk.length);
+          if (builder.length + chunk.length > maxBytes) return null;
+          builder.add(chunk);
+        }
+        final bytes = builder.takeBytes();
+        if (cancelled ||
+            generation != _prefetchGeneration ||
+            bytes.isEmpty ||
+            (response.contentLength >= 0 &&
+                bytes.length != response.contentLength)) {
+          continue;
+        }
+        _storePrefetchedSegment(url, bytes, contentType);
+        return (bytes: bytes, contentType: contentType);
+      } catch (_) {
+        // Try the next route if the upstream failed.
+      } finally {
+        _cancelPrefetches.remove(cancel);
+        cancel();
+        await body?.cancel();
       }
-      final bytes = builder.takeBytes();
-      if (bytes.isEmpty) return null;
-      _storePrefetchedSegment(url, bytes, contentType);
-      return (bytes: bytes, contentType: contentType);
-    } catch (_) {
-      return null;
     }
+    return null;
   }
 
   String _rewriteM3u8PlaylistThroughRelay(
@@ -3677,6 +4285,8 @@ class LocalProxyTunnelBridge {
     required Uri baseUri,
     required Map<String, String> headers,
     required bool cleanAds,
+    required String playlistScope,
+    required bool enablePrefetch,
     bool forceDirect = false,
     List<ProxyNode> candidateNodes = const <ProxyNode>[],
   }) {
@@ -3684,7 +4294,7 @@ class LocalProxyTunnelBridge {
     final lines = const LineSplitter().convert(content);
     final sb = StringBuffer();
     final discoveredSegments = <String>[];
-    final isMediaPlaylist = content.contains('#EXTINF');
+    final isMediaPlaylist = content.contains('#EXT-X-ENDLIST');
 
     final preferredNodeId =
         (!forceDirect && candidateNodes.isNotEmpty) ? candidateNodes.first.id : null;
@@ -3725,7 +4335,12 @@ class LocalProxyTunnelBridge {
       }
     }
 
-    if (discoveredSegments.isNotEmpty) {
+    if (enablePrefetch && discoveredSegments.isNotEmpty) {
+      if (_playlistScope != playlistScope ||
+          !listEquals(_playlistSegmentUrls, discoveredSegments)) {
+        _clearPlaylistPrefetch();
+      }
+      _playlistScope = playlistScope;
       _registerPlaylistSegments(discoveredSegments);
       _initialPrefetchTimer?.cancel();
       if (forceDirect) {
@@ -3765,13 +4380,23 @@ class LocalProxyTunnelBridge {
     Completer<Uint8List?>? firstPayloadWaiter;
     StreamSubscription<Uint8List>? clientSub;
 
+    var closed = false;
     void cleanup() {
+      if (closed) return;
+      closed = true;
+      _clientCleanups.remove(client);
+      _clientDisconnectHandlers.remove(client)?.call();
+      if (firstPayloadWaiter != null && !firstPayloadWaiter!.isCompleted) {
+        firstPayloadWaiter!.complete(null);
+      }
       clientSub?.cancel();
       activeUpstream?.close();
       try {
         client.destroy();
       } catch (_) {}
     }
+
+    _clientCleanups[client] = cleanup;
 
     // Single-subscription listener on `client` (never call `client.listen` twice!)
     clientSub = client.listen(
@@ -3824,6 +4449,10 @@ class LocalProxyTunnelBridge {
               );
             },
             onUpstreamReady: (upstream) {
+              if (closed) {
+                upstream.close();
+                return;
+              }
               activeUpstream = upstream;
               for (final queued in postHeaderQueue) {
                 try {
@@ -3838,12 +4467,7 @@ class LocalProxyTunnelBridge {
         );
       },
       onError: (_) => cleanup(),
-      onDone: () {
-        if (firstPayloadWaiter != null && !firstPayloadWaiter!.isCompleted) {
-          firstPayloadWaiter!.complete(null);
-        }
-        activeUpstream?.close();
-      },
+      onDone: cleanup,
     );
   }
 
@@ -4094,16 +4718,8 @@ class LocalProxyTunnelBridge {
             client.add(data);
           } catch (_) {}
         },
-        onDone: () {
-          try {
-            client.destroy();
-          } catch (_) {}
-        },
-        onError: (_) {
-          try {
-            client.destroy();
-          } catch (_) {}
-        },
+        onDone: cleanup,
+        onError: (_) => cleanup(),
       );
     } catch (_) {
       cleanup();
@@ -5430,6 +6046,8 @@ class ProxyRoutingService extends ChangeNotifier {
     final timedOut = _nodes
         .where(
           (n) =>
+              n.enabled &&
+              n.isSupportedByClientTunnel &&
               !n.isInfoNode &&
               !n.isReachable &&
               n.isTimeout,
@@ -5598,6 +6216,7 @@ class ProxyRoutingService extends ChangeNotifier {
   }
 
   Future<int> _ensureBridgeForNode(ProxyNode node) async {
+    if (_disposed) return 0;
     if (node.id == activeNode?.id) {
       return _localBridge.ensureStarted();
     }
@@ -5825,7 +6444,6 @@ class ProxyRoutingService extends ChangeNotifier {
         if (!candidate.isSupportedByClientTunnel) {
           continue;
         }
-        await _ensureBridgeForNode(candidate);
         final proxyHc = _localBridge._getOrCreateStreamRelayHttpClient(
           candidate,
         );
@@ -6009,11 +6627,7 @@ class ProxyRoutingService extends ChangeNotifier {
     if (rule.mode == ScenarioRouteMode.direct) {
       return ScenarioRouteMode.direct;
     }
-    if (rule.mode == ScenarioRouteMode.proxyNode) {
-      return resolveNodeForScenario(scenario) != null
-          ? ScenarioRouteMode.proxyNode
-          : ScenarioRouteMode.direct;
-    }
+    // Master global proxy switch: when disabled, NEVER route through any client proxy node!
     if (!_proxyEnabled) {
       return ScenarioRouteMode.direct;
     }
@@ -6140,15 +6754,15 @@ class ProxyRoutingService extends ChangeNotifier {
           );
         }
       }
-      if (scenario == RequestScenario.vodStream &&
-          lowerTrimmed.contains('.m3u8') &&
-          !uri.path.toLowerCase().startsWith('/api/vod/proxy')) {
+      if (scenario == RequestScenario.telegram ||
+          lowerTrimmed.contains('/api/telegram/video') ||
+          lowerTrimmed.contains('/api/telegram/file-content')) {
         final directPort = await _localBridge.ensureStarted();
         if (directPort > 0) {
           return _localBridge.buildStreamRelayUrl(
             targetUrl: trimmed,
             headers: headers,
-            cleanM3u8Ads: cleanM3u8Ads,
+            cleanM3u8Ads: false,
             forceDirect: true,
           );
         }
@@ -6156,7 +6770,23 @@ class ProxyRoutingService extends ChangeNotifier {
       return trimmed;
     }
     final node = resolveNodeForScenario(scenario);
-    if (node == null) return trimmed;
+    if (node == null) {
+      final lowerTrimmed = trimmed.toLowerCase();
+      if (scenario == RequestScenario.telegram ||
+          lowerTrimmed.contains('/api/telegram/video') ||
+          lowerTrimmed.contains('/api/telegram/file-content')) {
+        final directPort = await _localBridge.ensureStarted();
+        if (directPort > 0) {
+          return _localBridge.buildStreamRelayUrl(
+            targetUrl: trimmed,
+            headers: headers,
+            cleanM3u8Ads: false,
+            forceDirect: true,
+          );
+        }
+      }
+      return trimmed;
+    }
 
     String targetUrlToProxy = trimmed;
     Map<String, String> targetHeadersToProxy = headers;
@@ -6204,16 +6834,14 @@ class ProxyRoutingService extends ChangeNotifier {
 
     final port = await _ensureBridgeForNode(node);
     if (port <= 0) return trimmed;
-    final bridge = (node.id == activeNode?.id)
-        ? _localBridge
-        : (_nodeBridges[node.id] ?? _localBridge);
 
-    return bridge.buildStreamRelayUrl(
+    final bridge = port == _localBridge.port ? _localBridge : _nodeBridges[node.id];
+    return bridge?.buildStreamRelayUrl(
       targetUrl: targetUrlToProxy,
       headers: targetHeadersToProxy,
       cleanM3u8Ads: cleanM3u8Ads,
       preferredNodeId: node.id,
-    );
+    ) ?? trimmed;
   }
 
   /// Returns an `http://127.0.0.1:<port>` proxy URL for `media_kit` (`libmpv`)
@@ -6386,6 +7014,20 @@ class ProxyRoutingService extends ChangeNotifier {
   /// Enable or disable the global proxy master switch.
   Future<void> setProxyEnabled(bool enabled) async {
     _proxyEnabled = enabled;
+    var rulesReset = false;
+    if (!enabled) {
+      // Clear any sticky per-scenario `proxyNode` overrides so turning off global proxy truly disables all proxy routing
+      for (final s in RequestScenario.values) {
+        final cur = _scenarioRules[s];
+        if (cur != null && cur.mode == ScenarioRouteMode.proxyNode) {
+          _scenarioRules[s] = ScenarioRuleConfig(
+            scenario: s,
+            mode: ScenarioRouteMode.followGlobal,
+          );
+          rulesReset = true;
+        }
+      }
+    }
     _resetAllBridgeSessionCaches();
     if (enabled) {
       await _localBridge.ensureStarted();
@@ -6401,11 +7043,14 @@ class ProxyRoutingService extends ChangeNotifier {
           : '已开启代理（当前节点：${activeNode?.displayTitle ?? "未选择"}）';
     } else {
       _autoFastestTimer?.cancel();
-      _lastStatusMessage = '已关闭全局代理，请求将按默认直连或场景独立规则执行';
+      _lastStatusMessage = '已彻底关闭全局代理，所有请求与视频流已恢复直连';
     }
     _lastStatusIsError = false;
     notifyListeners();
     try {
+      if (rulesReset) {
+        await _persistScenarioRules();
+      }
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool(_prefProxyEnabledKey, enabled);
     } catch (_) {}

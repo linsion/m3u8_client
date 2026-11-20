@@ -63,13 +63,10 @@ class _VideoProxyNodeSelectorState extends State<VideoProxyNodeSelector> {
   }
 
   bool _isDirectActive() {
-    final rule = proxyService.scenarioRules[scenario];
-    if (rule?.mode == ScenarioRouteMode.serverRelay ||
-        rule?.mode == ScenarioRouteMode.proxyNode) {
-      return false;
-    }
+    if (_isServerRelayActive()) return false;
     if (!proxyService.proxyEnabled) return true;
-    return rule?.mode == ScenarioRouteMode.direct;
+    return proxyService.resolveEffectiveRoute(scenario) ==
+        ScenarioRouteMode.direct;
   }
 
   String _buildCurrentLabel() {

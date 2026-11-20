@@ -260,6 +260,7 @@ class TelegramScreen extends StatefulWidget {
 }
 
 class _TelegramScreenState extends State<TelegramScreen> {
+  final _inlinePlaybackOwner = ValueNotifier<Object?>(null);
   // Static in-memory session cache so switching between chats, folders, or app
   // tabs restores the conversation and scroll position in 0ms without re-fetching.
   static List<TelegramAccount> _cachedAccounts = [];
@@ -1204,6 +1205,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
     _audioCompletedSub?.cancel();
     _audioErrorSub?.cancel();
     _audioPlayer?.dispose();
+    _inlinePlaybackOwner.dispose();
     _chatSearchCtrl.dispose();
     _msgSearchCtrl.dispose();
     _composeController.dispose();
@@ -2207,6 +2209,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
   }
 
   Future<void> _selectChat(TelegramChat chat) async {
+    if (_selectedChat?.peer != chat.peer) _inlinePlaybackOwner.value = null;
     _userExitedChat = false;
     _saveCurrentDraft();
     _saveCurrentChatToMemoryCache();
@@ -3483,6 +3486,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
   }) {
     final att = msg.attachment;
     if (att == null) return;
+    _inlinePlaybackOwner.value = null;
     if (_isAudioPlaying) {
       unawaited(_audioPlayer?.pause());
     }
@@ -3525,6 +3529,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
     if ((msg.attachment?.isVideo ?? false) && _isAudioPlaying) {
       unawaited(_audioPlayer?.pause());
     }
+    _inlinePlaybackOwner.value = null;
     final allVisualMedia = _messages
         .where((m) => m.attachment != null && m.attachment!.isVisualMedia)
         .toList();
@@ -7831,6 +7836,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
                 return _TelegramAlbumMediaTile(
                   key: ValueKey('album_tile_${chat.peer}_${m.id}'),
+                  inlinePlaybackOwner: _inlinePlaybackOwner,
                   appState: widget.appState,
                   accountId: _activeAccountId,
                   chat: chat,
@@ -14613,6 +14619,7 @@ class _TelegramVideoFrameFallback extends StatelessWidget {
 /// (with video thumbnail/first-frame preview, inline cell playback, PiP mini-player, and unified gallery viewer)
 class _TelegramAlbumMediaTile extends StatefulWidget {
   final AppState appState;
+  final ValueNotifier<Object?> inlinePlaybackOwner;
   final String accountId;
   final TelegramChat chat;
   final TelegramMessage message;
@@ -14635,6 +14642,7 @@ class _TelegramAlbumMediaTile extends StatefulWidget {
   const _TelegramAlbumMediaTile({
     super.key,
     required this.appState,
+    required this.inlinePlaybackOwner,
     required this.accountId,
     required this.chat,
     required this.message,
@@ -14662,6 +14670,7 @@ class _TelegramAlbumMediaTile extends StatefulWidget {
 
 class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
     with AutomaticKeepAliveClientMixin {
+  final _inlinePlaybackToken = Object();
   Player? _inlinePlayer;
   VideoController? _inlineController;
   StreamSubscription<bool>? _playingSub;
@@ -14684,9 +14693,30 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
   bool get wantKeepAlive => _isInlineMode;
 
   @override
+  void initState() {
+    super.initState();
+    widget.inlinePlaybackOwner.addListener(_onInlinePlaybackOwnerChanged);
+  }
+
+  @override
   void dispose() {
+    widget.inlinePlaybackOwner.removeListener(_onInlinePlaybackOwnerChanged);
     _disposeInlinePlayer();
     super.dispose();
+  }
+
+  void _onInlinePlaybackOwnerChanged() {
+    if (_inlinePlayer == null ||
+        identical(widget.inlinePlaybackOwner.value, _inlinePlaybackToken)) {
+      return;
+    }
+    _pendingResumeSeconds = _position.inSeconds;
+    _disposeInlinePlayer();
+    setState(() {
+      _isInlineMode = false;
+      _isPlaying = false;
+    });
+    updateKeepAlive();
   }
 
   void _disposeInlinePlayer() {
@@ -14713,15 +14743,15 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
         'vd-lavc-software-fallback': 'yes',
         'cache': 'yes',
         'cache-on-disk': 'no',
-        'cache-secs': isMobileOrTv ? '45' : '90',
+        'cache-secs': isMobileOrTv ? '60' : '120',
         'cache-pause': 'yes',
         'cache-pause-initial': 'no',
-        'cache-pause-wait': '0.8',
+        'cache-pause-wait': '2.5',
         'demuxer-thread': 'yes',
-        'demuxer-max-bytes': isMobileOrTv ? '33554432' : '134217728',
-        'demuxer-max-back-bytes': isMobileOrTv ? '8388608' : '33554432',
-        'demuxer-readahead-secs': isMobileOrTv ? '25' : '45',
-        'stream-buffer-size': '524288',
+        'demuxer-max-bytes': isMobileOrTv ? '67108864' : '134217728',
+        'demuxer-max-back-bytes': isMobileOrTv ? '16777216' : '33554432',
+        'demuxer-readahead-secs': isMobileOrTv ? '45' : '90',
+        'stream-buffer-size': '2097152',
         'demuxer-lavf-probesize': '131072',
         'vd-lavc-threads': Platform.isAndroid ? '4' : '0',
         'ad-lavc-threads': '0',
@@ -14744,6 +14774,8 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
     if (att == null || !att.isVideo) return;
 
     if (!_isInlineMode || _inlinePlayer == null) {
+      if (_inlinePlayer != null) return;
+      widget.inlinePlaybackOwner.value = _inlinePlaybackToken;
       final p = Player(
         configuration: PlayerConfiguration(
           bufferSize: (Platform.isAndroid || Platform.isIOS)
@@ -14775,7 +14807,9 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
         rawStreamUrl,
         headers: widget.appState.api.authHeaders,
       );
+      if (!mounted || _inlinePlayer != p) return;
       final usingLocalRelay = streamUrl.contains('/__m3u8_proxy__/');
+      var retriedPrematureEnd = false;
       _playingSub = p.stream.playing.listen((playing) {
         if (mounted) setState(() => _isPlaying = playing);
       });
@@ -14806,12 +14840,15 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
         }
       });
       _completedSub = p.stream.completed.listen((completed) {
-        if (!completed || !mounted || _userPaused) return;
+        if (!completed || !mounted || _inlinePlayer != p || _userPaused) {
+          return;
+        }
         final durSec = _duration.inSeconds;
         final posSec = _position.inSeconds;
         final isPrematureEof =
             durSec <= 0 || (durSec > 6 && posSec > 1 && posSec < durSec - 4);
-        if (isPrematureEof) {
+        if (isPrematureEof && !retriedPrematureEnd) {
+          retriedPrematureEnd = true;
           _pendingResumeSeconds = posSec;
           unawaited(
             p.open(
@@ -14823,6 +14860,9 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
               play: true,
             ),
           );
+        } else {
+          if (!isPrematureEof) _position = Duration.zero;
+          widget.inlinePlaybackOwner.value = null;
         }
       });
       setState(() {
@@ -14831,7 +14871,9 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
       });
       updateKeepAlive();
       await _configureTelegramPlayer(p);
+      if (!mounted || _inlinePlayer != p) return;
       await p.setVolume(_isMuted ? 0 : _volume);
+      if (!mounted || _inlinePlayer != p) return;
       await p.open(
         Media(
           streamUrl,
@@ -15532,8 +15574,92 @@ class _TelegramPhotoGalleryDialog extends StatefulWidget {
       _TelegramPhotoGalleryDialogState();
 }
 
+class _TelegramGalleryPlaybackTiming {
+  final Stopwatch clock;
+  final String route;
+  final Duration initialPosition;
+  int? _startedAt;
+  int? _seekStartedAt;
+  Duration? _seekTarget;
+  int? _stallStartedAt;
+  int _stallCount = 0;
+  int _stallMs = 0;
+
+  _TelegramGalleryPlaybackTiming(this.clock, this.route, this.initialPosition);
+
+  void log(String event, String metrics) {
+    debugPrint(
+      '[TelegramPlayback] session=${identityHashCode(this)} route=$route '
+      'event=$event $metrics',
+    );
+  }
+
+  void recordPosition(Duration position) {
+    final now = clock.elapsedMilliseconds;
+    if (_startedAt == null &&
+        position > initialPosition + const Duration(milliseconds: 80)) {
+      _startedAt = now;
+      log('start', 'playback_start_ms=$now');
+    }
+    final target = _seekTarget;
+    final seekStartedAt = _seekStartedAt;
+    if (target != null && seekStartedAt != null) {
+      final advance = position - target;
+      if (advance >= const Duration(milliseconds: 80) &&
+          advance <= const Duration(seconds: 2)) {
+        log('seek', 'seek_resume_ms=${now - seekStartedAt}');
+        _seekTarget = null;
+        _seekStartedAt = null;
+      }
+    }
+  }
+
+  void seek(Duration target) {
+    pause();
+    _seekStartedAt = clock.elapsedMilliseconds;
+    _seekTarget = target;
+  }
+
+  void buffering(bool value) {
+    if (value) {
+      if (_startedAt != null && _seekTarget == null) {
+        _stallStartedAt ??= clock.elapsedMilliseconds;
+      }
+    } else if (_stallStartedAt case final start?) {
+      _stallCount++;
+      _stallMs += clock.elapsedMilliseconds - start;
+      _stallStartedAt = null;
+    }
+  }
+
+  void pause() {
+    buffering(false);
+    if (_seekStartedAt case final start?) {
+      log('seek_interrupted', 'seek_wait_ms=${clock.elapsedMilliseconds - start}');
+    }
+    _seekTarget = null;
+    _seekStartedAt = null;
+  }
+
+  void finish() {
+    pause();
+    clock.stop();
+    log(
+      'summary',
+      'elapsed_ms=${clock.elapsedMilliseconds} '
+      'stall_count=$_stallCount stall_ms=$_stallMs',
+    );
+  }
+}
+
 class _TelegramPhotoGalleryDialogState
     extends State<_TelegramPhotoGalleryDialog> {
+  static const _playbackTimingEnabled = bool.fromEnvironment(
+    'TELEGRAM_PLAYBACK_TIMING',
+  );
+  static const _compareDirectPlayback = bool.fromEnvironment(
+    'TELEGRAM_PLAYBACK_DIRECT',
+  );
   final FocusNode _focusNode = FocusNode(debugLabel: 'Gallery_Stage');
   final FocusNode _scrubberFocusNode = FocusNode(debugLabel: 'Gallery_Scrubber');
 
@@ -15627,6 +15753,8 @@ class _TelegramPhotoGalleryDialogState
   bool _isGalleryHorizontalSeeking = false;
   Duration _gallerySeekStartPos = Duration.zero;
   Duration _gallerySeekPreviewPos = Duration.zero;
+  Duration? _gallerySliderPreviewPos;
+  _TelegramGalleryPlaybackTiming? _galleryPlaybackTiming;
   String _galleryAspectMode = 'fit'; // 'fit', 'cover'
   bool? _galleryLandscapeOverride;
   bool _galleryDidChangeOrientation = false;
@@ -15640,6 +15768,10 @@ class _TelegramPhotoGalleryDialogState
   bool _topTitleHidden = false;
   int _controlsPosPreset = 0; // 0: 底部默认, 1: 顶部避字幕, 2: 中上位置
   int _galleryVideoOpenSeq = 0;
+  Future<void>? _galleryPlayerSetup;
+  bool _galleryOpening = false;
+  bool _galleryRetriedPrematureEnd = false;
+  bool _galleryWantsPlayback = true;
   String _activeGalleryStreamUrl = '';
   bool _activeGalleryUsingLocalRelay = false;
   bool _showProxyStatsOverlay = false;
@@ -15987,6 +16119,8 @@ class _TelegramPhotoGalleryDialogState
 
   void _disposeVideoPlayer() {
     _galleryVideoOpenSeq++;
+    _finishGalleryPlaybackTiming();
+    _galleryPlayerSetup = null;
     _playingSub?.cancel();
     _posSub?.cancel();
     _durSub?.cancel();
@@ -16015,15 +16149,15 @@ class _TelegramPhotoGalleryDialogState
         'vd-lavc-software-fallback': 'yes',
         'cache': 'yes',
         'cache-on-disk': 'no',
-        'cache-secs': isMobileOrTv ? '45' : '120',
+        'cache-secs': isMobileOrTv ? '60' : '120',
         'cache-pause': 'yes',
         'cache-pause-initial': 'no',
-        'cache-pause-wait': '0.8',
+        'cache-pause-wait': '2.5',
         'demuxer-thread': 'yes',
-        'demuxer-max-bytes': isMobileOrTv ? '50331648' : '134217728',
+        'demuxer-max-bytes': isMobileOrTv ? '67108864' : '134217728',
         'demuxer-max-back-bytes': isMobileOrTv ? '16777216' : '33554432',
-        'demuxer-readahead-secs': isMobileOrTv ? '30' : '60',
-        'stream-buffer-size': '524288',
+        'demuxer-readahead-secs': isMobileOrTv ? '45' : '90',
+        'stream-buffer-size': '2097152',
         'demuxer-lavf-probesize': '131072',
         'demuxer-lavf-analyzeduration': '0.5',
         'vd-lavc-threads': Platform.isAndroid ? '4' : '0',
@@ -16042,15 +16176,25 @@ class _TelegramPhotoGalleryDialogState
     } catch (_) {}
   }
 
-  Future<void> _syncVideoPlayerForCurrentItem() async {
+  Future<void> _syncVideoPlayerForCurrentItem({
+    Duration resumeFrom = Duration.zero,
+    bool play = true,
+  }) async {
     final openSeq = ++_galleryVideoOpenSeq;
+    _finishGalleryPlaybackTiming();
+    _gallerySliderPreviewPos = null;
+    final timingClock = _playbackTimingEnabled && play ? Stopwatch() : null;
+    timingClock?.start();
     final list = _activeMessages;
     if (list.isEmpty) return;
     _currentIndex = _currentIndex.clamp(0, list.length - 1);
     final msg = list[_currentIndex];
     final att = msg.attachment;
     if (att == null || !att.isVideo) {
-      _videoPlayer?.stop();
+      _galleryOpening = false;
+      _activeGalleryStreamUrl = '';
+      await _videoPlayer?.stop();
+      if (openSeq != _galleryVideoOpenSeq) return;
       if (mounted) {
         setState(() {
           _isVideoPlaying = false;
@@ -16064,12 +16208,14 @@ class _TelegramPhotoGalleryDialogState
     }
 
     Player p;
+    VideoController? newController;
     if (_videoPlayer == null || _videoController == null) {
       p = Player(
         configuration: PlayerConfiguration(
-          bufferSize: (Platform.isAndroid || Platform.isIOS)
-              ? 32 * 1024 * 1024
-              : 128 * 1024 * 1024,
+          bufferSize:
+              (Platform.isAndroid || Platform.isIOS)
+                  ? 32 * 1024 * 1024
+                  : 128 * 1024 * 1024,
         ),
       );
       final c = VideoController(
@@ -16081,7 +16227,8 @@ class _TelegramPhotoGalleryDialogState
       );
       _videoPlayer = p;
       _videoController = c;
-      await _configureGalleryVideoPlayer(p);
+      newController = c;
+      _galleryPlayerSetup = _configureGalleryVideoPlayer(p);
 
       _playingSub = p.stream.playing.listen((playing) {
         if (mounted && _isVideoPlaying != playing) {
@@ -16090,6 +16237,9 @@ class _TelegramPhotoGalleryDialogState
       });
       _posSub = p.stream.position.listen((pos) {
         if (!mounted) return;
+        if (_galleryWantsPlayback && p.state.playing && !p.state.buffering) {
+          _galleryPlaybackTiming?.recordPosition(pos);
+        }
         if (pos > Duration.zero) {
           final now = DateTime.now();
           final shouldClearBuf = _isVideoBuffering && !p.state.buffering;
@@ -16130,25 +16280,34 @@ class _TelegramPhotoGalleryDialogState
         }
       });
       _bufferingSub = p.stream.buffering.listen((buf) {
+        _galleryPlaybackTiming?.buffering(buf && _galleryWantsPlayback);
         if (mounted && _isVideoBuffering != buf) {
           setState(() => _isVideoBuffering = buf);
         }
       });
       _completedSub = p.stream.completed.listen((completed) {
-        if (!completed || !mounted) return;
+        if (!completed ||
+            !mounted ||
+            _galleryOpening ||
+            _galleryRetriedPrematureEnd ||
+            !_galleryWantsPlayback) {
+          return;
+        }
         final durSec = _videoDuration.inSeconds;
         final posSec = _videoPosition.inSeconds;
         final isPrematureEof =
             durSec <= 0 || (durSec > 6 && posSec > 1 && posSec < durSec - 4);
         if (isPrematureEof && _activeGalleryStreamUrl.isNotEmpty) {
+          _galleryRetriedPrematureEnd = true;
           _pendingGalleryResumeSeconds = posSec;
           unawaited(
             p.open(
               Media(
                 _activeGalleryStreamUrl,
-                httpHeaders: _activeGalleryUsingLocalRelay
-                    ? const {}
-                    : widget.appState.api.authHeaders,
+                httpHeaders:
+                    _activeGalleryUsingLocalRelay
+                        ? const {}
+                        : widget.appState.api.authHeaders,
               ),
               play: true,
             ),
@@ -16159,7 +16318,10 @@ class _TelegramPhotoGalleryDialogState
       p = _videoPlayer!;
     }
 
-    _videoPosition = Duration.zero;
+    _galleryOpening = true;
+    _galleryWantsPlayback = play;
+    _galleryRetriedPrematureEnd = false;
+    _videoPosition = resumeFrom;
     _videoBuffer = Duration.zero;
     _pendingGalleryResumeSeconds = 0;
     _videoDuration =
@@ -16186,36 +16348,113 @@ class _TelegramPhotoGalleryDialogState
       }
     }
 
+    bool isCurrent() =>
+        mounted && _videoPlayer == p && _galleryVideoOpenSeq == openSeq;
     try {
+      await _galleryPlayerSetup;
+      if (!isCurrent()) return;
+      await p.stop();
+      if (!isCurrent()) return;
+      final authHeaders = widget.appState.api.authHeaders;
+      final proxyService = widget.appState.proxyService;
+      final useDirectComparison =
+          _compareDirectPlayback &&
+          proxyService.resolveEffectiveRoute(
+                RequestScenario.telegram,
+                targetUri: Uri.parse(rawStreamUrl),
+              ) ==
+              ScenarioRouteMode.direct;
       final resolvedUrl =
-          await widget.appState.proxyService.resolveProxiedStreamUrl(
-        RequestScenario.telegram,
-        rawStreamUrl,
-        headers: widget.appState.api.authHeaders,
-      );
-      if (!mounted || _videoPlayer != p || _galleryVideoOpenSeq != openSeq) {
-        return;
-      }
+          useDirectComparison
+              ? rawStreamUrl
+              : await proxyService.resolveProxiedStreamUrl(
+                RequestScenario.telegram,
+                rawStreamUrl,
+                headers: authHeaders,
+              );
+      if (!isCurrent()) return;
       _activeGalleryStreamUrl = resolvedUrl;
       _activeGalleryUsingLocalRelay = resolvedUrl.contains('/__m3u8_proxy__/');
       await p.setVolume(_isMuted ? 0 : _volume);
+      if (!isCurrent()) return;
+      final playOnOpen = _galleryWantsPlayback;
+      if (timingClock != null && playOnOpen) {
+        final route =
+            !_activeGalleryUsingLocalRelay
+                ? 'server_direct'
+                : Uri.parse(resolvedUrl).queryParameters['direct'] == '1'
+                ? 'relay_direct'
+                : 'relay_proxy';
+        final timing = _TelegramGalleryPlaybackTiming(
+          timingClock,
+          route,
+          resumeFrom,
+        );
+        _galleryPlaybackTiming = timing;
+        if (newController != null) {
+          unawaited(
+            newController.waitUntilFirstFrameRendered.then<void>((_) {
+              if (identical(_galleryPlaybackTiming, timing)) {
+                timing.log(
+                  'first_frame',
+                  'first_frame_ms=${timingClock.elapsedMilliseconds}',
+                );
+              }
+            }, onError: (Object _) {}),
+          );
+        }
+      }
       await p.open(
         Media(
-          _activeGalleryStreamUrl,
-          httpHeaders: _activeGalleryUsingLocalRelay
-              ? const {}
-              : widget.appState.api.authHeaders,
+          resolvedUrl,
+          httpHeaders: _activeGalleryUsingLocalRelay ? const {} : authHeaders,
+          start: resumeFrom > Duration.zero ? resumeFrom : null,
         ),
-        play: true,
+        play: playOnOpen,
       );
-      if (_playbackSpeed != 1.0) {
+      if (!isCurrent()) return;
+      if (playOnOpen != _galleryWantsPlayback) {
+        if (_galleryWantsPlayback) {
+          await p.play();
+        } else {
+          await p.pause();
+        }
+      }
+      if (isCurrent() && _playbackSpeed != 1.0) {
         await p.setRate(_playbackSpeed);
       }
     } catch (_) {
-      if (mounted && _galleryVideoOpenSeq == openSeq) {
+      if (isCurrent()) {
+        _finishGalleryPlaybackTiming();
         setState(() => _isVideoBuffering = false);
       }
+    } finally {
+      if (isCurrent()) _galleryOpening = false;
     }
+  }
+
+  Future<void> _toggleGalleryPlayback() async {
+    final player = _videoPlayer;
+    if (player == null) return;
+    _galleryWantsPlayback = !_galleryWantsPlayback;
+    if (!_galleryWantsPlayback) _galleryPlaybackTiming?.pause();
+    if (_galleryOpening) return;
+    if (_galleryWantsPlayback) {
+      await player.play();
+    } else {
+      await player.pause();
+    }
+  }
+
+  void _switchGalleryProxy(String status) {
+    if (!mounted) return;
+    _showGalleryHud(status, state: 'success');
+    unawaited(
+      _syncVideoPlayerForCurrentItem(
+        resumeFrom: _videoPosition,
+        play: _galleryWantsPlayback,
+      ),
+    );
   }
 
   bool _usingGallery115Direct = false;
@@ -16244,6 +16483,7 @@ class _TelegramPhotoGalleryDialogState
   Future<void> _applyGallery115Stream(Resolved115Stream resolved) async {
     final p = _videoPlayer;
     if (!mounted || p == null) return;
+    _finishGalleryPlaybackTiming();
     final curSec = _videoPosition.inSeconds;
     setState(() {
       _usingGallery115Direct = true;
@@ -16353,8 +16593,6 @@ class _TelegramPhotoGalleryDialogState
   }
 
   void _seekRelative(int deltaSeconds) {
-    final p = _videoPlayer;
-    if (p == null) return;
     final target = _videoPosition + Duration(seconds: deltaSeconds);
     final maxDur = _videoDuration > Duration.zero
         ? _videoDuration
@@ -16362,7 +16600,35 @@ class _TelegramPhotoGalleryDialogState
     final clamped = target < Duration.zero
         ? Duration.zero
         : (target > maxDur ? maxDur : target);
-    p.seek(clamped);
+    _seekGalleryVideo(clamped);
+  }
+
+  void _seekGalleryVideo(Duration target) {
+    final player = _videoPlayer;
+    if (player == null) return;
+    if (_galleryWantsPlayback) _galleryPlaybackTiming?.seek(target);
+    player.seek(target);
+  }
+
+  void _previewGallerySlider(double value) {
+    setState(() {
+      _gallerySliderPreviewPos = Duration(milliseconds: value.round());
+    });
+  }
+
+  void _commitGallerySlider(double value) {
+    if (_gallerySliderPreviewPos == null) return;
+    final target = Duration(milliseconds: value.round());
+    setState(() {
+      _gallerySliderPreviewPos = null;
+      _videoPosition = target;
+    });
+    _seekGalleryVideo(target);
+  }
+
+  void _finishGalleryPlaybackTiming() {
+    _galleryPlaybackTiming?.finish();
+    _galleryPlaybackTiming = null;
   }
 
   String _fmtClock(Duration d) {
@@ -16658,7 +16924,9 @@ class _TelegramPhotoGalleryDialogState
     final totalMs =
         _videoDuration.inMilliseconds > 0 ? _videoDuration.inMilliseconds : 1;
     final activePos =
-        _isGalleryHorizontalSeeking ? _gallerySeekPreviewPos : _videoPosition;
+        _isGalleryHorizontalSeeking
+            ? _gallerySeekPreviewPos
+            : _gallerySliderPreviewPos ?? _videoPosition;
     final posMs = activePos.inMilliseconds.clamp(0, totalMs);
     final bufMs = _videoBuffer.inMilliseconds.clamp(posMs, totalMs);
 
@@ -16826,7 +17094,7 @@ class _TelegramPhotoGalleryDialogState
                             event.logicalKey ==
                                 LogicalKeyboardKey.gameButtonA) &&
                         isVideo) {
-                      _videoPlayer?.playOrPause();
+                      _toggleGalleryPlayback();
                       return KeyEventResult.handled;
                     } else if (event is KeyDownEvent &&
                         event.logicalKey == LogicalKeyboardKey.keyM &&
@@ -16851,10 +17119,10 @@ class _TelegramPhotoGalleryDialogState
                             setState(() => _controlsHidden = false);
                             _scrollActiveThumbnailIntoView(animated: false);
                           } else {
-                            _videoPlayer?.playOrPause();
+                            _toggleGalleryPlayback();
                           }
                         },
-                        onDoubleTap: () => _videoPlayer?.playOrPause(),
+                        onDoubleTap: () => _toggleGalleryPlayback(),
                         onHorizontalDragStart: (details) {
                           if (details.globalPosition.dx <= 40.0) return;
                           if (_videoPlayer == null) return;
@@ -16895,7 +17163,7 @@ class _TelegramPhotoGalleryDialogState
                             _isGalleryHorizontalSeeking = false;
                             _videoPosition = target;
                           });
-                          _videoPlayer?.seek(target);
+                          _seekGalleryVideo(target);
                         },
                         child: Stack(
                           alignment: Alignment.center,
@@ -17228,15 +17496,7 @@ class _TelegramPhotoGalleryDialogState
                               proxyService: widget.appState.proxyService,
                               scenario: RequestScenario.telegram,
                               overlayStyle: true,
-                              onProxyChanged: (statusMsg) {
-                                _showGalleryHud(statusMsg, state: 'success');
-                                final curSec = _videoPosition.inSeconds;
-                                _syncVideoPlayerForCurrentItem().then((_) {
-                                  if (curSec > 2) {
-                                    _pendingGalleryResumeSeconds = curSec;
-                                  }
-                                });
-                              },
+                              onProxyChanged: _switchGalleryProxy,
                             ),
                             const SizedBox(width: 6),
                             VideoProxyStatsButton(
@@ -17845,7 +18105,7 @@ class _TelegramPhotoGalleryDialogState
                                               LogicalKeyboardKey.space ||
                                           event.logicalKey ==
                                               LogicalKeyboardKey.gameButtonA)) {
-                                    _videoPlayer?.playOrPause();
+                                    _toggleGalleryPlayback();
                                     return KeyEventResult.handled;
                                   }
                                   return KeyEventResult.ignored;
@@ -17924,14 +18184,10 @@ class _TelegramPhotoGalleryDialogState
                                                       bufMs.toDouble(),
                                                   min: 0,
                                                   max: totalMs.toDouble(),
-                                                  onChanged: (val) {
-                                                    _videoPlayer?.seek(
-                                                      Duration(
-                                                        milliseconds:
-                                                            val.round(),
-                                                      ),
-                                                    );
-                                                  },
+                                                  onChanged:
+                                                      _previewGallerySlider,
+                                                  onChangeEnd:
+                                                      _commitGallerySlider,
                                                 ),
                                               ),
                                             ),
@@ -17992,7 +18248,7 @@ class _TelegramPhotoGalleryDialogState
                                       ? Icons.pause_rounded
                                       : Icons.play_arrow_rounded,
                                   label: _isVideoPlaying ? '暂停' : '播放',
-                                  onTap: () => _videoPlayer?.playOrPause(),
+                                  onTap: () => _toggleGalleryPlayback(),
                                   upFocusNode: _scrubberFocusNode,
                                   downFocusNode: activeThumbNode,
                                   leftFocusNode: _neighborInChain(
@@ -18236,18 +18492,7 @@ class _TelegramPhotoGalleryDialogState
                                     scenario: RequestScenario.telegram,
                                     overlayStyle: true,
                                     compact: true,
-                                    onProxyChanged: (statusMsg) {
-                                      _showGalleryHud(
-                                        statusMsg,
-                                        state: 'success',
-                                      );
-                                      final curSec = _videoPosition.inSeconds;
-                                      _syncVideoPlayerForCurrentItem().then((_) {
-                                        if (curSec > 2) {
-                                          _pendingGalleryResumeSeconds = curSec;
-                                        }
-                                      });
-                                    },
+                                    onProxyChanged: _switchGalleryProxy,
                                   ),
                                   const SizedBox(width: 6),
                                   VideoProxyStatsButton(

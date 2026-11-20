@@ -1338,14 +1338,14 @@ proxies:
       await req.response.close();
     });
 
-    final svc = ProxyRoutingService();
-    await svc.initialize();
-    await svc.setProxyEnabled(false); // Even in Direct mode, VOD M3U8 uses multi-connection relay
+    final bridge = LocalProxyTunnelBridge(resolveDefaultNode: () => null);
+    addTearDown(bridge.stop);
+    expect(await bridge.ensureStarted(), greaterThan(0));
 
     final m3u8Url = 'http://127.0.0.1:$originPort/vod/index.m3u8';
-    final relayedUrl = await svc.resolveProxiedStreamUrl(
-      RequestScenario.vodStream,
-      m3u8Url,
+    final relayedUrl = bridge.buildStreamRelayUrl(
+      targetUrl: m3u8Url,
+      forceDirect: true,
     );
     expect(relayedUrl, contains('/__m3u8_proxy__/playlist.m3u8'));
     expect(relayedUrl, contains('direct=1'));
@@ -1364,10 +1364,10 @@ proxies:
 
     // Wait briefly for the 4 concurrent prefetch workers to finish downloading seg_0..seg_3
     for (var i = 0; i < 20; i++) {
-      if (svc.localBridgePrefetchedSegmentCount >= 4) break;
+      if (bridge.prefetchedSegmentCount >= 4) break;
       await Future<void>.delayed(const Duration(milliseconds: 25));
     }
-    expect(svc.localBridgePrefetchedSegmentCount, greaterThanOrEqualTo(4));
+    expect(bridge.prefetchedSegmentCount, greaterThanOrEqualTo(4));
     expect(fetchedSegmentsOnOrigin.length, greaterThanOrEqualTo(4));
 
     // Request seg_0 from the local relay -> should be served immediately from memory cache!
@@ -1380,7 +1380,6 @@ proxies:
     expect(seg0Bytes.length, 2048);
 
     hc.close(force: true);
-    svc.dispose();
     await originServer.close(force: true);
   });
 

@@ -105,13 +105,13 @@ final class TvAppState: ObservableObject {
   var appVersion: String {
     let raw = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String)?
       .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    return (raw.isEmpty || raw.contains("$(")) ? "1.2.3" : raw
+    return (raw.isEmpty || raw.contains("$(")) ? "1.2.4" : raw
   }
 
   var appBuildNumber: String {
     let raw = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String)?
       .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    return (raw.isEmpty || raw.contains("$(")) ? "38" : raw
+    return (raw.isEmpty || raw.contains("$(")) ? "39" : raw
   }
 
   var appFullVersion: String {
@@ -3090,6 +3090,21 @@ final class TvAppState: ObservableObject {
       return (url, headers, "\(mount.name) · \(entry.formattedSize)")
 
     case .cloud115:
+      if !TvLocal115DirectClient.shared.hasLocalCookie {
+        let srvSettings = await api.fetchServerSettings()
+        let srvCookie = TvApiClient.stringValue(
+          srvSettings["cookie_115"],
+          fallback: TvApiClient.stringValue(
+            srvSettings["115_cookie"],
+            fallback: TvApiClient.stringValue(srvSettings["cookies"])
+          )
+        )
+        let norm = TvLocal115DirectClient.normalizeCookieString(srvCookie)
+        if norm.contains("UID=") && norm.contains("CID=") && norm.contains("SEID=") {
+          TvLocal115DirectClient.shared.savedCookie = norm
+          self.is115LoggedIn = true
+        }
+      }
       guard !entry.pickcode115.isEmpty else {
         throw NSError(domain: "Tv115", code: -1, userInfo: [NSLocalizedDescriptionKey: "无法获取 115 文件直链，请确认登录状态"])
       }
@@ -3102,11 +3117,7 @@ final class TvAppState: ObservableObject {
       guard let validUrl = directUrl, !validUrl.isEmpty else {
         throw NSError(domain: "Tv115", code: -1, userInfo: [NSLocalizedDescriptionKey: "无法获取 115 文件直链，请确认登录状态"])
       }
-      let hdrs: [String: String] = [
-        "User-Agent": TvLocal115DirectClient.browserUserAgent,
-        "Cookie": TvLocal115DirectClient.shared.savedCookie,
-        "Referer": "https://115.com/"
-      ]
+      let hdrs = TvLocal115DirectClient.shared.streamHeaders(forUrl: validUrl)
       return (validUrl, hdrs, "115 网盘原画直连 · \(entry.formattedSize)")
 
     case .localCache:
@@ -3162,13 +3173,14 @@ final class TvAppState: ObservableObject {
       if entry.sourceKind == .server, TvLocal115DirectClient.shared.hasLocalCookie {
         if let resolved115 = await TvLocal115DirectClient.shared.findAndResolveDirectPlayUrl(keywords: [entry.name]) {
           let serverFallback = self.api.buildFileStreamUrl(path: entry.path)
+          let primary115 = resolved115.directCdnUrl.isEmpty ? resolved115.proxyStreamUrl : resolved115.directCdnUrl
           self.showToast("⚡ 已从本地直连 115 网盘播放：\(entry.name)")
           self.playerControlsVisible = true
           self.playerShowEpisodeDrawer = false
           self.activePlayback = TvPlaybackRequest(
             title: entry.name,
             subtitle: "115 本地直连 · \(entry.formattedSize)",
-            streamUrl: resolved115.proxyStreamUrl,
+            streamUrl: primary115,
             backupProxyUrl: serverFallback,
             headers: resolved115.headers,
             resumeSeconds: 0,
@@ -3192,16 +3204,12 @@ final class TvAppState: ObservableObject {
           self.showToast("⚠️ 该 115 文件缺少 pickcode，无法播放")
           return
         }
-        let hdrs: [String: String] = [
-          "User-Agent": TvLocal115DirectClient.browserUserAgent,
-          "Cookie": TvLocal115DirectClient.shared.savedCookie,
-          "Referer": "https://115.com/"
-        ]
         let ext = entry.normalizedExt
-        let needsHlsTranscode = [".mkv", ".avi", ".rmvb", ".wmv", ".flv", ".ts", ".webm", ".iso"].contains(ext)
+        let needsHlsTranscode = [".f4v", ".flv", ".mkv", ".avi", ".rmvb", ".wmv", ".ts", ".webm", ".iso"].contains(ext)
         async let hlsTask = TvLocal115DirectClient.shared.resolvePickcodeHlsM3u8Url(pickcode: entry.pickcode115)
         async let directTask = TvLocal115DirectClient.shared.resolvePickcodeStreamUrl(pickcode: entry.pickcode115)
         let (hlsUrl, directUrl) = await (hlsTask, directTask)
+        let hdrs = TvLocal115DirectClient.shared.streamHeaders(forUrl: directUrl ?? "")
 
         var proxiedHlsUrl: String? = nil
         if let hls = hlsUrl, !hls.isEmpty {
@@ -3229,7 +3237,7 @@ final class TvAppState: ObservableObject {
           } else {
             primaryStream = dir
             backupStream = proxiedHlsUrl
-              ?? TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(remoteUrl: dir, headers: hdrs)
+              ?? TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(remoteUrl: dir, headers: hdrs, extHint: ext)
           }
         } else if let phls = proxiedHlsUrl, !phls.isEmpty {
           primaryStream = phls
@@ -4502,14 +4510,20 @@ final class TvAppState: ObservableObject {
         self.cloudMusicSubtitle = resolved.subtitle
         var targetUrlStr = resolved.url
         var targetHeaders = resolved.headers
+        let ext = track.normalizedExt
+        let urlPathLower = (URL(string: resolved.url)?.path ?? "").lowercased()
+        let urlHasAudioExtension = !ext.isEmpty && urlPathLower.hasSuffix(ext)
 
-        // For 115 Cloud Drive (or when retrying with local chunk proxy), route through local loopback proxy
-        // with the real audio extension (`.flac`, `.mp3`, `.m4a`, `.wav`) and inferred audio MIME Content-Type
-        if track.sourceKind == .cloud115 || useLocalChunkProxy {
+        // When URL path lacks the audio extension (e.g. `/api/files/stream?path=...`) or when retrying with WAV header normalization proxy (`useLocalChunkProxy`),
+        // route through local loopback proxy (`TvLocalHlsProxyServer`).
+        // For direct CDN URLs that already carry `.wav` / `.flac` / `.mp3` / `.m4a` in their path (e.g. 115 CDN with `auth_cookie`),
+        // play directly via `AVURLAssetHTTPHeaderFieldsKey` first so AppleCoreMedia handles WAV tail-chunk seeks over a single native socket in 0.3s,
+        // and automatically fall back to `useLocalChunkProxy = true` if the file has a non-standard header (e.g. leading ID3v2 before RIFF).
+        if useLocalChunkProxy || !urlHasAudioExtension {
           targetUrlStr = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
             remoteUrl: resolved.url,
             headers: resolved.headers,
-            extHint: track.normalizedExt
+            extHint: ext
           )
           targetHeaders = [:]
         }
@@ -5006,8 +5020,13 @@ final class TvAppState: ObservableObject {
       NotificationCenter.default.removeObserver(failObs)
       cloudMusicFailObserver = nil
     }
+    let previousUrl = (cloudMusicPlayer?.currentItem?.asset as? AVURLAsset)?.url
     cloudMusicPlayer?.pause()
+    cloudMusicPlayer?.replaceCurrentItem(with: nil)
     cloudMusicPlayer = nil
+    if let previousUrl {
+      TvLocalHlsProxyServer.shared.releaseTelegramVideoProxyUrl(previousUrl)
+    }
   }
 
   func stopCloudMusicPlayer(clearPersistedQueue: Bool = false) {
@@ -5898,8 +5917,28 @@ final class TvAppState: ObservableObject {
 
   func setProxyEnabled(_ enabled: Bool) {
     proxyEnabled = enabled
+    if !enabled {
+      for sc in TvRequestScenario.allCases {
+        if var r = scenarioRules[sc], r.mode == .proxyNode {
+          r.mode = .followGlobal
+          r.specificNodeId = nil
+          scenarioRules[sc] = r
+        }
+      }
+      vodRouteMode = .direct
+      liveRouteMode = .direct
+      telegramRouteMode = .direct
+      TvLocalProxyTunnelServer.shared.configure(node: nil, enabled: false)
+      TvLocalProxyTunnelServer.shared.seedFallbackNode(nil, backupNodes: [])
+    } else if let node = activeProxyNode {
+      let backups = activePoolNodes
+        .filter(\.isSupportedByClientTunnel)
+        .sorted { ($0.latencyMs ?? 9999) < ($1.latencyMs ?? 9999) }
+      TvLocalProxyTunnelServer.shared.seedFallbackNode(node, backupNodes: backups)
+      TvLocalProxyTunnelServer.shared.configure(node: node, enabled: true)
+    }
     persistProxyState()
-    showToast(enabled ? "⚡ 全局代理已开启" : "🌐 全局代理已关闭（跟随全局的场景将直连）")
+    showToast(enabled ? "⚡ 全局代理已开启" : "🌐 已彻底关闭全局代理，所有请求与视频流已恢复直连")
   }
 
   func setProxySelectionMode(_ mode: TvProxySelectionMode) {
@@ -6370,6 +6409,16 @@ final class TvAppState: ObservableObject {
   /// Never automatically falls back to `.serverRelay` unless the user explicitly selected `.serverRelay`!
   func resolveEffectiveRoute(for scenario: TvRequestScenario) -> TvScenarioRouteMode {
     let r = rule(for: scenario)
+    if r.mode == .direct {
+      return .direct
+    }
+    if r.mode == .serverRelay {
+      return .serverRelay
+    }
+    // Master global proxy switch: when disabled, NEVER route through any client proxy node!
+    if !proxyEnabled {
+      return .direct
+    }
     switch r.mode {
     case .direct:
       return .direct
@@ -6383,7 +6432,6 @@ final class TvAppState: ObservableObject {
       }
       return .direct
     case .followGlobal:
-      if !proxyEnabled { return .direct }
       return activePoolNodes.isEmpty ? .direct : .proxyNode
     }
   }
@@ -7482,12 +7530,15 @@ final class TvAppState: ObservableObject {
     accel115Progress = 0
   }
 
-  /// Full 3-stage pipeline:
-  /// 1) Checks if the video is already in 115 Cloud Drive (instant switch if found)
-  /// 2) Instructs the server to download the video (`POST /api/download`) and monitors real-time progress (`/api/tasks`)
+  /// Full 3-stage pipeline with automatic URL unwrapping, stale-failed-task recovery,
+  /// multi-line candidate failover, and 115 official Cloud Offline Download (`离线下载`) fallback:
+  /// 1) Checks if the video is already in 115 Cloud Drive (`/流光115加速` priority, instant switch if found)
+  /// 2) Unwraps any local loopback (`127.0.0.1`) / `/api/vod/proxy` / inline header URL, instructs the server to download (`POST /api/download`),
+  ///    automatically retries or switches to backup candidate URLs if a line fails on the server, and falls back to 115 Cloud Offline Download if all server lines fail
   /// 3) Waits for 115 upload (`Uploading` / `/api/115/upload/:id` / CloudDrive2 sync), then resolves the official 115 domestic CDN direct link locally from Apple TV (`TvLocal115DirectClient`) and invokes `onResolved`!
   func start115AcceleratedPlayback(
     downloadUrl: String,
+    fallbackDownloadUrls: [String] = [],
     videoName: String,
     headers: [String: String] = [:],
     telegramAccountId: String? = nil,
@@ -7509,9 +7560,10 @@ final class TvAppState: ObservableObject {
       guard let self = self else { return }
       let pipelineStartedAt = Date()
 
-      // Ensure backend server also has our local 115 Cookie so server-side 115 rapid/API upload works
+      // Ensure backend server also has our local 115 Cookie and designated target folder (`eleven_dir_id`)
       if TvLocal115DirectClient.shared.hasLocalCookie {
         try? await self.api.login115WithCookie(cookie: TvLocal115DirectClient.shared.savedCookie)
+        _ = await TvLocal115DirectClient.shared.ensureAccelerationFolderCid(syncToServerApi: self.api)
       }
 
       // Step 1: Fast-check if the video already exists in the user's 115 Cloud Drive
@@ -7526,110 +7578,227 @@ final class TvAppState: ObservableObject {
 
       guard !Task.isCancelled else { return }
 
-      // Step 2: Create or attach to server download task (`POST /api/download`)
-      self.accel115StageTitle = "阶段 1/3 · 正在提交服务器高速下载任务..."
-      self.accel115DetailText = taskTitle
-      self.accel115Progress = 0.10
+      // Fetch active HLS proxy upstream config in case `downloadUrl` is `http://127.0.0.1:<port>/live.m3u8?gen=...`
+      let hlsCfg = await TvLocalHlsProxyServer.shared.currentUpstreamConfig()
+      let hlsUpstream = !hlsCfg.streamUrl.isEmpty ? hlsCfg.streamUrl : hlsCfg.gatewayUrl
 
-      var createdTaskId: String? = nil
-      do {
-        createdTaskId = try await self.api.createDownloadTask(
-          url: downloadUrl,
-          name: taskTitle,
-          headers: headers,
-          telegramAccountId: telegramAccountId
+      var candidates: [(url: String, headers: [String: String])] = []
+      var seenUrls = Set<String>()
+
+      func addCandidate(_ rawU: String, _ baseH: [String: String]) {
+        let unwrapped = TvLocal115DirectClient.unwrapDownloadTargetUrlAndHeaders(
+          rawUrl: rawU,
+          baseHeaders: baseH,
+          hlsUpstreamUrl: hlsUpstream,
+          hlsUpstreamHeaders: hlsCfg.headers
         )
-      } catch {
-        guard !Task.isCancelled else { return }
+        let u = unwrapped.url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !u.isEmpty else { return }
+        if u.contains("://127.0.0.1") || u.contains("://localhost") || u.hasPrefix("file://") {
+          return
+        }
+        if seenUrls.insert(u).inserted {
+          candidates.append((url: u, headers: unwrapped.headers))
+        }
+      }
+
+      addCandidate(downloadUrl, headers)
+      for fb in fallbackDownloadUrls {
+        addCandidate(fb, headers)
+      }
+      if !hlsUpstream.isEmpty {
+        addCandidate(hlsUpstream, hlsCfg.headers)
+      }
+
+      guard !candidates.isEmpty else {
         self.is115Accelerating = false
-        self.showToast("提交服务器下载失败：\(error.localizedDescription)")
+        self.showToast("⚠️ 无法提取有效的远程视频源链接，请切换其他线路后重试")
         return
       }
 
-      // Step 3: Poll `/api/tasks` until server download & 115 upload complete
+      var createdTaskId: String? = nil
       var matchedTask: TvDownloadTask? = nil
-      var didTriggerManual115Upload = false
+      var lastServerFailureReason = ""
+      var serverDownloadSucceeded = false
 
-      for pollTick in 0..<600 {
+      // Step 2 & 3: Try each candidate URL on the backend server (with automatic cleanup/retry of stale Failed tasks)
+      for (cIdx, candidate) in candidates.enumerated() {
         guard !Task.isCancelled else { return }
-        let tasks = await self.api.fetchDownloadTasks()
-        self.downloadTasks = tasks
+        let lineLabel = candidates.count > 1 ? " (线路 \(cIdx + 1)/\(candidates.count))" : ""
 
-        if let tid = createdTaskId, !tid.isEmpty,
-           let byId = tasks.first(where: { $0.id == tid }) {
-          matchedTask = byId
-        } else if let byNameOrUrl = tasks.first(where: { $0.name == taskTitle || $0.url == downloadUrl }) {
-          matchedTask = byNameOrUrl
-          createdTaskId = byNameOrUrl.id
+        self.accel115StageTitle = cIdx == 0
+          ? "阶段 1/3 · 正在提交服务器高速下载任务..."
+          : "阶段 1/3 · 当前线路下载失败，正在自动切换备用线路 (\(cIdx + 1)/\(candidates.count))..."
+        self.accel115DetailText = "\(taskTitle)\(lineLabel)"
+        self.accel115Progress = 0.10
+
+        // Pre-clean any stale Failed task with the same name or URL so `/api/download` doesn't attach to an old Failed task
+        let existingTasks = await self.api.fetchDownloadTasks()
+        for t in existingTasks where (t.name == taskTitle || t.url == candidate.url) && t.status == "Failed" {
+          try? await self.api.deleteDownloadTask(id: t.id, deleteFiles: true)
         }
 
-        if let t = matchedTask {
-          switch t.status {
-          case "Pending", "Downloading":
-            let pct = max(1.0, min(99.5, t.progress))
-            self.accel115StageTitle = "阶段 1/3 · 服务器正在高速下载该视频..."
-            self.accel115Progress = 0.10 + (pct / 100.0) * 0.58
-            let segInfo = t.totalSegments > 0 ? " · 分片 \(t.downloadedSegments)/\(t.totalSegments)" : ""
-            self.accel115DetailText = String(format: "下载进度 %.1f%% · 速度 %@%@", pct, t.formattedSpeed, segInfo)
+        do {
+          createdTaskId = try await self.api.createDownloadTask(
+            url: candidate.url,
+            name: taskTitle,
+            headers: candidate.headers,
+            telegramAccountId: telegramAccountId,
+            forceDuplicate: cIdx > 0
+          )
+        } catch {
+          lastServerFailureReason = error.localizedDescription
+          continue
+        }
 
-          case "Converting":
-            self.accel115StageTitle = "阶段 1/3 · 服务器正在无损转封装 MP4..."
-            self.accel115Progress = 0.70
-            self.accel115DetailText = "即将自动上传至 115 网盘"
+        matchedTask = nil
+        var didTriggerManual115Upload = false
+        var didRetryFailedTaskOnce = false
+        var candidateFailed = false
 
-          case "Uploading":
-            let upPct = max(1.0, min(99.5, t.progress))
-            self.accel115StageTitle = "阶段 2/3 · 服务器正在上传视频至 115 网盘..."
-            self.accel115Progress = 0.72 + (upPct / 100.0) * 0.18
-            self.accel115DetailText = String(format: "上传 115 进度 %.1f%% · %@", upPct, t.name)
+        for pollTick in 0..<600 {
+          guard !Task.isCancelled else { return }
+          let tasks = await self.api.fetchDownloadTasks()
+          self.downloadTasks = tasks
 
-          case "Completed", "Duplicate":
-            if !didTriggerManual115Upload {
-              didTriggerManual115Upload = true
-              // If the server skipped API upload or only moved to local mount, also trigger explicit 115 API upload
-              if t.error.lowercased().contains("115") || !t.outputFile.isEmpty {
-                self.accel115StageTitle = "阶段 2/3 · 正在同步视频至 115 网盘..."
+          if let tid = createdTaskId, !tid.isEmpty,
+             let byId = tasks.first(where: { $0.id == tid }) {
+            matchedTask = byId
+          } else if let activeMatch = tasks.first(where: { ($0.url == candidate.url || $0.name == taskTitle) && $0.status != "Failed" }) {
+            matchedTask = activeMatch
+            createdTaskId = activeMatch.id
+          } else if let anyMatch = tasks.first(where: { $0.url == candidate.url || $0.name == taskTitle }) {
+            matchedTask = anyMatch
+            createdTaskId = anyMatch.id
+          }
+
+          if let t = matchedTask {
+            switch t.status {
+            case "Pending", "Downloading":
+              let pct = max(1.0, min(99.5, t.progress))
+              self.accel115StageTitle = "阶段 1/3 · 服务器正在高速下载该视频\(lineLabel)..."
+              self.accel115Progress = 0.10 + (pct / 100.0) * 0.58
+              let segInfo = t.totalSegments > 0 ? " · 分片 \(t.downloadedSegments)/\(t.totalSegments)" : ""
+              self.accel115DetailText = String(format: "下载进度 %.1f%% · 速度 %@%@", pct, t.formattedSpeed, segInfo)
+
+            case "Converting":
+              self.accel115StageTitle = "阶段 1/3 · 服务器正在无损转封装 MP4..."
+              self.accel115Progress = 0.70
+              self.accel115DetailText = "即将自动上传至 115 网盘"
+
+            case "Uploading":
+              let upPct = max(1.0, min(99.5, t.progress))
+              self.accel115StageTitle = "阶段 2/3 · 服务器正在上传视频至 115 网盘..."
+              self.accel115Progress = 0.72 + (upPct / 100.0) * 0.18
+              self.accel115DetailText = String(format: "上传 115 进度 %.1f%% · %@", upPct, t.name)
+
+            case "Completed", "Duplicate":
+              serverDownloadSucceeded = true
+              var quickKeywords: [String] = []
+              if !t.outputFile.isEmpty {
+                quickKeywords.append((t.outputFile as NSString).lastPathComponent)
+              }
+              if !t.name.isEmpty {
+                quickKeywords.append(t.name)
+              }
+              quickKeywords.append(taskTitle)
+              quickKeywords.append(videoName)
+              if let alreadyIn115 = await TvLocal115DirectClient.shared.findAndResolveDirectPlayUrl(
+                keywords: quickKeywords,
+                allowNewestRecentFallbackAfter: pipelineStartedAt
+              ) {
+                guard !Task.isCancelled else { return }
+                self.accel115Progress = 1.0
+                self.is115Accelerating = false
+                self.showToast("⚡ 已切换至本地直连 115 高速播放：\(alreadyIn115.fileName)")
+                onResolved(alreadyIn115.proxyStreamUrl, alreadyIn115.directCdnUrl, alreadyIn115.headers, alreadyIn115.fileName)
+                return
+              }
+
+              if !didTriggerManual115Upload {
+                didTriggerManual115Upload = true
+                if t.error.lowercased().contains("115") || !t.outputFile.isEmpty {
+                  let folderName = TvLocal115DirectClient.shared.targetFolderName
+                  self.accel115StageTitle = "阶段 2/3 · 正在同步视频至 115 网盘 (/\(folderName))..."
+                  self.accel115Progress = 0.76
+                  self.accel115DetailText = "正在触发 115 秒传 / 接口上传..."
+                  try? await self.api.uploadTaskTo115(id: t.id)
+                  if !t.outputFile.isEmpty {
+                    try? await self.api.uploadFileTo115(path: t.outputFile)
+                  }
+                  try? await Task.sleep(nanoseconds: 1_200_000_000)
+                  let refreshed = await self.api.fetchDownloadTasks()
+                  if let reTask = refreshed.first(where: { $0.id == t.id }), reTask.status == "Uploading" {
+                    continue
+                  }
+                }
+              }
+              break
+
+            case "Failed":
+              let errText = t.error.trimmingCharacters(in: .whitespacesAndNewlines)
+              lastServerFailureReason = errText.isEmpty ? "视频源连接被拒绝或超时" : errText
+
+              // If the file actually finished downloading on server (`outputFile` non-empty) and only 115 upload failed, retry 115 upload directly
+              if !t.outputFile.isEmpty && !didTriggerManual115Upload {
+                didTriggerManual115Upload = true
+                let folderName = TvLocal115DirectClient.shared.targetFolderName
+                self.accel115StageTitle = "阶段 2/3 · 正在重新上传视频至 115 网盘 (/\(folderName))..."
                 self.accel115Progress = 0.76
                 self.accel115DetailText = "正在触发 115 秒传 / 接口上传..."
                 try? await self.api.uploadTaskTo115(id: t.id)
-                if !t.outputFile.isEmpty {
-                  try? await self.api.uploadFileTo115(path: t.outputFile)
-                }
-                try? await Task.sleep(nanoseconds: 1_200_000_000)
-                // Re-check if task entered Uploading state
-                let refreshed = await self.api.fetchDownloadTasks()
-                if let reTask = refreshed.first(where: { $0.id == t.id }), reTask.status == "Uploading" {
-                  continue
+                try? await self.api.uploadFileTo115(path: t.outputFile)
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                if let postUpload = await TvLocal115DirectClient.shared.findAndResolveDirectPlayUrl(
+                  keywords: [(t.outputFile as NSString).lastPathComponent, t.name, taskTitle, videoName],
+                  allowNewestRecentFallbackAfter: pipelineStartedAt
+                ) {
+                  guard !Task.isCancelled else { return }
+                  self.accel115Progress = 1.0
+                  self.is115Accelerating = false
+                  self.showToast("⚡ 已切换至本地直连 115 高速播放：\(postUpload.fileName)")
+                  onResolved(postUpload.proxyStreamUrl, postUpload.directCdnUrl, postUpload.headers, postUpload.fileName)
+                  return
                 }
               }
+
+              if !didRetryFailedTaskOnce && cIdx == candidates.count - 1 {
+                didRetryFailedTaskOnce = true
+                self.accel115StageTitle = "阶段 1/3 · 服务器下载遇到波动，正在自动重试..."
+                self.accel115DetailText = lastServerFailureReason
+                try? await self.api.retryDownloadTask(id: t.id)
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                continue
+              }
+
+              candidateFailed = true
+              break
+
+            default:
+              break
             }
-            break
 
-          case "Failed":
-            self.is115Accelerating = false
-            self.showToast("服务器下载或上传失败：\(t.error.isEmpty ? "请检查资源链接" : t.error)")
-            return
-
-          default:
-            break
-          }
-
-          if (t.status == "Completed" || t.status == "Duplicate") && didTriggerManual115Upload {
+            if candidateFailed {
+              break
+            }
+            if (t.status == "Completed" || t.status == "Duplicate") && didTriggerManual115Upload {
+              break
+            }
+          } else if pollTick >= 4 {
+            serverDownloadSucceeded = true
             break
           }
-        } else if pollTick >= 4 {
-          // Task may have completed and been moved immediately
-          break
+
+          try? await Task.sleep(nanoseconds: 1_200_000_000)
         }
 
-        try? await Task.sleep(nanoseconds: 1_200_000_000)
+        if serverDownloadSucceeded && !candidateFailed {
+          break
+        }
       }
 
       guard !Task.isCancelled else { return }
 
-      // Step 4: Poll local 115 Cloud Drive (`TvLocal115DirectClient`) to get the official 115 domestic CDN direct URL
-      self.accel115StageTitle = "阶段 3/3 · 正在从本地连接 115 获取高速直链..."
-      self.accel115Progress = 0.92
       var keywords: [String] = []
       if let outPath = matchedTask?.outputFile, !outPath.isEmpty {
         keywords.append((outPath as NSString).lastPathComponent)
@@ -7639,6 +7808,50 @@ final class TvAppState: ObservableObject {
       }
       keywords.append(taskTitle)
       keywords.append(videoName)
+
+      // If all server download candidates failed, automatically fall back to 115 Official Cloud Offline Download (`离线下载` `add_task_url`)
+      if !serverDownloadSucceeded {
+        if let lixianResolved = await TvLocal115DirectClient.shared.try115CloudOfflineLixianFallback(
+          candidateUrls: candidates.map { $0.url },
+          searchKeywords: keywords,
+          pipelineStartedAt: pipelineStartedAt,
+          onProgressUpdate: { [weak self] stage, detail, prog in
+            self?.accel115StageTitle = stage
+            self?.accel115DetailText = detail
+            self?.accel115Progress = prog
+          }
+        ) {
+          guard !Task.isCancelled else { return }
+          self.accel115Progress = 1.0
+          self.is115Accelerating = false
+          self.showToast("⚡ 已通过 115 云端离线完成加速：\(lixianResolved.fileName)")
+          onResolved(lixianResolved.proxyStreamUrl, lixianResolved.directCdnUrl, lixianResolved.headers, lixianResolved.fileName)
+          return
+        }
+
+        if let finalCheck = await TvLocal115DirectClient.shared.findAndResolveDirectPlayUrl(
+          keywords: keywords,
+          allowNewestRecentFallbackAfter: pipelineStartedAt
+        ) {
+          guard !Task.isCancelled else { return }
+          self.accel115Progress = 1.0
+          self.is115Accelerating = false
+          self.showToast("⚡ 已切换至本地直连 115 高速播放：\(finalCheck.fileName)")
+          onResolved(finalCheck.proxyStreamUrl, finalCheck.directCdnUrl, finalCheck.headers, finalCheck.fileName)
+          return
+        }
+
+        self.is115Accelerating = false
+        let errDetail = lastServerFailureReason.isEmpty
+          ? "当前视频源防盗链限制了海外服务器下载，请切换其他线路后再试"
+          : lastServerFailureReason
+        self.showToast("服务器下载失败：\(errDetail)")
+        return
+      }
+
+      // Step 4: Poll local 115 Cloud Drive (`TvLocal115DirectClient`) to get the official 115 domestic CDN direct URL
+      self.accel115StageTitle = "阶段 3/3 · 正在从本地连接 115 获取高速直链..."
+      self.accel115Progress = 0.92
 
       for attempt in 0..<25 {
         guard !Task.isCancelled else { return }

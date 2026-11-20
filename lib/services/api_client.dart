@@ -63,7 +63,13 @@ class ApiClient {
 
   String _findProxyForUri(Uri uri, {RequestScenario? scenarioHint}) {
     final svc = _proxyService;
-    if (svc == null) return 'DIRECT';
+    if (svc == null || !svc.proxyEnabled) return 'DIRECT';
+    final baseUri = Uri.tryParse(_config.normalizedBaseUrl);
+    if (baseUri != null &&
+        baseUri.host.isNotEmpty &&
+        uri.host.toLowerCase() == baseUri.host.toLowerCase()) {
+      return svc.resolveFindProxyDirective(RequestScenario.backendApi, uri);
+    }
     final scenario = scenarioHint ?? _inferScenarioFromUri(uri);
     return svc.resolveFindProxyDirective(scenario, uri);
   }
@@ -71,6 +77,12 @@ class ApiClient {
   RequestScenario _inferScenarioFromUri(Uri uri) {
     final path = uri.path.toLowerCase();
     final host = uri.host.toLowerCase();
+    final baseUri = Uri.tryParse(_config.normalizedBaseUrl);
+    if (baseUri != null &&
+        baseUri.host.isNotEmpty &&
+        host == baseUri.host.toLowerCase()) {
+      return RequestScenario.backendApi;
+    }
     if (path.startsWith('/api/telegram') ||
         host.contains('telegram') ||
         host == 't.me') {
@@ -97,12 +109,6 @@ class ApiClient {
         host == '223.5.5.5' ||
         host.contains('liangxin.xyz')) {
       return RequestScenario.externalWeb;
-    }
-    final baseUri = Uri.tryParse(_config.normalizedBaseUrl);
-    if (baseUri != null &&
-        baseUri.host.isNotEmpty &&
-        host == baseUri.host.toLowerCase()) {
-      return RequestScenario.backendApi;
     }
     return RequestScenario.vodApi;
   }
@@ -2107,8 +2113,8 @@ class ApiClient {
     return tasks;
   }
 
-  /// Create a download task
-  Future<void> createDownloadTask({
+  /// Create a download task and return its task ID (or `duplicate_of_task_id` if deduplicated)
+  Future<String?> createDownloadTask({
     required String url,
     required String name,
     Map<String, String>? headers,
@@ -2116,7 +2122,7 @@ class ApiClient {
     String? telegramAccountId,
     bool forceDuplicate = false,
   }) async {
-    await _postJson(
+    final data = await _postJson(
       '/api/download',
       body: {
         'url': url.trim(),
@@ -2128,6 +2134,13 @@ class ApiClient {
         if (forceDuplicate) 'force_duplicate': true,
       },
     );
+    if (data is Map<String, dynamic>) {
+      final dupId = (data['duplicate_of_task_id'] ?? '').toString().trim();
+      if (dupId.isNotEmpty) return dupId;
+      final id = (data['id'] ?? '').toString().trim();
+      if (id.isNotEmpty) return id;
+    }
+    return null;
   }
 
   /// Retry a download task

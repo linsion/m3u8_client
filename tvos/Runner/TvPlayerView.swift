@@ -1328,6 +1328,7 @@ struct TvPlayerModalView: View {
   @State private var usingServerProxy: Bool = false
   @State private var using115Direct: Bool = false
   @State private var active115StreamUrl: String = ""
+  @State private var fallback115StreamUrl: String = ""
   @State private var active115Headers: [String: String] = [:]
   @State private var show115LoginSheet: Bool = false
   @State private var showProxySelectorSheet: Bool = false
@@ -1979,7 +1980,14 @@ struct TvPlayerModalView: View {
             isBuffering = false
           }
         case .failed:
-          if !didFallbackToProxy,
+          if using115Direct,
+             !fallback115StreamUrl.isEmpty,
+             fallback115StreamUrl != active115StreamUrl {
+            let next115 = fallback115StreamUrl
+            fallback115StreamUrl = ""
+            active115StreamUrl = next115
+            startPlayerItem(urlStr: next115, resumeAt: positionSec, overrideHeaders: active115Headers)
+          } else if !didFallbackToProxy,
              !request.backupProxyUrl.isEmpty,
              request.backupProxyUrl != request.streamUrl,
              !request.backupProxyUrl.contains("/api/vod/proxy") {
@@ -1990,7 +1998,15 @@ struct TvPlayerModalView: View {
           }
         default:
           let timeoutLimit: TimeInterval = request.isLive ? 12.0 : 8.5
-          if !didFallbackToProxy,
+          if using115Direct,
+             !fallback115StreamUrl.isEmpty,
+             fallback115StreamUrl != active115StreamUrl,
+             now.timeIntervalSince(streamStartedAt) >= timeoutLimit {
+            let next115 = fallback115StreamUrl
+            fallback115StreamUrl = ""
+            active115StreamUrl = next115
+            startPlayerItem(urlStr: next115, resumeAt: positionSec, overrideHeaders: active115Headers)
+          } else if !didFallbackToProxy,
              !request.backupProxyUrl.isEmpty,
              request.backupProxyUrl != request.streamUrl,
              !request.backupProxyUrl.contains("/api/vod/proxy"),
@@ -2122,23 +2138,42 @@ struct TvPlayerModalView: View {
     guard !request.isLive else { return }
     let targetDownloadUrl = request.streamUrl
     var episodeTitle = request.title
+    var fallbackUrls: [String] = []
+    if !request.backupProxyUrl.isEmpty {
+      fallbackUrls.append(request.backupProxyUrl)
+    }
     if let detail = request.vodDetail,
        request.playGroupIndex < detail.playGroups.count {
       let grp = detail.playGroups[request.playGroupIndex]
       if request.episodeIndex < grp.episodes.count {
-        episodeTitle = "\(detail.vodName) - \(grp.episodes[request.episodeIndex].title)"
+        let curEp = grp.episodes[request.episodeIndex]
+        episodeTitle = "\(detail.vodName) - \(curEp.title)"
+        if curEp.rawUrl.hasPrefix("http://") || curEp.rawUrl.hasPrefix("https://") {
+          fallbackUrls.append(curEp.rawUrl)
+        }
+        for (gIdx, otherGrp) in detail.playGroups.enumerated() where gIdx != request.playGroupIndex {
+          guard !otherGrp.episodes.isEmpty else { continue }
+          let match = otherGrp.episodes.first(where: { $0.title == curEp.title })
+            ?? (request.episodeIndex < otherGrp.episodes.count ? otherGrp.episodes[request.episodeIndex] : otherGrp.episodes[0])
+          if match.rawUrl.hasPrefix("http://") || match.rawUrl.hasPrefix("https://") {
+            fallbackUrls.append(match.rawUrl)
+          }
+        }
       }
     }
     appState.start115AcceleratedPlayback(
       downloadUrl: targetDownloadUrl,
+      fallbackDownloadUrls: fallbackUrls,
       videoName: episodeTitle,
       headers: request.headers
     ) { proxyStreamUrl, directCdnUrl, headers115, _ in
       let savedPos = self.positionSec
+      let primary115Url = directCdnUrl.isEmpty ? proxyStreamUrl : directCdnUrl
       self.using115Direct = true
-      self.active115StreamUrl = proxyStreamUrl
+      self.active115StreamUrl = primary115Url
+      self.fallback115StreamUrl = (proxyStreamUrl != primary115Url) ? proxyStreamUrl : ""
       self.active115Headers = headers115
-      self.startPlayerItem(urlStr: proxyStreamUrl, resumeAt: savedPos, overrideHeaders: headers115, fallbackDirect115Url: directCdnUrl)
+      self.startPlayerItem(urlStr: primary115Url, resumeAt: savedPos, overrideHeaders: headers115, fallbackDirect115Url: proxyStreamUrl)
     }
   }
 
@@ -2229,7 +2264,7 @@ struct TvPlayerModalView: View {
     overrideHeaders: [String: String]? = nil,
     fallbackDirect115Url: String? = nil
   ) {
-    cleanupPlayer()
+    cleanupPlayer(keepingRelayUrl: URL(string: urlStr))
     guard let url = URL(string: urlStr) else {
       isBuffering = false
       return
@@ -2409,7 +2444,7 @@ struct TvPlayerModalView: View {
     }
   }
 
-  private func cleanupPlayer() {
+  private func cleanupPlayer(keepingRelayUrl: URL? = nil) {
     flvEngine.stop()
     isUsingDirectFlvEngine = false
     if let token = timeObserverToken {
@@ -2428,8 +2463,12 @@ struct TvPlayerModalView: View {
       NotificationCenter.default.removeObserver(failToken)
       failObserverToken = nil
     }
+    let previousUrl = (player.currentItem?.asset as? AVURLAsset)?.url
     player.pause()
     player.replaceCurrentItem(with: nil)
+    if let previousUrl, previousUrl != keepingRelayUrl {
+      TvLocalHlsProxyServer.shared.releaseTelegramVideoProxyUrl(previousUrl)
+    }
   }
 
   private func handleEndedOrNext() {
@@ -2492,6 +2531,7 @@ struct TvTelegramGalleryModalView: View {
   @State private var show115LoginSheet: Bool = false
   @State private var using115Direct: Bool = false
   @State private var active115StreamUrl: String = ""
+  @State private var fallback115StreamUrl: String = ""
   @State private var active115Headers: [String: String] = [:]
   @State private var didFallbackToDirectUrl: Bool = false
 
@@ -3131,21 +3171,24 @@ struct TvTelegramGalleryModalView: View {
       if isVid && userWantsToPlay, let curItem = player.currentItem {
         switch curItem.status {
         case .failed:
-          if now.timeIntervalSince(lastStallRecoveryAt) >= 2.5 {
+          if now.timeIntervalSince(lastStallRecoveryAt) >= 3.0 {
             lastStallRecoveryAt = now
-            resumeCurrentMediaFromStall(at: positionSec, preferDirectFallback: !didFallbackToDirectUrl)
+            resumeCurrentMediaFromStall(at: positionSec, preferDirectFallback: false)
           }
         case .readyToPlay:
           let stalledFor = now.timeIntervalSince(lastProgressAdvanceAt)
           if stalledFor >= 2.2 && (player.timeControlStatus != .playing || player.rate == 0) {
             isBuffering = true
-            if stalledFor < 7.5 {
+            if stalledFor < 22.0 {
               if curItem.isPlaybackLikelyToKeepUp {
-                player.playImmediately(atRate: playbackRate)
-              } else {
+                player.play()
+                if playbackRate != 1.0 {
+                  player.rate = playbackRate
+                }
+              } else if player.timeControlStatus == .paused {
                 player.play()
               }
-            } else if now.timeIntervalSince(lastStallRecoveryAt) >= 7.5 {
+            } else if now.timeIntervalSince(lastStallRecoveryAt) >= 22.0 {
               lastStallRecoveryAt = now
               resumeCurrentMediaFromStall(at: positionSec, preferDirectFallback: false)
             }
@@ -3154,9 +3197,9 @@ struct TvTelegramGalleryModalView: View {
           }
         default:
           let stalledFor = now.timeIntervalSince(lastProgressAdvanceAt)
-          if stalledFor >= 8.5 && now.timeIntervalSince(lastStallRecoveryAt) >= 8.0 {
+          if stalledFor >= 20.0 && now.timeIntervalSince(lastStallRecoveryAt) >= 20.0 {
             lastStallRecoveryAt = now
-            resumeCurrentMediaFromStall(at: positionSec, preferDirectFallback: !didFallbackToDirectUrl)
+            resumeCurrentMediaFromStall(at: positionSec, preferDirectFallback: false)
           }
         }
       }
@@ -3191,7 +3234,7 @@ struct TvTelegramGalleryModalView: View {
       ) {
         appState.activateScenarioProxyTunnel(for: .telegram)
         if isVideo {
-          loadCurrentMedia(resumeAt: positionSec)
+          loadCurrentMedia(resumeAt: positionSec, autoplay: userWantsToPlay)
         }
       }
       .environmentObject(appState)
@@ -3317,12 +3360,13 @@ struct TvTelegramGalleryModalView: View {
       videoName: videoName,
       headers: appState.api.authHeaders,
       telegramAccountId: session.accountId
-    ) { proxyStreamUrl, _, headers115, _ in
+    ) { proxyStreamUrl, directCdnUrl, headers115, _ in
       let savedPos = self.positionSec
+      let primary115Url = directCdnUrl.isEmpty ? proxyStreamUrl : directCdnUrl
       self.using115Direct = true
-      self.active115StreamUrl = proxyStreamUrl
+      self.active115StreamUrl = primary115Url
       self.active115Headers = headers115
-      self.loadCurrentMedia(resumeAt: savedPos, useDirectRemoteUrl: false, custom115Url: proxyStreamUrl, custom115Headers: headers115)
+      self.loadCurrentMedia(resumeAt: savedPos, useDirectRemoteUrl: false, custom115Url: primary115Url, custom115Headers: headers115)
     }
   }
 
@@ -3341,7 +3385,8 @@ struct TvTelegramGalleryModalView: View {
     resumeAt: Double? = nil,
     useDirectRemoteUrl: Bool = false,
     custom115Url: String? = nil,
-    custom115Headers: [String: String]? = nil
+    custom115Headers: [String: String]? = nil,
+    autoplay: Bool = true
   ) {
     cleanupPlayer()
     appState.activateScenarioProxyTunnel(for: .telegram)
@@ -3370,12 +3415,13 @@ struct TvTelegramGalleryModalView: View {
     }
     guard let url = URL(string: streamUrl) else { return }
 
-    let options: [String: Any] = [
+    let isLocalProxy = streamUrl.contains("://127.0.0.1:") || streamUrl.contains("://localhost:")
+    let options: [String: Any] = isLocalProxy ? [:] : [
       "AVURLAssetHTTPHeaderFieldsKey": custom115Headers ?? appState.api.authHeaders
     ]
     let asset = AVURLAsset(url: url, options: options)
     let item = AVPlayerItem(asset: asset)
-    item.preferredForwardBufferDuration = 30
+    item.preferredForwardBufferDuration = 20
     if durationSec <= 0 || resumeAt == nil {
       durationSec = Double(msg.attachment?.duration ?? 0)
     }
@@ -3385,8 +3431,8 @@ struct TvTelegramGalleryModalView: View {
     lastProgressAdvanceAt = Date()
     bufferedSec = initialSeek
     isBuffering = true
-    userWantsToPlay = true
-    isPlaying = true
+    userWantsToPlay = autoplay
+    isPlaying = autoplay
 
     player.replaceCurrentItem(with: item)
     player.automaticallyWaitsToMinimizeStalling = true
@@ -3394,11 +3440,15 @@ struct TvTelegramGalleryModalView: View {
     if initialSeek > 0.8 {
       let target = CMTime(seconds: initialSeek, preferredTimescale: 600)
       let tol = CMTime(seconds: 0.5, preferredTimescale: 600)
-      player.seek(to: target, toleranceBefore: tol, toleranceAfter: tol) { [weak player] _ in
-        player?.playImmediately(atRate: self.playbackRate)
+      player.seek(to: target, toleranceBefore: tol, toleranceAfter: tol) { [weak player, weak item] completed in
+        guard completed, let player, let item, player.currentItem === item, self.userWantsToPlay else { return }
+        player.playImmediately(atRate: self.playbackRate)
       }
-    } else {
+    } else if autoplay {
       player.playImmediately(atRate: playbackRate)
+      if playbackRate != 1.0 {
+        player.rate = playbackRate
+      }
     }
 
     let interval = CMTime(seconds: 0.4, preferredTimescale: 600)
@@ -3469,7 +3519,7 @@ struct TvTelegramGalleryModalView: View {
       queue: .main
     ) { _ in
       guard self.userWantsToPlay else { return }
-      self.resumeCurrentMediaFromStall(at: self.positionSec, preferDirectFallback: !self.didFallbackToDirectUrl)
+      self.resumeCurrentMediaFromStall(at: self.positionSec, preferDirectFallback: false)
     }
   }
 
@@ -3483,7 +3533,10 @@ struct TvTelegramGalleryModalView: View {
       userWantsToPlay = true
       isPlaying = true
       lastProgressAdvanceAt = Date()
-      player.playImmediately(atRate: playbackRate)
+      player.play()
+      if playbackRate != 1.0 {
+        player.rate = playbackRate
+      }
     }
   }
 
@@ -3499,7 +3552,10 @@ struct TvTelegramGalleryModalView: View {
     let tol = CMTime(seconds: 1.2, preferredTimescale: 600)
     player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: tol, toleranceAfter: tol) { [weak player] _ in
       if self.userWantsToPlay {
-        player?.playImmediately(atRate: self.playbackRate)
+        player?.play()
+        if self.playbackRate != 1.0 {
+          player?.rate = self.playbackRate
+        }
       }
     }
   }
@@ -3530,8 +3586,12 @@ struct TvTelegramGalleryModalView: View {
       NotificationCenter.default.removeObserver(failToken)
       failObserverToken = nil
     }
+    let previousUrl = (player.currentItem?.asset as? AVURLAsset)?.url
     player.pause()
     player.replaceCurrentItem(with: nil)
+    if let previousUrl {
+      TvLocalHlsProxyServer.shared.releaseTelegramVideoProxyUrl(previousUrl)
+    }
   }
 
   private func formatClock(_ seconds: Double) -> String {

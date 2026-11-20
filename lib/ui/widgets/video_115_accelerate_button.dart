@@ -10,6 +10,7 @@ import '../theme.dart';
 class Video115AccelerateButton extends StatefulWidget {
   final ApiClient api;
   final String Function() downloadUrlBuilder;
+  final List<String> Function()? fallbackUrlsBuilder;
   final String Function() videoNameBuilder;
   final Map<String, String> Function()? headersBuilder;
   final String? telegramAccountId;
@@ -28,6 +29,7 @@ class Video115AccelerateButton extends StatefulWidget {
     super.key,
     required this.api,
     required this.downloadUrlBuilder,
+    this.fallbackUrlsBuilder,
     required this.videoNameBuilder,
     this.headersBuilder,
     this.telegramAccountId,
@@ -77,7 +79,9 @@ class _Video115AccelerateButtonState extends State<Video115AccelerateButton> {
     }
 
     final downloadUrl = widget.downloadUrlBuilder().trim();
-    if (downloadUrl.isEmpty) {
+    final fallbackUrls =
+        widget.fallbackUrlsBuilder?.call() ?? const <String>[];
+    if (downloadUrl.isEmpty && fallbackUrls.isEmpty) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('当前视频地址尚未就绪，请稍候再试')),
@@ -92,7 +96,8 @@ class _Video115AccelerateButtonState extends State<Video115AccelerateButton> {
     final resolved = await show115AccelerationProgressDialog(
       context: context,
       api: widget.api,
-      downloadUrl: downloadUrl,
+      downloadUrl: downloadUrl.isNotEmpty ? downloadUrl : fallbackUrls.first,
+      fallbackDownloadUrls: fallbackUrls,
       videoName: videoName.isEmpty ? '视频资源' : videoName,
       headers: headers,
       telegramAccountId: widget.telegramAccountId,
@@ -467,6 +472,7 @@ Future<Resolved115Stream?> show115AccelerationProgressDialog({
   required BuildContext context,
   required ApiClient api,
   required String downloadUrl,
+  List<String> fallbackDownloadUrls = const [],
   required String videoName,
   Map<String, String> headers = const {},
   String? telegramAccountId,
@@ -483,6 +489,7 @@ Future<Resolved115Stream?> show115AccelerationProgressDialog({
         .run115CloudAccelerationPipeline(
       api: api,
       downloadUrl: downloadUrl,
+      fallbackDownloadUrls: fallbackDownloadUrls,
       videoName: videoName,
       headers: headers,
       telegramAccountId: telegramAccountId,
@@ -567,6 +574,28 @@ Future<Resolved115Stream?> show115AccelerationProgressDialog({
                       fontSize: 12.5,
                       color: VideoPlatformTheme.textSecondary,
                     ),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Icon(
+                        Icons.folder_special_rounded,
+                        size: 14,
+                        color: VideoPlatformTheme.accent,
+                      ),
+                      const SizedBox(width: 5),
+                      Expanded(
+                        child: Text(
+                          '115 存放目录：/${svc.targetFolderName}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 11.5,
+                            color: VideoPlatformTheme.textMuted,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),

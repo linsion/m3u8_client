@@ -2670,8 +2670,6 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       ),
     ];
 
-    final hasActiveSearch = state.searchKeyword.isNotEmpty;
-
     return Container(
       color: VideoPlatformTheme.bgPrimary,
       child: SafeArea(
@@ -2680,7 +2678,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
           padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
           child: Row(
             children: [
-              // 1. Left Floating Stadium Capsule Bar (Telegram Floating Pill Style)
+              // Floating Stadium Capsule Bar
               Expanded(
                 child: Container(
                   height: 62,
@@ -2813,48 +2811,6 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                               ),
                             );
                           }),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 10),
-              // 2. Right Floating Circular Search Button (matching Telegram screenshot)
-              GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: () {
-                  HapticFeedback.selectionClick();
-                  _showTvSearchInputDialog(state);
-                },
-                child: Container(
-                  width: 62,
-                  height: 62,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    boxShadow: shadowList,
-                  ),
-                  child: ClipOval(
-                    child: BackdropFilter(
-                      filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
-                      child: Container(
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: capsuleBg,
-                          border: Border.all(
-                            color: hasActiveSearch
-                                ? accentColor
-                                : capsuleBorderColor,
-                            width: hasActiveSearch ? 1.4 : 0.8,
-                          ),
-                        ),
-                        alignment: Alignment.center,
-                        child: Icon(
-                          Icons.search_rounded,
-                          size: 27,
-                          color: hasActiveSearch
-                              ? accentColor
-                              : VideoPlatformTheme.textPrimary,
                         ),
                       ),
                     ),
@@ -3526,6 +3482,7 @@ class _FloatingMiniPlayerOverlayState
   int _pendingSeekSeconds = 0;
   bool _userPaused = false;
   bool _isRecovering = false;
+  int _playbackOpenSequence = 0;
   int _consecutiveRecoveries = 0;
   Duration _lastKnownPosition = Duration.zero;
   Duration _lastKnownDuration = Duration.zero;
@@ -3664,60 +3621,77 @@ class _FloatingMiniPlayerOverlayState
     return url;
   }
 
+  RequestScenario get _playbackScenario {
+    if (widget.session.isLive) return RequestScenario.liveStream;
+    final original = _unwrapRelayUrlIfNeeded(widget.session.streamUrl);
+    return original.contains('/api/telegram/')
+        ? RequestScenario.telegram
+        : RequestScenario.vodStream;
+  }
+
   Future<void> _startPlayback({int? overrideResumeSeconds}) async {
+    final openSequence = ++_playbackOpenSequence;
+    bool isCurrent() => mounted && openSequence == _playbackOpenSequence;
     if (overrideResumeSeconds != null && overrideResumeSeconds > 2) {
       _pendingSeekSeconds = overrideResumeSeconds;
       _hasAppliedInitialSeek = false;
     }
     var streamUrl = _unwrapRelayUrlIfNeeded(widget.session.streamUrl);
-    if (!widget.session.isLive && !streamUrl.contains('/api/telegram/')) {
-      final relayed = await widget.appState.proxyService.resolveProxiedStreamUrl(
-        RequestScenario.vodStream,
-        streamUrl,
-        headers: widget.session.headers,
-        cleanM3u8Ads: widget.appState.vodFilterM3u8Ads,
-      );
+    final scenario = _playbackScenario;
+    if (scenario != RequestScenario.liveStream) {
+      final relayed = await widget.appState.proxyService
+          .resolveProxiedStreamUrl(
+            scenario,
+            streamUrl,
+            headers: widget.session.headers,
+            cleanM3u8Ads:
+                scenario == RequestScenario.vodStream &&
+                widget.appState.vodFilterM3u8Ads,
+          );
+      if (!isCurrent()) return;
       if (relayed.isNotEmpty) {
         streamUrl = relayed;
       }
     }
-    final usingLocalStreamRelay = streamUrl.contains('/__m3u8_proxy__/') ||
+    final usingLocalStreamRelay =
+        streamUrl.contains('/__m3u8_proxy__/') ||
         streamUrl.contains('://127.0.0.1:') ||
         streamUrl.contains('://localhost:');
 
     await _configureMiniNativePlayer();
+    if (!isCurrent()) return;
 
     try {
       final dynamic platform = _player.platform;
       final headers = widget.session.headers;
-      final ua = headers['User-Agent'] ??
+      final ua =
+          headers['User-Agent'] ??
           headers['user-agent'] ??
           'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
       await platform.setProperty('user-agent', ua);
       final ref =
           headers['Referer'] ?? headers['referer'] ?? headers['Referrer'] ?? '';
+      if (!isCurrent()) return;
       await platform.setProperty('referrer', ref);
+      if (!isCurrent()) return;
 
       if (usingLocalStreamRelay) {
         await platform.setProperty('http-proxy', '');
       } else {
-        final scenario = widget.session.isLive
-            ? RequestScenario.liveStream
-            : (streamUrl.contains('/api/telegram/')
-                ? RequestScenario.telegram
-                : RequestScenario.vodStream);
         final proxyUrl = await widget.appState.proxyService
             .resolvePlayerHttpProxyUrl(
-          scenario,
-          streamUri: Uri.tryParse(streamUrl),
-        );
+              scenario,
+              streamUri: Uri.tryParse(streamUrl),
+            );
+        if (!isCurrent()) return;
         await platform.setProperty('http-proxy', proxyUrl);
       }
     } catch (_) {}
 
-    if (!mounted) return;
+    if (!isCurrent()) return;
     _lastPositionAdvanceAt = DateTime.now();
     await _player.setVolume(_isMuted ? 0.0 : _volume);
+    if (!isCurrent()) return;
     await _player.open(
       Media(
         streamUrl,
@@ -4087,18 +4061,16 @@ class _FloatingMiniPlayerOverlayState
                         const SizedBox(width: 4),
                         VideoProxyNodeSelector(
                           proxyService: widget.appState.proxyService,
-                          scenario: widget.session.isLive
-                              ? RequestScenario.liveStream
-                              : (widget.session.streamUrl
-                                      .contains('/api/telegram/')
-                                  ? RequestScenario.telegram
-                                  : RequestScenario.vodStream),
+                          scenario: _playbackScenario,
                           compact: true,
                           overlayStyle: true,
                           onProxyChanged: (_) {
-                            _scheduleAutoRecovery(
-                              keepPosition: !widget.session.isLive,
-                            );
+                            _recoveryTimer?.cancel();
+                            _isRecovering = false;
+                            final resume = widget.session.isLive
+                                ? null
+                                : _lastKnownPosition.inSeconds;
+                            unawaited(_startPlayback(overrideResumeSeconds: resume));
                           },
                         ),
                         const SizedBox(width: 3),

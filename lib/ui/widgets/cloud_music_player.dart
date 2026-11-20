@@ -1270,14 +1270,14 @@ class CloudMusicController extends ChangeNotifier {
         );
       case StorageSourceKind.alist:
         if (mount == null) throw Exception('未找到对应的 AList 存储挂载');
-        final url = await RemoteStorageService.instance.resolveAlistDirectUrl(
+        final info = await RemoteStorageService.instance.resolveAlistStreamInfo(
           mount,
           entry.path,
           fallbackUrl: entry.rawDownloadUrl,
         );
         return (
-          url: url,
-          headers: const <String, String>{},
+          url: info.url,
+          headers: info.headers,
           subtitle: '${mount.name} · ${entry.formattedSize}',
         );
       case StorageSourceKind.webdav:
@@ -1301,7 +1301,7 @@ class CloudMusicController extends ChangeNotifier {
         }
         return (
           url: directUrl,
-          headers: Local115DirectService.instance.requestHeaders,
+          headers: Local115DirectService.instance.requestHeadersForUrl(directUrl),
           subtitle: '115 网盘直连 · ${entry.formattedSize}',
         );
       case StorageSourceKind.localCache:
@@ -1980,6 +1980,11 @@ class CloudMusicController extends ChangeNotifier {
       if (!_retriedCurrentTrack && currentTrack != null) {
         _retriedCurrentTrack = true;
         unawaited(_openCurrentTrack(forceRefreshUrl: true));
+      } else if (_isLoadingTrack || _errorText.isEmpty) {
+        _isLoadingTrack = false;
+        _isPlaying = false;
+        _errorText = '音频播放失败：$err';
+        notifyListeners();
       }
     });
   }
@@ -2166,8 +2171,9 @@ class CloudMusicController extends ChangeNotifier {
         if (!lowerUrl.contains('.m3u8') &&
             track.sourceKind != StorageSourceKind.localCache &&
             (track.sourceKind == StorageSourceKind.cloud115 ||
-                (isLosslessNeedsExtensionProxy &&
-                    (urlLacksAudioExtension || playHeaders.isNotEmpty)))) {
+                isLosslessNeedsExtensionProxy ||
+                urlLacksAudioExtension ||
+                playHeaders.isNotEmpty)) {
           playUrl =
               await Local115DirectService.instance.wrapWithLocal115HeaderProxy(
             playUrl,
@@ -2573,16 +2579,32 @@ class CloudMusicController extends ChangeNotifier {
       } else {
         final resolved = await resolveEntryEndpoint(track);
         if (seq != _openSeq || resolved.url.isEmpty) return;
-        final uri = Uri.tryParse(resolved.url);
-        if (uri != null && (uri.scheme == 'http' || uri.scheme == 'https')) {
-          final rangeRes = await CloudArchiveMusicService.instance
-              ._fetchRemoteRangeWithTotal(
-            uri: uri,
-            headers: resolved.headers,
-            start: 0,
-            end: 384 * 1024 - 1,
-          );
-          headerBytes = rangeRes.bytes;
+        // Wait briefly for the local audio proxy to cache the first 256 KB header
+        // so we never open a competing HTTP Range connection against 115 CDN / AList
+        for (int poll = 0; poll < 12; poll++) {
+          if (seq != _openSeq) return;
+          final cached = Local115DirectService.instance
+              .getCachedRawHeaderBytes(resolved.url);
+          if (cached != null && cached.isNotEmpty) {
+            headerBytes = cached;
+            break;
+          }
+          await Future<void>.delayed(const Duration(milliseconds: 220));
+        }
+        if (seq != _openSeq) return;
+        if (headerBytes.isEmpty &&
+            track.sourceKind != StorageSourceKind.cloud115) {
+          final uri = Uri.tryParse(resolved.url);
+          if (uri != null && (uri.scheme == 'http' || uri.scheme == 'https')) {
+            final rangeRes = await CloudArchiveMusicService.instance
+                ._fetchRemoteRangeWithTotal(
+              uri: uri,
+              headers: resolved.headers,
+              start: 0,
+              end: 256 * 1024 - 1,
+            );
+            headerBytes = rangeRes.bytes;
+          }
         }
       }
       if (seq != _openSeq || headerBytes.length < 32) return;
@@ -2636,8 +2658,39 @@ class CloudMusicController extends ChangeNotifier {
       }
     }
 
-    // 2. Scan for embedded JPEG (`FF D8 FF E0` / `FF D8 FF E1`) or PNG (`89 50 4E 47 0D 0A 1A 0A`) inside ID3v2 / MP4 `covr` atom
-    for (int i = 0; i + 16 < data.length; i++) {
+    // 2. If starts with standard RIFF....WAVE, bound the scan to chunks before the raw PCM `data` chunk
+    int scanLimit = data.length;
+    if (data.length >= 44 &&
+        data[0] == 0x52 &&
+        data[1] == 0x49 &&
+        data[2] == 0x46 &&
+        data[3] == 0x46 &&
+        data[8] == 0x57 &&
+        data[9] == 0x41 &&
+        data[10] == 0x56 &&
+        data[11] == 0x45) {
+      int pos = 12;
+      while (pos + 8 <= data.length) {
+        final c0 = data[pos];
+        final c1 = data[pos + 1];
+        final c2 = data[pos + 2];
+        final c3 = data[pos + 3];
+        final cSize = data[pos + 4] |
+            (data[pos + 5] << 8) |
+            (data[pos + 6] << 16) |
+            (data[pos + 7] << 24);
+        if (c0 == 0x64 && c1 == 0x61 && c2 == 0x74 && c3 == 0x61) {
+          // Reached raw PCM `data` chunk
+          scanLimit = pos;
+          break;
+        }
+        if (cSize < 0 || cSize > data.length) break;
+        pos += 8 + cSize + (cSize.isOdd ? 1 : 0);
+      }
+    }
+
+    // 3. Scan for embedded JPEG (`FF D8 FF E0` / `FF D8 FF E1`) or PNG (`89 50 4E 47 0D 0A 1A 0A`) inside ID3v2 / MP4 `covr` atom
+    for (int i = 0; i + 16 < scanLimit; i++) {
       // PNG signature
       if (data[i] == 0x89 &&
           data[i + 1] == 0x50 &&
@@ -2648,12 +2701,12 @@ class CloudMusicController extends ChangeNotifier {
           data[i + 6] == 0x1A &&
           data[i + 7] == 0x0A) {
         // Find PNG IEND (`49 45 4E 44 AE 42 60 82`)
-        for (int j = i + 32; j + 8 <= data.length; j++) {
+        for (int j = i + 32; j + 8 <= scanLimit; j++) {
           if (data[j] == 0x49 &&
               data[j + 1] == 0x45 &&
               data[j + 2] == 0x4E &&
               data[j + 3] == 0x44) {
-            final endIdx = math.min(data.length, j + 8);
+            final endIdx = math.min(scanLimit, j + 8);
             if (endIdx - i > 256) {
               return Uint8List.sublistView(data, i, endIdx);
             }
@@ -2667,7 +2720,7 @@ class CloudMusicController extends ChangeNotifier {
           data[i + 2] == 0xFF &&
           (data[i + 3] == 0xE0 || data[i + 3] == 0xE1 || data[i + 3] == 0xDB)) {
         // Find JPEG EOI (`FF D9`)
-        for (int j = i + 256; j + 2 <= data.length; j++) {
+        for (int j = i + 256; j + 2 <= scanLimit; j++) {
           if (data[j] == 0xFF && data[j + 1] == 0xD9) {
             final endIdx = j + 2;
             if (endIdx - i > 512) {
