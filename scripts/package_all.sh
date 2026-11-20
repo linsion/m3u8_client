@@ -71,7 +71,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
       CODE_SIGNING_ALLOWED=NO build >/dev/null 2>&1; then
     TVOS_SDK_PATH="$(xcrun --sdk appletvos --show-sdk-path)"
     mkdir -p "$TVOS_APP_PATH"
-    cp -f tvos/Runner/AppIcon.png tvos/Runner/TopShelfWide.png "$TVOS_APP_PATH/" 2>/dev/null || true
+    cp -f tvos/Runner/Assets.car tvos/Runner/AppIcon.png tvos/Runner/AppIcon@2x.png tvos/Runner/TopShelfWide.png tvos/Runner/TopShelfWide@2x.png "$TVOS_APP_PATH/" 2>/dev/null || true
     cp -f tvos/Runner/Info.plist "$TVOS_APP_PATH/Info.plist"
     /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable Runner" "$TVOS_APP_PATH/Info.plist" || true
     /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.linsion.m3u8Client.tvos" "$TVOS_APP_PATH/Info.plist" || true
@@ -92,6 +92,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
       -o "$TVOS_APP_PATH/Runner"
   fi
   if [[ -d "$TVOS_APP_PATH" ]]; then
+    cp -f tvos/Runner/Assets.car tvos/Runner/AppIcon.png tvos/Runner/AppIcon@2x.png tvos/Runner/TopShelfWide.png tvos/Runner/TopShelfWide@2x.png "$TVOS_APP_PATH/" 2>/dev/null || true
     TVOS_IPA="${DIST_DIR}/${APP_SLUG}-tvOS-v${VERSION}-unsigned.ipa"
     rm -f "$TVOS_IPA"
     IPA_STAGE="$(mktemp -d)"

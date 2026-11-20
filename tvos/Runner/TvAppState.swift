@@ -1,8 +1,10 @@
 import AVFoundation
 import Compression
 import Foundation
+import MediaPlayer
 import Network
 import SwiftUI
+import UIKit
 
 @MainActor
 final class TvAppState: ObservableObject {
@@ -44,6 +46,10 @@ final class TvAppState: ObservableObject {
   @Published var subscriptionHistory: [String] = []
   @Published var lanInputUrl: String = ""
   @Published var lanInputRunning: Bool = false
+  @Published var activeLanQuickInputPrompt: String = ""
+  @Published var activeLanQuickInputPlaceholder: String = ""
+  @Published var showLanQuickInputModal: Bool = false
+  var activeLanQuickInputReceiver: ((String) -> Void)? = nil
   var customBackHandler: (() -> Bool)? = nil
   var scrollWindowToTopHandler: (() -> Bool)? = nil
   var exitApplicationHandler: (() -> Void)? = nil
@@ -58,15 +64,22 @@ final class TvAppState: ObservableObject {
   func handleDidEnterBackground() {
     guard !isAppInBackground else { return }
     isAppInBackground = true
-    api.handleEnterBackground()
+    let hasActiveBackgroundAudio = isCloudMusicPlaying || isAudioPlaying
+    if !hasActiveBackgroundAudio {
+      api.handleEnterBackground()
+    }
     stopLanInputServer()
     TvTelegramAvatarMemoryCache.shared.handleAppLifecycleTransition(enteringBackground: true)
-    if isAudioPlaying {
-      audioPlayer?.pause()
+    // Keep Cloud Hi-Fi Music and Telegram Audio playing in the background (tvOS UIBackgroundModes: audio)
+    if hasActiveBackgroundAudio {
+      try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.allowAirPlay])
+      try? AVAudioSession.sharedInstance().setActive(true)
+      updateNowPlayingInfo()
     }
   }
 
   func handleDidBecomeActive() {
+    UIApplication.shared.isIdleTimerDisabled = true
     guard isAppInBackground else { return }
     isAppInBackground = false
     lastRemoteActivityAt = Date()
@@ -79,6 +92,9 @@ final class TvAppState: ObservableObject {
       if self.isAudioPlaying {
         self.audioPlayer?.play()
       }
+      if self.isCloudMusicPlaying {
+        self.cloudMusicPlayer?.playImmediately(atRate: self.cloudMusicSpeed)
+      }
     }
   }
 
@@ -89,13 +105,13 @@ final class TvAppState: ObservableObject {
   var appVersion: String {
     let raw = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String)?
       .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    return (raw.isEmpty || raw.contains("$(")) ? "1.2.1" : raw
+    return (raw.isEmpty || raw.contains("$(")) ? "1.2.3" : raw
   }
 
   var appBuildNumber: String {
     let raw = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String)?
       .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    return (raw.isEmpty || raw.contains("$(")) ? "33" : raw
+    return (raw.isEmpty || raw.contains("$(")) ? "38" : raw
   }
 
   var appFullVersion: String {
@@ -331,7 +347,12 @@ final class TvAppState: ObservableObject {
   @Published var cloudMusicLyricsSource: String = ""
   @Published var isCloudMusicLoadingLyrics: Bool = false
   @Published var showCloudMusicFullscreen: Bool = false
+  @Published var isCloudMusicSessionDocked: Bool = false
   @Published var savedMusicFolders: [TvSavedMusicFolderItem] = []
+  @Published var savedMusicPlaylists: [TvSavedMusicPlaylist] = []
+  @Published var activeMusicPlaylistId: String = "default_playlist"
+  @Published var currentMusicQueueSources: [TvSavedMusicFolderItem] = []
+  @Published var showMusicPlaylistManagerSheet: Bool = false
   @Published var isScanningMusicFolders: Bool = false
   @Published var scanningMusicStatusText: String = ""
   @Published var activeArchiveMusicBrowserEntry: TvFileEntry? = nil
@@ -531,7 +552,165 @@ final class TvAppState: ObservableObject {
        let decodedMusic = try? JSONDecoder().decode([TvSavedMusicFolderItem].self, from: savedMusicData) {
       self.savedMusicFolders = decodedMusic
     }
+    if let savedPlData = UserDefaults.standard.data(forKey: "tv_saved_music_playlists_v1"),
+       let decodedPls = try? JSONDecoder().decode([TvSavedMusicPlaylist].self, from: savedPlData) {
+      self.savedMusicPlaylists = decodedPls
+    }
+    if let savedActivePlId = UserDefaults.standard.string(forKey: "tv_active_music_playlist_id_v1"),
+       !savedActivePlId.isEmpty {
+      self.activeMusicPlaylistId = savedActivePlId
+    }
+    if let defaultQueueData = UserDefaults.standard.data(forKey: "tv_default_music_queue_v1"),
+       let decodedQueue = try? JSONDecoder().decode([TvFileEntry].self, from: defaultQueueData),
+       !decodedQueue.isEmpty {
+      self.cloudMusicQueue = decodedQueue
+      let savedIdx = UserDefaults.standard.integer(forKey: "tv_default_music_index_v1")
+      self.cloudMusicCurrentIndex = min(max(0, savedIdx), decodedQueue.count - 1)
+    }
+    if let defaultSrcData = UserDefaults.standard.data(forKey: "tv_default_music_sources_v1"),
+       let decodedSrc = try? JSONDecoder().decode([TvSavedMusicFolderItem].self, from: defaultSrcData) {
+      self.currentMusicQueueSources = decodedSrc
+    }
+    if self.cloudMusicQueue.isEmpty, let firstPl = self.savedMusicPlaylists.first(where: { $0.id == self.activeMusicPlaylistId }) ?? self.savedMusicPlaylists.first, !firstPl.tracks.isEmpty {
+      self.activeMusicPlaylistId = firstPl.id
+      self.cloudMusicQueue = firstPl.tracks
+      self.cloudMusicCurrentIndex = min(max(0, firstPl.currentIndex), firstPl.tracks.count - 1)
+      self.currentMusicQueueSources = firstPl.sources
+    }
     self.fileViewIsGrid = UserDefaults.standard.bool(forKey: "tv_file_view_grid_v1")
+    setupRemoteTransportCommands()
+    syncDefaultCloudMusicPlaylist(persist: false)
+    if let track = currentCloudMusicTrack {
+      loadCloudMusicCoverAndLyrics(for: track, seq: cloudMusicOpenSeq)
+    }
+  }
+
+  private var remoteCommandsConfigured: Bool = false
+  private var lastNowPlayingUpdateAt: Date = .distantPast
+
+  func setupRemoteTransportCommands() {
+    guard !remoteCommandsConfigured else { return }
+    remoteCommandsConfigured = true
+    let center = MPRemoteCommandCenter.shared()
+    center.playCommand.isEnabled = true
+    center.playCommand.addTarget { [weak self] _ in
+      Task { @MainActor in
+        guard let self = self else { return }
+        if self.currentCloudMusicTrack != nil {
+          if !self.isCloudMusicPlaying {
+            self.toggleCloudMusicPlayPause()
+          }
+        } else if self.playingAudioMessage != nil, !self.isAudioPlaying {
+          self.audioPlayer?.play()
+          self.isAudioPlaying = true
+          self.updateNowPlayingInfo(force: true)
+        }
+      }
+      return .success
+    }
+    center.pauseCommand.isEnabled = true
+    center.pauseCommand.addTarget { [weak self] _ in
+      Task { @MainActor in
+        guard let self = self else { return }
+        if self.currentCloudMusicTrack != nil {
+          if self.isCloudMusicPlaying {
+            self.toggleCloudMusicPlayPause()
+          }
+        } else if self.playingAudioMessage != nil, self.isAudioPlaying {
+          self.audioPlayer?.pause()
+          self.isAudioPlaying = false
+          self.updateNowPlayingInfo(force: true)
+        }
+      }
+      return .success
+    }
+    center.togglePlayPauseCommand.isEnabled = true
+    center.togglePlayPauseCommand.addTarget { [weak self] _ in
+      Task { @MainActor in
+        guard let self = self else { return }
+        if self.currentCloudMusicTrack != nil {
+          self.toggleCloudMusicPlayPause()
+        } else if let chat = self.playingAudioChat, let msg = self.playingAudioMessage {
+          self.togglePlayAudioMessage(chat: chat, message: msg)
+        }
+      }
+      return .success
+    }
+    center.nextTrackCommand.isEnabled = true
+    center.nextTrackCommand.addTarget { [weak self] _ in
+      Task { @MainActor in
+        guard let self = self else { return }
+        if self.currentCloudMusicTrack != nil {
+          self.stepCloudMusicTrack(delta: 1)
+        } else if self.playingAudioMessage != nil {
+          self.playAdjacentAudioTrack(delta: 1)
+        }
+      }
+      return .success
+    }
+    center.previousTrackCommand.isEnabled = true
+    center.previousTrackCommand.addTarget { [weak self] _ in
+      Task { @MainActor in
+        guard let self = self else { return }
+        if self.currentCloudMusicTrack != nil {
+          self.stepCloudMusicTrack(delta: -1)
+        } else if self.playingAudioMessage != nil {
+          self.playAdjacentAudioTrack(delta: -1)
+        }
+      }
+      return .success
+    }
+    center.changePlaybackPositionCommand.isEnabled = true
+    center.changePlaybackPositionCommand.addTarget { [weak self] event in
+      guard let posEvent = event as? MPChangePlaybackPositionCommandEvent else {
+        return .commandFailed
+      }
+      Task { @MainActor in
+        self?.seekCloudMusic(to: posEvent.positionTime)
+      }
+      return .success
+    }
+  }
+
+  func updateNowPlayingInfo(force: Bool = false) {
+    let now = Date()
+    if !force && now.timeIntervalSince(lastNowPlayingUpdateAt) < 1.5 {
+      return
+    }
+    lastNowPlayingUpdateAt = now
+
+    if let track = currentCloudMusicTrack {
+      let meta = Self.parseCloudTrackMetadata(
+        track,
+        fallbackArtist: mountDisplayName(for: track)
+      )
+      var info: [String: Any] = [
+        MPMediaItemPropertyTitle: meta.title,
+        MPMediaItemPropertyArtist: meta.artist,
+        MPMediaItemPropertyAlbumTitle: "流光音乐 · \(mountDisplayName(for: track))",
+        MPNowPlayingInfoPropertyElapsedPlaybackTime: cloudMusicPosition,
+        MPMediaItemPropertyPlaybackDuration: max(cloudMusicDuration, 0),
+        MPNowPlayingInfoPropertyPlaybackRate: isCloudMusicPlaying ? Double(cloudMusicSpeed) : 0.0
+      ]
+      if let img = cloudMusicCoverImage {
+        let artwork = MPMediaItemArtwork(boundsSize: img.size) { _ in img }
+        info[MPMediaItemPropertyArtwork] = artwork
+      }
+      MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    } else if let msg = playingAudioMessage {
+      let title = msg.attachment?.displayName ?? (msg.text.isEmpty ? "Telegram 音乐" : msg.text)
+      let artist = playingAudioChat?.title ?? "Telegram"
+      let info: [String: Any] = [
+        MPMediaItemPropertyTitle: title,
+        MPMediaItemPropertyArtist: artist,
+        MPNowPlayingInfoPropertyElapsedPlaybackTime: audioPosition,
+        MPMediaItemPropertyPlaybackDuration: max(audioDuration, 0),
+        MPNowPlayingInfoPropertyPlaybackRate: isAudioPlaying ? Double(audioSpeed) : 0.0
+      ]
+      MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    } else {
+      MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+    }
   }
 
   func showToast(_ message: String) {
@@ -3185,32 +3364,136 @@ final class TvAppState: ObservableObject {
     return cloudMusicLyrics[idx].text
   }
 
+  private static let trackMetadataCacheLock = NSLock()
+  private static var trackMetadataCache: [String: (title: String, artist: String, qualityTag: String)] = [:]
+  private static let leadingTrackNumRegex = try? NSRegularExpression(
+    pattern: #"^\s*(\[\d+\]|\(\d+\)|\d{1,4}[\.\-_、\s]+)\s*"#
+  )
+  private static let qualitySuffixRegex = try? NSRegularExpression(
+    pattern: #"\s*(\[(?:FLAC|APE|WAV|MP3|AAC|ALAC|DSD|Hi-Res|24bit|16bit|320K|无损|母带)[^\]]*\]|\((?:FLAC|APE|WAV|MP3|AAC|ALAC|DSD|Hi-Res|24bit|16bit|320K|无损|母带)[^\)]*\))\s*$"#,
+    options: [.caseInsensitive]
+  )
+  private static let separatorPatternStrings = [" - ", " – ", " — ", " _ "]
+
+  /// Heuristic to determine if a segment looks more like a song title than an artist name
+  /// (e.g., quoted with 《...》, contains feat/live/version/OST/主题曲/插曲/片尾曲/Remix/伴奏)
+  private static func looksMoreLikeSongTitle(_ text: String) -> Int {
+    var score = 0
+    if text.contains("《") || text.contains("》") || text.contains("「") || text.contains("」") {
+      score += 4
+    }
+    let lower = text.lowercased()
+    let titleKeywords = [
+      "live", "remix", "ver.", "version", "ost", "伴奏", "纯音乐", "主题曲", "片尾曲", "插曲",
+      "推广曲", "概念曲", "合唱", "独唱", "钢琴版", "吉他版", "acoustic", "instrumental", "cover", "翻唱"
+    ]
+    for kw in titleKeywords where lower.contains(kw) {
+      score += 2
+    }
+    if (text.contains("(") && text.contains(")")) || (text.contains("（") && text.contains("）")) {
+      score += 1
+    }
+    return score
+  }
+
   static func parseCloudTrackMetadata(_ entry: TvFileEntry, fallbackArtist: String = "") -> (title: String, artist: String, qualityTag: String) {
+    let cacheKey = "\(entry.mountId)::\(entry.path)::\(entry.size)::\(fallbackArtist)"
+    trackMetadataCacheLock.lock()
+    if let hit = trackMetadataCache[cacheKey] {
+      trackMetadataCacheLock.unlock()
+      return hit
+    }
+    trackMetadataCacheLock.unlock()
+
     var base = (entry.name as NSString).deletingPathExtension
     if base.isEmpty { base = entry.name }
-    if let range = base.range(of: #"^\s*(\[\d+\]|\d+[\.\-_、\s]+)\s*"#, options: .regularExpression) {
-      base.removeSubrange(range)
+    if let regex = leadingTrackNumRegex {
+      let ns = base as NSString
+      base = regex.stringByReplacingMatches(in: base, range: NSRange(location: 0, length: ns.length), withTemplate: "")
+    }
+    if let qRegex = qualitySuffixRegex {
+      let ns = base as NSString
+      base = qRegex.stringByReplacingMatches(in: base, range: NSRange(location: 0, length: ns.length), withTemplate: "")
     }
     base = base.trimmingCharacters(in: .whitespacesAndNewlines)
 
     var artist = fallbackArtist
     var title = base
-    if let dashRange = base.range(of: " - ") {
-      let a = String(base[..<dashRange.lowerBound]).trimmingCharacters(in: .whitespaces)
-      let t = String(base[dashRange.upperBound...]).trimmingCharacters(in: .whitespaces)
-      if !a.isEmpty && !t.isEmpty {
-        artist = a
-        title = t
+
+    // 1. Check explicit book-title quotes: e.g. `周杰伦《晴天》` or `《晴天》周杰伦`
+    if let openIdx = base.firstIndex(of: "《"),
+       let closeIdx = base.firstIndex(of: "》"),
+       openIdx < closeIdx {
+      let inside = String(base[base.index(after: openIdx)..<closeIdx]).trimmingCharacters(in: .whitespaces)
+      let before = String(base[..<openIdx]).trimmingCharacters(in: CharacterSet(charactersIn: " -–—_·:"))
+      let after = String(base[base.index(after: closeIdx)...]).trimmingCharacters(in: CharacterSet(charactersIn: " -–—_·:"))
+      if !inside.isEmpty {
+        title = inside
+        if !before.isEmpty {
+          artist = before
+        } else if !after.isEmpty {
+          artist = after
+        }
       }
-    } else if let dashIdx = base.firstIndex(of: "-") {
-      let a = String(base[..<dashIdx]).trimmingCharacters(in: .whitespaces)
-      let t = String(base[base.index(after: dashIdx)...]).trimmingCharacters(in: .whitespaces)
-      if a.count >= 2 && a.count <= 22 && !t.isEmpty {
-        artist = a
-        title = t
+    } else {
+      // 2. Split by ` - `, ` – `, ` — `, ` _ `, or `-`
+      var leftPart = ""
+      var rightPart = ""
+      for sep in separatorPatternStrings {
+        if let r = base.range(of: sep) {
+          leftPart = String(base[..<r.lowerBound]).trimmingCharacters(in: .whitespaces)
+          rightPart = String(base[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+          break
+        }
+      }
+      if leftPart.isEmpty, let dashIdx = base.firstIndex(of: "-") {
+        let l = String(base[..<dashIdx]).trimmingCharacters(in: .whitespaces)
+        let r = String(base[base.index(after: dashIdx)...]).trimmingCharacters(in: .whitespaces)
+        if !l.isEmpty && !r.isEmpty {
+          leftPart = l
+          rightPart = r
+        }
+      }
+
+      if !leftPart.isEmpty && !rightPart.isEmpty {
+        // Strip leading track numbers from rightPart too (e.g. `周杰伦 - 01. 晴天`)
+        if let regex = leadingTrackNumRegex {
+          let nsR = rightPart as NSString
+          let cleanedR = regex.stringByReplacingMatches(in: rightPart, range: NSRange(location: 0, length: nsR.length), withTemplate: "").trimmingCharacters(in: .whitespaces)
+          if !cleanedR.isEmpty { rightPart = cleanedR }
+        }
+        let leftTitleScore = looksMoreLikeSongTitle(leftPart)
+        let rightTitleScore = looksMoreLikeSongTitle(rightPart)
+        if leftTitleScore > rightTitleScore {
+          title = leftPart
+          artist = rightPart
+        } else {
+          // Standard `歌手 - 歌名`: Song title is the primary title, artist is the subtitle
+          artist = leftPart
+          title = rightPart
+        }
       }
     }
-    if title.isEmpty { title = entry.name }
+
+    // Fallback: if artist is still empty or equals mount name, try parent folder name
+    if artist.isEmpty || artist == fallbackArtist {
+      let rawParent: String
+      if entry.isInsideArchive {
+        let innerDir = (entry.archiveInnerPath as NSString).deletingLastPathComponent
+        rawParent = innerDir.isEmpty
+          ? (entry.archiveContainerName as NSString).deletingPathExtension
+          : (innerDir as NSString).lastPathComponent
+      } else {
+        let pDir = (entry.path as NSString).deletingLastPathComponent
+        rawParent = (pDir as NSString).lastPathComponent
+      }
+      let cleanParent = rawParent.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !cleanParent.isEmpty && cleanParent != "/" && cleanParent != "0" && cleanParent != title {
+        artist = cleanParent
+      }
+    }
+    if title.isEmpty { title = base.isEmpty ? entry.name : base }
+    if artist.isEmpty { artist = fallbackArtist }
 
     let ext = entry.normalizedExt.replacingOccurrences(of: ".", with: "").uppercased()
     let qualityTag: String
@@ -3232,7 +3515,14 @@ final class TvAppState: ObservableObject {
     default:
       qualityTag = ext.isEmpty ? "AUDIO" : ext
     }
-    return (title, artist, qualityTag)
+    let result = (title: title, artist: artist, qualityTag: qualityTag)
+    trackMetadataCacheLock.lock()
+    if trackMetadataCache.count > 6000 {
+      trackMetadataCache.removeAll(keepingCapacity: true)
+    }
+    trackMetadataCache[cacheKey] = result
+    trackMetadataCacheLock.unlock()
+    return result
   }
 
   func mountDisplayName(for entry: TvFileEntry) -> String {
@@ -3276,6 +3566,128 @@ final class TvAppState: ObservableObject {
     savedMusicFolders.contains { $0.mountId == mountId && $0.path == path }
   }
 
+  var activeMusicPlaylist: TvSavedMusicPlaylist? {
+    savedMusicPlaylists.first(where: { $0.id == activeMusicPlaylistId })
+  }
+
+  var activeMusicPlaylistName: String {
+    activeMusicPlaylist?.name ?? "默认播放列表"
+  }
+
+  func syncDefaultCloudMusicPlaylist(persist: Bool = true) {
+    let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+    if !cloudMusicQueue.isEmpty {
+      let safeIdx = min(max(0, cloudMusicCurrentIndex), cloudMusicQueue.count - 1)
+      let defaultIdx = savedMusicPlaylists.firstIndex(where: { $0.id == "default_playlist" })
+      let defaultName = defaultIdx != nil ? savedMusicPlaylists[defaultIdx!].name : "默认播放列表"
+      let updatedDefault = TvSavedMusicPlaylist(
+        id: "default_playlist",
+        name: defaultName,
+        tracks: cloudMusicQueue,
+        sources: currentMusicQueueSources,
+        currentIndex: safeIdx,
+        updatedEpochMs: nowMs
+      )
+      if let dIdx = defaultIdx {
+        savedMusicPlaylists[dIdx] = updatedDefault
+      } else {
+        savedMusicPlaylists.insert(updatedDefault, at: 0)
+      }
+      if activeMusicPlaylistId.isEmpty {
+        activeMusicPlaylistId = "default_playlist"
+      } else if activeMusicPlaylistId != "default_playlist",
+                let aIdx = savedMusicPlaylists.firstIndex(where: { $0.id == activeMusicPlaylistId }) {
+        savedMusicPlaylists[aIdx].tracks = cloudMusicQueue
+        savedMusicPlaylists[aIdx].sources = currentMusicQueueSources
+        savedMusicPlaylists[aIdx].currentIndex = safeIdx
+        savedMusicPlaylists[aIdx].updatedEpochMs = nowMs
+      }
+    }
+    if persist {
+      persistDefaultMusicQueueAndPlaylists()
+    }
+  }
+
+  private func persistDefaultMusicQueueAndPlaylists() {
+    if !cloudMusicQueue.isEmpty {
+      if let qData = try? JSONEncoder().encode(cloudMusicQueue) {
+        defaults.set(qData, forKey: "tv_default_music_queue_v1")
+      }
+      let safeIdx = min(max(0, cloudMusicCurrentIndex), cloudMusicQueue.count - 1)
+      defaults.set(safeIdx, forKey: "tv_default_music_index_v1")
+      if let sData = try? JSONEncoder().encode(currentMusicQueueSources) {
+        defaults.set(sData, forKey: "tv_default_music_sources_v1")
+      }
+    }
+    if let plData = try? JSONEncoder().encode(savedMusicPlaylists) {
+      defaults.set(plData, forKey: "tv_saved_music_playlists_v1")
+    }
+    defaults.set(activeMusicPlaylistId, forKey: "tv_active_music_playlist_id_v1")
+  }
+
+  @discardableResult
+  func saveCurrentCloudMusicQueueAsPlaylist(name: String) -> TvSavedMusicPlaylist {
+    let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    let finalName = clean.isEmpty ? "我的歌单 \(savedMusicPlaylists.count + 1)" : clean
+    let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+    let safeIdx = cloudMusicQueue.isEmpty ? 0 : min(max(0, cloudMusicCurrentIndex), cloudMusicQueue.count - 1)
+    let pl = TvSavedMusicPlaylist(
+      id: "pl_\(nowMs)",
+      name: finalName,
+      tracks: cloudMusicQueue,
+      sources: currentMusicQueueSources,
+      currentIndex: safeIdx,
+      updatedEpochMs: nowMs
+    )
+    savedMusicPlaylists.append(pl)
+    activeMusicPlaylistId = pl.id
+    persistDefaultMusicQueueAndPlaylists()
+    showToast("✓ 已保存播放列表「\(finalName)」（共 \(cloudMusicQueue.count) 首）")
+    return pl
+  }
+
+  func deleteSavedMusicPlaylist(_ playlistId: String) {
+    if playlistId == "default_playlist" && savedMusicPlaylists.count <= 1 {
+      return
+    }
+    savedMusicPlaylists.removeAll { $0.id == playlistId }
+    if activeMusicPlaylistId == playlistId {
+      activeMusicPlaylistId = savedMusicPlaylists.first?.id ?? "default_playlist"
+    }
+    persistDefaultMusicQueueAndPlaylists()
+    showToast("已删除播放列表")
+  }
+
+  func switchAndPlayMusicPlaylist(_ playlistId: String, shuffle: Bool = false) {
+    guard let pl = savedMusicPlaylists.first(where: { $0.id == playlistId }) else { return }
+    activeMusicPlaylistId = pl.id
+    currentMusicQueueSources = pl.sources
+    if pl.tracks.isEmpty && !pl.sources.isEmpty {
+      Task {
+        _ = await scanAndPlayMusicFoldersOrArchives(
+          sources: pl.sources,
+          shuffle: shuffle,
+          openFullscreen: false
+        )
+      }
+      return
+    }
+    guard !pl.tracks.isEmpty else { return }
+    var tracks = pl.tracks
+    if shuffle {
+      cloudMusicPlayMode = "shuffle"
+      tracks.shuffle()
+      cloudMusicQueue = tracks
+      cloudMusicCurrentIndex = 0
+    } else {
+      cloudMusicQueue = tracks
+      cloudMusicCurrentIndex = min(max(0, pl.currentIndex), tracks.count - 1)
+    }
+    persistDefaultMusicQueueAndPlaylists()
+    openCurrentCloudMusicTrack()
+    showToast("🎵 已切换至列表「\(pl.name)」（共 \(tracks.count) 首）")
+  }
+
   func shuffleCurrentCloudMusicQueue() {
     guard cloudMusicQueue.count > 1 else { return }
     cloudMusicPlayMode = "shuffle"
@@ -3283,6 +3695,7 @@ final class TvAppState: ObservableObject {
     shuffled.shuffle()
     cloudMusicQueue = shuffled
     cloudMusicCurrentIndex = 0
+    syncDefaultCloudMusicPlaylist()
     openCurrentCloudMusicTrack()
     showToast("🔀 已随机打乱播放队列（共 \(cloudMusicQueue.count) 首）")
   }
@@ -3293,13 +3706,24 @@ final class TvAppState: ObservableObject {
       let res = try await api.fetchFiles(path: path)
       return res.entries
     case .alist:
-      let res = try await TvRemoteStorageClient.shared.listAlistDirectory(
-        mount: mount,
-        path: path.isEmpty ? mount.rootPath : path,
-        page: 1,
-        perPage: 250
-      )
-      return res.entries
+      let targetPath = path.isEmpty ? mount.rootPath : path
+      var allEntries: [TvFileEntry] = []
+      var existingIds = Set<String>()
+      let perPage = 500
+      for page in 1...8 {
+        let res = try await TvRemoteStorageClient.shared.listAlistDirectory(
+          mount: mount,
+          path: targetPath,
+          page: page,
+          perPage: perPage
+        )
+        let newItems = res.entries.filter { existingIds.insert($0.id).inserted }
+        allEntries.append(contentsOf: newItems)
+        if !res.hasMoreRemotePages || newItems.isEmpty || allEntries.count >= res.totalCount {
+          break
+        }
+      }
+      return allEntries
     case .webdav:
       let res = try await TvRemoteStorageClient.shared.listWebdavDirectory(
         mount: mount,
@@ -3308,13 +3732,23 @@ final class TvAppState: ObservableObject {
       return res.entries
     case .cloud115:
       let cid = (path.isEmpty || path == "/") ? "0" : path
-      let res = try await TvLocal115DirectClient.shared.list115Directory(
-        cid: cid,
-        mountId: mount.id,
-        page: 1,
-        perPage: 200
-      )
-      return res.entries
+      var allEntries: [TvFileEntry] = []
+      var existingIds = Set<String>()
+      let perPage = 115
+      for page in 1...15 {
+        let res = try await TvLocal115DirectClient.shared.list115Directory(
+          cid: cid,
+          mountId: mount.id,
+          page: page,
+          perPage: perPage
+        )
+        let newItems = res.entries.filter { existingIds.insert($0.id).inserted }
+        allEntries.append(contentsOf: newItems)
+        if !res.hasMoreRemotePages || newItems.isEmpty || allEntries.count >= res.totalCount {
+          break
+        }
+      }
+      return allEntries
     case .localCache:
       return listLocalOfflineDirectory(path: path).entries
     }
@@ -3784,6 +4218,19 @@ final class TvAppState: ObservableObject {
       if openFullscreen {
         showCloudMusicFullscreen = true
       }
+      currentMusicQueueSources = [
+        TvSavedMusicFolderItem(
+          mountId: archiveEntry.mountId,
+          mountName: mountDisplayName(for: archiveEntry),
+          sourceKind: archiveEntry.sourceKind,
+          path: archiveEntry.path,
+          title: archiveEntry.name,
+          isArchive: true,
+          size: archiveEntry.size,
+          pickcode115: archiveEntry.pickcode115
+        )
+      ]
+      syncDefaultCloudMusicPlaylist()
       openCurrentCloudMusicTrack()
       return audioTracks.count
     } catch {
@@ -3832,9 +4279,9 @@ final class TvAppState: ObservableObject {
           }
         }
       }
-      if includeSubfolders && depth < 3 && collectedTracks.count < 600 {
+      if includeSubfolders && depth < 5 && collectedTracks.count < 3000 {
         for sub in entries where sub.isDir {
-          if collectedTracks.count >= 600 { break }
+          if collectedTracks.count >= 3000 { break }
           await scanFolderRecursive(mount: mount, folderPath: sub.path, folderTitle: sub.name, depth: depth + 1)
         }
       }
@@ -3863,7 +4310,24 @@ final class TvAppState: ObservableObject {
           }
         }
       } else {
-        await scanFolderRecursive(mount: mount, folderPath: src.path, folderTitle: src.title, depth: 0)
+        let dotExt = ".\((src.title as NSString).pathExtension.lowercased())"
+        let potentialAudio = TvFileEntry(
+          name: src.title,
+          path: src.path,
+          size: src.size,
+          modTime: "",
+          isDir: false,
+          isMp4: dotExt == ".mp4",
+          ext: dotExt == "." ? "" : dotExt,
+          mountId: src.mountId,
+          sourceKind: src.sourceKind,
+          pickcode115: src.pickcode115
+        )
+        if potentialAudio.isAudio {
+          collectedTracks.append(potentialAudio)
+        } else {
+          await scanFolderRecursive(mount: mount, folderPath: src.path, folderTitle: src.title, depth: 0)
+        }
       }
     }
 
@@ -3882,6 +4346,8 @@ final class TvAppState: ObservableObject {
     }
     cloudMusicQueue = collectedTracks
     cloudMusicCurrentIndex = 0
+    currentMusicQueueSources = sources
+    syncDefaultCloudMusicPlaylist()
     if openFullscreen && selectedSection != .music {
       showCloudMusicFullscreen = true
     }
@@ -3922,6 +4388,7 @@ final class TvAppState: ObservableObject {
     if openFullscreen {
       showCloudMusicFullscreen = true
     }
+    syncDefaultCloudMusicPlaylist()
     openCurrentCloudMusicTrack()
   }
 
@@ -3930,6 +4397,7 @@ final class TvAppState: ObservableObject {
     if cloudMusicQueue.isEmpty || cloudMusicCurrentIndex < 0 {
       cloudMusicQueue = [track]
       cloudMusicCurrentIndex = 0
+      syncDefaultCloudMusicPlaylist()
       openCurrentCloudMusicTrack()
       return
     }
@@ -3942,6 +4410,7 @@ final class TvAppState: ObservableObject {
         let insertIdx = min(max(0, cloudMusicCurrentIndex + 1), cloudMusicQueue.count)
         cloudMusicQueue.insert(item, at: insertIdx)
       }
+      syncDefaultCloudMusicPlaylist()
       return
     }
     if playNext {
@@ -3950,6 +4419,7 @@ final class TvAppState: ObservableObject {
     } else {
       cloudMusicQueue.append(track)
     }
+    syncDefaultCloudMusicPlaylist()
   }
 
   func playCloudMusicQueueIndex(_ index: Int) {
@@ -3959,6 +4429,7 @@ final class TvAppState: ObservableObject {
       return
     }
     cloudMusicCurrentIndex = index
+    syncDefaultCloudMusicPlaylist()
     openCurrentCloudMusicTrack()
   }
 
@@ -3976,8 +4447,11 @@ final class TvAppState: ObservableObject {
       if cloudMusicCurrentIndex >= cloudMusicQueue.count {
         cloudMusicCurrentIndex = 0
       }
+      syncDefaultCloudMusicPlaylist()
       openCurrentCloudMusicTrack()
+      return
     }
+    syncDefaultCloudMusicPlaylist()
   }
 
   private func openCurrentCloudMusicTrack(useLocalChunkProxy: Bool = false) {
@@ -3990,6 +4464,7 @@ final class TvAppState: ObservableObject {
 
     cleanupCloudMusicPlayerInstance()
     isCloudMusicLoading = true
+    isCloudMusicSessionDocked = true
     cloudMusicErrorText = ""
     cloudMusicPosition = 0
     cloudMusicDuration = 0
@@ -4101,6 +4576,7 @@ final class TvAppState: ObservableObject {
             self.isCloudMusicLoading = false
           }
         }
+        self.updateNowPlayingInfo()
       }
     }
 
@@ -4131,8 +4607,11 @@ final class TvAppState: ObservableObject {
       }
     }
 
+    try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.allowAirPlay])
+    try? AVAudioSession.sharedInstance().setActive(true)
     player.playImmediately(atRate: cloudMusicSpeed)
     isCloudMusicPlaying = true
+    updateNowPlayingInfo(force: true)
   }
 
   private func loadCloudMusicCoverAndLyrics(for track: TvFileEntry, seq: Int) {
@@ -4196,6 +4675,30 @@ final class TvAppState: ObservableObject {
            seq == self.cloudMusicOpenSeq {
           self.cloudMusicCoverImage = img
         }
+      }
+
+      if self.cloudMusicCoverImage == nil, seq == self.cloudMusicOpenSeq {
+        let meta = Self.parseCloudTrackMetadata(track)
+        let cleanTitle = meta.title.replacingOccurrences(
+          of: #"\(.*?\)|\[.*?\]|【.*?】"#,
+          with: " ",
+          options: .regularExpression
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanArtist = (!meta.artist.contains("115") && !meta.artist.contains("AList") && !meta.artist.contains("WebDAV"))
+          ? meta.artist.replacingOccurrences(
+              of: #"\(.*?\)|\[.*?\]|【.*?】"#,
+              with: " ",
+              options: .regularExpression
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+          : ""
+        let artQuery = cleanArtist.isEmpty ? cleanTitle : "\(cleanArtist) \(cleanTitle)"
+        if let onlineImg = await Self.fetchOnlineItunesCoverImage(query: artQuery),
+           seq == self.cloudMusicOpenSeq {
+          self.cloudMusicCoverImage = onlineImg
+        }
+      }
+      if self.cloudMusicCoverImage != nil, seq == self.cloudMusicOpenSeq {
+        self.updateNowPlayingInfo(force: true)
       }
 
       // 2. Discover `.lrc` sidecar file in the same 115 / AList / WebDAV / Local directory
@@ -4294,6 +4797,36 @@ final class TvAppState: ObservableObject {
     return result
   }
 
+  private static func fetchOnlineItunesCoverImage(query: String) async -> UIImage? {
+    let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty,
+          let enc = trimmed.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+          let url = URL(string: "https://itunes.apple.com/search?term=\(enc)&media=music&entity=song&limit=3") else {
+      return nil
+    }
+    var req = URLRequest(url: url)
+    req.timeoutInterval = 6.0
+    req.setValue("LiuguangMusicPlayerTV/1.2.2", forHTTPHeaderField: "User-Agent")
+    guard let (data, resp) = try? await URLSession.shared.data(for: req),
+          let http = resp as? HTTPURLResponse,
+          http.statusCode == 200,
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let results = obj["results"] as? [[String: Any]] else {
+      return nil
+    }
+    for item in results {
+      if let rawArt = item["artworkUrl100"] as? String, !rawArt.isEmpty {
+        let hdArt = rawArt.replacingOccurrences(of: "100x100bb", with: "600x600bb")
+        if let artUrl = URL(string: hdArt),
+           let (imgData, _) = try? await URLSession.shared.data(from: artUrl),
+           let img = UIImage(data: imgData) {
+          return img
+        }
+      }
+    }
+    return nil
+  }
+
   private static func fetchOnlineLrclibLyrics(query: String) async -> [TvCloudLrcLine]? {
     let cleaned = query.replacingOccurrences(
       of: #"\(.*?\)|\[.*?\]|【.*?】"#,
@@ -4346,9 +4879,12 @@ final class TvAppState: ObservableObject {
       cloudMusicPlayer?.pause()
       isCloudMusicPlaying = false
     } else {
+      try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.allowAirPlay])
+      try? AVAudioSession.sharedInstance().setActive(true)
       cloudMusicPlayer?.playImmediately(atRate: cloudMusicSpeed)
       isCloudMusicPlaying = true
     }
+    updateNowPlayingInfo(force: true)
   }
 
   func seekCloudMusic(to seconds: Double) {
@@ -4356,6 +4892,7 @@ final class TvAppState: ObservableObject {
     let clamped = max(0, min(seconds, cloudMusicDuration > 0 ? cloudMusicDuration : 86400))
     cloudMusicPosition = clamped
     player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600))
+    updateNowPlayingInfo(force: true)
   }
 
   func seekCloudMusicRelative(delta: Double) {
@@ -4380,6 +4917,7 @@ final class TvAppState: ObservableObject {
     } else {
       cloudMusicCurrentIndex = (cloudMusicCurrentIndex + delta + cloudMusicQueue.count) % cloudMusicQueue.count
     }
+    syncDefaultCloudMusicPlaylist()
     openCurrentCloudMusicTrack()
   }
 
@@ -4405,12 +4943,15 @@ final class TvAppState: ObservableObject {
     if cloudMusicPlayMode == "shuffle" {
       let indices = cloudMusicQueue.indices.filter { $0 != cloudMusicCurrentIndex }
       cloudMusicCurrentIndex = indices.randomElement() ?? 0
+      syncDefaultCloudMusicPlaylist()
       openCurrentCloudMusicTrack()
     } else if cloudMusicCurrentIndex + 1 < cloudMusicQueue.count {
       cloudMusicCurrentIndex += 1
+      syncDefaultCloudMusicPlaylist()
       openCurrentCloudMusicTrack()
     } else if cloudMusicPlayMode == "repeatAll" {
       cloudMusicCurrentIndex = 0
+      syncDefaultCloudMusicPlaylist()
       openCurrentCloudMusicTrack()
     } else {
       isCloudMusicPlaying = false
@@ -4469,19 +5010,21 @@ final class TvAppState: ObservableObject {
     cloudMusicPlayer = nil
   }
 
-  func stopCloudMusicPlayer() {
+  func stopCloudMusicPlayer(clearPersistedQueue: Bool = false) {
     cloudMusicOpenSeq &+= 1
     cleanupCloudMusicPlayerInstance()
-    cloudMusicQueue = []
-    cloudMusicCurrentIndex = -1
+    if clearPersistedQueue {
+      cloudMusicQueue = []
+      cloudMusicCurrentIndex = -1
+    }
     isCloudMusicPlaying = false
     isCloudMusicLoading = false
+    isCloudMusicSessionDocked = false
     cloudMusicErrorText = ""
     cloudMusicPosition = 0
     cloudMusicDuration = 0
-    cloudMusicCoverImage = nil
-    cloudMusicLyrics = []
     showCloudMusicFullscreen = false
+    updateNowPlayingInfo(force: true)
   }
 
   // MARK: - Unified File Operations (Mkdir / Rename / Delete / Copy / Move) Across All Storage Mounts
@@ -6107,6 +6650,18 @@ final class TvAppState: ObservableObject {
     lanInputRunning = false
   }
 
+  func presentLanQuickInput(
+    prompt: String,
+    placeholder: String = "在此输入或粘贴内容...",
+    onReceive: @escaping (String) -> Void
+  ) {
+    startLanInputServer()
+    activeLanQuickInputPrompt = prompt
+    activeLanQuickInputPlaceholder = placeholder
+    activeLanQuickInputReceiver = onReceive
+    showLanQuickInputModal = true
+  }
+
   private nonisolated static func handleLanHttpConnection(_ conn: NWConnection, appState: TvAppState) {
     conn.start(queue: .global(qos: .userInitiated))
 
@@ -6356,6 +6911,39 @@ final class TvAppState: ObservableObject {
     }
 
     // 5. Push Subscription / 115 Cookie / Server Config (`POST /push`)
+    if method == "POST" && pathAndQuery.hasPrefix("/quick-input") {
+      let bodyPart = String(data: bodyData, encoding: .utf8) ?? ""
+      let form = parseFormUrlEncoded(bodyPart)
+      let text = form["text"] ?? ""
+      Task { @MainActor in
+        let targetName = appState.activeLanQuickInputPrompt.isEmpty ? "当前输入框" : appState.activeLanQuickInputPrompt
+        if let receiver = appState.activeLanQuickInputReceiver {
+          receiver(text)
+          appState.showLanQuickInputModal = false
+          appState.showToast("📱 已收到手机扫码输入：\(targetName)")
+        } else {
+          // Intelligent fallback if no specific input modal was open
+          switch appState.selectedSection {
+          case .vod:
+            appState.searchKeyword = text
+            Task { await appState.performSearch() }
+          case .live:
+            appState.liveSearchKeyword = text
+          case .telegram:
+            appState.telegramChatFilter = text
+          case .mediaLibrary:
+            appState.fileSearchKeyword = text
+          default:
+            break
+          }
+          appState.showToast("📱 已收到手机扫码输入：\(text)")
+        }
+        let okHtml = buildLanPortalPage(appState: appState, pushedBanner: "✅ 已成功填入 Apple TV「\(targetName)」！")
+        sendHttpResponse(conn: conn, html: okHtml)
+      }
+      return
+    }
+
     if method == "POST" && pathAndQuery.hasPrefix("/push") {
       let bodyPart = String(data: bodyData, encoding: .utf8) ?? ""
       let form = parseFormUrlEncoded(bodyPart)
@@ -6564,6 +7152,14 @@ final class TvAppState: ObservableObject {
     </head>
     <body>
       \(bannerHtml)
+      <div class="card" style="border-color:#FF9F0A;">
+        <h2>⌨️ 0. 电视端万能扫码快捷输入（\(appState.activeLanQuickInputPrompt.isEmpty ? "自动填入当前页面搜索/输入框" : "当前目标：\(appState.activeLanQuickInputPrompt)")）</h2>
+        <p class="sub">在下方输入或粘贴文字、影视片名、频道名、网址、密码、歌单名或聊天内容，点击发送即可立即填入 Apple TV 当前输入框：</p>
+        <form method="POST" action="/quick-input">
+          <textarea name="text" rows="3" placeholder="\(appState.activeLanQuickInputPlaceholder.isEmpty ? "在此输入或粘贴要发送到电视的内容..." : appState.activeLanQuickInputPlaceholder)" autofocus></textarea>
+          <button type="submit">🚀 立即填入 Apple TV 输入框</button>
+        </form>
+      </div>
       <div class="card">
         <h2>📂 1. 局域网文件上传与下载（Apple TV 实时同步显示进度）</h2>
         <p class="sub">当前 Apple TV 正在浏览：<strong style="color:#60A5FA;">\(mount.name)</strong> · 目录 <code style="color:#FFB340;">\(currentDir.isEmpty ? "/" : currentDir)</code>。选择或拖拽文件后将直接上传至该目录，并在手机与电视屏幕上同时显示实时进度条！</p>

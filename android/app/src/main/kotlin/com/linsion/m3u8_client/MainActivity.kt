@@ -8,23 +8,36 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.UiModeManager
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.LinearGradient
+import android.graphics.Paint
+import android.graphics.Shader
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.hardware.Camera
+import android.media.MediaMetadata
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.ViewGroup
 import android.view.Window
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -34,7 +47,9 @@ import androidx.core.content.ContextCompat
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.BinaryBitmap
 import com.google.zxing.DecodeHintType
+import com.google.zxing.EncodeHintType
 import com.google.zxing.MultiFormatReader
+import com.google.zxing.MultiFormatWriter
 import com.google.zxing.PlanarYUVLuminanceSource
 import com.google.zxing.RGBLuminanceSource
 import com.google.zxing.common.GlobalHistogramBinarizer
@@ -43,6 +58,7 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import java.io.ByteArrayOutputStream
 import java.util.EnumMap
 
 @Suppress("DEPRECATION")
@@ -50,17 +66,48 @@ class MainActivity : FlutterActivity() {
     private val channelName = "com.linsion.m3u8_client/tv_platform"
     private val notifChannelName = "com.linsion.m3u8_client/notifications"
     private val qrChannelName = "com.linsion.m3u8_client/qr_scanner"
+    private val mediaSessionChannelName = "com.linsion.m3u8_client/media_session"
     private val telegramChannelId = "telegram_messages_channel"
+    private val musicChannelId = "cloud_music_playback_channel"
+    private val musicNotificationId = 880102
     private var notificationsChannel: MethodChannel? = null
+    private var mediaSessionChannel: MethodChannel? = null
     private var pendingPermissionResult: MethodChannel.Result? = null
     private var pendingQrScanResult: MethodChannel.Result? = null
     private var activeQrDialog: Dialog? = null
     private var pendingTapPayload: Map<String, Any>? = null
 
+    private var mediaSession: MediaSession? = null
+    private var mediaControlReceiver: BroadcastReceiver? = null
+    private var musicWakeLock: PowerManager.WakeLock? = null
+    private var cachedAlbumArtBitmap: Bitmap? = null
+    private var cachedTrackTitle: String = ""
+
+    companion object {
+        private const val ACTION_MEDIA_PREV = "com.linsion.m3u8_client.MEDIA_PREV"
+        private const val ACTION_MEDIA_TOGGLE = "com.linsion.m3u8_client.MEDIA_TOGGLE"
+        private const val ACTION_MEDIA_NEXT = "com.linsion.m3u8_client.MEDIA_NEXT"
+        private const val ACTION_MEDIA_STOP = "com.linsion.m3u8_client.MEDIA_STOP"
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         ensureTelegramNotificationChannel()
+        ensureMusicNotificationChannel()
+        registerMediaControlReceiver()
         extractNotificationTapIntent(intent)
+    }
+
+    override fun onDestroy() {
+        clearLockScreenMediaSession()
+        unregisterMediaControlReceiver()
+        super.onDestroy()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -93,6 +140,11 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "scanCamera" -> startCameraQrScan(result)
                     "scanGallery" -> startGalleryQrScan(result)
+                    "generateQrPng" -> {
+                        val content = call.argument<String>("content") ?: ""
+                        val size = (call.argument<Int>("size") ?: 360).coerceIn(120, 800)
+                        result.success(generateQrPngBytes(content, size))
+                    }
                     else -> result.notImplemented()
                 }
             }
@@ -105,6 +157,12 @@ class MainActivity : FlutterActivity() {
         pendingTapPayload?.let { payload ->
             pendingTapPayload = null
             nChannel.invokeMethod("onNotificationTapped", payload)
+        }
+
+        val mChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, mediaSessionChannelName)
+        mediaSessionChannel = mChannel
+        mChannel.setMethodCallHandler { call, result ->
+            handleMediaSessionMethodCall(call, result)
         }
     }
 
@@ -158,6 +216,32 @@ class MainActivity : FlutterActivity() {
         hints[DecodeHintType.CHARACTER_SET] = "UTF-8"
         hints[DecodeHintType.TRY_HARDER] = true
         return MultiFormatReader().apply { setHints(hints) }
+    }
+
+    private fun generateQrPngBytes(content: String, size: Int): ByteArray? {
+        if (content.isBlank()) return null
+        return try {
+            val hints = EnumMap<EncodeHintType, Any>(EncodeHintType::class.java)
+            hints[EncodeHintType.CHARACTER_SET] = "UTF-8"
+            hints[EncodeHintType.MARGIN] = 1
+            val matrix = MultiFormatWriter().encode(content, BarcodeFormat.QR_CODE, size, size, hints)
+            val w = matrix.width
+            val h = matrix.height
+            val pixels = IntArray(w * h)
+            for (y in 0 until h) {
+                val offset = y * w
+                for (x in 0 until w) {
+                    pixels[offset + x] = if (matrix.get(x, y)) Color.BLACK else Color.WHITE
+                }
+            }
+            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            bmp.setPixels(pixels, 0, w, 0, 0, w, h)
+            val bos = ByteArrayOutputStream()
+            bmp.compress(Bitmap.CompressFormat.PNG, 100, bos)
+            bos.toByteArray()
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun decodeQrFromBitmap(bitmap: Bitmap): String? {
@@ -485,6 +569,382 @@ class MainActivity : FlutterActivity() {
             }
             nm.createNotificationChannel(channel)
         }
+    }
+
+    private fun ensureMusicNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+            val channel = NotificationChannel(
+                musicChannelId,
+                "流光云端音乐播放",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "用于锁屏音乐播放器与通知栏媒体控制"
+                setShowBadge(false)
+                enableVibration(false)
+                setSound(null, null)
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+            }
+            nm.createNotificationChannel(channel)
+        }
+    }
+
+    private fun registerMediaControlReceiver() {
+        if (mediaControlReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                when (intent?.action) {
+                    ACTION_MEDIA_PREV -> sendMediaCommandToFlutter("previous")
+                    ACTION_MEDIA_TOGGLE -> sendMediaCommandToFlutter("togglePlayPause")
+                    ACTION_MEDIA_NEXT -> sendMediaCommandToFlutter("next")
+                    ACTION_MEDIA_STOP -> {
+                        clearLockScreenMediaSession()
+                        sendMediaCommandToFlutter("stop")
+                    }
+                }
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(ACTION_MEDIA_PREV)
+            addAction(ACTION_MEDIA_TOGGLE)
+            addAction(ACTION_MEDIA_NEXT)
+            addAction(ACTION_MEDIA_STOP)
+        }
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(receiver, filter)
+        }
+        mediaControlReceiver = receiver
+    }
+
+    private fun unregisterMediaControlReceiver() {
+        try {
+            mediaControlReceiver?.let { unregisterReceiver(it) }
+        } catch (_: Exception) {}
+        mediaControlReceiver = null
+    }
+
+    private fun sendMediaCommandToFlutter(action: String, positionMs: Long? = null) {
+        runOnUiThread {
+            val payload = mutableMapOf<String, Any>("action" to action)
+            if (positionMs != null) {
+                payload["positionMs"] = positionMs
+            }
+            mediaSessionChannel?.invokeMethod("onMediaCommand", payload)
+        }
+    }
+
+    private fun ensureMediaSessionInitialized(): MediaSession {
+        var session = mediaSession
+        if (session != null) return session
+        session = MediaSession(this, "LiuguangCloudMusicSession").apply {
+            setFlags(
+                MediaSession.FLAG_HANDLES_MEDIA_BUTTONS or
+                    MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS
+            )
+            setCallback(object : MediaSession.Callback() {
+                override fun onPlay() {
+                    sendMediaCommandToFlutter("play")
+                }
+
+                override fun onPause() {
+                    sendMediaCommandToFlutter("pause")
+                }
+
+                override fun onSkipToNext() {
+                    sendMediaCommandToFlutter("next")
+                }
+
+                override fun onSkipToPrevious() {
+                    sendMediaCommandToFlutter("previous")
+                }
+
+                override fun onStop() {
+                    clearLockScreenMediaSession()
+                    sendMediaCommandToFlutter("stop")
+                }
+
+                override fun onSeekTo(pos: Long) {
+                    sendMediaCommandToFlutter("seek", pos)
+                }
+            })
+            isActive = true
+        }
+        mediaSession = session
+        return session
+    }
+
+    private fun updateMusicWakeLock(isPlaying: Boolean) {
+        try {
+            if (isPlaying) {
+                if (musicWakeLock == null) {
+                    val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                    musicWakeLock = pm?.newWakeLock(
+                        PowerManager.PARTIAL_WAKE_LOCK,
+                        "m3u8_client:CloudMusicWakeLock"
+                    )?.apply {
+                        setReferenceCounted(false)
+                    }
+                }
+                if (musicWakeLock?.isHeld == false) {
+                    musicWakeLock?.acquire(6 * 60 * 60 * 1000L)
+                }
+            } else {
+                if (musicWakeLock?.isHeld == true) {
+                    musicWakeLock?.release()
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun clearLockScreenMediaSession() {
+        updateMusicWakeLock(false)
+        cachedTrackTitle = ""
+        cachedAlbumArtBitmap = null
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            nm?.cancel(musicNotificationId)
+        } catch (_: Exception) {}
+        try {
+            mediaSession?.isActive = false
+            mediaSession?.release()
+        } catch (_: Exception) {}
+        mediaSession = null
+    }
+
+    private fun handleMediaSessionMethodCall(call: MethodCall, result: MethodChannel.Result) {
+        when (call.method) {
+            "updateMediaSession" -> {
+                val title = call.argument<String>("title") ?: "流光云端音乐"
+                val artist = call.argument<String>("artist") ?: "流光播放器"
+                val album = call.argument<String>("album") ?: ""
+                val isPlaying = call.argument<Boolean>("isPlaying") ?: false
+                val positionMs = (call.argument<Number>("positionMs")?.toLong() ?: 0L).coerceAtLeast(0L)
+                val durationMs = (call.argument<Number>("durationMs")?.toLong() ?: 0L).coerceAtLeast(0L)
+                val speed = (call.argument<Number>("speed")?.toFloat() ?: 1.0f).coerceAtLeast(0.25f)
+                val coverBytes = call.argument<ByteArray>("coverBytes")
+
+                if (title != cachedTrackTitle) {
+                    cachedTrackTitle = title
+                    cachedAlbumArtBitmap = null
+                }
+                if (coverBytes != null && coverBytes.isNotEmpty()) {
+                    try {
+                        val decoded = BitmapFactory.decodeByteArray(coverBytes, 0, coverBytes.size)
+                        if (decoded != null) {
+                            cachedAlbumArtBitmap = decoded
+                        }
+                    } catch (_: Exception) {}
+                }
+                if (cachedAlbumArtBitmap == null) {
+                    try {
+                        cachedAlbumArtBitmap = generateVinylCoverBitmap(title, artist, album)
+                    } catch (_: Exception) {
+                        try {
+                            cachedAlbumArtBitmap = BitmapFactory.decodeResource(resources, R.mipmap.ic_launcher)
+                        } catch (_: Exception) {}
+                    }
+                }
+
+                updateMusicWakeLock(isPlaying)
+                ensureMusicNotificationChannel()
+                val session = ensureMediaSessionInitialized()
+                session.isActive = true
+
+                val metaBuilder = MediaMetadata.Builder()
+                    .putString(MediaMetadata.METADATA_KEY_TITLE, title)
+                    .putString(MediaMetadata.METADATA_KEY_ARTIST, artist)
+                    .putString(MediaMetadata.METADATA_KEY_ALBUM, album)
+                if (durationMs > 0L) {
+                    metaBuilder.putLong(MediaMetadata.METADATA_KEY_DURATION, durationMs)
+                }
+                cachedAlbumArtBitmap?.let { bmp ->
+                    metaBuilder.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, bmp)
+                    metaBuilder.putBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON, bmp)
+                }
+                session.setMetadata(metaBuilder.build())
+
+                val actions = PlaybackState.ACTION_PLAY or
+                    PlaybackState.ACTION_PAUSE or
+                    PlaybackState.ACTION_PLAY_PAUSE or
+                    PlaybackState.ACTION_SKIP_TO_NEXT or
+                    PlaybackState.ACTION_SKIP_TO_PREVIOUS or
+                    PlaybackState.ACTION_STOP or
+                    PlaybackState.ACTION_SEEK_TO
+                val stateCode = if (isPlaying) {
+                    PlaybackState.STATE_PLAYING
+                } else {
+                    PlaybackState.STATE_PAUSED
+                }
+                val pbState = PlaybackState.Builder()
+                    .setActions(actions)
+                    .setState(
+                        stateCode,
+                        positionMs,
+                        if (isPlaying) speed else 0f,
+                        SystemClock.elapsedRealtime()
+                    )
+                    .build()
+                session.setPlaybackState(pbState)
+
+                val piFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                } else {
+                    PendingIntent.FLAG_UPDATE_CURRENT
+                }
+                val openAppIntent = Intent(this, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                }
+                val contentPendingIntent = PendingIntent.getActivity(
+                    this,
+                    880100,
+                    openAppIntent,
+                    piFlags
+                )
+
+                fun buildBroadcastPendingIntent(action: String, reqCode: Int): PendingIntent {
+                    val i = Intent(action).apply { setPackage(packageName) }
+                    return PendingIntent.getBroadcast(this, reqCode, i, piFlags)
+                }
+
+                val prevAction = Notification.Action.Builder(
+                    android.R.drawable.ic_media_previous,
+                    "上一首",
+                    buildBroadcastPendingIntent(ACTION_MEDIA_PREV, 880101)
+                ).build()
+                val toggleAction = Notification.Action.Builder(
+                    if (isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play,
+                    if (isPlaying) "暂停" else "播放",
+                    buildBroadcastPendingIntent(ACTION_MEDIA_TOGGLE, 880102)
+                ).build()
+                val nextAction = Notification.Action.Builder(
+                    android.R.drawable.ic_media_next,
+                    "下一首",
+                    buildBroadcastPendingIntent(ACTION_MEDIA_NEXT, 880103)
+                ).build()
+                val stopAction = Notification.Action.Builder(
+                    android.R.drawable.ic_menu_close_clear_cancel,
+                    "退出",
+                    buildBroadcastPendingIntent(ACTION_MEDIA_STOP, 880104)
+                ).build()
+
+                val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    Notification.Builder(this, musicChannelId)
+                } else {
+                    @Suppress("DEPRECATION")
+                    Notification.Builder(this)
+                }
+
+                val subtitleLine = if (album.isNotEmpty()) "$artist · $album" else artist
+                builder.setSmallIcon(R.mipmap.ic_launcher)
+                    .setContentTitle(title)
+                    .setContentText(subtitleLine)
+                    .setSubText("流光云端音乐")
+                    .setVisibility(Notification.VISIBILITY_PUBLIC)
+                    .setContentIntent(contentPendingIntent)
+                    .setDeleteIntent(buildBroadcastPendingIntent(ACTION_MEDIA_STOP, 880105))
+                    .setOngoing(isPlaying)
+                    .setOnlyAlertOnce(true)
+                    .setShowWhen(false)
+                    .addAction(prevAction)
+                    .addAction(toggleAction)
+                    .addAction(nextAction)
+                    .addAction(stopAction)
+                    .setStyle(
+                        Notification.MediaStyle()
+                            .setMediaSession(session.sessionToken)
+                            .setShowActionsInCompactView(0, 1, 2)
+                    )
+                cachedAlbumArtBitmap?.let { bmp ->
+                    builder.setLargeIcon(bmp)
+                }
+
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                nm?.notify(musicNotificationId, builder.build())
+                result.success(true)
+            }
+            "clearMediaSession" -> {
+                clearLockScreenMediaSession()
+                result.success(true)
+            }
+            else -> result.notImplemented()
+        }
+    }
+
+    private fun generateVinylCoverBitmap(title: String, artist: String, album: String): Bitmap {
+        val size = 512
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        val hash = kotlin.math.abs((title + artist).hashCode())
+        val palettes = arrayOf(
+            intArrayOf(Color.rgb(20, 88, 172), Color.rgb(10, 30, 72)),
+            intArrayOf(Color.rgb(108, 40, 168), Color.rgb(36, 15, 66)),
+            intArrayOf(Color.rgb(18, 132, 122), Color.rgb(10, 46, 52)),
+            intArrayOf(Color.rgb(174, 56, 82), Color.rgb(56, 18, 36)),
+            intArrayOf(Color.rgb(184, 108, 26), Color.rgb(56, 34, 12))
+        )
+        val pair = palettes[hash % palettes.size]
+        val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            shader = LinearGradient(
+                0f, 0f, size.toFloat(), size.toFloat(),
+                pair[0], pair[1], Shader.TileMode.CLAMP
+            )
+        }
+        canvas.drawRect(0f, 0f, size.toFloat(), size.toFloat(), bgPaint)
+
+        val cx = size / 2f
+        val cy = 210f
+        val discPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(235, 20, 22, 28)
+            style = Paint.Style.FILL
+        }
+        canvas.drawCircle(cx, cy, 142f, discPaint)
+
+        val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(38, 255, 255, 255)
+            style = Paint.Style.STROKE
+            strokeWidth = 2.5f
+        }
+        canvas.drawCircle(cx, cy, 142f, ringPaint)
+        for (r in intArrayOf(116, 94, 72)) {
+            ringPaint.color = Color.argb(20, 255, 255, 255)
+            ringPaint.strokeWidth = 1.5f
+            canvas.drawCircle(cx, cy, r.toFloat(), ringPaint)
+        }
+
+        val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = pair[0]
+            style = Paint.Style.FILL
+        }
+        canvas.drawCircle(cx, cy, 48f, labelPaint)
+
+        val holePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(15, 16, 20)
+            style = Paint.Style.FILL
+        }
+        canvas.drawCircle(cx, cy, 9f, holePaint)
+
+        val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = 30f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            textAlign = Paint.Align.CENTER
+        }
+        val cleanTitle = if (title.length > 16) title.substring(0, 15) + "…" else title
+        canvas.drawText(cleanTitle, cx, 412f, titlePaint)
+
+        val subPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(215, 235, 238, 245)
+            textSize = 20f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.NORMAL)
+            textAlign = Paint.Align.CENTER
+        }
+        val rawSub = if (artist.isNotEmpty()) artist else album
+        val cleanSub = if (rawSub.length > 22) rawSub.substring(0, 21) + "…" else rawSub
+        canvas.drawText(cleanSub, cx, 452f, subPaint)
+
+        return bmp
     }
 
     private fun extractNotificationTapIntent(intent: Intent?) {

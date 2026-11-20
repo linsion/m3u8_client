@@ -5,7 +5,9 @@ import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
+import 'services/tv_platform_service.dart';
 import 'state/app_state.dart';
 import 'ui/main_shell.dart';
 import 'ui/theme.dart';
@@ -13,6 +15,9 @@ import 'ui/theme.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   MediaKit.ensureInitialized();
+  try {
+    await WakelockPlus.enable();
+  } catch (_) {}
 
   final appState = AppState();
   await appState.initialize();
@@ -119,6 +124,7 @@ class _TvRemoteKeyInterceptor extends StatefulWidget {
 class _TvRemoteKeyInterceptorState extends State<_TvRemoteKeyInterceptor> {
   FocusNode? _explicitlyActivatedEditableNode;
   bool _focusedIsUnactivatedInput = false;
+  bool _hasActiveEditableFocus = false;
   Timer? _imeHideGuardTimer1;
   Timer? _imeHideGuardTimer2;
 
@@ -156,9 +162,45 @@ class _TvRemoteKeyInterceptorState extends State<_TvRemoteKeyInterceptor> {
     }
 
     bool nextIsUnactivatedInput = false;
+    bool nextHasEditableFocus = false;
     if (widget.appState.tvMode && primary != null) {
       final ctx = primary.context;
       final editable = ctx?.findAncestorStateOfType<EditableTextState>();
+      if (editable != null) {
+        nextHasEditableFocus = true;
+        String fieldHint = '';
+        ctx?.visitAncestorElements((el) {
+          final w = el.widget;
+          if (w is TextField) {
+            fieldHint = w.decoration?.labelText ??
+                w.decoration?.hintText ??
+                '';
+            return false;
+          }
+          return true;
+        });
+        TvLanInputService.instance.bindActiveInput(
+          label: fieldHint,
+          currentValue: editable.textEditingValue.text,
+          onReceive: (text, submit) {
+            if (!editable.mounted) return;
+            editable.userUpdateTextEditingValue(
+              TextEditingValue(
+                text: text,
+                selection: TextSelection.collapsed(offset: text.length),
+              ),
+              SelectionChangedCause.keyboard,
+            );
+            if (submit) {
+              try {
+                editable.widget.onSubmitted?.call(text);
+              } catch (_) {}
+            }
+          },
+        );
+      } else {
+        TvLanInputService.instance.unbindActiveInput();
+      }
       if (editable != null && primary != _explicitlyActivatedEditableNode) {
         nextIsUnactivatedInput = true;
         // Prevent TextField from immediately popping up the soft keyboard when focus lands on it
@@ -199,11 +241,15 @@ class _TvRemoteKeyInterceptorState extends State<_TvRemoteKeyInterceptor> {
           } catch (_) {}
         });
       }
+    } else {
+      TvLanInputService.instance.unbindActiveInput();
     }
 
-    if (_focusedIsUnactivatedInput != nextIsUnactivatedInput) {
+    if (_focusedIsUnactivatedInput != nextIsUnactivatedInput ||
+        _hasActiveEditableFocus != nextHasEditableFocus) {
       setState(() {
         _focusedIsUnactivatedInput = nextIsUnactivatedInput;
+        _hasActiveEditableFocus = nextHasEditableFocus;
       });
     }
   }
@@ -412,7 +458,124 @@ class _TvRemoteKeyInterceptorState extends State<_TvRemoteKeyInterceptor> {
         canRequestFocus: false,
         skipTraversal: true,
         onKeyEvent: _handleKeyEvent,
-        child: widget.child,
+        child: Stack(
+          children: [
+            widget.child,
+            if (widget.appState.tvMode && _hasActiveEditableFocus)
+              Positioned(
+                right: 20,
+                bottom: 20,
+                child: ExcludeFocus(
+                  child: ListenableBuilder(
+                    listenable: TvLanInputService.instance,
+                    builder: (context, _) {
+                      final svc = TvLanInputService.instance;
+                      final qrBytes = svc.qrPngBytes;
+                      final url = svc.lanUrl;
+                      if (url.isEmpty) return const SizedBox.shrink();
+                      return Material(
+                        color: Colors.transparent,
+                        child: Container(
+                          width: 240,
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: VideoPlatformTheme.bgElevated
+                                .withValues(alpha: 0.96),
+                            borderRadius: BorderRadius.circular(16),
+                            border: Border.all(
+                              color: const Color(0xFFFFE066),
+                              width: 2,
+                            ),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withValues(alpha: 0.65),
+                                blurRadius: 24,
+                                offset: const Offset(0, 8),
+                              ),
+                            ],
+                          ),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  Icon(
+                                    Icons.qr_code_scanner_rounded,
+                                    size: 16,
+                                    color: VideoPlatformTheme.accent,
+                                  ),
+                                  const SizedBox(width: 6),
+                                  const Flexible(
+                                    child: Text(
+                                      '手机扫码快捷输入',
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        fontSize: 13,
+                                        fontWeight: FontWeight.w800,
+                                        color: Colors.white,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                svc.activeFieldLabel,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: VideoPlatformTheme.accent,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                              const SizedBox(height: 8),
+                              if (qrBytes != null && qrBytes.isNotEmpty)
+                                Container(
+                                  padding: const EdgeInsets.all(6),
+                                  decoration: BoxDecoration(
+                                    color: Colors.white,
+                                    borderRadius: BorderRadius.circular(10),
+                                  ),
+                                  child: Image.memory(
+                                    qrBytes,
+                                    width: 118,
+                                    height: 118,
+                                    fit: BoxFit.contain,
+                                  ),
+                                ),
+                              const SizedBox(height: 6),
+                              Text(
+                                url,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w700,
+                                  color: Color(0xFFFFE066),
+                                ),
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                '按确定键弹出软键盘 · 扫码免打字',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  color: VideoPlatformTheme.textSecondary,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }

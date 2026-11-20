@@ -74,6 +74,80 @@ class SavedMusicFolderItem {
   }
 }
 
+class SavedMusicPlaylist {
+  final String id;
+  final String name;
+  final List<FileEntry> tracks;
+  final List<SavedMusicFolderItem> sources;
+  final int currentIndex;
+  final int updatedEpochMs;
+
+  const SavedMusicPlaylist({
+    required this.id,
+    required this.name,
+    required this.tracks,
+    this.sources = const [],
+    this.currentIndex = 0,
+    this.updatedEpochMs = 0,
+  });
+
+  SavedMusicPlaylist copyWith({
+    String? name,
+    List<FileEntry>? tracks,
+    List<SavedMusicFolderItem>? sources,
+    int? currentIndex,
+    int? updatedEpochMs,
+  }) {
+    return SavedMusicPlaylist(
+      id: id,
+      name: name ?? this.name,
+      tracks: tracks ?? this.tracks,
+      sources: sources ?? this.sources,
+      currentIndex: currentIndex ?? this.currentIndex,
+      updatedEpochMs: updatedEpochMs ?? this.updatedEpochMs,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'tracks': tracks.map((e) => e.toJson()).toList(),
+        'sources': sources.map((s) => s.toJson()).toList(),
+        'current_index': currentIndex,
+        'updated_epoch_ms': updatedEpochMs,
+      };
+
+  factory SavedMusicPlaylist.fromJson(Map<String, dynamic> json) {
+    final rawTracks = json['tracks'];
+    final tracks = <FileEntry>[];
+    if (rawTracks is List) {
+      for (final item in rawTracks) {
+        if (item is Map<String, dynamic>) {
+          tracks.add(FileEntry.fromJson(item));
+        }
+      }
+    }
+    final rawSources = json['sources'];
+    final sources = <SavedMusicFolderItem>[];
+    if (rawSources is List) {
+      for (final item in rawSources) {
+        if (item is Map<String, dynamic>) {
+          sources.add(SavedMusicFolderItem.fromJson(item));
+        }
+      }
+    }
+    return SavedMusicPlaylist(
+      id: (json['id'] ?? 'default_playlist').toString(),
+      name: (json['name'] ?? '默认播放列表').toString(),
+      tracks: tracks,
+      sources: sources,
+      currentIndex: int.tryParse((json['current_index'] ?? 0).toString()) ?? 0,
+      updatedEpochMs:
+          int.tryParse((json['updated_epoch_ms'] ?? 0).toString()) ?? 0,
+    );
+  }
+}
+
 typedef CloudEndpointResolver = Future<
     ({
       String url,
@@ -656,6 +730,16 @@ class CloudArchiveMusicService {
 
 class CloudMusicController extends ChangeNotifier {
   static const String _prefSavedMusicFoldersKey = 'm3u8_saved_music_folders_v1';
+  static const String _prefSavedMusicPlaylistsKey =
+      'm3u8_saved_music_playlists_v1';
+  static const String _prefActiveMusicPlaylistIdKey =
+      'm3u8_active_music_playlist_id_v1';
+  static const String _prefDefaultMusicQueueKey =
+      'm3u8_default_music_queue_v1';
+  static const String _prefDefaultMusicIndexKey =
+      'm3u8_default_music_index_v1';
+  static const String _prefDefaultMusicSourcesKey =
+      'm3u8_default_music_sources_v1';
   static const String _prefMountsKey = 'm3u8_storage_mounts_v1';
 
   static final CloudMusicController shared = CloudMusicController._internal();
@@ -669,6 +753,7 @@ class CloudMusicController extends ChangeNotifier {
   int _currentIndex = -1;
   bool _isPlaying = false;
   bool _isLoadingTrack = false;
+  bool _isSessionDocked = false;
   bool _isScanningFolders = false;
   String _scanningStatusText = '';
   String _errorText = '';
@@ -683,6 +768,11 @@ class CloudMusicController extends ChangeNotifier {
   String? _coverImageUrl;
   Map<String, String> _coverImageHeaders = const {};
   bool _coverIsLocalFile = false;
+  Uint8List? _coverImageBytes;
+
+  static const MethodChannel _mediaSessionChannel =
+      MethodChannel('com.linsion.m3u8_client/media_session');
+  int _lastMediaSessionSyncEpochMs = 0;
 
   List<CloudLrcLine> _lyrics = const [];
   String _lyricsSourceLabel = '';
@@ -692,6 +782,9 @@ class CloudMusicController extends ChangeNotifier {
   final Map<String, String> _mountNameById = {};
   List<StorageMount> _availableMounts = const [];
   List<SavedMusicFolderItem> _savedMusicFolders = [];
+  List<SavedMusicPlaylist> _savedPlaylists = [];
+  String _activePlaylistId = 'default_playlist';
+  List<SavedMusicFolderItem> _currentQueueSources = [];
 
   int _openSeq = 0;
   bool _handlingCompletion = false;
@@ -699,7 +792,108 @@ class CloudMusicController extends ChangeNotifier {
   bool _prefsLoaded = false;
 
   CloudMusicController._internal() {
+    _initNativeMediaSessionHandler();
     _loadSavedMusicFoldersAndMounts();
+  }
+
+  void _initNativeMediaSessionHandler() {
+    if (!Platform.isIOS && !Platform.isAndroid && !Platform.isMacOS) return;
+    _mediaSessionChannel.setMethodCallHandler((call) async {
+      if (call.method != 'onMediaCommand') return;
+      final args = call.arguments;
+      String action = '';
+      int? positionMs;
+      if (args is Map) {
+        action = (args['action'] ?? '').toString();
+        final rawPos = args['positionMs'];
+        if (rawPos is int) {
+          positionMs = rawPos;
+        } else if (rawPos is num) {
+          positionMs = rawPos.round();
+        }
+      } else if (args is String) {
+        action = args;
+      }
+      switch (action) {
+        case 'play':
+          if (!_isPlaying) {
+            await togglePlayPause();
+          }
+          break;
+        case 'pause':
+          if (_isPlaying) {
+            await togglePlayPause();
+          }
+          break;
+        case 'togglePlayPause':
+          await togglePlayPause();
+          break;
+        case 'next':
+          await stepTrack(1);
+          break;
+        case 'previous':
+          await stepTrack(-1);
+          break;
+        case 'stop':
+          await stopAndClose();
+          break;
+        case 'seek':
+          if (positionMs != null && positionMs >= 0) {
+            await seekTo(Duration(milliseconds: positionMs));
+          }
+          break;
+      }
+    });
+  }
+
+  void _syncNativeMediaSession({
+    bool force = false,
+    bool includeCoverBytes = false,
+  }) {
+    if (!Platform.isIOS && !Platform.isAndroid && !Platform.isMacOS) return;
+    final track = currentTrack;
+    if (track == null) {
+      unawaited(_clearNativeMediaSession());
+      return;
+    }
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (!force && (nowMs - _lastMediaSessionSyncEpochMs) < 1500) {
+      return;
+    }
+    _lastMediaSessionSyncEpochMs = nowMs;
+    final meta = parseTrackMetadata(
+      track,
+      fallbackArtist: mountNameFor(track),
+    );
+    final albumText = '${mountNameFor(track)} · ${meta.qualityTag}';
+    final payload = <String, dynamic>{
+      'title': meta.title,
+      'artist': meta.artist.isNotEmpty ? meta.artist : mountNameFor(track),
+      'album': albumText,
+      'isPlaying': _isPlaying,
+      'positionMs': _position.inMilliseconds,
+      'durationMs': _duration.inMilliseconds,
+      'speed': _speed,
+      'queueIndex': _currentIndex,
+      'queueCount': _queue.length,
+    };
+    if (includeCoverBytes &&
+        _coverImageBytes != null &&
+        _coverImageBytes!.isNotEmpty) {
+      payload['coverBytes'] = _coverImageBytes;
+    }
+    unawaited(
+      _mediaSessionChannel
+          .invokeMethod<void>('updateMediaSession', payload)
+          .catchError((_) {}),
+    );
+  }
+
+  Future<void> _clearNativeMediaSession() async {
+    if (!Platform.isIOS && !Platform.isAndroid && !Platform.isMacOS) return;
+    try {
+      await _mediaSessionChannel.invokeMethod<void>('clearMediaSession');
+    } catch (_) {}
   }
 
   factory CloudMusicController({
@@ -729,7 +923,7 @@ class CloudMusicController extends ChangeNotifier {
       (_currentIndex >= 0 && _currentIndex < _queue.length)
           ? _queue[_currentIndex]
           : null;
-  bool get hasActiveSession => currentTrack != null;
+  bool get hasActiveSession => _isSessionDocked && currentTrack != null;
   bool get isPlaying => _isPlaying;
   bool get isLoadingTrack => _isLoadingTrack;
   bool get isScanningFolders => _isScanningFolders;
@@ -745,11 +939,17 @@ class CloudMusicController extends ChangeNotifier {
   String? get coverImageUrl => _coverImageUrl;
   Map<String, String> get coverImageHeaders => _coverImageHeaders;
   bool get coverIsLocalFile => _coverIsLocalFile;
+  Uint8List? get coverImageBytes => _coverImageBytes;
   List<CloudLrcLine> get lyrics => _lyrics;
   String get lyricsSourceLabel => _lyricsSourceLabel;
   bool get isLoadingLyrics => _isLoadingLyrics;
   List<StorageMount> get availableMounts => _availableMounts;
   List<SavedMusicFolderItem> get savedMusicFolders => _savedMusicFolders;
+  List<SavedMusicPlaylist> get savedPlaylists => _savedPlaylists;
+  String get activePlaylistId => _activePlaylistId;
+  SavedMusicPlaylist? get activePlaylist =>
+      _savedPlaylists.where((p) => p.id == _activePlaylistId).firstOrNull;
+  String get activePlaylistName => activePlaylist?.name ?? '默认播放列表';
 
   Future<void> _loadSavedMusicFoldersAndMounts() async {
     _prefsLoaded = true;
@@ -803,10 +1003,225 @@ class CloudMusicController extends ChangeNotifier {
               .toList();
         }
       }
+
+      final rawPlaylists = prefs.getString(_prefSavedMusicPlaylistsKey);
+      if (rawPlaylists != null && rawPlaylists.isNotEmpty) {
+        final decoded = jsonDecode(rawPlaylists);
+        if (decoded is List) {
+          _savedPlaylists = decoded
+              .whereType<Map<String, dynamic>>()
+              .map(SavedMusicPlaylist.fromJson)
+              .toList();
+        }
+      }
+      final savedActiveId = prefs.getString(_prefActiveMusicPlaylistIdKey);
+      if (savedActiveId != null && savedActiveId.isNotEmpty) {
+        _activePlaylistId = savedActiveId;
+      }
+
+      if (_queue.isEmpty) {
+        final rawDefaultQueue = prefs.getString(_prefDefaultMusicQueueKey);
+        if (rawDefaultQueue != null && rawDefaultQueue.isNotEmpty) {
+          final decoded = jsonDecode(rawDefaultQueue);
+          if (decoded is List) {
+            final restoredQueue = decoded
+                .whereType<Map<String, dynamic>>()
+                .map(FileEntry.fromJson)
+                .toList();
+            if (restoredQueue.isNotEmpty) {
+              _queue = restoredQueue;
+              final savedIdx = prefs.getInt(_prefDefaultMusicIndexKey) ?? 0;
+              _currentIndex = savedIdx.clamp(0, _queue.length - 1);
+            }
+          }
+        }
+        final rawDefaultSources = prefs.getString(_prefDefaultMusicSourcesKey);
+        if (rawDefaultSources != null && rawDefaultSources.isNotEmpty) {
+          final decoded = jsonDecode(rawDefaultSources);
+          if (decoded is List) {
+            _currentQueueSources = decoded
+                .whereType<Map<String, dynamic>>()
+                .map(SavedMusicFolderItem.fromJson)
+                .toList();
+          }
+        }
+        if (_queue.isEmpty && _savedPlaylists.isNotEmpty) {
+          final targetPl = _savedPlaylists
+                  .where((p) => p.id == _activePlaylistId)
+                  .firstOrNull ??
+              _savedPlaylists.first;
+          if (targetPl.tracks.isNotEmpty) {
+            _activePlaylistId = targetPl.id;
+            _queue = List<FileEntry>.from(targetPl.tracks);
+            _currentIndex =
+                targetPl.currentIndex.clamp(0, _queue.length - 1);
+            _currentQueueSources =
+                List<SavedMusicFolderItem>.from(targetPl.sources);
+          }
+        }
+        if (_queue.isNotEmpty && currentTrack != null) {
+          unawaited(_loadCoverAndLyricsForTrack(currentTrack!, _openSeq));
+        }
+      }
+      _ensureDefaultPlaylistInSync(persist: false);
     } catch (_) {
       _availableMounts = builtIn;
     }
     notifyListeners();
+  }
+
+  void _ensureDefaultPlaylistInSync({bool persist = true}) {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final defaultIdx =
+        _savedPlaylists.indexWhere((p) => p.id == 'default_playlist');
+    if (_queue.isNotEmpty) {
+      final updatedDefault = SavedMusicPlaylist(
+        id: 'default_playlist',
+        name: defaultIdx >= 0
+            ? _savedPlaylists[defaultIdx].name
+            : '默认播放列表',
+        tracks: List<FileEntry>.from(_queue),
+        sources: List<SavedMusicFolderItem>.from(_currentQueueSources),
+        currentIndex: _currentIndex.clamp(0, _queue.length - 1),
+        updatedEpochMs: nowMs,
+      );
+      if (defaultIdx >= 0) {
+        _savedPlaylists[defaultIdx] = updatedDefault;
+      } else {
+        _savedPlaylists.insert(0, updatedDefault);
+      }
+      if (_activePlaylistId.isEmpty) {
+        _activePlaylistId = 'default_playlist';
+      } else if (_activePlaylistId != 'default_playlist') {
+        final activeIdx =
+            _savedPlaylists.indexWhere((p) => p.id == _activePlaylistId);
+        if (activeIdx >= 0) {
+          _savedPlaylists[activeIdx] = _savedPlaylists[activeIdx].copyWith(
+            tracks: List<FileEntry>.from(_queue),
+            sources: List<SavedMusicFolderItem>.from(_currentQueueSources),
+            currentIndex: _currentIndex.clamp(0, _queue.length - 1),
+            updatedEpochMs: nowMs,
+          );
+        }
+      }
+    }
+    if (persist) {
+      unawaited(_persistDefaultQueueAndPlaylists());
+    }
+  }
+
+  Future<void> _persistDefaultQueueAndPlaylists() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (_queue.isNotEmpty) {
+        await prefs.setString(
+          _prefDefaultMusicQueueKey,
+          jsonEncode(_queue.map((e) => e.toJson()).toList()),
+        );
+        await prefs.setInt(
+          _prefDefaultMusicIndexKey,
+          _currentIndex.clamp(0, _queue.length - 1),
+        );
+        await prefs.setString(
+          _prefDefaultMusicSourcesKey,
+          jsonEncode(_currentQueueSources.map((s) => s.toJson()).toList()),
+        );
+      }
+      await prefs.setString(
+        _prefSavedMusicPlaylistsKey,
+        jsonEncode(_savedPlaylists.map((p) => p.toJson()).toList()),
+      );
+      await prefs.setString(
+        _prefActiveMusicPlaylistIdKey,
+        _activePlaylistId,
+      );
+    } catch (_) {}
+  }
+
+  Future<SavedMusicPlaylist> saveCurrentQueueAsPlaylist(String name) async {
+    final cleanName = name.trim().isEmpty
+        ? '歌单 ${_savedPlaylists.length + 1}'
+        : name.trim();
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final pl = SavedMusicPlaylist(
+      id: 'pl_$nowMs',
+      name: cleanName,
+      tracks: List<FileEntry>.from(_queue),
+      sources: List<SavedMusicFolderItem>.from(_currentQueueSources),
+      currentIndex: _queue.isEmpty ? 0 : _currentIndex.clamp(0, _queue.length - 1),
+      updatedEpochMs: nowMs,
+    );
+    _savedPlaylists.add(pl);
+    _activePlaylistId = pl.id;
+    notifyListeners();
+    await _persistDefaultQueueAndPlaylists();
+    return pl;
+  }
+
+  Future<void> renameSavedPlaylist(String playlistId, String newName) async {
+    final clean = newName.trim();
+    if (clean.isEmpty) return;
+    final idx = _savedPlaylists.indexWhere((p) => p.id == playlistId);
+    if (idx < 0) return;
+    _savedPlaylists[idx] = _savedPlaylists[idx].copyWith(
+      name: clean,
+      updatedEpochMs: DateTime.now().millisecondsSinceEpoch,
+    );
+    notifyListeners();
+    await _persistDefaultQueueAndPlaylists();
+  }
+
+  Future<void> deleteSavedPlaylist(String playlistId) async {
+    if (playlistId == 'default_playlist' && _savedPlaylists.length <= 1) {
+      return;
+    }
+    _savedPlaylists.removeWhere((p) => p.id == playlistId);
+    if (_activePlaylistId == playlistId) {
+      _activePlaylistId = _savedPlaylists.isNotEmpty
+          ? _savedPlaylists.first.id
+          : 'default_playlist';
+    }
+    notifyListeners();
+    await _persistDefaultQueueAndPlaylists();
+  }
+
+  Future<void> switchAndPlayPlaylist(
+    String playlistId, {
+    bool autoPlay = true,
+    bool shuffle = false,
+  }) async {
+    final pl = _savedPlaylists.where((p) => p.id == playlistId).firstOrNull;
+    if (pl == null) return;
+    _activePlaylistId = pl.id;
+    _currentQueueSources = List<SavedMusicFolderItem>.from(pl.sources);
+    if (pl.tracks.isEmpty && pl.sources.isNotEmpty) {
+      await scanAndPlayFoldersOrArchives(
+        sources: pl.sources,
+        shuffle: shuffle,
+      );
+      return;
+    }
+    if (pl.tracks.isEmpty) {
+      notifyListeners();
+      return;
+    }
+    final tracks = List<FileEntry>.from(pl.tracks);
+    if (shuffle) {
+      _playMode = 'shuffle';
+      tracks.shuffle(math.Random());
+      _queue = tracks;
+      _currentIndex = 0;
+    } else {
+      _queue = tracks;
+      _currentIndex = pl.currentIndex.clamp(0, _queue.length - 1);
+    }
+    notifyListeners();
+    await _persistDefaultQueueAndPlaylists();
+    if (autoPlay) {
+      await _openCurrentTrack();
+    } else if (currentTrack != null) {
+      unawaited(_loadCoverAndLyricsForTrack(currentTrack!, _openSeq));
+    }
   }
 
   Future<void> refreshAvailableMounts() async {
@@ -1062,9 +1477,12 @@ class CloudMusicController extends ChangeNotifier {
           }
         }
 
-        if (includeSubfolders && depth < 2 && subfolders.isNotEmpty) {
-          // Scan up to 12 subfolders per directory to prevent excessive network wait on huge trees
-          for (final sub in subfolders.take(12)) {
+        if (includeSubfolders &&
+            depth < 5 &&
+            subfolders.isNotEmpty &&
+            collectedTracks.length < 3000) {
+          for (final sub in subfolders) {
+            if (collectedTracks.length >= 3000) break;
             await scanFolderRecursive(mount, sub.path, sub.name, depth + 1);
           }
         }
@@ -1157,6 +1575,8 @@ class CloudMusicController extends ChangeNotifier {
 
       _queue = collectedTracks;
       _currentIndex = 0;
+      _currentQueueSources = List<SavedMusicFolderItem>.from(sources);
+      _ensureDefaultPlaylistInSync();
       notifyListeners();
       await _openCurrentTrack();
       return collectedTracks.length;
@@ -1220,6 +1640,19 @@ class CloudMusicController extends ChangeNotifier {
           _currentIndex = 0;
         }
       }
+      _currentQueueSources = [
+        SavedMusicFolderItem(
+          mountId: archiveEntry.mountId,
+          mountName: mountNameFor(archiveEntry),
+          sourceKind: archiveEntry.sourceKind,
+          path: archiveEntry.path,
+          title: archiveEntry.name,
+          isArchive: true,
+          size: archiveEntry.size,
+          pickcode115: archiveEntry.pickcode115,
+        ),
+      ];
+      _ensureDefaultPlaylistInSync();
       notifyListeners();
       await _openCurrentTrack();
       return audioTracks.length;
@@ -1254,39 +1687,171 @@ class CloudMusicController extends ChangeNotifier {
     return '';
   }
 
+  static final Map<String, ({String title, String artist, String qualityTag})>
+      _trackMetaCache = {};
+  static final RegExp _leadingTrackNumPattern =
+      RegExp(r'^\s*(\[\d+\]|\(\d+\)|\d{1,4}[\.\-_、\s]+)\s*');
+  static final RegExp _qualitySuffixPattern = RegExp(
+    r'\s*(\[(?:FLAC|APE|WAV|MP3|AAC|ALAC|DSD|Hi-Res|24bit|16bit|320K|无损|母带)[^\]]*\]|\((?:FLAC|APE|WAV|MP3|AAC|ALAC|DSD|Hi-Res|24bit|16bit|320K|无损|母带)[^\)]*\))\s*$',
+    caseSensitive: false,
+  );
+
+  static int _looksMoreLikeSongTitle(String text) {
+    int score = 0;
+    if (text.contains('《') ||
+        text.contains('》') ||
+        text.contains('「') ||
+        text.contains('」')) {
+      score += 4;
+    }
+    final lower = text.toLowerCase();
+    const titleKeywords = [
+      'live',
+      'remix',
+      'ver.',
+      'version',
+      'ost',
+      '伴奏',
+      '纯音乐',
+      '主题曲',
+      '片尾曲',
+      '插曲',
+      '推广曲',
+      '概念曲',
+      '合唱',
+      '独唱',
+      '钢琴版',
+      '吉他版',
+      'acoustic',
+      'instrumental',
+      'cover',
+      '翻唱',
+    ];
+    for (final kw in titleKeywords) {
+      if (lower.contains(kw)) score += 2;
+    }
+    if ((text.contains('(') && text.contains(')')) ||
+        (text.contains('（') && text.contains('）'))) {
+      score += 1;
+    }
+    return score;
+  }
+
   static ({String title, String artist, String qualityTag}) parseTrackMetadata(
     FileEntry entry, {
     String fallbackArtist = '',
   }) {
+    final cacheKey =
+        '${entry.mountId}::${entry.path}::${entry.size}::$fallbackArtist';
+    final cached = _trackMetaCache[cacheKey];
+    if (cached != null) return cached;
+
     String base = entry.name;
     final dot = base.lastIndexOf('.');
     if (dot > 0) {
       base = base.substring(0, dot);
     }
-    base = base.replaceAll(RegExp(r'^\s*(\[\d+\]|\d+[\.\-_、\s]+)\s*'), '').trim();
+    base = base.replaceFirst(_leadingTrackNumPattern, '');
+    base = base.replaceFirst(_qualitySuffixPattern, '').trim();
 
     String artist = entry.isInsideArchive && fallbackArtist.isEmpty
         ? entry.archiveContainerName
         : fallbackArtist;
     String title = base;
-    final dashIdx = base.indexOf(' - ');
-    if (dashIdx > 0 && dashIdx < base.length - 3) {
-      artist = base.substring(0, dashIdx).trim();
-      title = base.substring(dashIdx + 3).trim();
+
+    final openBook = base.indexOf('《');
+    final closeBook = base.indexOf('》');
+    if (openBook >= 0 && closeBook > openBook + 1) {
+      final inside = base.substring(openBook + 1, closeBook).trim();
+      final before = base
+          .substring(0, openBook)
+          .replaceAll(RegExp(r'^[\s\-–—_·:]+|[\s\-–—_·:]+$'), '');
+      final after = base
+          .substring(closeBook + 1)
+          .replaceAll(RegExp(r'^[\s\-–—_·:]+|[\s\-–—_·:]+$'), '');
+      if (inside.isNotEmpty) {
+        title = inside;
+        if (before.isNotEmpty) {
+          artist = before;
+        } else if (after.isNotEmpty) {
+          artist = after;
+        }
+      }
     } else {
-      final altDash = base.indexOf('-');
-      if (altDash > 1 && altDash < 24 && altDash < base.length - 2) {
-        artist = base.substring(0, altDash).trim();
-        title = base.substring(altDash + 1).trim();
+      String leftPart = '';
+      String rightPart = '';
+      for (final sep in const [' - ', ' – ', ' — ', ' _ ']) {
+        final idx = base.indexOf(sep);
+        if (idx > 0 && idx < base.length - sep.length) {
+          leftPart = base.substring(0, idx).trim();
+          rightPart = base.substring(idx + sep.length).trim();
+          break;
+        }
+      }
+      if (leftPart.isEmpty) {
+        final altDash = base.indexOf('-');
+        if (altDash > 0 && altDash < base.length - 1) {
+          leftPart = base.substring(0, altDash).trim();
+          rightPart = base.substring(altDash + 1).trim();
+        }
+      }
+      if (leftPart.isNotEmpty && rightPart.isNotEmpty) {
+        final cleanedRight =
+            rightPart.replaceFirst(_leadingTrackNumPattern, '').trim();
+        if (cleanedRight.isNotEmpty) {
+          rightPart = cleanedRight;
+        }
+        final leftScore = _looksMoreLikeSongTitle(leftPart);
+        final rightScore = _looksMoreLikeSongTitle(rightPart);
+        if (leftScore > rightScore) {
+          title = leftPart;
+          artist = rightPart;
+        } else {
+          artist = leftPart;
+          title = rightPart;
+        }
       }
     }
-    if (title.isEmpty) title = entry.name;
+
+    if (artist.isEmpty || artist == fallbackArtist) {
+      String rawParent = '';
+      if (entry.isInsideArchive) {
+        final slash = entry.archiveInnerPath.lastIndexOf('/');
+        if (slash > 0) {
+          final dirPart = entry.archiveInnerPath.substring(0, slash);
+          rawParent = dirPart.split('/').last;
+        } else if (entry.archiveContainerName.isNotEmpty) {
+          final cDot = entry.archiveContainerName.lastIndexOf('.');
+          rawParent = cDot > 0
+              ? entry.archiveContainerName.substring(0, cDot)
+              : entry.archiveContainerName;
+        }
+      } else {
+        final parts = entry.path
+            .replaceAll('\\', '/')
+            .split('/')
+            .where((s) => s.isNotEmpty)
+            .toList();
+        if (parts.length >= 2) {
+          rawParent = parts[parts.length - 2];
+        }
+      }
+      final cleanParent = rawParent.trim();
+      if (cleanParent.isNotEmpty &&
+          cleanParent != '0' &&
+          cleanParent != title) {
+        artist = cleanParent;
+      }
+    }
+    if (title.isEmpty) title = base.isEmpty ? entry.name : base;
+    if (artist.isEmpty) artist = fallbackArtist;
 
     final ext = entry.normalizedExt.replaceAll('.', '').toUpperCase();
     String qualityTag;
     switch (ext) {
       case 'FLAC':
-        qualityTag = entry.size > 35 * 1024 * 1024 ? 'Hi-Res · FLAC 无损' : 'FLAC 无损';
+        qualityTag =
+            entry.size > 35 * 1024 * 1024 ? 'Hi-Res · FLAC 无损' : 'FLAC 无损';
         break;
       case 'WAV':
       case 'WAVE':
@@ -1326,7 +1891,12 @@ class CloudMusicController extends ChangeNotifier {
       qualityTag = '📦 $qualityTag';
     }
 
-    return (title: title, artist: artist, qualityTag: qualityTag);
+    final res = (title: title, artist: artist, qualityTag: qualityTag);
+    if (_trackMetaCache.length > 6000) {
+      _trackMetaCache.clear();
+    }
+    _trackMetaCache[cacheKey] = res;
+    return res;
   }
 
   String mountNameFor(FileEntry entry) {
@@ -1379,6 +1949,7 @@ class CloudMusicController extends ChangeNotifier {
           _errorText = '';
         }
         notifyListeners();
+        _syncNativeMediaSession(force: true);
       }
     });
     p.stream.position.listen((pos) {
@@ -1389,12 +1960,14 @@ class CloudMusicController extends ChangeNotifier {
           pos == Duration.zero) {
         _position = pos;
         notifyListeners();
+        _syncNativeMediaSession(force: false);
       }
     });
     p.stream.duration.listen((dur) {
       if (dur > Duration.zero && dur != _duration) {
         _duration = dur;
         notifyListeners();
+        _syncNativeMediaSession(force: true);
       }
     });
     p.stream.completed.listen((completed) {
@@ -1439,6 +2012,7 @@ class CloudMusicController extends ChangeNotifier {
         _currentIndex = 0;
       }
     }
+    _ensureDefaultPlaylistInSync();
     await _openCurrentTrack();
   }
 
@@ -1448,6 +2022,7 @@ class CloudMusicController extends ChangeNotifier {
     _playMode = 'shuffle';
     _queue.shuffle(math.Random());
     _currentIndex = 0;
+    _ensureDefaultPlaylistInSync();
     notifyListeners();
     await _openCurrentTrack();
   }
@@ -1467,6 +2042,7 @@ class CloudMusicController extends ChangeNotifier {
     if (_queue.isEmpty || _currentIndex < 0) {
       _queue = [track];
       _currentIndex = 0;
+      _ensureDefaultPlaylistInSync();
       await _openCurrentTrack();
       return;
     }
@@ -1477,6 +2053,7 @@ class CloudMusicController extends ChangeNotifier {
         final insertIdx = (_currentIndex + 1).clamp(0, _queue.length);
         _queue.insert(insertIdx, item);
       }
+      _ensureDefaultPlaylistInSync();
       notifyListeners();
       return;
     }
@@ -1486,6 +2063,7 @@ class CloudMusicController extends ChangeNotifier {
     } else {
       _queue.add(track);
     }
+    _ensureDefaultPlaylistInSync();
     notifyListeners();
   }
 
@@ -1496,6 +2074,7 @@ class CloudMusicController extends ChangeNotifier {
       return;
     }
     _currentIndex = index;
+    _ensureDefaultPlaylistInSync();
     await _openCurrentTrack();
   }
 
@@ -1513,9 +2092,11 @@ class CloudMusicController extends ChangeNotifier {
       if (_currentIndex >= _queue.length) {
         _currentIndex = 0;
       }
+      _ensureDefaultPlaylistInSync();
       await _openCurrentTrack();
       return;
     }
+    _ensureDefaultPlaylistInSync();
     notifyListeners();
   }
 
@@ -1529,10 +2110,13 @@ class CloudMusicController extends ChangeNotifier {
     }
 
     _isLoadingTrack = true;
+    _isSessionDocked = true;
     _errorText = '';
     _position = Duration.zero;
     _duration = Duration.zero;
+    _coverImageBytes = null;
     notifyListeners();
+    _syncNativeMediaSession(force: true);
 
     unawaited(_loadCoverAndLyricsForTrack(track, seq));
 
@@ -1623,6 +2207,7 @@ class CloudMusicController extends ChangeNotifier {
     _coverImageUrl = track.thumbUrl.isNotEmpty ? track.thumbUrl : null;
     _coverImageHeaders = const {};
     _coverIsLocalFile = false;
+    _coverImageBytes = null;
     _lyrics = const [];
     _lyricsSourceLabel = '';
     _isLoadingLyrics = true;
@@ -1682,6 +2267,27 @@ class CloudMusicController extends ChangeNotifier {
           if (seq == _openSeq) notifyListeners();
         } catch (_) {}
       }
+    }
+
+    if (seq == _openSeq && _coverImageUrl != null && _coverImageUrl!.isNotEmpty) {
+      await _fetchCoverBytesForLockScreen(
+        urlOrPath: _coverImageUrl!,
+        headers: _coverImageHeaders,
+        isLocal: _coverIsLocalFile,
+        seq: seq,
+      );
+    }
+
+    // 1b. If no local/directory cover image was found, try extracting embedded cover art (ID3v2 APIC / FLAC METADATA_BLOCK_PICTURE)
+    if (seq == _openSeq &&
+        (_coverImageBytes == null || _coverImageBytes!.isEmpty)) {
+      await _tryExtractEmbeddedCoverArt(track, seq);
+    }
+
+    // 1c. If still no cover image, search iTunes Search API by song title + artist for high-res 600x600 album cover!
+    if (seq == _openSeq &&
+        (_coverImageBytes == null || _coverImageBytes!.isEmpty)) {
+      await _tryFetchOnlineCoverArtFromItunes(track, seq);
     }
 
     // 2. Discover `.lrc` sidecar file in the same directory or inside the same `.zip` / `.tar` archive!
@@ -1875,6 +2481,282 @@ class CloudMusicController extends ChangeNotifier {
     return dot > 0 ? name.substring(0, dot) : name;
   }
 
+  Future<void> _fetchCoverBytesForLockScreen({
+    required String urlOrPath,
+    required Map<String, String> headers,
+    required bool isLocal,
+    required int seq,
+  }) async {
+    try {
+      Uint8List? bytes;
+      if (isLocal) {
+        final f = File(urlOrPath);
+        if (await f.exists()) {
+          final len = await f.length();
+          if (len > 0 && len <= 4 * 1024 * 1024) {
+            bytes = await f.readAsBytes();
+          }
+        }
+      } else {
+        final uri = Uri.tryParse(urlOrPath);
+        if (uri != null && (uri.scheme == 'http' || uri.scheme == 'https')) {
+          final client = HttpClient()
+            ..badCertificateCallback = (_, __, ___) => true;
+          try {
+            final req =
+                await client.getUrl(uri).timeout(const Duration(seconds: 8));
+            headers.forEach((k, v) {
+              if (v.isNotEmpty) req.headers.set(k, v);
+            });
+            final resp = await req.close().timeout(const Duration(seconds: 8));
+            if (resp.statusCode == 200 || resp.statusCode == 206) {
+              final builder = BytesBuilder(copy: false);
+              await for (final chunk in resp) {
+                builder.add(chunk);
+                if (builder.length > 4 * 1024 * 1024) break;
+              }
+              if (builder.length > 0 && builder.length <= 4 * 1024 * 1024) {
+                bytes = builder.takeBytes();
+              }
+            }
+          } finally {
+            client.close(force: true);
+          }
+        }
+      }
+      if (seq == _openSeq && bytes != null && bytes.isNotEmpty) {
+        _coverImageBytes = bytes;
+        notifyListeners();
+        _syncNativeMediaSession(force: true, includeCoverBytes: true);
+      }
+    } catch (_) {}
+  }
+
+  static final Map<String, String> _onlineCoverUrlCache = {};
+
+  Future<void> _tryExtractEmbeddedCoverArt(FileEntry track, int seq) async {
+    final ext = track.normalizedExt;
+    if (!const {'.mp3', '.flac', '.m4a', '.aac', '.wav', '.aiff', '.aif'}
+        .contains(ext)) {
+      return;
+    }
+    try {
+      Uint8List headerBytes = Uint8List(0);
+      if (track.isInsideArchive) {
+        final extractedPath =
+            await CloudArchiveMusicService.instance.extractArchiveAudioToTempFile(
+          entry: track,
+          endpointResolver: resolveEntryEndpoint,
+        );
+        if (seq != _openSeq) return;
+        final f = File(extractedPath);
+        if (await f.exists()) {
+          final raf = await f.open();
+          try {
+            final readLen = math.min(await f.length(), 384 * 1024);
+            headerBytes = await raf.read(readLen);
+          } finally {
+            await raf.close();
+          }
+        }
+      } else if (track.sourceKind == StorageSourceKind.localCache) {
+        final f = File(track.path);
+        if (await f.exists()) {
+          final raf = await f.open();
+          try {
+            final readLen = math.min(await f.length(), 384 * 1024);
+            headerBytes = await raf.read(readLen);
+          } finally {
+            await raf.close();
+          }
+        }
+      } else {
+        final resolved = await resolveEntryEndpoint(track);
+        if (seq != _openSeq || resolved.url.isEmpty) return;
+        final uri = Uri.tryParse(resolved.url);
+        if (uri != null && (uri.scheme == 'http' || uri.scheme == 'https')) {
+          final rangeRes = await CloudArchiveMusicService.instance
+              ._fetchRemoteRangeWithTotal(
+            uri: uri,
+            headers: resolved.headers,
+            start: 0,
+            end: 384 * 1024 - 1,
+          );
+          headerBytes = rangeRes.bytes;
+        }
+      }
+      if (seq != _openSeq || headerBytes.length < 32) return;
+      final picBytes = _extractCoverImageFromAudioHeaderBytes(headerBytes);
+      if (picBytes != null && picBytes.length > 128 && seq == _openSeq) {
+        _coverImageBytes = picBytes;
+        notifyListeners();
+        _syncNativeMediaSession(force: true, includeCoverBytes: true);
+      }
+    } catch (_) {}
+  }
+
+  static Uint8List? _extractCoverImageFromAudioHeaderBytes(Uint8List data) {
+    // 1. Check FLAC `fLaC` magic and `METADATA_BLOCK_PICTURE` (block type 6)
+    if (data.length > 42 &&
+        data[0] == 0x66 &&
+        data[1] == 0x4C &&
+        data[2] == 0x61 &&
+        data[3] == 0x43) {
+      int pos = 4;
+      while (pos + 4 <= data.length) {
+        final headerByte = data[pos];
+        final isLast = (headerByte & 0x80) != 0;
+        final blockType = headerByte & 0x7F;
+        final blockLen =
+            (data[pos + 1] << 16) | (data[pos + 2] << 8) | data[pos + 3];
+        pos += 4;
+        if (pos + blockLen > data.length) break;
+        if (blockType == 6 && blockLen > 32) {
+          int p = pos;
+          p += 4; // picture type
+          if (p + 4 > pos + blockLen) break;
+          final mimeLen =
+              (data[p] << 24) | (data[p + 1] << 16) | (data[p + 2] << 8) | data[p + 3];
+          p += 4 + mimeLen;
+          if (p + 4 > pos + blockLen) break;
+          final descLen =
+              (data[p] << 24) | (data[p + 1] << 16) | (data[p + 2] << 8) | data[p + 3];
+          p += 4 + descLen;
+          p += 16; // width, height, depth, colors
+          if (p + 4 > pos + blockLen) break;
+          final picLen =
+              (data[p] << 24) | (data[p + 1] << 16) | (data[p + 2] << 8) | data[p + 3];
+          p += 4;
+          if (picLen > 64 && p + picLen <= pos + blockLen) {
+            return Uint8List.sublistView(data, p, p + picLen);
+          }
+        }
+        pos += blockLen;
+        if (isLast) break;
+      }
+    }
+
+    // 2. Scan for embedded JPEG (`FF D8 FF E0` / `FF D8 FF E1`) or PNG (`89 50 4E 47 0D 0A 1A 0A`) inside ID3v2 / MP4 `covr` atom
+    for (int i = 0; i + 16 < data.length; i++) {
+      // PNG signature
+      if (data[i] == 0x89 &&
+          data[i + 1] == 0x50 &&
+          data[i + 2] == 0x4E &&
+          data[i + 3] == 0x47 &&
+          data[i + 4] == 0x0D &&
+          data[i + 5] == 0x0A &&
+          data[i + 6] == 0x1A &&
+          data[i + 7] == 0x0A) {
+        // Find PNG IEND (`49 45 4E 44 AE 42 60 82`)
+        for (int j = i + 32; j + 8 <= data.length; j++) {
+          if (data[j] == 0x49 &&
+              data[j + 1] == 0x45 &&
+              data[j + 2] == 0x4E &&
+              data[j + 3] == 0x44) {
+            final endIdx = math.min(data.length, j + 8);
+            if (endIdx - i > 256) {
+              return Uint8List.sublistView(data, i, endIdx);
+            }
+            break;
+          }
+        }
+      }
+      // JPEG signature (`FF D8 FF E0` or `FF D8 FF E1` or `FF D8 FF DB`)
+      if (data[i] == 0xFF &&
+          data[i + 1] == 0xD8 &&
+          data[i + 2] == 0xFF &&
+          (data[i + 3] == 0xE0 || data[i + 3] == 0xE1 || data[i + 3] == 0xDB)) {
+        // Find JPEG EOI (`FF D9`)
+        for (int j = i + 256; j + 2 <= data.length; j++) {
+          if (data[j] == 0xFF && data[j + 1] == 0xD9) {
+            final endIdx = j + 2;
+            if (endIdx - i > 512) {
+              return Uint8List.sublistView(data, i, endIdx);
+            }
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  Future<void> _tryFetchOnlineCoverArtFromItunes(
+    FileEntry track,
+    int seq,
+  ) async {
+    final meta = parseTrackMetadata(track);
+    final cleanTitle = meta.title
+        .replaceAll(RegExp(r'\(.*?\)|\[.*?\]|【.*?】'), ' ')
+        .trim();
+    if (cleanTitle.isEmpty) return;
+    final cleanArtist = (!meta.artist.contains('115') &&
+            !meta.artist.contains('AList') &&
+            !meta.artist.contains('WebDAV') &&
+            !meta.artist.contains('服务端') &&
+            !meta.artist.endsWith('.zip') &&
+            !meta.artist.endsWith('.tar'))
+        ? meta.artist
+            .replaceAll(RegExp(r'\(.*?\)|\[.*?\]|【.*?】'), ' ')
+            .trim()
+        : '';
+    final query =
+        cleanArtist.isNotEmpty ? '$cleanArtist $cleanTitle' : cleanTitle;
+
+    String? artworkUrl = _onlineCoverUrlCache[query];
+    if (artworkUrl == null) {
+      final uri = Uri.parse(
+        'https://itunes.apple.com/search?term=${Uri.encodeQueryComponent(query)}&media=music&entity=song&limit=3',
+      );
+      final client = HttpClient()
+        ..badCertificateCallback = (_, __, ___) => true;
+      try {
+        final req =
+            await client.getUrl(uri).timeout(const Duration(seconds: 6));
+        req.headers.set('User-Agent', 'LiuguangMusicPlayer/1.2.2');
+        final resp = await req.close().timeout(const Duration(seconds: 6));
+        if (resp.statusCode == 200) {
+          final body = await resp.transform(utf8.decoder).join();
+          final decoded = jsonDecode(body);
+          if (decoded is Map<String, dynamic>) {
+            final results = decoded['results'];
+            if (results is List && results.isNotEmpty) {
+              for (final item in results) {
+                if (item is Map<String, dynamic>) {
+                  final rawArt = (item['artworkUrl100'] ?? '').toString().trim();
+                  if (rawArt.isNotEmpty) {
+                    artworkUrl = rawArt.replaceAll('100x100bb', '600x600bb');
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        }
+      } catch (_) {
+      } finally {
+        client.close(force: true);
+      }
+      if (artworkUrl != null && artworkUrl.isNotEmpty) {
+        if (_onlineCoverUrlCache.length > 1000) {
+          _onlineCoverUrlCache.clear();
+        }
+        _onlineCoverUrlCache[query] = artworkUrl;
+      }
+    }
+
+    if (seq != _openSeq || artworkUrl == null || artworkUrl.isEmpty) return;
+    _coverImageUrl = artworkUrl;
+    _coverImageHeaders = const {};
+    _coverIsLocalFile = false;
+    notifyListeners();
+    await _fetchCoverBytesForLockScreen(
+      urlOrPath: artworkUrl,
+      headers: const {},
+      isLocal: false,
+      seq: seq,
+    );
+  }
+
   Future<void> togglePlayPause() async {
     if (currentTrack == null) return;
     if (_errorText.isNotEmpty || _player == null) {
@@ -1882,6 +2764,7 @@ class CloudMusicController extends ChangeNotifier {
       return;
     }
     await _player!.playOrPause();
+    _syncNativeMediaSession(force: true);
   }
 
   Future<void> seekTo(Duration target) async {
@@ -1889,6 +2772,7 @@ class CloudMusicController extends ChangeNotifier {
     _position = target;
     notifyListeners();
     await _player!.seek(target);
+    _syncNativeMediaSession(force: true);
   }
 
   Future<void> seekRelative(Duration delta) async {
@@ -1923,6 +2807,7 @@ class CloudMusicController extends ChangeNotifier {
     } else {
       _currentIndex = (_currentIndex + delta + _queue.length) % _queue.length;
     }
+    _ensureDefaultPlaylistInSync();
     await _openCurrentTrack();
   }
 
@@ -1957,12 +2842,15 @@ class CloudMusicController extends ChangeNotifier {
           }
         }
         _currentIndex = nextIdx;
+        _ensureDefaultPlaylistInSync();
         await _openCurrentTrack();
       } else if (_currentIndex + 1 < _queue.length) {
         _currentIndex++;
+        _ensureDefaultPlaylistInSync();
         await _openCurrentTrack();
       } else if (_playMode == 'repeatAll') {
         _currentIndex = 0;
+        _ensureDefaultPlaylistInSync();
         await _openCurrentTrack();
       } else {
         _isPlaying = false;
@@ -1987,6 +2875,7 @@ class CloudMusicController extends ChangeNotifier {
     _speed = speeds[(idx + 1) % speeds.length];
     _player?.setRate(_speed);
     notifyListeners();
+    _syncNativeMediaSession(force: true);
   }
 
   void setVolume(double v) {
@@ -1995,19 +2884,34 @@ class CloudMusicController extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> stopAndClose() async {
+  Future<void> stopAndClose({bool clearPersistedQueue = false}) async {
     _openSeq++;
     await _player?.stop();
-    _queue = [];
-    _currentIndex = -1;
+    if (clearPersistedQueue) {
+      _queue = [];
+      _currentIndex = -1;
+    }
     _isPlaying = false;
     _isLoadingTrack = false;
+    _isSessionDocked = false;
     _errorText = '';
     _position = Duration.zero;
     _duration = Duration.zero;
     _lyrics = const [];
     _coverImageUrl = null;
+    _coverImageBytes = null;
     notifyListeners();
+    unawaited(_clearNativeMediaSession());
+  }
+
+  /// Clears the current queue and starts fresh if the user explicitly wants to empty the current playlist
+  Future<void> clearCurrentPlaylistQueue() async {
+    await stopAndClose(clearPersistedQueue: true);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_prefDefaultMusicQueueKey);
+      await prefs.remove(_prefDefaultMusicIndexKey);
+    } catch (_) {}
   }
 }
 
@@ -2039,6 +2943,8 @@ class _CloudMusicFolderPickerDialogState
   String _currentTitle = '根目录';
   final List<({String path, String title})> _breadcrumbs = [];
   List<FileEntry> _entries = const [];
+  final TextEditingController _searchCtrl = TextEditingController();
+  String _searchQuery = '';
   bool _isLoading = false;
   String? _error;
   bool _includeSubfolders = true;
@@ -2046,6 +2952,18 @@ class _CloudMusicFolderPickerDialogState
   final List<SavedMusicFolderItem> _selectedItems = [];
 
   CloudMusicController get _ctrl => widget.controller;
+
+  @override
+  void dispose() {
+    _searchCtrl.dispose();
+    super.dispose();
+  }
+
+  List<FileEntry> get _filteredEntries {
+    final kw = _searchQuery.trim().toLowerCase();
+    if (kw.isEmpty) return _entries;
+    return _entries.where((e) => e.name.toLowerCase().contains(kw)).toList();
+  }
 
   @override
   void initState() {
@@ -2107,6 +3025,8 @@ class _CloudMusicFolderPickerDialogState
       _error = null;
       _currentPath = path;
       _currentTitle = title;
+      _searchQuery = '';
+      _searchCtrl.clear();
       if (pushCrumb) {
         final existingIdx = _breadcrumbs.indexWhere((c) => c.path == path);
         if (existingIdx >= 0) {
@@ -2117,8 +3037,11 @@ class _CloudMusicFolderPickerDialogState
       }
     });
     try {
-      final list = await _ctrl.listDirectoryForMount(mount, path);
+      var list = await _ctrl.listDirectoryForMount(mount, path);
       if (!mounted) return;
+      list = list
+          .where((e) => e.isDir || e.isAudio || e.isStreamableMusicArchive)
+          .toList();
       list.sort((a, b) {
         if (a.isDir != b.isDir) return a.isDir ? -1 : 1;
         return a.name.toLowerCase().compareTo(b.name.toLowerCase());
@@ -2176,9 +3099,11 @@ class _CloudMusicFolderPickerDialogState
   Widget build(BuildContext context) {
     final mounts = _ctrl.availableMounts;
     final activeMount = _activeMount;
+    final dirCount = _entries.where((e) => e.isDir).length;
     final audioInCurrentDir = _entries.where((e) => !e.isDir && e.isAudio).length;
     final archivesInCurrentDir =
         _entries.where((e) => !e.isDir && e.isStreamableMusicArchive).length;
+    final filteredEntries = _filteredEntries;
     final screenSize = MediaQuery.sizeOf(context);
     final isMobile = screenSize.width < 680;
 
@@ -2236,18 +3161,43 @@ class _CloudMusicFolderPickerDialogState
               ),
               const SizedBox(width: 8),
               Expanded(
-                child: Text(
-                  isMobile
-                      ? '自选音乐目录 / 压缩包'
-                      : '自选音乐文件夹 / 压缩包 (支持 115 · AList · WebDAV · 本地)',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: isMobile ? 14.5 : 15.5,
-                    fontWeight: FontWeight.w800,
-                    color: VideoPlatformTheme.textPrimary,
-                  ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      isMobile
+                          ? '自选音乐目录 / 压缩包'
+                          : '自选音乐文件夹 / 压缩包 (支持 115 · AList · WebDAV · 本地)',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: isMobile ? 14.5 : 15.5,
+                        fontWeight: FontWeight.w800,
+                        color: VideoPlatformTheme.textPrimary,
+                      ),
+                    ),
+                    Text(
+                      '共 ${_entries.length} 项（$dirCount 个文件夹 · $archivesInCurrentDir 个压缩包 · $audioInCurrentDir 首音频）',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        color: VideoPlatformTheme.textSecondary,
+                      ),
+                    ),
+                  ],
                 ),
+              ),
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                tooltip: '刷新当前目录',
+                onPressed: () => _loadDir(
+                  _currentPath,
+                  title: _currentTitle,
+                  pushCrumb: false,
+                ),
+                icon: const Icon(Icons.refresh_rounded, size: 18),
               ),
               IconButton(
                 visualDensity: VisualDensity.compact,
@@ -2257,8 +3207,10 @@ class _CloudMusicFolderPickerDialogState
             ],
           ),
           content: SizedBox(
-            width: 820,
-            height: isMobile ? (screenSize.height * 0.66).clamp(320.0, 520.0) : 520,
+            width: 980,
+            height: isMobile
+                ? (screenSize.height * 0.72).clamp(360.0, 620.0)
+                : (screenSize.height * 0.72).clamp(520.0, 680.0),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -2494,6 +3446,42 @@ class _CloudMusicFolderPickerDialogState
                           ),
                           if (!isMobile && activeMount != null) ...[
                             const SizedBox(width: 8),
+                            SizedBox(
+                              width: 185,
+                              height: 28,
+                              child: TextField(
+                                controller: _searchCtrl,
+                                onChanged: (v) =>
+                                    setState(() => _searchQuery = v),
+                                style: const TextStyle(fontSize: 12),
+                                decoration: InputDecoration(
+                                  hintText: '快速筛选文件夹或音乐...',
+                                  prefixIcon: const Icon(
+                                    Icons.search_rounded,
+                                    size: 15,
+                                  ),
+                                  suffixIcon: _searchQuery.isNotEmpty
+                                      ? IconButton(
+                                          icon: const Icon(
+                                            Icons.clear_rounded,
+                                            size: 13,
+                                          ),
+                                          onPressed: () {
+                                            _searchCtrl.clear();
+                                            setState(() => _searchQuery = '');
+                                          },
+                                        )
+                                      : null,
+                                  contentPadding: const EdgeInsets.symmetric(
+                                    horizontal: 8,
+                                  ),
+                                  border: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(14),
+                                  ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 6),
                             OutlinedButton.icon(
                               onPressed: () {
                                 final item = _currentDirectoryAsItem();
@@ -2548,7 +3536,31 @@ class _CloudMusicFolderPickerDialogState
                         Wrap(
                           spacing: 6,
                           runSpacing: 6,
+                          crossAxisAlignment: WrapCrossAlignment.center,
                           children: [
+                            SizedBox(
+                              width: 150,
+                              height: 28,
+                              child: TextField(
+                                controller: _searchCtrl,
+                                onChanged: (v) =>
+                                    setState(() => _searchQuery = v),
+                                style: const TextStyle(fontSize: 11.5),
+                                decoration: InputDecoration(
+                                  hintText: '筛选目录/音乐...',
+                                  prefixIcon: const Icon(
+                                    Icons.search_rounded,
+                                    size: 14,
+                                  ),
+                                  contentPadding: const EdgeInsets.symmetric(
+                                    horizontal: 8,
+                                  ),
+                                  border: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(14),
+                                  ),
+                                ),
+                              ),
+                            ),
                             OutlinedButton.icon(
                               onPressed: () {
                                 final item = _currentDirectoryAsItem();
@@ -2615,8 +3627,21 @@ class _CloudMusicFolderPickerDialogState
                     ),
                     child: _isLoading
                         ? Center(
-                            child: CircularProgressIndicator(
-                              color: VideoPlatformTheme.accent,
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                CircularProgressIndicator(
+                                  color: VideoPlatformTheme.accent,
+                                ),
+                                const SizedBox(height: 10),
+                                Text(
+                                  '正在完整加载目录与全部分页文件夹...',
+                                  style: TextStyle(
+                                    fontSize: 12.5,
+                                    color: VideoPlatformTheme.textSecondary,
+                                  ),
+                                ),
+                              ],
                             ),
                           )
                         : (_error != null
@@ -2631,20 +3656,40 @@ class _CloudMusicFolderPickerDialogState
                                   ),
                                 ),
                               )
-                            : ListView.separated(
-                                padding: const EdgeInsets.all(6),
-                                itemCount: _entries.length,
-                                separatorBuilder: (_, __) => Divider(
-                                  height: 1,
-                                  color: VideoPlatformTheme.borderSubtle,
-                                ),
-                                itemBuilder: (context, idx) {
-                                  final e = _entries[idx];
+                            : (filteredEntries.isEmpty
+                                ? Center(
+                                    child: Text(
+                                      _searchQuery.isEmpty
+                                          ? '当前目录下暂无子文件夹或音频文件'
+                                          : '未找到匹配「$_searchQuery」的文件夹或音频',
+                                      style: TextStyle(
+                                        fontSize: 13,
+                                        color: VideoPlatformTheme.textMuted,
+                                      ),
+                                    ),
+                                  )
+                                : ListView.separated(
+                                    padding: const EdgeInsets.all(6),
+                                    itemCount: filteredEntries.length,
+                                    separatorBuilder: (_, __) => Divider(
+                                      height: 1,
+                                      color: VideoPlatformTheme.borderSubtle,
+                                    ),
+                                    itemBuilder: (context, idx) {
+                                      final e = filteredEntries[idx];
                                   final isSelectable = e.isDir ||
                                       e.isStreamableMusicArchive ||
                                       e.isAudio;
                                   final checked = activeMount != null &&
                                       _isSelected(activeMount.id, e.path);
+                                  final audioMeta = e.isAudio
+                                      ? CloudMusicController.parseTrackMetadata(
+                                          e,
+                                          fallbackArtist: _breadcrumbs.isNotEmpty
+                                              ? _breadcrumbs.last.title
+                                              : '',
+                                        )
+                                      : null;
 
                                   return StatefulBuilder(
                                     builder: (rowCtx, setRowState) {
@@ -2718,8 +3763,10 @@ class _CloudMusicFolderPickerDialogState
                                                                   .textMuted)),
                                                 ),
                                                 title: Text(
-                                                  e.name,
-                                                  maxLines: 1,
+                                                  audioMeta != null
+                                                      ? audioMeta.title
+                                                      : e.name,
+                                                  maxLines: e.isDir ? 2 : 1,
                                                   overflow:
                                                       TextOverflow.ellipsis,
                                                   style: TextStyle(
@@ -2739,7 +3786,7 @@ class _CloudMusicFolderPickerDialogState
                                                       ? '文件夹 · 点击进入，右侧可勾选随机播放'
                                                       : (e.isStreamableMusicArchive
                                                           ? '压缩包 (${e.formattedSize}) · 免整包下载直读音乐'
-                                                          : '${e.typeTagText} · ${e.formattedSize}'),
+                                                          : '${audioMeta != null && audioMeta.artist.isNotEmpty ? "${audioMeta.artist} · " : ""}${audioMeta?.qualityTag ?? e.typeTagText} · ${e.formattedSize}'),
                                                   maxLines: 1,
                                                   overflow:
                                                       TextOverflow.ellipsis,
@@ -2873,7 +3920,7 @@ class _CloudMusicFolderPickerDialogState
                                     },
                                   );
                                 },
-                              )),
+                              ))),
                   ),
                 ),
                 const SizedBox(height: 6),
@@ -3268,7 +4315,7 @@ class _CloudArchiveMusicBrowserDialogState
                                                 ),
                                               ),
                                               subtitle: Text(
-                                                '${track.archiveInnerPath} · ${track.formattedSize}',
+                                                '${meta.artist.isNotEmpty ? "${meta.artist} · " : ""}${track.archiveInnerPath} · ${track.formattedSize}',
                                                 maxLines: 1,
                                                 overflow: TextOverflow.ellipsis,
                                                 style: TextStyle(
@@ -3450,7 +4497,8 @@ class CloudMusicBottomDockBar extends StatelessWidget {
       listenable: controller,
       builder: (context, _) {
         final track = controller.currentTrack;
-        if (track == null && !controller.isScanningFolders) {
+        if ((!controller.hasActiveSession || track == null) &&
+            !controller.isScanningFolders) {
           return const SizedBox.shrink();
         }
 
@@ -3601,6 +4649,8 @@ class CloudMusicBottomDockBar extends StatelessWidget {
                                         children: [
                                           _MiniSpinningVinylAvatar(
                                             isPlaying: controller.isPlaying,
+                                            coverBytes:
+                                                controller.coverImageBytes,
                                             coverUrl: controller.coverImageUrl,
                                             coverHeaders:
                                                 controller.coverImageHeaders,
@@ -3904,12 +4954,14 @@ class CloudMusicBottomDockBar extends StatelessWidget {
 
 class _MiniSpinningVinylAvatar extends StatefulWidget {
   final bool isPlaying;
+  final Uint8List? coverBytes;
   final String? coverUrl;
   final Map<String, String> coverHeaders;
   final bool isLocalFile;
 
   const _MiniSpinningVinylAvatar({
     required this.isPlaying,
+    this.coverBytes,
     this.coverUrl,
     this.coverHeaders = const {},
     this.isLocalFile = false,
@@ -3991,6 +5043,14 @@ class _MiniSpinningVinylAvatarState extends State<_MiniSpinningVinylAvatar>
   }
 
   Widget _buildCoverImage() {
+    final bytes = widget.coverBytes;
+    if (bytes != null && bytes.isNotEmpty) {
+      return Image.memory(
+        bytes,
+        fit: BoxFit.cover,
+        errorBuilder: (_, __, ___) => _fallbackIcon(),
+      );
+    }
     final url = widget.coverUrl;
     if (url != null && url.isNotEmpty) {
       if (widget.isLocalFile) {
@@ -4095,8 +5155,11 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
 
   int _rightTabIndex = 0; // Desktop right pane: 0 = 实时同步歌词, 1 = 播放队列
   int _mobileViewIndex = 0; // Mobile 3-pane switcher: 0 = 黑胶唱盘, 1 = 同步歌词, 2 = 播放队列
+  int _queuePageIndex = 0;
+  static const int _queuePageSize = 100;
   String _queueSearch = '';
   int _lastScrolledLyricIndex = -1;
+  int _lastKnownTrackIndex = -1;
 
   CloudMusicController get _ctrl => widget.controller;
 
@@ -4119,6 +5182,14 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
       _vinylController.repeat();
     } else if (!_ctrl.isPlaying && _vinylController.isAnimating) {
       _vinylController.stop();
+    }
+
+    if (_ctrl.currentIndex >= 0 && _ctrl.currentIndex != _lastKnownTrackIndex) {
+      _lastKnownTrackIndex = _ctrl.currentIndex;
+      final targetPage = _ctrl.currentIndex ~/ _queuePageSize;
+      if (_queuePageIndex != targetPage) {
+        _queuePageIndex = targetPage;
+      }
     }
 
     final lyricIdx = _ctrl.activeLyricIndex;
@@ -4155,6 +5226,255 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
       context: context,
       builder: (_) => CloudMusicFolderPickerDialog(controller: _ctrl),
     );
+  }
+
+  Future<void> _promptSaveCurrentPlaylistDialog() async {
+    if (_ctrl.queue.isEmpty) return;
+    final defaultTitle = _ctrl.activePlaylistId != 'default_playlist'
+        ? '${_ctrl.activePlaylistName} (副本)'
+        : '我的歌单 ${_ctrl.savedPlaylists.length}';
+    final textCtrl = TextEditingController(text: defaultTitle);
+    final createdName = await showDialog<String>(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          backgroundColor: VideoPlatformTheme.bgElevated,
+          title: const Text(
+            '保存当前列表为歌单',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                '当前列表共 ${_ctrl.queue.length} 首歌曲（默认列表已自动为您永久保存，您还可以另存为多个独立歌单随时切换）：',
+                style: TextStyle(
+                  fontSize: 12.5,
+                  color: VideoPlatformTheme.textSecondary,
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: textCtrl,
+                autofocus: true,
+                decoration: InputDecoration(
+                  labelText: '歌单名称',
+                  hintText: '例如：华语无损精选 / 车载嗨曲',
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                ),
+                onSubmitted: (v) => Navigator.of(ctx).pop(v.trim()),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('取消'),
+            ),
+            FilledButton.icon(
+              onPressed: () => Navigator.of(ctx).pop(textCtrl.text.trim()),
+              icon: const Icon(Icons.playlist_add_check_rounded, size: 17),
+              label: const Text('保存歌单'),
+            ),
+          ],
+        );
+      },
+    );
+    if (createdName != null && createdName.isNotEmpty) {
+      await _ctrl.saveCurrentQueueAsPlaylist(createdName);
+    }
+  }
+
+  Future<void> _openPlaylistManagerDialog() async {
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) {
+        return ListenableBuilder(
+          listenable: _ctrl,
+          builder: (context, _) {
+            final playlists = _ctrl.savedPlaylists;
+            return AlertDialog(
+              backgroundColor: VideoPlatformTheme.bgElevated,
+              title: Row(
+                children: [
+                  Icon(
+                    Icons.library_music_rounded,
+                    color: VideoPlatformTheme.accent,
+                    size: 20,
+                  ),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text(
+                      '播放列表 / 歌单管理',
+                      style:
+                          TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+                    ),
+                  ),
+                  if (_ctrl.queue.isNotEmpty)
+                    FilledButton.tonalIcon(
+                      onPressed: () {
+                        Navigator.of(ctx).pop();
+                        _promptSaveCurrentPlaylistDialog();
+                      },
+                      icon: const Icon(Icons.add_rounded, size: 16),
+                      label: const Text(
+                        '另存当前列表',
+                        style: TextStyle(fontSize: 12),
+                      ),
+                    ),
+                ],
+              ),
+              content: SizedBox(
+                width: 520,
+                height: 360,
+                child: playlists.isEmpty
+                    ? Center(
+                        child: Text(
+                          '暂无已保存的播放列表，选择目录播放后将自动保存默认列表',
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: VideoPlatformTheme.textSecondary,
+                          ),
+                        ),
+                      )
+                    : ListView.separated(
+                        itemCount: playlists.length,
+                        separatorBuilder: (_, __) => const SizedBox(height: 8),
+                        itemBuilder: (context, idx) {
+                          final pl = playlists[idx];
+                          final isActive = pl.id == _ctrl.activePlaylistId;
+                          return Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 10,
+                            ),
+                            decoration: BoxDecoration(
+                              color: isActive
+                                  ? VideoPlatformTheme.accent
+                                      .withValues(alpha: 0.16)
+                                  : VideoPlatformTheme.bgCard,
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(
+                                color: isActive
+                                    ? VideoPlatformTheme.accent
+                                    : VideoPlatformTheme.borderSubtle,
+                              ),
+                            ),
+                            child: Row(
+                              children: [
+                                Icon(
+                                  pl.id == 'default_playlist'
+                                      ? Icons.push_pin_rounded
+                                      : Icons.queue_music_rounded,
+                                  size: 18,
+                                  color: isActive
+                                      ? VideoPlatformTheme.accent
+                                      : VideoPlatformTheme.textSecondary,
+                                ),
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        pl.name,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          fontSize: 13.5,
+                                          fontWeight: FontWeight.w700,
+                                          color: VideoPlatformTheme.textPrimary,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        '共 ${pl.tracks.length} 首歌曲${pl.id == 'default_playlist' ? ' · 每次播放自动同步保存' : ''}',
+                                        style: TextStyle(
+                                          fontSize: 11.5,
+                                          color:
+                                              VideoPlatformTheme.textSecondary,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                TextButton.icon(
+                                  onPressed: () {
+                                    Navigator.of(ctx).pop();
+                                    _ctrl.switchAndPlayPlaylist(
+                                      pl.id,
+                                      autoPlay: true,
+                                      shuffle: false,
+                                    );
+                                  },
+                                  icon: const Icon(
+                                    Icons.play_arrow_rounded,
+                                    size: 16,
+                                  ),
+                                  label: const Text(
+                                    '播放',
+                                    style: TextStyle(fontSize: 12),
+                                  ),
+                                ),
+                                TextButton.icon(
+                                  onPressed: () {
+                                    Navigator.of(ctx).pop();
+                                    _ctrl.switchAndPlayPlaylist(
+                                      pl.id,
+                                      autoPlay: true,
+                                      shuffle: true,
+                                    );
+                                  },
+                                  icon: const Icon(
+                                    Icons.shuffle_rounded,
+                                    size: 15,
+                                  ),
+                                  label: const Text(
+                                    '随机',
+                                    style: TextStyle(fontSize: 12),
+                                  ),
+                                ),
+                                if (pl.id != 'default_playlist' ||
+                                    playlists.length > 1)
+                                  IconButton(
+                                    tooltip: '删除此歌单',
+                                    visualDensity: VisualDensity.compact,
+                                    onPressed: () =>
+                                        _ctrl.deleteSavedPlaylist(pl.id),
+                                    icon: Icon(
+                                      Icons.delete_outline_rounded,
+                                      size: 17,
+                                      color: VideoPlatformTheme.danger,
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  child: const Text('关闭'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _exitMusicPlayer() async {
+    await _ctrl.stopAndClose();
+    if (!widget.isStandalonePage && mounted) {
+      Navigator.of(context).pop();
+    }
   }
 
   KeyEventResult _handleKeyEvent(FocusNode node, KeyEvent event) {
@@ -4227,7 +5547,8 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
             child: Column(
               children: [
                 _buildHeaderBar(track, meta, isWide: isWide),
-                if (_ctrl.savedMusicFolders.isNotEmpty)
+                if (_ctrl.savedPlaylists.isNotEmpty ||
+                    _ctrl.savedMusicFolders.isNotEmpty)
                   _buildSavedMusicFoldersStrip(isWide: isWide),
                 if (!isWide && track != null && !_ctrl.isScanningFolders)
                   _buildMobileThreePaneSwitcherBar(),
@@ -4647,6 +5968,28 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                     const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
               ),
             ),
+            const SizedBox(width: 8),
+            OutlinedButton.icon(
+              onPressed: _openPlaylistManagerDialog,
+              icon: const Icon(Icons.library_music_rounded, size: 15),
+              label: Text(
+                isWide
+                    ? '列表管理 (${_ctrl.savedPlaylists.length})'
+                    : '列表 (${_ctrl.savedPlaylists.length})',
+                style: const TextStyle(fontSize: 12),
+              ),
+            ),
+            if (_ctrl.queue.isNotEmpty) ...[
+              const SizedBox(width: 8),
+              OutlinedButton.icon(
+                onPressed: _promptSaveCurrentPlaylistDialog,
+                icon: const Icon(Icons.playlist_add_check_rounded, size: 16),
+                label: Text(
+                  isWide ? '存为歌单' : '存列表',
+                  style: const TextStyle(fontSize: 12),
+                ),
+              ),
+            ],
             if (_ctrl.queue.length > 1) ...[
               const SizedBox(width: 8),
               OutlinedButton.icon(
@@ -4715,6 +6058,28 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                 ),
               ),
             ],
+            if (track != null) ...[
+              const SizedBox(width: 8),
+              OutlinedButton.icon(
+                onPressed: _exitMusicPlayer,
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: VideoPlatformTheme.danger,
+                  side: BorderSide(
+                    color: VideoPlatformTheme.danger.withValues(alpha: 0.55),
+                  ),
+                  backgroundColor:
+                      VideoPlatformTheme.danger.withValues(alpha: 0.10),
+                ),
+                icon: const Icon(Icons.power_settings_new_rounded, size: 15),
+                label: Text(
+                  isWide ? '退出播放' : '退出',
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ],
           ],
         ),
       ),
@@ -4723,6 +6088,7 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
 
   Widget _buildSavedMusicFoldersStrip({required bool isWide}) {
     final saved = _ctrl.savedMusicFolders;
+    final playlists = _ctrl.savedPlaylists;
     return Container(
       height: 40,
       padding: EdgeInsets.symmetric(horizontal: isWide ? 18 : 12),
@@ -4735,14 +6101,14 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
       child: Row(
         children: [
           Icon(
-            Icons.star_rounded,
+            Icons.library_music_rounded,
             size: 15,
-            color: VideoPlatformTheme.warning,
+            color: VideoPlatformTheme.accent,
           ),
           if (isWide) ...[
             const SizedBox(width: 6),
             Text(
-              '常用音乐源:',
+              '播放列表:',
               style: TextStyle(
                 fontSize: 11.5,
                 color: VideoPlatformTheme.textSecondary,
@@ -4750,151 +6116,264 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
             ),
           ],
           const SizedBox(width: 6),
-          StatefulBuilder(
-            builder: (rndAllCtx, setRndAllState) {
-              return InkWell(
-                borderRadius: BorderRadius.circular(14),
-                onFocusChange: (_) {
-                  if (rndAllCtx.mounted) setRndAllState(() {});
-                },
-                onTap: () {
-                  _ctrl.scanAndPlayFoldersOrArchives(
-                    sources: saved,
-                    shuffle: true,
-                  );
-                },
-                child: Builder(
-                  builder: (ctx) {
-                    final isFocused = Focus.of(ctx).hasPrimaryFocus;
-                    return Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 10,
-                        vertical: 4,
-                      ),
-                      decoration: BoxDecoration(
-                        color: isFocused
-                            ? VideoPlatformTheme.accent
-                            : VideoPlatformTheme.accent.withValues(alpha: 0.18),
-                        borderRadius: BorderRadius.circular(14),
-                        border: Border.all(
-                          color: isFocused
-                              ? const Color(0xFFFFE066)
-                              : VideoPlatformTheme.accent
-                                  .withValues(alpha: 0.5),
-                          width: isFocused ? 2.2 : 1.0,
-                        ),
-                      ),
+          Expanded(
+            child: ListView(
+              scrollDirection: Axis.horizontal,
+              children: [
+                for (final pl in playlists) ...[
+                  Center(
+                    child: StatefulBuilder(
+                      builder: (plCtx, setPlState) {
+                        final isActive = pl.id == _ctrl.activePlaylistId;
+                        return InkWell(
+                          borderRadius: BorderRadius.circular(14),
+                          onFocusChange: (_) {
+                            if (plCtx.mounted) setPlState(() {});
+                          },
+                          onTap: () => _ctrl.switchAndPlayPlaylist(
+                            pl.id,
+                            autoPlay: true,
+                            shuffle: false,
+                          ),
+                          onLongPress: _openPlaylistManagerDialog,
+                          child: Builder(
+                            builder: (ctx) {
+                              final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                              return Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 4,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: isFocused
+                                      ? VideoPlatformTheme.accent
+                                      : (isActive
+                                          ? VideoPlatformTheme.accent
+                                              .withValues(alpha: 0.22)
+                                          : VideoPlatformTheme.bgCard),
+                                  borderRadius: BorderRadius.circular(14),
+                                  border: Border.all(
+                                    color: isFocused
+                                        ? const Color(0xFFFFE066)
+                                        : (isActive
+                                            ? VideoPlatformTheme.accent
+                                            : VideoPlatformTheme.borderSubtle),
+                                    width: isFocused ? 2.2 : 1.0,
+                                  ),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(
+                                      pl.id == 'default_playlist'
+                                          ? Icons.push_pin_rounded
+                                          : Icons.queue_music_rounded,
+                                      size: 13,
+                                      color: isFocused
+                                          ? Colors.white
+                                          : (isActive
+                                              ? VideoPlatformTheme.accent
+                                              : VideoPlatformTheme
+                                                  .textSecondary),
+                                    ),
+                                    const SizedBox(width: 4),
+                                    Text(
+                                      '${pl.name} (${pl.tracks.length}首)',
+                                      style: TextStyle(
+                                        fontSize: 11.5,
+                                        height: 1.2,
+                                        fontWeight: (isActive || isFocused)
+                                            ? FontWeight.w700
+                                            : FontWeight.w500,
+                                        color: isFocused
+                                            ? Colors.white
+                                            : (isActive
+                                                ? VideoPlatformTheme.accent
+                                                : VideoPlatformTheme
+                                                    .textPrimary),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              );
+                            },
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                ],
+                if (saved.isNotEmpty) ...[
+                  Center(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 4),
                       child: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           Icon(
-                            Icons.shuffle_rounded,
-                            size: 13,
-                            color: isFocused
-                                ? Colors.white
-                                : VideoPlatformTheme.accent,
+                            Icons.star_rounded,
+                            size: 14,
+                            color: VideoPlatformTheme.warning,
                           ),
-                          const SizedBox(width: 4),
+                          const SizedBox(width: 3),
                           Text(
-                            '全部随机 (${saved.length})',
+                            '常用目录:',
                             style: TextStyle(
                               fontSize: 11,
-                              height: 1.2,
-                              fontWeight: FontWeight.w700,
-                              color: isFocused
-                                  ? Colors.white
-                                  : VideoPlatformTheme.accent,
+                              color: VideoPlatformTheme.textSecondary,
                             ),
                           ),
                         ],
                       ),
-                    );
-                  },
-                ),
-              );
-            },
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: ListView.separated(
-              scrollDirection: Axis.horizontal,
-              itemCount: saved.length,
-              separatorBuilder: (_, __) => const SizedBox(width: 6),
-              itemBuilder: (context, idx) {
-                final item = saved[idx];
-                return Center(
-                  child: StatefulBuilder(
-                    builder: (svCtx, setSvState) {
-                      return InkWell(
-                        borderRadius: BorderRadius.circular(14),
-                        onFocusChange: (_) {
-                          if (svCtx.mounted) setSvState(() {});
-                        },
-                        onTap: () => _ctrl.scanAndPlayFoldersOrArchives(
-                          sources: [item],
-                          shuffle: true,
-                        ),
-                        onLongPress: () =>
-                            _ctrl.addOrToggleSavedMusicFolder(item),
-                        child: Builder(
-                          builder: (ctx) {
-                            final isFocused = Focus.of(ctx).hasPrimaryFocus;
-                            return Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 9,
-                                vertical: 4,
-                              ),
-                              decoration: BoxDecoration(
-                                color: isFocused
-                                    ? VideoPlatformTheme.accent
-                                        .withValues(alpha: 0.34)
-                                    : VideoPlatformTheme.bgCard,
-                                borderRadius: BorderRadius.circular(14),
-                                border: Border.all(
-                                  color: isFocused
-                                      ? const Color(0xFFFFE066)
-                                      : VideoPlatformTheme.borderSubtle,
-                                  width: isFocused ? 2.2 : 1.0,
-                                ),
-                              ),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Icon(
-                                    item.isArchive
-                                        ? Icons.folder_zip_rounded
-                                        : Icons.folder_special_rounded,
-                                    size: 13,
-                                    color: isFocused
-                                        ? Colors.white
-                                        : (item.isArchive
-                                            ? VideoPlatformTheme.badgeHot
-                                            : VideoPlatformTheme.warning),
-                                  ),
-                                  const SizedBox(width: 5),
-                                  Text(
-                                    '${item.mountName}: ${item.title}',
-                                    style: TextStyle(
-                                      fontSize: 11.5,
-                                      height: 1.2,
-                                      fontWeight: isFocused
-                                          ? FontWeight.w700
-                                          : FontWeight.w500,
-                                      color: isFocused
-                                          ? Colors.white
-                                          : VideoPlatformTheme.textPrimary,
-                                    ),
-                                  ),
-                                ],
-                              ),
+                    ),
+                  ),
+                  Center(
+                    child: StatefulBuilder(
+                      builder: (rndAllCtx, setRndAllState) {
+                        return InkWell(
+                          borderRadius: BorderRadius.circular(14),
+                          onFocusChange: (_) {
+                            if (rndAllCtx.mounted) setRndAllState(() {});
+                          },
+                          onTap: () {
+                            _ctrl.scanAndPlayFoldersOrArchives(
+                              sources: saved,
+                              shuffle: true,
                             );
                           },
-                        ),
-                      );
-                    },
+                          child: Builder(
+                            builder: (ctx) {
+                              final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                              return Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 4,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: isFocused
+                                      ? VideoPlatformTheme.accent
+                                      : VideoPlatformTheme.accent
+                                          .withValues(alpha: 0.18),
+                                  borderRadius: BorderRadius.circular(14),
+                                  border: Border.all(
+                                    color: isFocused
+                                        ? const Color(0xFFFFE066)
+                                        : VideoPlatformTheme.accent
+                                            .withValues(alpha: 0.5),
+                                    width: isFocused ? 2.2 : 1.0,
+                                  ),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(
+                                      Icons.shuffle_rounded,
+                                      size: 13,
+                                      color: isFocused
+                                          ? Colors.white
+                                          : VideoPlatformTheme.accent,
+                                    ),
+                                    const SizedBox(width: 4),
+                                    Text(
+                                      '全部随机 (${saved.length})',
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        height: 1.2,
+                                        fontWeight: FontWeight.w700,
+                                        color: isFocused
+                                            ? Colors.white
+                                            : VideoPlatformTheme.accent,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              );
+                            },
+                          ),
+                        );
+                      },
+                    ),
                   ),
-                );
-              },
+                  const SizedBox(width: 6),
+                  for (final item in saved) ...[
+                    Center(
+                      child: StatefulBuilder(
+                        builder: (svCtx, setSvState) {
+                          return InkWell(
+                            borderRadius: BorderRadius.circular(14),
+                            onFocusChange: (_) {
+                              if (svCtx.mounted) setSvState(() {});
+                            },
+                            onTap: () => _ctrl.scanAndPlayFoldersOrArchives(
+                              sources: [item],
+                              shuffle: true,
+                            ),
+                            onLongPress: () =>
+                                _ctrl.addOrToggleSavedMusicFolder(item),
+                            child: Builder(
+                              builder: (ctx) {
+                                final isFocused =
+                                    Focus.of(ctx).hasPrimaryFocus;
+                                return Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 9,
+                                    vertical: 4,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: isFocused
+                                        ? VideoPlatformTheme.accent
+                                            .withValues(alpha: 0.34)
+                                        : VideoPlatformTheme.bgCard,
+                                    borderRadius: BorderRadius.circular(14),
+                                    border: Border.all(
+                                      color: isFocused
+                                          ? const Color(0xFFFFE066)
+                                          : VideoPlatformTheme.borderSubtle,
+                                      width: isFocused ? 2.2 : 1.0,
+                                    ),
+                                  ),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(
+                                        item.isArchive
+                                            ? Icons.folder_zip_rounded
+                                            : Icons.folder_special_rounded,
+                                        size: 13,
+                                        color: isFocused
+                                            ? Colors.white
+                                            : (item.isArchive
+                                                ? VideoPlatformTheme.badgeHot
+                                                : VideoPlatformTheme.warning),
+                                      ),
+                                      const SizedBox(width: 5),
+                                      Text(
+                                        '${item.mountName}: ${item.title}',
+                                        style: TextStyle(
+                                          fontSize: 11.5,
+                                          height: 1.2,
+                                          fontWeight: isFocused
+                                              ? FontWeight.w700
+                                              : FontWeight.w500,
+                                          color: isFocused
+                                              ? Colors.white
+                                              : VideoPlatformTheme.textPrimary,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                );
+                              },
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                  ],
+                ],
+              ],
             ),
           ),
         ],
@@ -5039,6 +6518,26 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                       ),
                     ),
                   ),
+                  if (_ctrl.savedPlaylists.isNotEmpty)
+                    OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        minimumSize: const Size(160, 40),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 10,
+                        ),
+                      ),
+                      onPressed: _openPlaylistManagerDialog,
+                      icon: const Icon(Icons.library_music_rounded, size: 18),
+                      label: Text(
+                        '播放已保存列表 (${_ctrl.savedPlaylists.length}个)',
+                        style: const TextStyle(
+                          fontSize: 13,
+                          height: 1.2,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
                   if (_ctrl.savedMusicFolders.isNotEmpty)
                     OutlinedButton.icon(
                       style: OutlinedButton.styleFrom(
@@ -5239,6 +6738,14 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
   }
 
   Widget _buildAlbumCoverWidget() {
+    final bytes = _ctrl.coverImageBytes;
+    if (bytes != null && bytes.isNotEmpty) {
+      return Image.memory(
+        bytes,
+        fit: BoxFit.cover,
+        errorBuilder: (_, __, ___) => _defaultAlbumArt(),
+      );
+    }
     final url = _ctrl.coverImageUrl;
     if (url != null && url.isNotEmpty) {
       if (_ctrl.coverIsLocalFile) {
@@ -5544,18 +7051,27 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
 
   Widget _buildPlaylistQueueView(FileEntry currentTrack) {
     final kw = _queueSearch.trim().toLowerCase();
-    final items = <({int index, FileEntry entry})>[];
+    final allMatching = <({int index, FileEntry entry})>[];
     for (int i = 0; i < _ctrl.queue.length; i++) {
       final e = _ctrl.queue[i];
       if (kw.isEmpty || e.name.toLowerCase().contains(kw)) {
-        items.add((index: i, entry: e));
+        allMatching.add((index: i, entry: e));
       }
     }
+
+    final totalCount = allMatching.length;
+    final pageCount = math.max(1, (totalCount + _queuePageSize - 1) ~/ _queuePageSize);
+    final safePage = _queuePageIndex.clamp(0, pageCount - 1);
+    final pageStart = safePage * _queuePageSize;
+    final pageEnd = math.min(totalCount, pageStart + _queuePageSize);
+    final pageItems = pageStart < pageEnd
+        ? allMatching.sublist(pageStart, pageEnd)
+        : const <({int index, FileEntry entry})>[];
 
     return Column(
       children: [
         Padding(
-          padding: const EdgeInsets.fromLTRB(14, 10, 14, 8),
+          padding: const EdgeInsets.fromLTRB(14, 10, 14, 6),
           child: Row(
             children: [
               Expanded(
@@ -5563,7 +7079,10 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                   height: 36,
                   child: TextField(
                     controller: _queueFilterCtrl,
-                    onChanged: (v) => setState(() => _queueSearch = v),
+                    onChanged: (v) => setState(() {
+                      _queueSearch = v;
+                      _queuePageIndex = 0;
+                    }),
                     style: const TextStyle(fontSize: 13),
                     decoration: InputDecoration(
                       hintText: '在播放队列中搜索歌曲...',
@@ -5573,7 +7092,12 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                               icon: const Icon(Icons.clear_rounded, size: 15),
                               onPressed: () {
                                 _queueFilterCtrl.clear();
-                                setState(() => _queueSearch = '');
+                                setState(() {
+                                  _queueSearch = '';
+                                  _queuePageIndex = _ctrl.currentIndex >= 0
+                                      ? _ctrl.currentIndex ~/ _queuePageSize
+                                      : 0;
+                                });
                               },
                             )
                           : null,
@@ -5591,21 +7115,95 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                 icon: const Icon(Icons.shuffle_rounded, size: 15),
                 label: const Text('随机重排', style: TextStyle(fontSize: 12)),
               ),
+              const SizedBox(width: 6),
+              OutlinedButton.icon(
+                onPressed: _promptSaveCurrentPlaylistDialog,
+                icon: const Icon(Icons.playlist_add_check_rounded, size: 15),
+                label: const Text('另存歌单', style: TextStyle(fontSize: 12)),
+              ),
+              const SizedBox(width: 6),
+              IconButton(
+                tooltip: '播放列表管理',
+                visualDensity: VisualDensity.compact,
+                onPressed: _openPlaylistManagerDialog,
+                icon: Icon(
+                  Icons.library_music_rounded,
+                  size: 18,
+                  color: VideoPlatformTheme.accent,
+                ),
+              ),
             ],
           ),
         ),
+        if (pageCount > 1)
+          SizedBox(
+            height: 32,
+            child: ListView.separated(
+              padding: const EdgeInsets.symmetric(horizontal: 14),
+              scrollDirection: Axis.horizontal,
+              itemCount: pageCount,
+              separatorBuilder: (_, __) => const SizedBox(width: 6),
+              itemBuilder: (context, pIdx) {
+                final s = pIdx * _queuePageSize + 1;
+                final e = math.min(totalCount, (pIdx + 1) * _queuePageSize);
+                final isSelectedPage = pIdx == safePage;
+                return Center(
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(14),
+                    onTap: () => setState(() => _queuePageIndex = pIdx),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color: isSelectedPage
+                            ? VideoPlatformTheme.accent.withValues(alpha: 0.22)
+                            : VideoPlatformTheme.bgCard,
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(
+                          color: isSelectedPage
+                              ? VideoPlatformTheme.accent
+                              : VideoPlatformTheme.borderSubtle,
+                        ),
+                      ),
+                      child: Text(
+                        '$s-$e',
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: isSelectedPage
+                              ? FontWeight.w700
+                              : FontWeight.w500,
+                          color: isSelectedPage
+                              ? VideoPlatformTheme.accent
+                              : VideoPlatformTheme.textSecondary,
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
         Expanded(
           child: ListView.separated(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            itemCount: items.length,
+            itemCount: pageItems.length,
             separatorBuilder: (_, __) => const SizedBox(height: 4),
             itemBuilder: (context, i) {
-              final item = items[i];
+              final item = pageItems[i];
               final isCurrent = item.index == _ctrl.currentIndex;
+              final mountTitle = _ctrl.mountNameFor(item.entry);
               final meta = CloudMusicController.parseTrackMetadata(
                 item.entry,
-                fallbackArtist: _ctrl.mountNameFor(item.entry),
+                fallbackArtist: mountTitle,
               );
+              final subtitleParts = <String>[
+                if (meta.artist.isNotEmpty) meta.artist,
+                if (mountTitle.isNotEmpty && mountTitle != meta.artist)
+                  mountTitle,
+                item.entry.formattedSize,
+              ];
               return StatefulBuilder(
                 builder: (qRowCtx, setQRowState) {
                   return InkWell(
@@ -5686,7 +7284,7 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                                     ),
                                     const SizedBox(height: 2),
                                     Text(
-                                      '${meta.artist} · ${_ctrl.mountNameFor(item.entry)} · ${item.entry.formattedSize}',
+                                      subtitleParts.join(' · '),
                                       maxLines: 1,
                                       overflow: TextOverflow.ellipsis,
                                       style: TextStyle(
@@ -6098,6 +7696,17 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                     );
                   },
                 ),
+                if (_ctrl.currentTrack != null)
+                  IconButton(
+                    tooltip: '停止并退出播放',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: _exitMusicPlayer,
+                    icon: Icon(
+                      Icons.power_settings_new_rounded,
+                      color: VideoPlatformTheme.danger,
+                      size: 21,
+                    ),
+                  ),
               ],
             )
           else
@@ -6259,6 +7868,34 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                     ),
                   ),
                 ),
+                if (_ctrl.currentTrack != null) ...[
+                  const SizedBox(width: 8),
+                  OutlinedButton.icon(
+                    onPressed: _exitMusicPlayer,
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: VideoPlatformTheme.danger,
+                      side: BorderSide(
+                        color:
+                            VideoPlatformTheme.danger.withValues(alpha: 0.55),
+                      ),
+                      backgroundColor:
+                          VideoPlatformTheme.danger.withValues(alpha: 0.10),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 11,
+                        vertical: 7,
+                      ),
+                    ),
+                    icon:
+                        const Icon(Icons.power_settings_new_rounded, size: 16),
+                    label: const Text(
+                      '停止退出',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ],
               ],
             ),
         ],

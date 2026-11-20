@@ -161,71 +161,91 @@ class RemoteStorageService {
 
   Future<FileDirectoryListing> listAlistDirectory(
     StorageMount mount,
-    String path,
-  ) async {
+    String path, {
+    int maxPages = 8,
+  }) async {
     final effectivePath =
         path.trim().isEmpty ? normalizePath(mount.rootPath) : normalizePath(path);
-    final root = await _alistJsonRequest(
-      mount,
-      '/api/fs/list',
-      {
-        'path': effectivePath,
-        'password': '',
-        'page': 1,
-        'per_page': 500,
-        'refresh': false,
-      },
-    );
-    final data = root['data'];
-    final content = (data is Map<String, dynamic> && data['content'] is List)
-        ? data['content'] as List
-        : const [];
     final base = cleanBaseUrl(mount.baseUrl);
     final entries = <FileEntry>[];
+    final seenPaths = <String>{};
+    const perPage = 500;
 
-    for (final item in content) {
-      if (item is! Map<String, dynamic>) continue;
-      final name = (item['name'] ?? '').toString().trim();
-      if (name.isEmpty) continue;
-      final isDir = item['is_dir'] == true;
-      final size = int.tryParse((item['size'] ?? 0).toString()) ?? 0;
-      var modTime = (item['modified'] ?? '').toString();
-      if (modTime.length > 16) {
-        modTime = modTime.substring(0, 16).replaceAll('T', ' ');
-      }
-      final sign = (item['sign'] ?? '').toString().trim();
-      final thumb = (item['thumb'] ?? '').toString().trim();
-      final itemPath = joinPath(effectivePath, name);
-      String ext = '';
-      if (!isDir) {
-        final dot = name.lastIndexOf('.');
-        if (dot > 0) ext = name.substring(dot).toLowerCase();
-      }
-      String directDownload = '';
-      if (!isDir) {
-        final encodedPath = itemPath
-            .split('/')
-            .map(Uri.encodeComponent)
-            .join('/');
-        directDownload = sign.isEmpty
-            ? '$base/d$encodedPath'
-            : '$base/d$encodedPath?sign=${Uri.encodeQueryComponent(sign)}';
-      }
-      entries.add(
-        FileEntry(
-          name: name,
-          path: itemPath,
-          size: size,
-          modTime: modTime,
-          isDir: isDir,
-          isMp4: ext == '.mp4',
-          ext: ext,
-          mountId: mount.id,
-          sourceKind: StorageSourceKind.alist,
-          rawDownloadUrl: directDownload,
-          thumbUrl: thumb,
-        ),
+    for (var page = 1; page <= maxPages; page++) {
+      final root = await _alistJsonRequest(
+        mount,
+        '/api/fs/list',
+        {
+          'path': effectivePath,
+          'password': '',
+          'page': page,
+          'per_page': perPage,
+          'refresh': false,
+        },
       );
+      final data = root['data'];
+      final content = (data is Map<String, dynamic> && data['content'] is List)
+          ? data['content'] as List
+          : const [];
+      final totalCount = data is Map<String, dynamic>
+          ? (int.tryParse((data['total'] ?? 0).toString()) ?? 0)
+          : 0;
+
+      if (content.isEmpty) break;
+      int addedThisPage = 0;
+
+      for (final item in content) {
+        if (item is! Map<String, dynamic>) continue;
+        final name = (item['name'] ?? '').toString().trim();
+        if (name.isEmpty) continue;
+        final isDir = item['is_dir'] == true;
+        final size = int.tryParse((item['size'] ?? 0).toString()) ?? 0;
+        var modTime = (item['modified'] ?? '').toString();
+        if (modTime.length > 16) {
+          modTime = modTime.substring(0, 16).replaceAll('T', ' ');
+        }
+        final sign = (item['sign'] ?? '').toString().trim();
+        final thumb = (item['thumb'] ?? '').toString().trim();
+        final itemPath = joinPath(effectivePath, name);
+        if (!seenPaths.add(itemPath)) continue;
+        addedThisPage++;
+        String ext = '';
+        if (!isDir) {
+          final dot = name.lastIndexOf('.');
+          if (dot > 0) ext = name.substring(dot).toLowerCase();
+        }
+        String directDownload = '';
+        if (!isDir) {
+          final encodedPath = itemPath
+              .split('/')
+              .map(Uri.encodeComponent)
+              .join('/');
+          directDownload = sign.isEmpty
+              ? '$base/d$encodedPath'
+              : '$base/d$encodedPath?sign=${Uri.encodeQueryComponent(sign)}';
+        }
+        entries.add(
+          FileEntry(
+            name: name,
+            path: itemPath,
+            size: size,
+            modTime: modTime,
+            isDir: isDir,
+            isMp4: ext == '.mp4',
+            ext: ext,
+            mountId: mount.id,
+            sourceKind: StorageSourceKind.alist,
+            rawDownloadUrl: directDownload,
+            thumbUrl: thumb,
+          ),
+        );
+      }
+
+      if (addedThisPage == 0 ||
+          content.length < perPage ||
+          (totalCount > 0 && entries.length >= totalCount)) {
+        break;
+      }
     }
 
     return FileDirectoryListing(

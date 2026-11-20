@@ -4,8 +4,13 @@ import FlutterMacOS
 @main
 class AppDelegate: FlutterAppDelegate {
   private var statusItem: NSStatusItem?
+  private var sleepPreventActivity: NSObjectProtocol?
 
   override func applicationDidFinishLaunching(_ notification: Notification) {
+    sleepPreventActivity = ProcessInfo.processInfo.beginActivity(
+      options: [.idleDisplaySleepDisabled, .idleSystemSleepDisabled, .userInitiated],
+      reason: "流光视频运行期间保持屏幕常亮并防止系统进入休眠"
+    )
     setupStatusMenuItem()
     super.applicationDidFinishLaunching(notification)
   }

@@ -106,7 +106,7 @@ struct TvAmbientBackdropView: View {
   }
 }
 
-/// Apple tvOS Liquid Glass Pill Button Style (Dynamic Theme Accent + Soft Scale + Zero Offscreen Shadow When Unfocused)
+/// Apple tvOS Liquid Glass Pill Button Style (Dynamic Theme Accent + Soft Scale + Never White Highlight)
 struct TvApplePillButtonStyle: ButtonStyle {
   var isSelected: Bool = false
   var isPrimary: Bool = false
@@ -135,23 +135,33 @@ struct TvApplePillButtonStyle: ButtonStyle {
       let palette = TvThemePalette.current
       let bgFill: Color = {
         if isFocused {
-          if isDestructive { return Color(red: 0.92, green: 0.26, blue: 0.24) }
-          if isPrimary { return palette.accentHover }
-          return Color.white
+          if isDestructive { return Color(red: 0.72, green: 0.14, blue: 0.16) }
+          if isPrimary { return palette.accent.opacity(0.65) }
+          return palette.accent.opacity(0.42)
         }
         if isDestructive { return Color(red: 0.88, green: 0.26, blue: 0.24).opacity(0.22) }
-        if isPrimary { return palette.accent }
-        if isSelected { return palette.accent.opacity(0.32) }
+        if isPrimary { return palette.accent.opacity(0.46) }
+        if isSelected { return palette.accent.opacity(0.28) }
         return Color.white.opacity(0.11)
       }()
 
       let fgColor: Color = {
         if isFocused {
-          return (isPrimary || isDestructive) ? .white : Color(red: 0.06, green: 0.08, blue: 0.12)
+          return .white
         }
         if isDestructive { return Color(red: 1.0, green: 0.45, blue: 0.42) }
         if isSelected { return palette.accentHover }
         return .white
+      }()
+
+      let borderColor: Color = {
+        if isFocused {
+          return isDestructive ? Color(red: 1.0, green: 0.52, blue: 0.48) : palette.accentHover
+        }
+        if isSelected || isPrimary {
+          return palette.accentHover.opacity(0.78)
+        }
+        return Color.white.opacity(0.16)
       }()
 
       configuration.label
@@ -160,24 +170,28 @@ struct TvApplePillButtonStyle: ButtonStyle {
         .padding(.horizontal, compact ? 14 : 18)
         .padding(.vertical, compact ? 7 : 9)
         .background(
-          Capsule(style: .continuous)
-            .fill(bgFill)
+          ZStack {
+            if isFocused {
+              Capsule(style: .continuous)
+                .fill(Color(red: 0.08, green: 0.11, blue: 0.18).opacity(0.96))
+            }
+            Capsule(style: .continuous)
+              .fill(bgFill)
+          }
         )
         .overlay(
           Capsule(style: .continuous)
             .stroke(
-              isFocused
-                ? Color.white.opacity(0.92)
-                : (isSelected ? palette.accentHover.opacity(0.80) : Color.white.opacity(0.14)),
-              lineWidth: isFocused ? 2.0 : 1.0
+              borderColor,
+              lineWidth: isFocused ? 2.6 : 1.0
             )
         )
-        .scaleEffect(configuration.isPressed ? 0.97 : (isFocused ? 1.03 : 1.0))
+        .scaleEffect(configuration.isPressed ? 0.97 : (isFocused ? 1.035 : 1.0))
     }
   }
 }
 
-/// Apple tvOS Glass Surface Card Button Style (Zero Offscreen Shadow / Zero Spring Overhead for High-Density Lists)
+/// Apple tvOS Glass Surface Card Button Style (Dark Theme Focus Highlight — Never White)
 struct TvAppleSurfaceButtonStyle: ButtonStyle {
   var isSelected: Bool = false
   var cornerRadius: CGFloat = 14
@@ -195,13 +209,22 @@ struct TvAppleSurfaceButtonStyle: ButtonStyle {
     var body: some View {
       let palette = TvThemePalette.current
       configuration.label
+        .foregroundColor(.white)
         .background(
-          RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-            .fill(
-              isFocused
-                ? palette.accent.opacity(0.28)
-                : (isSelected ? palette.accent.opacity(0.18) : palette.bgCard.opacity(0.88))
-            )
+          ZStack {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+              .fill(
+                isFocused
+                  ? Color(red: 0.08, green: 0.11, blue: 0.18).opacity(0.96)
+                  : palette.bgCard.opacity(0.88)
+              )
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+              .fill(
+                isFocused
+                  ? palette.accent.opacity(0.34)
+                  : (isSelected ? palette.accent.opacity(0.20) : Color.clear)
+              )
+          }
         )
         .overlay(
           RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
@@ -209,10 +232,49 @@ struct TvAppleSurfaceButtonStyle: ButtonStyle {
               isFocused
                 ? palette.accentHover
                 : (isSelected ? palette.accentHover.opacity(0.68) : Color.white.opacity(0.10)),
-              lineWidth: isFocused ? 2.4 : 1.0
+              lineWidth: isFocused ? 2.6 : 1.0
             )
         )
-        .scaleEffect(configuration.isPressed ? 0.98 : (isFocused ? 1.015 : 1.0))
+        .scaleEffect(configuration.isPressed ? 0.98 : (isFocused ? 1.018 : 1.0))
+    }
+  }
+}
+
+/// Apple tvOS Poster & Media Card Button Style (Replaces system `.card` so focus highlight is Dark + Theme Border, NEVER White!)
+struct TvApplePosterCardButtonStyle: ButtonStyle {
+  var cornerRadius: CGFloat = 20
+
+  func makeBody(configuration: Configuration) -> some View {
+    TvApplePosterCardBody(configuration: configuration, cornerRadius: cornerRadius)
+  }
+
+  private struct TvApplePosterCardBody: View {
+    @Environment(\.isFocused) private var isFocused
+    let configuration: Configuration
+    let cornerRadius: CGFloat
+
+    var body: some View {
+      let palette = TvThemePalette.current
+      configuration.label
+        .padding(8)
+        .background(
+          ZStack {
+            if isFocused {
+              RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .fill(Color(red: 0.08, green: 0.11, blue: 0.18).opacity(0.96))
+              RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .fill(palette.accent.opacity(0.28))
+            }
+          }
+        )
+        .overlay(
+          RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+            .stroke(
+              isFocused ? palette.accentHover : Color.clear,
+              lineWidth: isFocused ? 3.0 : 0.0
+            )
+        )
+        .scaleEffect(configuration.isPressed ? 0.98 : (isFocused ? 1.035 : 1.0))
     }
   }
 }
@@ -3531,7 +3593,7 @@ private struct TvGalleryBottomThumbnailButton: View {
         RoundedRectangle(cornerRadius: 14, style: .continuous)
           .stroke(
             isFocused
-              ? Color.white
+              ? TvThemePalette.current.accentHover
               : (isActive ? Color(red: 0.24, green: 0.62, blue: 0.98) : Color.white.opacity(0.16)),
             lineWidth: (isFocused || isActive) ? 3.2 : 1.0
           )

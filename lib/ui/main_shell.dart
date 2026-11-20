@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../models/models.dart';
 import '../services/proxy_routing_service.dart';
@@ -121,6 +122,9 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     final isForeground = state == AppLifecycleState.resumed;
+    if (isForeground) {
+      unawaited(WakelockPlus.enable().catchError((_) {}));
+    }
     widget.appState.updateTelegramReadingContext(
       isAppForeground: isForeground,
     );
@@ -673,6 +677,13 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                             ],
                           ),
                         ),
+                        if (!isImmersive &&
+                            _selectedIndex != 3 &&
+                            _selectedIndex != 9)
+                          CloudMusicBottomDockBar(
+                            controller: CloudMusicController(appState: state),
+                            onExpandFullscreen: () => _selectTab(9),
+                          ),
                       ],
                     ),
                     if (miniSession != null && !isImmersive)

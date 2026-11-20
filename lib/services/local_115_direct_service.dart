@@ -1251,58 +1251,78 @@ class Local115DirectService extends ChangeNotifier {
   Future<FileDirectoryListing> list115Directory({
     required String cid,
     String mountId = 'builtin_115',
+    int maxPages = 15,
   }) async {
     await ensureInitialized();
     if (!hasLocalCookie) {
       throw const ApiException('请先扫码或使用 Cookie 登录 115 网盘账号');
     }
     final cleanCid = (cid.isEmpty || cid == '/') ? '0' : cid;
-    final candidateUrls = <String>[
-      'https://webapi.115.com/files?aid=1&cid=$cleanCid&o=user_ptime&asc=0&offset=0&limit=100&show_dir=1&format=json',
-      'https://aps.115.com/natsort/files.php?aid=1&cid=$cleanCid&o=file_name&asc=1&offset=0&limit=100&show_dir=1&natsort=1&format=json',
-      'https://webapi.115.com/files?aid=1&cid=$cleanCid&o=user_ptime&asc=0&offset=0&limit=40&show_dir=1&format=json',
-      'https://proapi.115.com/android/2.0/ufile/files?aid=1&cid=$cleanCid&o=user_ptime&asc=0&offset=0&limit=100&show_dir=1',
-    ];
+    const pageLimit = 115;
 
     Map<String, dynamic>? root;
-    List<dynamic>? rawItems;
+    final allRawItems = <dynamic>[];
     bool anyStateOk = false;
-    for (final urlStr in candidateUrls) {
-      try {
-        final res = await _getJson(
-          Uri.parse(urlStr),
-          timeout: const Duration(seconds: 15),
-        );
-        if (res is Map<String, dynamic>) {
-          root ??= res;
-          final stateVal = res['state'];
-          final isStateOk = stateVal == true ||
-              (int.tryParse((stateVal ?? 0).toString()) ?? 0) == 1;
-          final errNo = int.tryParse(
-                (res['errNo'] ?? res['errno'] ?? res['errCode'] ?? 0)
-                    .toString(),
-              ) ??
-              0;
-          if (isStateOk) {
-            anyStateOk = true;
-            root = res;
-          }
-          if (res['data'] is List) {
-            final arr = res['data'] as List;
-            if (arr.isNotEmpty) {
-              root = res;
-              rawItems = arr;
+
+    for (var page = 0; page < maxPages; page++) {
+      final offset = page * pageLimit;
+      final candidateUrls = <String>[
+        'https://webapi.115.com/files?aid=1&cid=$cleanCid&o=user_ptime&asc=0&offset=$offset&limit=$pageLimit&show_dir=1&format=json',
+        'https://aps.115.com/natsort/files.php?aid=1&cid=$cleanCid&o=file_name&asc=1&offset=$offset&limit=$pageLimit&show_dir=1&natsort=1&format=json',
+        'https://proapi.115.com/android/2.0/ufile/files?aid=1&cid=$cleanCid&o=user_ptime&asc=0&offset=$offset&limit=$pageLimit&show_dir=1',
+      ];
+
+      List<dynamic>? pageItems;
+      int totalCount = 0;
+      for (final urlStr in candidateUrls) {
+        try {
+          final res = await _getJson(
+            Uri.parse(urlStr),
+            timeout: const Duration(seconds: 15),
+          );
+          if (res is Map<String, dynamic>) {
+            root ??= res;
+            final stateVal = res['state'];
+            final isStateOk = stateVal == true ||
+                (int.tryParse((stateVal ?? 0).toString()) ?? 0) == 1;
+            final errNo = int.tryParse(
+                  (res['errNo'] ?? res['errno'] ?? res['errCode'] ?? 0)
+                      .toString(),
+                ) ??
+                0;
+            if (isStateOk) {
               anyStateOk = true;
-              break;
-            } else if (isStateOk && errNo == 0) {
               root = res;
-              rawItems = const [];
-              break;
+            }
+            totalCount = int.tryParse((res['count'] ?? 0).toString()) ?? 0;
+            if (res['data'] is List) {
+              final arr = res['data'] as List;
+              if (arr.isNotEmpty) {
+                root = res;
+                pageItems = arr;
+                anyStateOk = true;
+                break;
+              } else if (isStateOk && errNo == 0) {
+                root = res;
+                pageItems = const [];
+                break;
+              }
             }
           }
-        }
-      } catch (_) {}
+        } catch (_) {}
+      }
+
+      if (pageItems == null || pageItems.isEmpty) {
+        break;
+      }
+      allRawItems.addAll(pageItems);
+      if (pageItems.length < 40 ||
+          (totalCount > 0 && allRawItems.length >= totalCount)) {
+        break;
+      }
     }
+
+    final List<dynamic>? rawItems = allRawItems.isEmpty ? null : allRawItems;
 
     if ((rawItems == null || rawItems.isEmpty) && !anyStateOk && root != null) {
       final errNo = int.tryParse(
@@ -1356,6 +1376,7 @@ class Local115DirectService extends ChangeNotifier {
     }
 
     final entries = <FileEntry>[];
+    final seenEntryKeys = <String>{};
     if (rawItems != null) {
       for (final item in rawItems) {
         if (item is! Map<String, dynamic>) continue;
@@ -1395,6 +1416,9 @@ class Local115DirectService extends ChangeNotifier {
         }
         final thumb = (item['u'] ?? '').toString();
         final entryPath = isDir ? itemCid : (hasValidFid ? fid : pickcode);
+        if (!seenEntryKeys.add('${isDir ? "D" : "F"}::$entryPath::$name')) {
+          continue;
+        }
         if (isDir) {
           _cidParentMap[itemCid] = cleanCid;
           _cidNameMap[itemCid] = name;

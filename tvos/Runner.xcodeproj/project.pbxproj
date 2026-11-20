@@ -13,7 +13,10 @@
 		A10000040000000000000001 /* TvAppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000040000000000000001 /* TvAppState.swift */; };
 		A10000050000000000000001 /* TvPlayerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000050000000000000001 /* TvPlayerView.swift */; };
 		A10000060000000000000001 /* AppIcon.png in Resources */ = {isa = PBXBuildFile; fileRef = A20000060000000000000001 /* AppIcon.png */; };
+		A10000070000000000000001 /* AppIcon@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = A20000090000000000000001 /* AppIcon@2x.png */; };
 		A10000080000000000000001 /* TopShelfWide.png in Resources */ = {isa = PBXBuildFile; fileRef = A20000080000000000000001 /* TopShelfWide.png */; };
+		A10000090000000000000001 /* TopShelfWide@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = A20000100000000000000001 /* TopShelfWide@2x.png */; };
+		A10000100000000000000001 /* Assets.car in Resources */ = {isa = PBXBuildFile; fileRef = A20000110000000000000001 /* Assets.car */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -26,6 +29,9 @@
 		A20000060000000000000001 /* AppIcon.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = AppIcon.png; sourceTree = "<group>"; };
 		A20000070000000000000001 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A20000080000000000000001 /* TopShelfWide.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = TopShelfWide.png; sourceTree = "<group>"; };
+		A20000090000000000000001 /* AppIcon@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon@2x.png"; sourceTree = "<group>"; };
+		A20000100000000000000001 /* TopShelfWide@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "TopShelfWide@2x.png"; sourceTree = "<group>"; };
+		A20000110000000000000001 /* Assets.car */ = {isa = PBXFileReference; lastKnownFileType = file; path = Assets.car; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -56,7 +62,10 @@
 				A20000040000000000000001 /* TvAppState.swift */,
 				A20000050000000000000001 /* TvPlayerView.swift */,
 				A20000060000000000000001 /* AppIcon.png */,
+				A20000090000000000000001 /* AppIcon@2x.png */,
 				A20000080000000000000001 /* TopShelfWide.png */,
+				A20000100000000000000001 /* TopShelfWide@2x.png */,
+				A20000110000000000000001 /* Assets.car */,
 				A20000070000000000000001 /* Info.plist */,
 			);
 			path = Runner;
@@ -130,7 +139,10 @@
 			buildActionMask = 2147483647;
 			files = (
 				A10000060000000000000001 /* AppIcon.png in Resources */,
+				A10000070000000000000001 /* AppIcon@2x.png in Resources */,
 				A10000080000000000000001 /* TopShelfWide.png in Resources */,
+				A10000090000000000000001 /* TopShelfWide@2x.png in Resources */,
+				A10000100000000000000001 /* Assets.car in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -196,14 +208,14 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 34;
+				CURRENT_PROJECT_VERSION = 38;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Runner/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.2.1;
+				MARKETING_VERSION = 1.2.3;
 				PRODUCT_BUNDLE_IDENTIFIER = com.linsion.m3u8Client.tvos;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = appletvos;
@@ -218,14 +230,14 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 34;
+				CURRENT_PROJECT_VERSION = 38;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Runner/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.2.1;
+				MARKETING_VERSION = 1.2.3;
 				PRODUCT_BUNDLE_IDENTIFIER = com.linsion.m3u8Client.tvos;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = appletvos;

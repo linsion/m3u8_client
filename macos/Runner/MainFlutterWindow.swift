@@ -1,7 +1,9 @@
 import AVKit
 import Cocoa
+import CoreImage
 import FlutterMacOS
 import GameController
+import MediaPlayer
 import UserNotifications
 
 /// Transparent AppKit drag-destination overlay view placed over FlutterView.
@@ -43,7 +45,11 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
   private let channelName = "com.linsion.m3u8_client/tv_platform"
   private var notificationsChannel: FlutterMethodChannel?
   private var utilsChannel: FlutterMethodChannel?
+  private var mediaSessionChannel: FlutterMethodChannel?
   private var dropOverlayView: MacFileDropOverlayView?
+  private var remoteCommandsConfigured = false
+  private var cachedNowPlayingArtwork: MPMediaItemArtwork?
+  private var cachedNowPlayingTrackTitle: String = ""
 
   override func awakeFromNib() {
     let flutterViewController = FlutterViewController()
@@ -132,6 +138,36 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
       self?.handleNotificationMethodCall(call: call, result: result)
     }
 
+    let mediaChannel = FlutterMethodChannel(
+      name: "com.linsion.m3u8_client/media_session",
+      binaryMessenger: flutterViewController.engine.binaryMessenger
+    )
+    self.mediaSessionChannel = mediaChannel
+    mediaChannel.setMethodCallHandler { [weak self] call, result in
+      self?.handleMediaSessionMethodCall(call: call, result: result)
+    }
+    configureMacRemoteCommands()
+
+    let qrChannel = FlutterMethodChannel(
+      name: "com.linsion.m3u8_client/qr_scanner",
+      binaryMessenger: flutterViewController.engine.binaryMessenger
+    )
+    qrChannel.setMethodCallHandler { call, result in
+      switch call.method {
+      case "generateQrPng":
+        let args = call.arguments as? [String: Any]
+        let content = (args?["content"] as? String) ?? ""
+        let size = CGFloat((args?["size"] as? Int) ?? 360)
+        if let pngData = Self.generateMacQrPngData(content: content, size: size) {
+          result(FlutterStandardTypedData(bytes: pngData))
+        } else {
+          result(nil)
+        }
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    }
+
     RegisterGeneratedPlugins(registry: flutterViewController)
 
     super.awakeFromNib()
@@ -163,6 +199,130 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
       DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
         picker.removeFromSuperview()
       }
+    }
+  }
+
+  private static func generateMacQrPngData(content: String, size: CGFloat) -> Data? {
+    guard !content.isEmpty,
+          let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
+    filter.setValue(Data(content.utf8), forKey: "inputMessage")
+    filter.setValue("M", forKey: "inputCorrectionLevel")
+    guard let ciImg = filter.outputImage else { return nil }
+    let scale = max(1.0, size / max(1.0, ciImg.extent.width))
+    let transformed = ciImg.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+    let rep = NSCIImageRep(ciImage: transformed)
+    let nsImg = NSImage(size: rep.size)
+    nsImg.addRepresentation(rep)
+    guard let tiff = nsImg.tiffRepresentation,
+          let bmp = NSBitmapImageRep(data: tiff) else { return nil }
+    return bmp.representation(using: .png, properties: [:])
+  }
+
+  private func configureMacRemoteCommands() {
+    guard !remoteCommandsConfigured else { return }
+    remoteCommandsConfigured = true
+    let commandCenter = MPRemoteCommandCenter.shared()
+    commandCenter.playCommand.isEnabled = true
+    commandCenter.playCommand.addTarget { [weak self] _ in
+      self?.sendMediaCommandToFlutter(action: "play")
+      return .success
+    }
+    commandCenter.pauseCommand.isEnabled = true
+    commandCenter.pauseCommand.addTarget { [weak self] _ in
+      self?.sendMediaCommandToFlutter(action: "pause")
+      return .success
+    }
+    commandCenter.togglePlayPauseCommand.isEnabled = true
+    commandCenter.togglePlayPauseCommand.addTarget { [weak self] _ in
+      self?.sendMediaCommandToFlutter(action: "togglePlayPause")
+      return .success
+    }
+    commandCenter.nextTrackCommand.isEnabled = true
+    commandCenter.nextTrackCommand.addTarget { [weak self] _ in
+      self?.sendMediaCommandToFlutter(action: "next")
+      return .success
+    }
+    commandCenter.previousTrackCommand.isEnabled = true
+    commandCenter.previousTrackCommand.addTarget { [weak self] _ in
+      self?.sendMediaCommandToFlutter(action: "previous")
+      return .success
+    }
+    commandCenter.stopCommand.isEnabled = true
+    commandCenter.stopCommand.addTarget { [weak self] _ in
+      self?.sendMediaCommandToFlutter(action: "stop")
+      return .success
+    }
+    commandCenter.changePlaybackPositionCommand.isEnabled = true
+    commandCenter.changePlaybackPositionCommand.addTarget { [weak self] event in
+      guard let posEvent = event as? MPChangePlaybackPositionCommandEvent else {
+        return .commandFailed
+      }
+      self?.sendMediaCommandToFlutter(action: "seek", positionMs: Int(posEvent.positionTime * 1000.0))
+      return .success
+    }
+  }
+
+  private func sendMediaCommandToFlutter(action: String, positionMs: Int? = nil) {
+    DispatchQueue.main.async { [weak self] in
+      var payload: [String: Any] = ["action": action]
+      if let posMs = positionMs {
+        payload["positionMs"] = posMs
+      }
+      self?.mediaSessionChannel?.invokeMethod("onMediaCommand", arguments: payload)
+    }
+  }
+
+  private func handleMediaSessionMethodCall(call: FlutterMethodCall, result: @escaping FlutterResult) {
+    switch call.method {
+    case "updateMediaSession":
+      guard let args = call.arguments as? [String: Any] else {
+        result(false)
+        return
+      }
+      let title = (args["title"] as? String) ?? "流光云端音乐"
+      let artist = (args["artist"] as? String) ?? "流光播放器"
+      let album = (args["album"] as? String) ?? ""
+      let isPlaying = (args["isPlaying"] as? Bool) ?? false
+      let positionMs = (args["positionMs"] as? NSNumber)?.doubleValue ?? 0.0
+      let durationMs = (args["durationMs"] as? NSNumber)?.doubleValue ?? 0.0
+      let speed = (args["speed"] as? NSNumber)?.doubleValue ?? 1.0
+
+      if title != cachedNowPlayingTrackTitle {
+        cachedNowPlayingTrackTitle = title
+        cachedNowPlayingArtwork = nil
+      }
+      if let typedBytes = args["coverBytes"] as? FlutterStandardTypedData,
+         let img = NSImage(data: typedBytes.data) {
+        cachedNowPlayingArtwork = MPMediaItemArtwork(boundsSize: img.size) { _ in img }
+      }
+
+      var nowPlayingInfo: [String: Any] = [
+        MPMediaItemPropertyTitle: title,
+        MPMediaItemPropertyArtist: artist,
+        MPMediaItemPropertyAlbumTitle: album,
+        MPNowPlayingInfoPropertyElapsedPlaybackTime: max(0.0, positionMs / 1000.0),
+        MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? speed : 0.0,
+        MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0,
+      ]
+      if durationMs > 0 {
+        nowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = durationMs / 1000.0
+      }
+      if let artwork = cachedNowPlayingArtwork {
+        nowPlayingInfo[MPMediaItemPropertyArtwork] = artwork
+      }
+      MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlayingInfo
+      MPNowPlayingInfoCenter.default().playbackState = isPlaying ? .playing : .paused
+      result(true)
+
+    case "clearMediaSession":
+      cachedNowPlayingTrackTitle = ""
+      cachedNowPlayingArtwork = nil
+      MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+      MPNowPlayingInfoCenter.default().playbackState = .stopped
+      result(true)
+
+    default:
+      result(FlutterMethodNotImplemented)
     }
   }
 

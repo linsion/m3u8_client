@@ -674,7 +674,16 @@ struct TvSavedMusicFolderItem: Codable, Identifiable, Hashable {
   var pickcode115: String
 }
 
-struct TvFileEntry: Identifiable, Hashable {
+struct TvSavedMusicPlaylist: Codable, Identifiable, Hashable {
+  var id: String
+  var name: String
+  var tracks: [TvFileEntry]
+  var sources: [TvSavedMusicFolderItem]
+  var currentIndex: Int
+  var updatedEpochMs: Int64
+}
+
+struct TvFileEntry: Codable, Identifiable, Hashable {
   var id: String { "\(mountId)::\(path)" }
   let name: String
   let path: String

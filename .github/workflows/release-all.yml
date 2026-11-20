@@ -7,15 +7,15 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Release tag version (e.g. v1.1.1)'
+        description: 'Release tag version (e.g. v1.2.3)'
         required: false
-        default: 'v1.1.1'
+        default: 'v1.2.3'
 
 permissions:
   contents: write
 
 env:
-  VERSION_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v1.1.1' }}
+  VERSION_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v1.2.3' }}
 
 jobs:
   build-android:
@@ -30,13 +30,60 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
-      - name: Build Universal, Split-ABI APKs & AppBundle
+      - name: Configure Gradle Maven Central Mirror & Build Android Artifacts
         run: |
           BUILD_NAME="${VERSION_TAG#v}"
           BUILD_NUM=$((100 + GITHUB_RUN_NUMBER))
+          mkdir -p ~/.gradle/init.d
+          cat << 'EOF' > ~/.gradle/init.d/maven-central.init.gradle.kts
+          beforeSettings {
+              pluginManagement {
+                  repositories {
+                      google()
+                      mavenCentral()
+                      gradlePluginPortal()
+                  }
+              }
+          }
+          settingsEvaluated {
+              pluginManagement {
+                  repositories {
+                      google()
+                      mavenCentral()
+                      gradlePluginPortal()
+                  }
+              }
+          }
+          allprojects {
+              buildscript {
+                  repositories {
+                      google()
+                      mavenCentral()
+                      gradlePluginPortal()
+                  }
+              }
+          }
+          EOF
+          FLUTTER_GRADLE_SETTINGS="$(dirname $(dirname $(which flutter)))/packages/flutter_tools/gradle/settings.gradle.kts"
+          if [ -f "$FLUTTER_GRADLE_SETTINGS" ] && ! grep -q "pluginManagement" "$FLUTTER_GRADLE_SETTINGS"; then
+            TMP_SETTINGS="$(mktemp)"
+            cat << 'EOF' > "$TMP_SETTINGS"
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          EOF
+            cat "$FLUTTER_GRADLE_SETTINGS" >> "$TMP_SETTINGS"
+            cp "$TMP_SETTINGS" "$FLUTTER_GRADLE_SETTINGS"
+          fi
           flutter pub get
           flutter build apk --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM"
+          (cd android && ./gradlew --stop || true)
           flutter build apk --split-per-abi --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM"
+          (cd android && ./gradlew --stop || true)
           flutter build appbundle --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM"
           mkdir -p dist
           cp build/app/outputs/flutter-apk/app-release.apk "dist/LiuguangVideo-Android-Universal-${VERSION_TAG}.apk"
@@ -99,7 +146,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO build; then
             TVOS_SDK_PATH="$(xcrun --sdk appletvos --show-sdk-path)"
             mkdir -p "$TVOS_APP_PATH"
-            cp -f tvos/Runner/AppIcon.png tvos/Runner/TopShelfWide.png "$TVOS_APP_PATH/" 2>/dev/null || true
+            cp -f tvos/Runner/Assets.car tvos/Runner/AppIcon.png tvos/Runner/AppIcon@2x.png tvos/Runner/TopShelfWide.png tvos/Runner/TopShelfWide@2x.png "$TVOS_APP_PATH/" 2>/dev/null || true
             cp -f tvos/Runner/Info.plist "$TVOS_APP_PATH/Info.plist"
             /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable Runner" "$TVOS_APP_PATH/Info.plist" || true
             /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.linsion.m3u8Client.tvos" "$TVOS_APP_PATH/Info.plist" || true
@@ -119,6 +166,7 @@ jobs:
               tvos/Runner/AppDelegate.swift \
               -o "$TVOS_APP_PATH/Runner"
           fi
+          cp -f tvos/Runner/Assets.car tvos/Runner/AppIcon.png tvos/Runner/AppIcon@2x.png tvos/Runner/TopShelfWide.png tvos/Runner/TopShelfWide@2x.png "$TVOS_APP_PATH/" 2>/dev/null || true
           IPA_STAGE="$(mktemp -d)"
           mkdir -p "$IPA_STAGE/Payload"
           cp -R "$TVOS_APP_PATH" "$IPA_STAGE/Payload/Runner.app"

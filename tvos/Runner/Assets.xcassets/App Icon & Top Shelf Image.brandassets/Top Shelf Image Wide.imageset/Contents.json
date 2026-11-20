@@ -1,12 +1,12 @@
 {
   "images" : [
     {
-      "filename" : "top_shelf_960x360.png",
+      "filename" : "top_shelf_2320x720.png",
       "idiom" : "tv",
       "scale" : "1x"
     },
     {
-      "filename" : "top_shelf_960x360.png",
+      "filename" : "top_shelf_4640x1440.png",
       "idiom" : "tv",
       "scale" : "2x"
     }

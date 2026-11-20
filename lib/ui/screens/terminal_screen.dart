@@ -407,16 +407,18 @@ class _TerminalScreenState extends State<TerminalScreen> {
   List<TerminalHostProfile> _hostProfiles = [];
   String _selectedProfileIdForNewConnect = 'builtin_backend_ws';
 
-  double _fontSize = 14.0;
+  double _fontSize = (Platform.isIOS || Platform.isAndroid) ? 12.5 : 14.0;
   String _terminalThemeId = 'ocean';
   bool _broadcastToAllTabs = false;
   TerminalCursorType _cursorType = TerminalCursorType.block;
 
-  // Toggleable panels (SFTP Explorer, Live Metrics, Virtual Keys, Command Composer)
+  // Toggleable panels (SFTP Explorer, Live Metrics, Virtual Keys, Command Composer, Quick Snippets)
   bool _showSftpPanel = true;
+  int _mobilePageIndex = 0; // 0: 命令行终端页, 1: SFTP 文件管理页
   bool _showLiveMetricsBar = true;
   bool _showVirtualKeysBar = true;
   bool _showCommandComposerBar = true;
+  bool _showQuickSnippetsBar = true;
   bool _ctrlLocked = false;
   bool _altLocked = false;
 
@@ -786,19 +788,13 @@ class _TerminalScreenState extends State<TerminalScreen> {
     );
 
     session.terminal.write(
-      '\x1b[38;2;121;221;208m╭──────────────────────────────────────────────────────────────╮\x1b[0m\r\n',
+      '\x1b[38;2;121;221;208m● 流光终端 & SFTP 工作台 (${session.label})\x1b[0m\r\n',
     );
     session.terminal.write(
-      '\x1b[38;2;121;221;208m│  流光全功能终端 & SFTP 工作台 (${session.label})\x1b[0m\r\n',
+      '\x1b[38;2;121;221;208m  目标主机: ${targetProfile.subtitle}\x1b[0m\r\n',
     );
     session.terminal.write(
-      '\x1b[38;2;121;221;208m│  目标主机: ${targetProfile.subtitle}\x1b[0m\r\n',
-    );
-    session.terminal.write(
-      '\x1b[38;2;121;221;208m│  当前状态: 默认待连接（点击上方「连接终端」或下方主机卡片启动）\x1b[0m\r\n',
-    );
-    session.terminal.write(
-      '\x1b[38;2;121;221;208m╰──────────────────────────────────────────────────────────────╯\x1b[0m\r\n',
+      '\x1b[38;2;121;221;208m  当前状态: 待连接 (点击连接按钮或主机卡片启动)\x1b[0m\r\n',
     );
 
     setState(() {
@@ -2293,235 +2289,316 @@ echo "KERN:$(uname -sr 2>/dev/null)"
 
     await showDialog<void>(
       context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setModalState) => AlertDialog(
-          backgroundColor: VideoPlatformTheme.bgElevated,
-          title: Row(
-            children: [
-              Icon(
-                Icons.dns_rounded,
-                color: VideoPlatformTheme.accent,
-                size: 20,
-              ),
-              const SizedBox(width: 8),
-              Text(
-                existing == null ? '添加 SSH2 / SFTP 远程服务器主机' : '编辑主机：${existing.name}',
-                style: const TextStyle(fontSize: 15.5, fontWeight: FontWeight.w700),
-              ),
-            ],
-          ),
-          content: SizedBox(
-            width: 560,
-            child: SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Expanded(
-                        flex: 2,
-                        child: TextField(
-                          controller: nameCtrl,
-                          decoration: const InputDecoration(
-                            labelText: '主机名称 (如 阿里云生产服 / 群晖 NAS)',
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: TextField(
-                          controller: groupCtrl,
-                          decoration: const InputDecoration(
-                            labelText: '分组标签',
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 10),
-                  Row(
-                    children: [
-                      Expanded(
-                        flex: 3,
-                        child: TextField(
-                          controller: hostCtrl,
-                          decoration: const InputDecoration(
-                            labelText: '主机 IP 或域名 (例如 192.168.1.10)',
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: TextField(
-                          controller: portCtrl,
-                          keyboardType: TextInputType.number,
-                          decoration: const InputDecoration(
-                            labelText: 'SSH 端口',
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 10),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: TextField(
-                          controller: userCtrl,
-                          decoration: const InputDecoration(
-                            labelText: '登录用户名 (如 root)',
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      ChoiceChip(
-                        label: const Text('密码认证'),
-                        selected: authType == 'password',
-                        onSelected: (_) =>
-                            setModalState(() => authType = 'password'),
-                      ),
-                      const SizedBox(width: 8),
-                      ChoiceChip(
-                        label: const Text('SSH 私钥 (PEM)'),
-                        selected: authType == 'privateKey',
-                        onSelected: (_) =>
-                            setModalState(() => authType = 'privateKey'),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 10),
-                  if (authType == 'password')
-                    TextField(
-                      controller: passCtrl,
-                      obscureText: true,
-                      decoration: const InputDecoration(
-                        labelText: 'SSH 登录密码',
-                      ),
-                    )
-                  else ...[
-                    TextField(
-                      controller: keyCtrl,
-                      maxLines: 4,
-                      style: const TextStyle(
-                        fontSize: 11.5,
-                        fontFamily: 'monospace',
-                      ),
-                      decoration: const InputDecoration(
-                        labelText:
-                            '粘贴私钥内容 (-----BEGIN OPENSSH/RSA PRIVATE KEY-----)',
-                      ),
+      builder: (ctx) {
+        final dialogScreenW = MediaQuery.sizeOf(ctx).width;
+        final isCompactModal = dialogScreenW < 640;
+        return StatefulBuilder(
+          builder: (ctx, setModalState) => AlertDialog(
+            backgroundColor: VideoPlatformTheme.bgElevated,
+            insetPadding: EdgeInsets.symmetric(
+              horizontal: isCompactModal ? 12 : 36,
+              vertical: isCompactModal ? 14 : 24,
+            ),
+            contentPadding: EdgeInsets.fromLTRB(
+              isCompactModal ? 14 : 24,
+              12,
+              isCompactModal ? 14 : 24,
+              8,
+            ),
+            title: Row(
+              children: [
+                Icon(
+                  Icons.dns_rounded,
+                  color: VideoPlatformTheme.accent,
+                  size: 20,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    existing == null
+                        ? '添加 SSH2 / SFTP 远程主机'
+                        : '编辑主机：${existing.name}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w700,
                     ),
-                    const SizedBox(height: 8),
-                    TextField(
-                      controller: phraseCtrl,
-                      obscureText: true,
-                      decoration: const InputDecoration(
-                        labelText: '私钥密码 Passphrase (无密码留空)',
+                  ),
+                ),
+              ],
+            ),
+            content: SizedBox(
+              width: 560,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (isCompactModal) ...[
+                      TextField(
+                        controller: nameCtrl,
+                        decoration: const InputDecoration(
+                          labelText: '主机名称 (如 阿里云生产服 / NAS)',
+                        ),
                       ),
+                      const SizedBox(height: 10),
+                      TextField(
+                        controller: groupCtrl,
+                        decoration: const InputDecoration(
+                          labelText: '分组标签',
+                        ),
+                      ),
+                    ] else
+                      Row(
+                        children: [
+                          Expanded(
+                            flex: 2,
+                            child: TextField(
+                              controller: nameCtrl,
+                              decoration: const InputDecoration(
+                                labelText: '主机名称 (如 阿里云生产服 / 群晖 NAS)',
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: TextField(
+                              controller: groupCtrl,
+                              decoration: const InputDecoration(
+                                labelText: '分组标签',
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          flex: 3,
+                          child: TextField(
+                            controller: hostCtrl,
+                            decoration: const InputDecoration(
+                              labelText: '主机 IP 或域名',
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: TextField(
+                            controller: portCtrl,
+                            keyboardType: TextInputType.number,
+                            decoration: const InputDecoration(
+                              labelText: '端口',
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
+                    const SizedBox(height: 10),
+                    if (isCompactModal) ...[
+                      TextField(
+                        controller: userCtrl,
+                        decoration: const InputDecoration(
+                          labelText: '登录用户名 (如 root)',
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 6,
+                        children: [
+                          ChoiceChip(
+                            label: const Text('密码认证'),
+                            selected: authType == 'password',
+                            onSelected: (_) =>
+                                setModalState(() => authType = 'password'),
+                          ),
+                          ChoiceChip(
+                            label: const Text('SSH 私钥 (PEM)'),
+                            selected: authType == 'privateKey',
+                            onSelected: (_) =>
+                                setModalState(() => authType = 'privateKey'),
+                          ),
+                        ],
+                      ),
+                    ] else
+                      Row(
+                        children: [
+                          Expanded(
+                            child: TextField(
+                              controller: userCtrl,
+                              decoration: const InputDecoration(
+                                labelText: '登录用户名 (如 root)',
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          ChoiceChip(
+                            label: const Text('密码认证'),
+                            selected: authType == 'password',
+                            onSelected: (_) =>
+                                setModalState(() => authType = 'password'),
+                          ),
+                          const SizedBox(width: 8),
+                          ChoiceChip(
+                            label: const Text('SSH 私钥 (PEM)'),
+                            selected: authType == 'privateKey',
+                            onSelected: (_) =>
+                                setModalState(() => authType = 'privateKey'),
+                          ),
+                        ],
+                      ),
+                    const SizedBox(height: 10),
+                    if (authType == 'password')
+                      TextField(
+                        controller: passCtrl,
+                        obscureText: true,
+                        decoration: const InputDecoration(
+                          labelText: 'SSH 登录密码',
+                        ),
+                      )
+                    else ...[
+                      TextField(
+                        controller: keyCtrl,
+                        maxLines: 4,
+                        style: const TextStyle(
+                          fontSize: 11.5,
+                          fontFamily: 'monospace',
+                        ),
+                        decoration: const InputDecoration(
+                          labelText:
+                              '粘贴私钥内容 (-----BEGIN OPENSSH/RSA PRIVATE KEY-----)',
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: phraseCtrl,
+                        obscureText: true,
+                        decoration: const InputDecoration(
+                          labelText: '私钥密码 Passphrase (无密码留空)',
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 10),
+                    if (isCompactModal) ...[
+                      TextField(
+                        controller: sftpPathCtrl,
+                        decoration: const InputDecoration(
+                          labelText: 'SFTP 默认起始目录 (如 /root 或 /)',
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      TextField(
+                        controller: startupCmdCtrl,
+                        decoration: const InputDecoration(
+                          labelText: '连接后自动执行命令 (选填)',
+                        ),
+                      ),
+                    ] else
+                      Row(
+                        children: [
+                          Expanded(
+                            child: TextField(
+                              controller: sftpPathCtrl,
+                              decoration: const InputDecoration(
+                                labelText: 'SFTP 默认起始目录 (如 /root 或 /)',
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: TextField(
+                              controller: startupCmdCtrl,
+                              decoration: const InputDecoration(
+                                labelText: '连接后自动执行命令 (选填)',
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
                   ],
-                  const SizedBox(height: 10),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: TextField(
-                          controller: sftpPathCtrl,
-                          decoration: const InputDecoration(
-                            labelText: 'SFTP 默认起始目录 (如 /root 或 /)',
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: TextField(
-                          controller: startupCmdCtrl,
-                          decoration: const InputDecoration(
-                            labelText: '连接后自动执行命令 (选填)',
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
+                ),
               ),
             ),
-          ),
-          actions: [
-            if (existing != null && !existing.isBuiltIn)
-              TextButton(
-                style: TextButton.styleFrom(
-                  foregroundColor: VideoPlatformTheme.danger,
+            actions: [
+              if (existing != null && !existing.isBuiltIn)
+                TextButton(
+                  style: TextButton.styleFrom(
+                    foregroundColor: VideoPlatformTheme.danger,
+                  ),
+                  onPressed: () async {
+                    Navigator.of(ctx).pop();
+                    setState(() {
+                      _hostProfiles.removeWhere((h) => h.id == existing.id);
+                      if (_selectedProfileIdForNewConnect == existing.id) {
+                        _selectedProfileIdForNewConnect = 'builtin_backend_ws';
+                      }
+                    });
+                    await _persistCustomHosts();
+                  },
+                  child: const Text('删除主机'),
                 ),
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(),
+                child: const Text('取消'),
+              ),
+              FilledButton.icon(
                 onPressed: () async {
+                  final host = hostCtrl.text.trim();
+                  if (host.isEmpty) return;
+                  final port = int.tryParse(portCtrl.text.trim()) ?? 22;
+                  final user = userCtrl.text.trim().isEmpty
+                      ? 'root'
+                      : userCtrl.text.trim();
+                  final name = nameCtrl.text.trim().isEmpty
+                      ? '$user@$host'
+                      : nameCtrl.text.trim();
+                  final newProfile = TerminalHostProfile(
+                    id: existing?.id ??
+                        'ssh_${DateTime.now().millisecondsSinceEpoch}',
+                    name: name,
+                    group: groupCtrl.text.trim().isEmpty
+                        ? '默认分组'
+                        : groupCtrl.text.trim(),
+                    kind: TerminalHostKind.ssh2,
+                    host: host,
+                    port: port,
+                    username: user,
+                    authType: authType,
+                    password: passCtrl.text,
+                    privateKeyPem: keyCtrl.text.trim(),
+                    passphrase: phraseCtrl.text,
+                    initialSftpPath: sftpPathCtrl.text.trim().isEmpty
+                        ? '/'
+                        : sftpPathCtrl.text.trim(),
+                    startupCommand: startupCmdCtrl.text.trim(),
+                  );
                   Navigator.of(ctx).pop();
                   setState(() {
-                    _hostProfiles.removeWhere((h) => h.id == existing.id);
-                    if (_selectedProfileIdForNewConnect == existing.id) {
-                      _selectedProfileIdForNewConnect = 'builtin_backend_ws';
+                    final idx = _hostProfiles
+                        .indexWhere((h) => h.id == newProfile.id);
+                    if (idx >= 0) {
+                      _hostProfiles[idx] = newProfile;
+                    } else {
+                      _hostProfiles.add(newProfile);
+                    }
+                    _selectedProfileIdForNewConnect = newProfile.id;
+                    if (!_activeTab.isConnected && !_activeTab.isConnecting) {
+                      _activeTab.hostProfile = newProfile;
+                      _activeTab.label = '${newProfile.name} #${_activeTab.id}';
                     }
                   });
                   await _persistCustomHosts();
                 },
-                child: const Text('删除主机'),
+                icon: const Icon(Icons.save_rounded, size: 16),
+                label: const Text('保存配置'),
               ),
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
-              child: const Text('取消'),
-            ),
-            FilledButton.icon(
-              onPressed: () async {
-                final host = hostCtrl.text.trim();
-                if (host.isEmpty) return;
-                final port = int.tryParse(portCtrl.text.trim()) ?? 22;
-                final user =
-                    userCtrl.text.trim().isEmpty ? 'root' : userCtrl.text.trim();
-                final name = nameCtrl.text.trim().isEmpty
-                    ? '$user@$host'
-                    : nameCtrl.text.trim();
-                final newProfile = TerminalHostProfile(
-                  id: existing?.id ??
-                      'ssh_${DateTime.now().millisecondsSinceEpoch}',
-                  name: name,
-                  group: groupCtrl.text.trim().isEmpty
-                      ? '默认分组'
-                      : groupCtrl.text.trim(),
-                  kind: TerminalHostKind.ssh2,
-                  host: host,
-                  port: port,
-                  username: user,
-                  authType: authType,
-                  password: passCtrl.text,
-                  privateKeyPem: keyCtrl.text.trim(),
-                  passphrase: phraseCtrl.text,
-                  initialSftpPath: sftpPathCtrl.text.trim().isEmpty
-                      ? '/'
-                      : sftpPathCtrl.text.trim(),
-                  startupCommand: startupCmdCtrl.text.trim(),
-                );
-                Navigator.of(ctx).pop();
-                setState(() {
-                  final idx =
-                      _hostProfiles.indexWhere((h) => h.id == newProfile.id);
-                  if (idx >= 0) {
-                    _hostProfiles[idx] = newProfile;
-                  } else {
-                    _hostProfiles.add(newProfile);
-                  }
-                  _selectedProfileIdForNewConnect = newProfile.id;
-                  if (!_activeTab.isConnected && !_activeTab.isConnecting) {
-                    _activeTab.hostProfile = newProfile;
-                    _activeTab.label = '${newProfile.name} #${_activeTab.id}';
-                  }
-                });
-                await _persistCustomHosts();
-              },
-              icon: const Icon(Icons.save_rounded, size: 16),
-              label: const Text('保存主机配置'),
-            ),
-          ],
-        ),
-      ),
+            ],
+          ),
+        );
+      },
     );
   }
 
@@ -2669,6 +2746,7 @@ echo "KERN:$(uname -sr 2>/dev/null)"
     final tab = _activeTab;
     final screenW = MediaQuery.sizeOf(context).width;
     final isWideScreen = screenW >= 960;
+    final isMobile = screenW < 760;
 
     return CallbackShortcuts(
       bindings: <ShortcutActivator, VoidCallback>{
@@ -2700,7 +2778,7 @@ echo "KERN:$(uname -sr 2>/dev/null)"
       child: Column(
         children: [
           // 1. Top Multi-Tab, Host Selector & Action Toolbar
-          _buildTopToolbar(tab),
+          isMobile ? _buildMobileHeader(tab) : _buildTopToolbar(tab),
 
           // 2. Live Server Metrics Strip (CPU Load / RAM / Disk / Uptime)
           if (_showLiveMetricsBar &&
@@ -2708,57 +2786,774 @@ echo "KERN:$(uname -sr 2>/dev/null)"
               tab.hostProfile.kind == TerminalHostKind.ssh2)
             _buildLiveMetricsStrip(tab),
 
-          // 3. Inline Buffer Search Bar
-          if (_showSearchBar) _buildSearchBar(tab),
+          // 3. Inline Buffer Search Bar (only shown on Terminal tab on mobile)
+          if (_showSearchBar && (!isMobile || _mobilePageIndex == 0))
+            _buildSearchBar(tab, isMobile: isMobile),
 
           // 4. Quick DevOps Command Snippets Bar
-          _buildQuickSnippetsBar(tab),
+          if (_showQuickSnippetsBar &&
+              (!isMobile || (tab.isConnected && _mobilePageIndex == 0)))
+            _buildQuickSnippetsBar(tab, isMobile: isMobile),
 
-          // 5. Main Split View: Terminal Canvas + SFTP Visual File Explorer
+          // 5. Main View: Paged Tabs on Mobile (0: 终端命令行, 1: SFTP 文件管理) or Split View on Desktop
           Expanded(
-            child: _showSftpPanel
-                ? (isWideScreen
-                    ? Row(
-                        children: [
-                          Expanded(
-                            flex: 6,
-                            child: _buildTerminalStackArea(tab),
-                          ),
-                          Container(
-                            width: 1,
-                            color: VideoPlatformTheme.borderSubtle,
-                          ),
-                          SizedBox(
-                            width: (screenW * 0.36).clamp(350.0, 520.0),
-                            child: _buildSftpExplorerPane(tab),
-                          ),
-                        ],
-                      )
-                    : Column(
-                        children: [
-                          Expanded(
-                            flex: 5,
-                            child: _buildTerminalStackArea(tab),
-                          ),
-                          Divider(
-                            height: 1,
-                            color: VideoPlatformTheme.borderSubtle,
-                          ),
-                          Expanded(
-                            flex: 5,
-                            child: _buildSftpExplorerPane(tab),
-                          ),
-                        ],
-                      ))
-                : _buildTerminalStackArea(tab),
+            child: isMobile
+                ? IndexedStack(
+                    index: _mobilePageIndex,
+                    children: [
+                      _buildTerminalStackArea(tab, isMobile: true),
+                      _buildSftpExplorerPane(tab, isMobile: true),
+                    ],
+                  )
+                : (_showSftpPanel
+                    ? (isWideScreen
+                        ? Row(
+                            children: [
+                              Expanded(
+                                flex: 6,
+                                child: _buildTerminalStackArea(
+                                  tab,
+                                  isMobile: false,
+                                ),
+                              ),
+                              Container(
+                                width: 1,
+                                color: VideoPlatformTheme.borderSubtle,
+                              ),
+                              SizedBox(
+                                width: (screenW * 0.36).clamp(350.0, 520.0),
+                                child: _buildSftpExplorerPane(tab),
+                              ),
+                            ],
+                          )
+                        : Column(
+                            children: [
+                              Expanded(
+                                flex: 5,
+                                child: _buildTerminalStackArea(
+                                  tab,
+                                  isMobile: false,
+                                ),
+                              ),
+                              Divider(
+                                height: 1,
+                                color: VideoPlatformTheme.borderSubtle,
+                              ),
+                              Expanded(
+                                flex: 5,
+                                child: _buildSftpExplorerPane(tab),
+                              ),
+                            ],
+                          ))
+                    : _buildTerminalStackArea(tab, isMobile: false)),
           ),
 
           // 6. Virtual Modifier & Function Key Bar (ESC / TAB / CTRL / ALT / Arrows / Pipes)
-          if (_showVirtualKeysBar) _buildVirtualFunctionKeysBar(tab),
+          if (_showVirtualKeysBar &&
+              (!isMobile || (tab.isConnected && _mobilePageIndex == 0)))
+            _buildVirtualFunctionKeysBar(tab),
 
           // 7. Command History & Multi-line Script Composer Bar
-          if (_showCommandComposerBar) _buildCommandComposerBar(tab),
+          if (_showCommandComposerBar &&
+              (!isMobile || (tab.isConnected && _mobilePageIndex == 0)))
+            _buildCommandComposerBar(tab, isMobile: isMobile),
         ],
+      ),
+    );
+  }
+
+  Widget _buildMobileHeader(_TerminalTabSession tab) {
+    return Container(
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color: VideoPlatformTheme.bgElevated,
+        border: Border(
+          bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
+        ),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(10, 6, 8, 6),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (_tabs.length > 1) ...[
+                  SizedBox(
+                    height: 28,
+                    child: ListView.separated(
+                      scrollDirection: Axis.horizontal,
+                      itemCount: _tabs.length + 1,
+                      separatorBuilder: (_, __) => const SizedBox(width: 6),
+                      itemBuilder: (_, idx) {
+                        if (idx == _tabs.length) {
+                          return InkWell(
+                            borderRadius: BorderRadius.circular(6),
+                            onTap: () => _createNewTab(autoConnect: false),
+                            child: Container(
+                              padding:
+                                  const EdgeInsets.symmetric(horizontal: 8),
+                              decoration: BoxDecoration(
+                                color: VideoPlatformTheme.bgCard,
+                                borderRadius: BorderRadius.circular(6),
+                                border: Border.all(
+                                  color: VideoPlatformTheme.borderSubtle,
+                                ),
+                              ),
+                              child: Icon(
+                                Icons.add_rounded,
+                                size: 15,
+                                color: VideoPlatformTheme.textSecondary,
+                              ),
+                            ),
+                          );
+                        }
+                        final t = _tabs[idx];
+                        final selected = idx == _activeTabIndex;
+                        return InkWell(
+                          borderRadius: BorderRadius.circular(6),
+                          onTap: () {
+                            setState(() {
+                              _activeTabIndex = idx;
+                              _sftpPathCtrl.text = t.sftpCurrentPath;
+                            });
+                            t.focusNode.requestFocus();
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 9),
+                            decoration: BoxDecoration(
+                              color: selected
+                                  ? VideoPlatformTheme.accent
+                                      .withValues(alpha: 0.16)
+                                  : VideoPlatformTheme.bgCard,
+                              borderRadius: BorderRadius.circular(6),
+                              border: Border.all(
+                                color: selected
+                                    ? VideoPlatformTheme.accent
+                                    : VideoPlatformTheme.borderSubtle,
+                              ),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Container(
+                                  width: 6,
+                                  height: 6,
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    color: t.isConnected
+                                        ? VideoPlatformTheme.success
+                                        : (t.isConnecting
+                                            ? VideoPlatformTheme.warning
+                                            : VideoPlatformTheme.textMuted),
+                                  ),
+                                ),
+                                const SizedBox(width: 5),
+                                Text(
+                                  t.label,
+                                  style: TextStyle(
+                                    fontSize: 11.5,
+                                    fontWeight: selected
+                                        ? FontWeight.w700
+                                        : FontWeight.w500,
+                                    color: selected
+                                        ? VideoPlatformTheme.accent
+                                        : VideoPlatformTheme.textPrimary,
+                                  ),
+                                ),
+                                const SizedBox(width: 4),
+                                InkWell(
+                                  onTap: () => _closeTab(idx),
+                                  child: Icon(
+                                    Icons.close_rounded,
+                                    size: 13,
+                                    color: VideoPlatformTheme.textMuted,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                ],
+                Row(
+                  children: [
+                    // Compact Host Selector Pill
+                    Expanded(
+                      child: Container(
+                        height: 32,
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        decoration: BoxDecoration(
+                          color: VideoPlatformTheme.bgCard,
+                          borderRadius: BorderRadius.circular(7),
+                          border:
+                              Border.all(color: VideoPlatformTheme.borderSubtle),
+                        ),
+                        child: Row(
+                          children: [
+                            Container(
+                              width: 7,
+                              height: 7,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: tab.isConnected
+                                    ? VideoPlatformTheme.success
+                                    : (tab.isConnecting
+                                        ? VideoPlatformTheme.warning
+                                        : VideoPlatformTheme.textMuted),
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            Expanded(
+                              child: DropdownButtonHideUnderline(
+                                child: DropdownButton<String>(
+                                  value: _hostProfiles.any(
+                                    (h) => h.id == tab.hostProfile.id,
+                                  )
+                                      ? tab.hostProfile.id
+                                      : _hostProfiles.first.id,
+                                  isDense: true,
+                                  isExpanded: true,
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w700,
+                                    color: VideoPlatformTheme.textPrimary,
+                                  ),
+                                  dropdownColor: VideoPlatformTheme.bgElevated,
+                                  items: _hostProfiles.map((p) {
+                                    return DropdownMenuItem<String>(
+                                      value: p.id,
+                                      child: Text(
+                                        p.name,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    );
+                                  }).toList(),
+                                  onChanged: (newId) {
+                                    if (newId == null) return;
+                                    final prof = _resolveProfileById(newId);
+                                    setState(() {
+                                      _selectedProfileIdForNewConnect = newId;
+                                      if (!tab.isConnected &&
+                                          !tab.isConnecting) {
+                                        tab.hostProfile = prof;
+                                        tab.label = '${prof.name} #${tab.id}';
+                                        tab.sftpCurrentPath =
+                                            prof.initialSftpPath;
+                                        _sftpPathCtrl.text =
+                                            prof.initialSftpPath;
+                                      }
+                                    });
+                                  },
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+
+                    // Primary Connect / Disconnect Button
+                    if (tab.isConnected || tab.isConnecting)
+                      OutlinedButton(
+                        style: OutlinedButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(horizontal: 10),
+                          minimumSize: const Size(0, 32),
+                          foregroundColor: VideoPlatformTheme.danger,
+                          side: BorderSide(
+                            color: VideoPlatformTheme.danger
+                                .withValues(alpha: 0.45),
+                          ),
+                        ),
+                        onPressed: () => _disconnectTab(tab),
+                        child: const Text(
+                          '断开',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      )
+                    else
+                      FilledButton(
+                        style: FilledButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          minimumSize: const Size(0, 32),
+                          backgroundColor: VideoPlatformTheme.accent,
+                          foregroundColor: Colors.white,
+                        ),
+                        onPressed: () => _connectTab(tab),
+                        child: Text(
+                          tab.sessionCount > 0 ? '重连' : '连接',
+                          style: const TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                    const SizedBox(width: 2),
+
+                    // Quick Clear Button (when in terminal tab)
+                    if (_mobilePageIndex == 0)
+                      IconButton(
+                        visualDensity: VisualDensity.compact,
+                        tooltip: '清屏',
+                        onPressed: () => _clearTerminal(tab),
+                        icon: const Icon(
+                          Icons.cleaning_services_outlined,
+                          size: 18,
+                        ),
+                      ),
+
+                    // Mobile Tools & Settings Menu
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: '更多终端工具与设置',
+                      onPressed: () => _showMobileTerminalToolsSheet(tab),
+                      icon: const Icon(Icons.more_vert_rounded, size: 20),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+
+          // Full-width 2-Tab Pagination Bar: [ 命令行终端 ] | [ SFTP 文件管理 ]
+          Container(
+            height: 38,
+            decoration: BoxDecoration(
+              color: VideoPlatformTheme.bgCard,
+              border: Border(
+                top: BorderSide(color: VideoPlatformTheme.borderSubtle),
+              ),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: InkWell(
+                    onTap: () {
+                      setState(() => _mobilePageIndex = 0);
+                      tab.focusNode.requestFocus();
+                    },
+                    child: Container(
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(
+                        color: _mobilePageIndex == 0
+                            ? VideoPlatformTheme.accent.withValues(alpha: 0.12)
+                            : Colors.transparent,
+                        border: Border(
+                          bottom: BorderSide(
+                            color: _mobilePageIndex == 0
+                                ? VideoPlatformTheme.accent
+                                : Colors.transparent,
+                            width: 2.5,
+                          ),
+                        ),
+                      ),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(
+                            Icons.terminal_rounded,
+                            size: 16,
+                            color: _mobilePageIndex == 0
+                                ? VideoPlatformTheme.accent
+                                : VideoPlatformTheme.textSecondary,
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            '命令行终端',
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              fontWeight: _mobilePageIndex == 0
+                                  ? FontWeight.w800
+                                  : FontWeight.w600,
+                              color: _mobilePageIndex == 0
+                                  ? VideoPlatformTheme.accent
+                                  : VideoPlatformTheme.textSecondary,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+                Container(
+                  width: 1,
+                  height: 20,
+                  color: VideoPlatformTheme.borderSubtle,
+                ),
+                Expanded(
+                  child: InkWell(
+                    onTap: () {
+                      setState(() => _mobilePageIndex = 1);
+                      if (tab.sftpEntries.isEmpty && !tab.isLoadingSftp) {
+                        _loadSftpDirectory(tab, tab.sftpCurrentPath);
+                      }
+                    },
+                    child: Container(
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(
+                        color: _mobilePageIndex == 1
+                            ? VideoPlatformTheme.accent.withValues(alpha: 0.12)
+                            : Colors.transparent,
+                        border: Border(
+                          bottom: BorderSide(
+                            color: _mobilePageIndex == 1
+                                ? VideoPlatformTheme.accent
+                                : Colors.transparent,
+                            width: 2.5,
+                          ),
+                        ),
+                      ),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(
+                            Icons.folder_copy_rounded,
+                            size: 16,
+                            color: _mobilePageIndex == 1
+                                ? VideoPlatformTheme.accent
+                                : VideoPlatformTheme.textSecondary,
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            'SFTP 文件管理',
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              fontWeight: _mobilePageIndex == 1
+                                  ? FontWeight.w800
+                                  : FontWeight.w600,
+                              color: _mobilePageIndex == 1
+                                  ? VideoPlatformTheme.accent
+                                  : VideoPlatformTheme.textSecondary,
+                            ),
+                          ),
+                          if (tab.sftpTransfers.isNotEmpty) ...[
+                            const SizedBox(width: 5),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 5,
+                                vertical: 1,
+                              ),
+                              decoration: BoxDecoration(
+                                color: VideoPlatformTheme.accent,
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Text(
+                                '${tab.sftpTransfers.length}',
+                                style: const TextStyle(
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w700,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showMobileTerminalToolsSheet(_TerminalTabSession tab) {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: VideoPlatformTheme.bgElevated,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+      ),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheetState) {
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 18),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Center(
+                      child: Container(
+                        width: 36,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: VideoPlatformTheme.borderStrong,
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Icon(
+                          Icons.tune_rounded,
+                          size: 18,
+                          color: VideoPlatformTheme.accent,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          '终端工具与界面设置',
+                          style: TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.w800,
+                            color: VideoPlatformTheme.textPrimary,
+                          ),
+                        ),
+                        const Spacer(),
+                        Text(
+                          tab.statusText,
+                          style: TextStyle(
+                            fontSize: 11.5,
+                            color: tab.isConnected
+                                ? VideoPlatformTheme.success
+                                : VideoPlatformTheme.textMuted,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        ActionChip(
+                          avatar: const Icon(Icons.add_rounded, size: 16),
+                          label: const Text('新建标签页'),
+                          onPressed: () {
+                            Navigator.pop(ctx);
+                            _createNewTab(autoConnect: false);
+                          },
+                        ),
+                        ActionChip(
+                          avatar: const Icon(
+                            Icons.add_moderator_rounded,
+                            size: 16,
+                          ),
+                          label: const Text('新增 SSH 主机'),
+                          onPressed: () {
+                            Navigator.pop(ctx);
+                            _showHostProfileEditorDialog();
+                          },
+                        ),
+                        if (!tab.hostProfile.isBuiltIn)
+                          ActionChip(
+                            avatar: const Icon(Icons.edit_outlined, size: 16),
+                            label: const Text('编辑当前主机'),
+                            onPressed: () {
+                              Navigator.pop(ctx);
+                              _showHostProfileEditorDialog(
+                                existing: tab.hostProfile,
+                              );
+                            },
+                          ),
+                        ActionChip(
+                          avatar: const Icon(
+                            Icons.cleaning_services_rounded,
+                            size: 15,
+                          ),
+                          label: const Text('清屏'),
+                          onPressed: () {
+                            Navigator.pop(ctx);
+                            _clearTerminal(tab);
+                          },
+                        ),
+                        ActionChip(
+                          avatar: const Icon(Icons.search_rounded, size: 16),
+                          label: Text(_showSearchBar ? '关闭搜索' : '搜索输出'),
+                          onPressed: () {
+                            Navigator.pop(ctx);
+                            setState(() => _showSearchBar = !_showSearchBar);
+                            if (!_showSearchBar) tab.clearHighlights();
+                          },
+                        ),
+                        ActionChip(
+                          avatar: const Icon(
+                            Icons.playlist_add_rounded,
+                            size: 16,
+                          ),
+                          label: const Text('添加快捷指令'),
+                          onPressed: () {
+                            Navigator.pop(ctx);
+                            _showAddSnippetDialog();
+                          },
+                        ),
+                        ActionChip(
+                          avatar: const Icon(Icons.download_outlined, size: 16),
+                          label: const Text('导出日志'),
+                          onPressed: () {
+                            Navigator.pop(ctx);
+                            _exportActiveTerminalLog();
+                          },
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+                    Divider(
+                      height: 1,
+                      color: VideoPlatformTheme.borderSubtle,
+                    ),
+                    const SizedBox(height: 10),
+                    Text(
+                      '显示面板开关',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        color: VideoPlatformTheme.textSecondary,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        FilterChip(
+                          label: const Text('快捷指令栏'),
+                          selected: _showQuickSnippetsBar,
+                          onSelected: (v) {
+                            setState(() => _showQuickSnippetsBar = v);
+                            setSheetState(() {});
+                          },
+                        ),
+                        FilterChip(
+                          label: const Text('虚拟按键栏 (ESC/TAB)'),
+                          selected: _showVirtualKeysBar,
+                          onSelected: (v) {
+                            setState(() => _showVirtualKeysBar = v);
+                            setSheetState(() {});
+                          },
+                        ),
+                        FilterChip(
+                          label: const Text('底部命令输入框'),
+                          selected: _showCommandComposerBar,
+                          onSelected: (v) {
+                            setState(() => _showCommandComposerBar = v);
+                            setSheetState(() {});
+                          },
+                        ),
+                        FilterChip(
+                          label: const Text('SSH 实时监控栏'),
+                          selected: _showLiveMetricsBar,
+                          onSelected: (v) {
+                            setState(() => _showLiveMetricsBar = v);
+                            setSheetState(() {});
+                          },
+                        ),
+                        if (_tabs.length > 1)
+                          FilterChip(
+                            label: const Text('多标签同步广播'),
+                            selected: _broadcastToAllTabs,
+                            onSelected: (v) {
+                              setState(() => _broadcastToAllTabs = v);
+                              setSheetState(() {});
+                            },
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+                    Divider(
+                      height: 1,
+                      color: VideoPlatformTheme.borderSubtle,
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Text(
+                          '终端字号：${_fontSize.toStringAsFixed(1)} pt',
+                          style: TextStyle(
+                            fontSize: 12.5,
+                            fontWeight: FontWeight.w700,
+                            color: VideoPlatformTheme.textPrimary,
+                          ),
+                        ),
+                        const Spacer(),
+                        IconButton.filledTonal(
+                          visualDensity: VisualDensity.compact,
+                          onPressed: () {
+                            setState(
+                              () => _fontSize =
+                                  (_fontSize - 0.5).clamp(10.0, 24.0),
+                            );
+                            setSheetState(() {});
+                            _saveTerminalAppearance();
+                          },
+                          icon: const Icon(Icons.remove_rounded, size: 16),
+                        ),
+                        const SizedBox(width: 8),
+                        IconButton.filledTonal(
+                          visualDensity: VisualDensity.compact,
+                          onPressed: () {
+                            setState(
+                              () => _fontSize =
+                                  (_fontSize + 0.5).clamp(10.0, 24.0),
+                            );
+                            setSheetState(() {});
+                            _saveTerminalAppearance();
+                          },
+                          icon: const Icon(Icons.add_rounded, size: 16),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Text(
+                          '配色主题：',
+                          style: TextStyle(
+                            fontSize: 12.5,
+                            fontWeight: FontWeight.w700,
+                            color: VideoPlatformTheme.textPrimary,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: DropdownButton<String>(
+                            value: _terminalThemeId,
+                            isExpanded: true,
+                            dropdownColor: VideoPlatformTheme.bgElevated,
+                            items: _terminalThemes.entries
+                                .map(
+                                  (e) => DropdownMenuItem<String>(
+                                    value: e.key,
+                                    child: Text(
+                                      e.value.name,
+                                      style: const TextStyle(fontSize: 12.5),
+                                    ),
+                                  ),
+                                )
+                                .toList(),
+                            onChanged: (themeId) {
+                              if (themeId == null) return;
+                              setState(() => _terminalThemeId = themeId);
+                              setSheetState(() {});
+                              _saveTerminalAppearance();
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        },
       ),
     );
   }
@@ -3259,9 +4054,12 @@ echo "KERN:$(uname -sr 2>/dev/null)"
     );
   }
 
-  Widget _buildSearchBar(_TerminalTabSession tab) {
+  Widget _buildSearchBar(_TerminalTabSession tab, {bool isMobile = false}) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+      padding: EdgeInsets.symmetric(
+        horizontal: isMobile ? 10 : 16,
+        vertical: 5,
+      ),
       decoration: BoxDecoration(
         color: VideoPlatformTheme.bgElevated,
         border: Border(
@@ -3272,48 +4070,80 @@ echo "KERN:$(uname -sr 2>/dev/null)"
         children: [
           const Icon(Icons.manage_search_rounded, size: 17),
           const SizedBox(width: 8),
-          SizedBox(
-            width: 280,
-            child: TextField(
-              controller: _searchCtrl,
-              autofocus: true,
-              onChanged: _runBufferSearch,
-              decoration: const InputDecoration(
-                hintText: '在终端缓冲区中搜索关键字...',
-                isDense: true,
+          if (isMobile)
+            Expanded(
+              child: TextField(
+                controller: _searchCtrl,
+                autofocus: true,
+                onChanged: _runBufferSearch,
+                style: const TextStyle(fontSize: 12.5),
+                decoration: const InputDecoration(
+                  hintText: '搜索终端输出...',
+                  isDense: true,
+                ),
+              ),
+            )
+          else
+            SizedBox(
+              width: 280,
+              child: TextField(
+                controller: _searchCtrl,
+                autofocus: true,
+                onChanged: _runBufferSearch,
+                decoration: const InputDecoration(
+                  hintText: '在终端缓冲区中搜索关键字...',
+                  isDense: true,
+                ),
               ),
             ),
-          ),
-          const SizedBox(width: 10),
+          const SizedBox(width: 8),
           Text(
-            '高亮匹配：$_searchMatchCount 处',
+            isMobile ? '$_searchMatchCount 处' : '高亮匹配：$_searchMatchCount 处',
             style: TextStyle(
-              fontSize: 12,
+              fontSize: 11.5,
               color: VideoPlatformTheme.textSecondary,
             ),
           ),
-          const Spacer(),
-          TextButton(
-            onPressed: () {
-              _searchCtrl.clear();
-              tab.clearHighlights();
-              setState(() {
-                _searchMatchCount = 0;
-                _showSearchBar = false;
-              });
-              tab.focusNode.requestFocus();
-            },
-            child: const Text('关闭搜索'),
-          ),
+          if (!isMobile) const Spacer(),
+          if (isMobile)
+            IconButton(
+              visualDensity: VisualDensity.compact,
+              onPressed: () {
+                _searchCtrl.clear();
+                tab.clearHighlights();
+                setState(() {
+                  _searchMatchCount = 0;
+                  _showSearchBar = false;
+                });
+                tab.focusNode.requestFocus();
+              },
+              icon: const Icon(Icons.close_rounded, size: 17),
+            )
+          else
+            TextButton(
+              onPressed: () {
+                _searchCtrl.clear();
+                tab.clearHighlights();
+                setState(() {
+                  _searchMatchCount = 0;
+                  _showSearchBar = false;
+                });
+                tab.focusNode.requestFocus();
+              },
+              child: const Text('关闭搜索'),
+            ),
         ],
       ),
     );
   }
 
-  Widget _buildQuickSnippetsBar(_TerminalTabSession tab) {
+  Widget _buildQuickSnippetsBar(
+    _TerminalTabSession tab, {
+    bool isMobile = false,
+  }) {
     return Container(
-      height: 36,
-      padding: const EdgeInsets.symmetric(horizontal: 12),
+      height: isMobile ? 33 : 36,
+      padding: EdgeInsets.symmetric(horizontal: isMobile ? 8 : 12),
       decoration: BoxDecoration(
         color: VideoPlatformTheme.bgCard,
         border: Border(
@@ -3322,15 +4152,17 @@ echo "KERN:$(uname -sr 2>/dev/null)"
       ),
       child: Row(
         children: [
-          Text(
-            '快捷指令:',
-            style: TextStyle(
-              fontSize: 11.5,
-              fontWeight: FontWeight.w600,
-              color: VideoPlatformTheme.textMuted,
+          if (!isMobile) ...[
+            Text(
+              '快捷指令:',
+              style: TextStyle(
+                fontSize: 11.5,
+                fontWeight: FontWeight.w600,
+                color: VideoPlatformTheme.textMuted,
+              ),
             ),
-          ),
-          const SizedBox(width: 8),
+            const SizedBox(width: 8),
+          ],
           Expanded(
             child: ListView.separated(
               scrollDirection: Axis.horizontal,
@@ -3381,7 +4213,7 @@ echo "KERN:$(uname -sr 2>/dev/null)"
             ),
           ),
           const SizedBox(width: 6),
-          if (_tabs.length > 1)
+          if (!isMobile && _tabs.length > 1)
             InkWell(
               borderRadius: BorderRadius.circular(5),
               onTap: () {
@@ -3429,17 +4261,38 @@ echo "KERN:$(uname -sr 2>/dev/null)"
               ),
             ),
           const SizedBox(width: 4),
-          TextButton.icon(
-            onPressed: _showAddSnippetDialog,
-            icon: const Icon(Icons.add_rounded, size: 15),
-            label: const Text('自定义指令', style: TextStyle(fontSize: 11.5)),
-          ),
+          if (isMobile)
+            InkWell(
+              borderRadius: BorderRadius.circular(5),
+              onTap: _showAddSnippetDialog,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+                decoration: BoxDecoration(
+                  color: VideoPlatformTheme.accent.withValues(alpha: 0.14),
+                  borderRadius: BorderRadius.circular(5),
+                ),
+                child: Icon(
+                  Icons.add_rounded,
+                  size: 15,
+                  color: VideoPlatformTheme.accent,
+                ),
+              ),
+            )
+          else
+            TextButton.icon(
+              onPressed: _showAddSnippetDialog,
+              icon: const Icon(Icons.add_rounded, size: 15),
+              label: const Text('自定义指令', style: TextStyle(fontSize: 11.5)),
+            ),
         ],
       ),
     );
   }
 
-  Widget _buildTerminalStackArea(_TerminalTabSession activeTab) {
+  Widget _buildTerminalStackArea(
+    _TerminalTabSession activeTab, {
+    bool isMobile = false,
+  }) {
     return Stack(
       children: [
         MediaQuery.removePadding(
@@ -3459,7 +4312,7 @@ echo "KERN:$(uname -sr 2>/dev/null)"
                   focusNode: t.focusNode,
                   autofocus: true,
                   theme: _activeXtermTheme,
-                  padding: const EdgeInsets.all(12),
+                  padding: EdgeInsets.all(isMobile ? 8 : 12),
                   cursorType: _cursorType,
                   alwaysShowCursor: true,
                   textScaler: TextScaler.noScaling,
@@ -3503,196 +4356,273 @@ echo "KERN:$(uname -sr 2>/dev/null)"
         if (!activeTab.isConnected && !activeTab.isConnecting)
           Positioned.fill(
             child: Container(
-              color: Colors.black.withValues(alpha: 0.58),
+              color: Colors.black.withValues(alpha: 0.65),
               alignment: Alignment.center,
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 560),
-                child: Card(
-                  color: VideoPlatformTheme.bgElevated,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(16),
-                    side: BorderSide(color: VideoPlatformTheme.borderStrong),
-                  ),
-                  elevation: 16,
-                  child: Padding(
-                    padding: const EdgeInsets.all(22),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          children: [
-                            Container(
-                              width: 40,
-                              height: 40,
-                              decoration: BoxDecoration(
-                                color: VideoPlatformTheme.accent
-                                    .withValues(alpha: 0.16),
-                                borderRadius: BorderRadius.circular(10),
+              child: SingleChildScrollView(
+                padding: EdgeInsets.symmetric(
+                  horizontal: isMobile ? 12 : 24,
+                  vertical: isMobile ? 12 : 20,
+                ),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 560),
+                  child: Card(
+                    margin: EdgeInsets.zero,
+                    color: VideoPlatformTheme.bgElevated,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(isMobile ? 14 : 16),
+                      side: BorderSide(color: VideoPlatformTheme.borderStrong),
+                    ),
+                    elevation: 16,
+                    child: Padding(
+                      padding: EdgeInsets.all(isMobile ? 14 : 22),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Container(
+                                width: isMobile ? 36 : 40,
+                                height: isMobile ? 36 : 40,
+                                decoration: BoxDecoration(
+                                  color: VideoPlatformTheme.accent
+                                      .withValues(alpha: 0.16),
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                child: Icon(
+                                  Icons.terminal_rounded,
+                                  color: VideoPlatformTheme.accent,
+                                  size: isMobile ? 20 : 22,
+                                ),
                               ),
-                              child: Icon(
-                                Icons.terminal_rounded,
-                                color: VideoPlatformTheme.accent,
-                                size: 22,
-                              ),
-                            ),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    '终端已就绪（当前未连接）',
-                                    style: TextStyle(
-                                      fontSize: 16,
-                                      fontWeight: FontWeight.w800,
-                                      color: VideoPlatformTheme.textPrimary,
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      '终端已就绪（未连接）',
+                                      style: TextStyle(
+                                        fontSize: isMobile ? 14.5 : 16,
+                                        fontWeight: FontWeight.w800,
+                                        color: VideoPlatformTheme.textPrimary,
+                                      ),
                                     ),
-                                  ),
-                                  Text(
-                                    '请选择要连接的终端或 SSH / SFTP 远程主机，支持多标签并行与 SFTP 文件可视化管理',
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      color: VideoPlatformTheme.textSecondary,
+                                    Text(
+                                      isMobile
+                                          ? '点击主机立即连接，或添加 SSH / SFTP 远程服务器'
+                                          : '请选择要连接的终端或 SSH / SFTP 远程主机，支持多标签并行与 SFTP 文件可视化管理',
+                                      style: TextStyle(
+                                        fontSize: isMobile ? 11.5 : 12,
+                                        color: VideoPlatformTheme.textSecondary,
+                                      ),
                                     ),
-                                  ),
-                                ],
+                                  ],
+                                ),
                               ),
+                            ],
+                          ),
+                          SizedBox(height: isMobile ? 12 : 16),
+                          ConstrainedBox(
+                            constraints: BoxConstraints(
+                              maxHeight: isMobile ? 260 : 230,
                             ),
-                          ],
-                        ),
-                        const SizedBox(height: 16),
-                        ConstrainedBox(
-                          constraints: const BoxConstraints(maxHeight: 230),
-                          child: ListView.separated(
-                            shrinkWrap: true,
-                            itemCount: _hostProfiles.length,
-                            separatorBuilder: (_, __) =>
-                                const SizedBox(height: 8),
-                            itemBuilder: (_, idx) {
-                              final p = _hostProfiles[idx];
-                              final isCur = activeTab.hostProfile.id == p.id;
-                              return InkWell(
-                                borderRadius: BorderRadius.circular(10),
-                                onTap: () =>
-                                    _connectTab(activeTab, overrideProfile: p),
-                                child: Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 12,
-                                    vertical: 10,
+                            child: ListView.separated(
+                              shrinkWrap: true,
+                              itemCount: _hostProfiles.length,
+                              separatorBuilder: (_, __) =>
+                                  const SizedBox(height: 8),
+                              itemBuilder: (_, idx) {
+                                final p = _hostProfiles[idx];
+                                final isCur = activeTab.hostProfile.id == p.id;
+                                return InkWell(
+                                  borderRadius: BorderRadius.circular(10),
+                                  onTap: () => _connectTab(
+                                    activeTab,
+                                    overrideProfile: p,
                                   ),
-                                  decoration: BoxDecoration(
-                                    color: isCur
-                                        ? VideoPlatformTheme.accent
-                                            .withValues(alpha: 0.14)
-                                        : VideoPlatformTheme.bgCard,
-                                    borderRadius: BorderRadius.circular(10),
-                                    border: Border.all(
+                                  child: Container(
+                                    padding: EdgeInsets.symmetric(
+                                      horizontal: isMobile ? 10 : 12,
+                                      vertical: isMobile ? 8 : 10,
+                                    ),
+                                    decoration: BoxDecoration(
                                       color: isCur
                                           ? VideoPlatformTheme.accent
-                                          : VideoPlatformTheme.borderSubtle,
+                                              .withValues(alpha: 0.14)
+                                          : VideoPlatformTheme.bgCard,
+                                      borderRadius: BorderRadius.circular(10),
+                                      border: Border.all(
+                                        color: isCur
+                                            ? VideoPlatformTheme.accent
+                                            : VideoPlatformTheme.borderSubtle,
+                                      ),
                                     ),
-                                  ),
-                                  child: Row(
-                                    children: [
-                                      Icon(
-                                        p.kind == TerminalHostKind.ssh2
-                                            ? Icons.dns_rounded
-                                            : (p.kind ==
-                                                    TerminalHostKind.localShell
-                                                ? Icons.computer_rounded
-                                                : Icons.cloud_rounded),
-                                        color: VideoPlatformTheme.accent,
-                                        size: 20,
-                                      ),
-                                      const SizedBox(width: 10),
-                                      Expanded(
-                                        child: Column(
-                                          crossAxisAlignment:
-                                              CrossAxisAlignment.start,
-                                          children: [
-                                            Text(
-                                              p.name,
-                                              style: TextStyle(
-                                                fontSize: 13.5,
-                                                fontWeight: FontWeight.w700,
-                                                color: VideoPlatformTheme
-                                                    .textPrimary,
-                                              ),
-                                            ),
-                                            Text(
-                                              p.subtitle,
-                                              style: TextStyle(
-                                                fontSize: 11.5,
-                                                color: VideoPlatformTheme
-                                                    .textMuted,
-                                              ),
-                                            ),
-                                          ],
+                                    child: Row(
+                                      children: [
+                                        Icon(
+                                          p.kind == TerminalHostKind.ssh2
+                                              ? Icons.dns_rounded
+                                              : (p.kind ==
+                                                      TerminalHostKind
+                                                          .localShell
+                                                  ? Icons.computer_rounded
+                                                  : Icons.cloud_rounded),
+                                          color: VideoPlatformTheme.accent,
+                                          size: isMobile ? 18 : 20,
                                         ),
-                                      ),
-                                      if (!p.isBuiltIn)
-                                        IconButton(
-                                          visualDensity: VisualDensity.compact,
-                                          tooltip: '编辑主机',
-                                          onPressed: () =>
-                                              _showHostProfileEditorDialog(
-                                            existing: p,
+                                        const SizedBox(width: 9),
+                                        Expanded(
+                                          child: Column(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            children: [
+                                              Text(
+                                                p.name,
+                                                maxLines: 1,
+                                                overflow: TextOverflow.ellipsis,
+                                                style: TextStyle(
+                                                  fontSize: isMobile ? 13 : 13.5,
+                                                  fontWeight: FontWeight.w700,
+                                                  color: VideoPlatformTheme
+                                                      .textPrimary,
+                                                ),
+                                              ),
+                                              Text(
+                                                p.subtitle,
+                                                maxLines: 1,
+                                                overflow: TextOverflow.ellipsis,
+                                                style: TextStyle(
+                                                  fontSize: isMobile ? 11 : 11.5,
+                                                  color: VideoPlatformTheme
+                                                      .textMuted,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                        if (!p.isBuiltIn)
+                                          IconButton(
+                                            visualDensity: VisualDensity.compact,
+                                            tooltip: '编辑主机',
+                                            onPressed: () =>
+                                                _showHostProfileEditorDialog(
+                                              existing: p,
+                                            ),
+                                            icon: const Icon(
+                                              Icons.edit_outlined,
+                                              size: 16,
+                                            ),
+                                          ),
+                                        const SizedBox(width: 2),
+                                        FilledButton.tonalIcon(
+                                          style: FilledButton.styleFrom(
+                                            visualDensity: VisualDensity.compact,
+                                            padding: EdgeInsets.symmetric(
+                                              horizontal: isMobile ? 9 : 12,
+                                            ),
+                                          ),
+                                          onPressed: () => _connectTab(
+                                            activeTab,
+                                            overrideProfile: p,
                                           ),
                                           icon: const Icon(
-                                            Icons.edit_outlined,
-                                            size: 16,
+                                            Icons.bolt_rounded,
+                                            size: 14,
+                                          ),
+                                          label: Text(
+                                            isMobile ? '连接' : '立即连接',
+                                            style: const TextStyle(fontSize: 12),
                                           ),
                                         ),
-                                      const SizedBox(width: 4),
-                                      FilledButton.tonalIcon(
-                                        style: FilledButton.styleFrom(
-                                          visualDensity: VisualDensity.compact,
-                                        ),
-                                        onPressed: () => _connectTab(
-                                          activeTab,
-                                          overrideProfile: p,
-                                        ),
-                                        icon: const Icon(
-                                          Icons.bolt_rounded,
-                                          size: 15,
-                                        ),
-                                        label: const Text(
-                                          '立即连接',
-                                          style: TextStyle(fontSize: 12),
-                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                );
+                              },
+                            ),
+                          ),
+                          SizedBox(height: isMobile ? 12 : 14),
+                          if (isMobile)
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: OutlinedButton.icon(
+                                    style: OutlinedButton.styleFrom(
+                                      visualDensity: VisualDensity.compact,
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 8,
+                                        vertical: 10,
                                       ),
-                                    ],
+                                    ),
+                                    onPressed: () =>
+                                        _showHostProfileEditorDialog(),
+                                    icon:
+                                        const Icon(Icons.add_rounded, size: 15),
+                                    label: const Text(
+                                      '新增 SSH 主机',
+                                      style: TextStyle(fontSize: 12),
+                                    ),
                                   ),
                                 ),
-                              );
-                            },
-                          ),
-                        ),
-                        const SizedBox(height: 14),
-                        Row(
-                          children: [
-                            OutlinedButton.icon(
-                              onPressed: () => _showHostProfileEditorDialog(),
-                              icon: const Icon(Icons.add_rounded, size: 16),
-                              label: const Text('新增 SSH / SFTP 远程服务器'),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: FilledButton.icon(
+                                    style: FilledButton.styleFrom(
+                                      visualDensity: VisualDensity.compact,
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 8,
+                                        vertical: 10,
+                                      ),
+                                      backgroundColor:
+                                          VideoPlatformTheme.accent,
+                                      foregroundColor: Colors.white,
+                                    ),
+                                    onPressed: () => _connectTab(activeTab),
+                                    icon: const Icon(
+                                      Icons.play_arrow_rounded,
+                                      size: 16,
+                                    ),
+                                    label: Text(
+                                      '连接当前主机',
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            )
+                          else
+                            Row(
+                              children: [
+                                OutlinedButton.icon(
+                                  onPressed: () =>
+                                      _showHostProfileEditorDialog(),
+                                  icon: const Icon(Icons.add_rounded, size: 16),
+                                  label: const Text('新增 SSH / SFTP 远程服务器'),
+                                ),
+                                const Spacer(),
+                                FilledButton.icon(
+                                  style: FilledButton.styleFrom(
+                                    backgroundColor: VideoPlatformTheme.accent,
+                                    foregroundColor: Colors.white,
+                                  ),
+                                  onPressed: () => _connectTab(activeTab),
+                                  icon: const Icon(
+                                    Icons.play_arrow_rounded,
+                                    size: 17,
+                                  ),
+                                  label:
+                                      Text('连接「${activeTab.hostProfile.name}」'),
+                                ),
+                              ],
                             ),
-                            const Spacer(),
-                            FilledButton.icon(
-                              style: FilledButton.styleFrom(
-                                backgroundColor: VideoPlatformTheme.accent,
-                                foregroundColor: Colors.white,
-                              ),
-                              onPressed: () => _connectTab(activeTab),
-                              icon: const Icon(
-                                Icons.play_arrow_rounded,
-                                size: 17,
-                              ),
-                              label: Text('连接「${activeTab.hostProfile.name}」'),
-                            ),
-                          ],
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
                   ),
                 ),
@@ -3707,7 +4637,10 @@ echo "KERN:$(uname -sr 2>/dev/null)"
   // SFTP Visual File Explorer Split Pane
   // ===========================================================================
 
-  Widget _buildSftpExplorerPane(_TerminalTabSession tab) {
+  Widget _buildSftpExplorerPane(
+    _TerminalTabSession tab, {
+    bool isMobile = false,
+  }) {
     final kw = tab.sftpSearchFilter.trim().toLowerCase();
     final filtered = tab.sftpEntries.where((e) {
       if (!tab.sftpShowHidden && e.name.startsWith('.')) return false;
@@ -3763,6 +4696,9 @@ echo "KERN:$(uname -sr 2>/dev/null)"
                                     ? '/'
                                     : tab.sftpCurrentPath;
                                 _sendToSingleTab(tab, 'cd "$p"\n');
+                                if (isMobile) {
+                                  setState(() => _mobilePageIndex = 0);
+                                }
                                 tab.focusNode.requestFocus();
                               },
                         child: Container(
@@ -4094,6 +5030,9 @@ echo "KERN:$(uname -sr 2>/dev/null)"
                                             ? item.path
                                             : _parentPosixPath(item.path);
                                         _sendToSingleTab(tab, 'cd "$dir"\n');
+                                        if (isMobile) {
+                                          setState(() => _mobilePageIndex = 0);
+                                        }
                                         tab.focusNode.requestFocus();
                                         break;
                                       case 'paste_path':
@@ -4101,6 +5040,9 @@ echo "KERN:$(uname -sr 2>/dev/null)"
                                           tab,
                                           '"${item.path}" ',
                                         );
+                                        if (isMobile) {
+                                          setState(() => _mobilePageIndex = 0);
+                                        }
                                         tab.focusNode.requestFocus();
                                         break;
                                       case 'download':
@@ -4265,9 +5207,15 @@ echo "KERN:$(uname -sr 2>/dev/null)"
     );
   }
 
-  Widget _buildCommandComposerBar(_TerminalTabSession tab) {
+  Widget _buildCommandComposerBar(
+    _TerminalTabSession tab, {
+    bool isMobile = false,
+  }) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      padding: EdgeInsets.symmetric(
+        horizontal: isMobile ? 8 : 12,
+        vertical: 5,
+      ),
       decoration: BoxDecoration(
         color: VideoPlatformTheme.bgCard,
         border: Border(
@@ -4311,7 +5259,10 @@ echo "KERN:$(uname -sr 2>/dev/null)"
                     )
                     .toList(),
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+              padding: EdgeInsets.symmetric(
+                horizontal: isMobile ? 7 : 8,
+                vertical: 5,
+              ),
               decoration: BoxDecoration(
                 color: VideoPlatformTheme.bgElevated,
                 borderRadius: BorderRadius.circular(6),
@@ -4322,16 +5273,18 @@ echo "KERN:$(uname -sr 2>/dev/null)"
                 children: [
                   Icon(
                     Icons.history_rounded,
-                    size: 15,
+                    size: 16,
                     color: VideoPlatformTheme.accent,
                   ),
-                  const SizedBox(width: 4),
-                  const Text('命令历史', style: TextStyle(fontSize: 11.5)),
+                  if (!isMobile) ...[
+                    const SizedBox(width: 4),
+                    const Text('命令历史', style: TextStyle(fontSize: 11.5)),
+                  ],
                 ],
               ),
             ),
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: 6),
           Expanded(
             child: SizedBox(
               height: 32,
@@ -4339,8 +5292,8 @@ echo "KERN:$(uname -sr 2>/dev/null)"
                 onKeyEvent: (node, event) {
                   if (event is KeyDownEvent && _commandHistory.isNotEmpty) {
                     if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
-                      _historyCursor =
-                          (_historyCursor + 1).clamp(0, _commandHistory.length - 1);
+                      _historyCursor = (_historyCursor + 1)
+                          .clamp(0, _commandHistory.length - 1);
                       _commandInputCtrl.text = _commandHistory[_historyCursor];
                       return KeyEventResult.handled;
                     } else if (event.logicalKey ==
@@ -4372,8 +5325,12 @@ echo "KERN:$(uname -sr 2>/dev/null)"
                   },
                   decoration: InputDecoration(
                     hintText: _broadcastToAllTabs
-                        ? '输入命令并回车（将同步广播至全部已连接终端标签页，按 ↑/↓ 翻阅历史）...'
-                        : '命令构建器：输入或粘贴命令回车发送（按 ↑/↓ 翻阅历史命令）...',
+                        ? (isMobile
+                            ? '广播命令至全部终端...'
+                            : '输入命令并回车（将同步广播至全部已连接终端标签页，按 ↑/↓ 翻阅历史）...')
+                        : (isMobile
+                            ? '输入或粘贴命令回车发送...'
+                            : '命令构建器：输入或粘贴命令回车发送（按 ↑/↓ 翻阅历史命令）...'),
                     contentPadding: const EdgeInsets.symmetric(horizontal: 10),
                     border: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(6),
@@ -4383,10 +5340,11 @@ echo "KERN:$(uname -sr 2>/dev/null)"
               ),
             ),
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: 6),
           FilledButton.icon(
             style: FilledButton.styleFrom(
               visualDensity: VisualDensity.compact,
+              padding: EdgeInsets.symmetric(horizontal: isMobile ? 10 : 12),
               backgroundColor: VideoPlatformTheme.accent,
               foregroundColor: Colors.white,
             ),
@@ -4486,8 +5444,20 @@ class _SftpOnlineEditorDialogState extends State<_SftpOnlineEditorDialog> {
 
   @override
   Widget build(BuildContext context) {
+    final screenSize = MediaQuery.sizeOf(context);
+    final isMobile = screenSize.width < 720;
     return AlertDialog(
       backgroundColor: VideoPlatformTheme.bgElevated,
+      insetPadding: EdgeInsets.symmetric(
+        horizontal: isMobile ? 10 : 32,
+        vertical: isMobile ? 12 : 24,
+      ),
+      contentPadding: EdgeInsets.fromLTRB(
+        isMobile ? 12 : 24,
+        10,
+        isMobile ? 12 : 24,
+        10,
+      ),
       title: Row(
         children: [
           Icon(
@@ -4501,14 +5471,18 @@ class _SftpOnlineEditorDialogState extends State<_SftpOnlineEditorDialog> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  'SFTP 在线编辑器：${widget.fileName}',
-                  style: const TextStyle(
-                    fontSize: 15,
+                  'SFTP 编辑器：${widget.fileName}',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: isMobile ? 14 : 15,
                     fontWeight: FontWeight.w800,
                   ),
                 ),
                 Text(
                   widget.remotePath,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                   style: TextStyle(
                     fontSize: 11,
                     fontFamily: 'monospace',
@@ -4519,14 +5493,15 @@ class _SftpOnlineEditorDialogState extends State<_SftpOnlineEditorDialog> {
             ),
           ),
           IconButton(
+            visualDensity: VisualDensity.compact,
             onPressed: () => Navigator.of(context).pop(),
             icon: const Icon(Icons.close_rounded, size: 20),
           ),
         ],
       ),
       content: SizedBox(
-        width: 820,
-        height: 500,
+        width: isMobile ? screenSize.width - 28 : 820,
+        height: isMobile ? (screenSize.height * 0.58).clamp(240.0, 480.0) : 500,
         child: _isLoading
             ? Center(
                 child: CircularProgressIndicator(
@@ -4545,7 +5520,7 @@ class _SftpOnlineEditorDialogState extends State<_SftpOnlineEditorDialog> {
                     maxLines: null,
                     expands: true,
                     style: const TextStyle(
-                      fontSize: 13,
+                      fontSize: 12.5,
                       fontFamily: 'monospace',
                       height: 1.4,
                     ),
@@ -4579,7 +5554,9 @@ class _SftpOnlineEditorDialogState extends State<_SftpOnlineEditorDialog> {
                   ),
                 )
               : const Icon(Icons.save_rounded, size: 16),
-          label: Text(_isSaving ? '正在写回服务器...' : '保存至远程服务器 (SFTP)'),
+          label: Text(
+            _isSaving ? '保存中...' : (isMobile ? '保存至服务器' : '保存至远程服务器 (SFTP)'),
+          ),
         ),
       ],
     );

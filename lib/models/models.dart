@@ -1186,6 +1186,10 @@ class FileEntry {
   }
 
   factory FileEntry.fromJson(Map<String, dynamic> json) {
+    final mountId = (json['mount_id'] ?? 'builtin_server').toString();
+    final sourceKind = json['source_kind'] != null
+        ? StorageSourceKind.fromId(json['source_kind']?.toString())
+        : StorageSourceKind.server;
     return FileEntry(
       name: (json['name'] ?? '').toString(),
       path: (json['path'] ?? '').toString(),
@@ -1194,10 +1198,47 @@ class FileEntry {
       isDir: json['is_dir'] == true,
       isMp4: json['is_mp4'] == true,
       ext: (json['ext'] ?? '').toString(),
-      mountId: 'builtin_server',
-      sourceKind: StorageSourceKind.server,
+      mountId: mountId.isEmpty ? 'builtin_server' : mountId,
+      sourceKind: sourceKind,
+      rawDownloadUrl: (json['raw_download_url'] ?? '').toString(),
+      thumbUrl: (json['thumb_url'] ?? '').toString(),
+      pickcode115: (json['pickcode_115'] ?? '').toString(),
+      fid115: (json['fid_115'] ?? '').toString(),
+      cid115: (json['cid_115'] ?? '').toString(),
+      archiveContainerPath: (json['archive_container_path'] ?? '').toString(),
+      archiveContainerName: (json['archive_container_name'] ?? '').toString(),
+      archiveInnerPath: (json['archive_inner_path'] ?? '').toString(),
+      archiveOffset: int.tryParse((json['archive_offset'] ?? 0).toString()) ?? 0,
+      archiveCompressedSize:
+          int.tryParse((json['archive_compressed_size'] ?? 0).toString()) ?? 0,
+      archiveCompressionMethod:
+          int.tryParse((json['archive_compression_method'] ?? 0).toString()) ??
+              0,
     );
   }
+
+  Map<String, dynamic> toJson() => {
+        'name': name,
+        'path': path,
+        'size': size,
+        'mod_time': modTime,
+        'is_dir': isDir,
+        'is_mp4': isMp4,
+        'ext': ext,
+        'mount_id': mountId,
+        'source_kind': sourceKind.id,
+        'raw_download_url': rawDownloadUrl,
+        'thumb_url': thumbUrl,
+        'pickcode_115': pickcode115,
+        'fid_115': fid115,
+        'cid_115': cid115,
+        'archive_container_path': archiveContainerPath,
+        'archive_container_name': archiveContainerName,
+        'archive_inner_path': archiveInnerPath,
+        'archive_offset': archiveOffset,
+        'archive_compressed_size': archiveCompressedSize,
+        'archive_compression_method': archiveCompressionMethod,
+      };
 }
 
 class FileDirectoryListing {

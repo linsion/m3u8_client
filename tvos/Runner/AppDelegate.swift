@@ -67,6 +67,102 @@ final class TvInteractiveWindow: UIWindow {
       }
     }
     super.sendEvent(event)
+    applyDarkFocusStyleToAllTextFields(in: self)
+  }
+
+  override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
+    super.didUpdateFocus(in: context, with: coordinator)
+    applyDarkFocusStyleToAllTextFields(in: self)
+    coordinator.addCoordinatedAnimations({ [weak self] in
+      guard let self = self else { return }
+      self.applyDarkFocusStyleToAllTextFields(in: self)
+    }, completion: { [weak self] in
+      guard let self = self else { return }
+      self.applyDarkFocusStyleToAllTextFields(in: self)
+    })
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    applyDarkFocusStyleToAllTextFields(in: self)
+  }
+
+  /// Ensures native tvOS UITextField / SecureField never uses a white focus platter background (which hides white text).
+  func applyDarkFocusStyleToAllTextFields(in view: UIView) {
+    if let tf = view as? UITextField {
+      styleSingleTextField(tf)
+      return
+    }
+    for sub in view.subviews {
+      applyDarkFocusStyleToAllTextFields(in: sub)
+    }
+  }
+
+  private func styleSingleTextField(_ tf: UITextField) {
+    let focusedView = UIFocusSystem.focusSystem(for: self)?.focusedItem as? UIView
+    let isFieldFocused = tf.isFocused || tf.isFirstResponder || (focusedView != nil && (focusedView === tf || focusedView?.isDescendant(of: tf) == true))
+
+    let darkUnfocused = UIColor(red: 0.09, green: 0.12, blue: 0.19, alpha: 0.94)
+    let darkFocused = UIColor(red: 0.13, green: 0.22, blue: 0.36, alpha: 0.98)
+    let borderAccent = UIColor(red: 0.22, green: 0.76, blue: 1.00, alpha: 1.0)
+    let borderIdle = UIColor(white: 1.0, alpha: 0.20)
+
+    tf.textColor = .white
+    tf.tintColor = borderAccent
+    tf.backgroundColor = isFieldFocused ? darkFocused : darkUnfocused
+    tf.layer.cornerRadius = 12
+    tf.layer.borderWidth = isFieldFocused ? 2.6 : 1.0
+    tf.layer.borderColor = (isFieldFocused ? borderAccent : borderIdle).cgColor
+
+    if let rawPlaceholder = tf.placeholder, !rawPlaceholder.isEmpty {
+      tf.attributedPlaceholder = NSAttributedString(
+        string: rawPlaceholder,
+        attributes: [.foregroundColor: UIColor(white: 0.78, alpha: 0.72)]
+      )
+    }
+
+    neutralizeWhitePlatterSubviews(in: tf, isFocused: isFieldFocused, darkFocused: darkFocused, darkUnfocused: darkUnfocused, isRootTextField: true)
+  }
+
+  private func neutralizeWhitePlatterSubviews(
+    in view: UIView,
+    isFocused: Bool,
+    darkFocused: UIColor,
+    darkUnfocused: UIColor,
+    isRootTextField: Bool = false
+  ) {
+    let setBgSel = NSSelectorFromString("setBackgroundColor:forState:")
+    if view.responds(to: setBgSel), let imp = view.method(for: setBgSel) {
+      typealias SetBgForStateFn = @convention(c) (AnyObject, Selector, UIColor?, UInt) -> Void
+      let fn = unsafeBitCast(imp, to: SetBgForStateFn.self)
+      fn(view, setBgSel, darkUnfocused, UIControl.State.normal.rawValue)
+      fn(view, setBgSel, darkFocused, UIControl.State.focused.rawValue)
+      fn(view, setBgSel, darkFocused, UIControl.State.highlighted.rawValue)
+      fn(view, setBgSel, darkFocused, UIControl.State.selected.rawValue)
+    }
+
+    if !isRootTextField {
+      let clsName = String(describing: type(of: view))
+      if let vev = view as? UIVisualEffectView {
+        vev.effect = UIBlurEffect(style: .dark)
+        vev.backgroundColor = isFocused ? darkFocused : darkUnfocused
+        vev.contentView.backgroundColor = isFocused ? darkFocused : darkUnfocused
+      } else if clsName.contains("Background") || clsName.contains("Floating") || clsName.contains("Backdrop") || clsName.contains("Platter") {
+        view.backgroundColor = isFocused ? darkFocused : darkUnfocused
+      } else if let bg = view.backgroundColor {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        if bg.getRed(&r, green: &g, blue: &b, alpha: &a), a > 0.15, r > 0.72, g > 0.72, b > 0.72 {
+          view.backgroundColor = isFocused ? darkFocused : darkUnfocused
+        }
+      }
+      if let label = view as? UILabel {
+        label.textColor = .white
+      }
+    }
+
+    for sub in view.subviews {
+      neutralizeWhitePlatterSubviews(in: sub, isFocused: isFocused, darkFocused: darkFocused, darkUnfocused: darkUnfocused)
+    }
   }
 
   /// Finds any active vertical UIScrollView on screen that is scrolled down (> 20pt) and scrolls it back to top.
@@ -146,8 +242,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
   ) -> Bool {
-    try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+    try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.allowAirPlay])
     try? AVAudioSession.sharedInstance().setActive(true)
+    application.isIdleTimerDisabled = true
+    application.beginReceivingRemoteControlEvents()
 
     let window = TvInteractiveWindow(frame: UIScreen.main.bounds)
     let rootView = TvRootView()
@@ -163,6 +261,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     let handleMenuBack: () -> Void = { [weak self, weak hosting] in
       Task { @MainActor in
         guard let self = self else { return }
+        if self.appState.showLanQuickInputModal {
+          self.appState.showLanQuickInputModal = false
+          return
+        }
         if self.appState.showMusicFolderPickerSheet {
           if self.appState.musicFolderPickerBackHandler?() == true {
             return
@@ -326,6 +428,16 @@ struct TvRootView: View {
           }
           .frame(maxWidth: .infinity, maxHeight: .infinity)
           .clipped()
+
+          if appState.currentCloudMusicTrack != nil
+             && appState.selectedSection != .music
+             && appState.selectedSection != .mediaLibrary
+             && !(appState.selectedSection == .live && appState.liveGuideCollapsed) {
+            TvCloudMusicBottomDockBar()
+              .padding(.horizontal, 48)
+              .padding(.bottom, 12)
+              .focusSection()
+          }
         }
         .frame(width: UIScreen.main.bounds.width, height: UIScreen.main.bounds.height)
         .clipped()
@@ -389,6 +501,19 @@ struct TvRootView: View {
           .shadow(color: .black.opacity(0.5), radius: 28, y: 12)
         }
         .zIndex(90)
+      }
+
+      // Universal LAN QR Code Quick Input Overlay
+      if appState.showLanQuickInputModal {
+        TvLanQuickInputModalView(
+          prompt: appState.activeLanQuickInputPrompt,
+          placeholder: appState.activeLanQuickInputPlaceholder,
+          onClose: {
+            appState.showLanQuickInputModal = false
+          }
+        )
+        .environmentObject(appState)
+        .zIndex(95)
       }
 
       // Floating Apple-style Toast Capsule
@@ -555,6 +680,203 @@ struct TvAppleTopNavigationBar: View {
   }
 }
 
+// MARK: - Universal QR Code Quick Input Components (Scan on Phone to Fill Any TV Input)
+
+struct TvLanQuickInputModalView: View {
+  @EnvironmentObject var appState: TvAppState
+  let prompt: String
+  let placeholder: String
+  let onClose: () -> Void
+  @FocusState private var closeBtnFocused: Bool
+
+  var body: some View {
+    let theme = appState.activeTheme
+    let portalUrl = appState.lanInputUrl.isEmpty
+      ? "http://\(TvAppState.localLanIPv4Address() ?? "127.0.0.1"):18088"
+      : appState.lanInputUrl
+
+    ZStack {
+      Color.black.opacity(0.76)
+        .ignoresSafeArea()
+
+      HStack(spacing: 38) {
+        VStack(spacing: 14) {
+          TvQRCodeImageView(content: portalUrl, size: 240)
+            .shadow(color: .black.opacity(0.45), radius: 18, y: 8)
+
+          Text("微信 / 手机相机扫码")
+            .font(.system(size: 15, weight: .bold))
+            .foregroundColor(theme.accentHover)
+        }
+
+        VStack(alignment: .leading, spacing: 16) {
+          HStack(spacing: 10) {
+            Image(systemName: "qrcode.viewfinder")
+              .font(.system(size: 28, weight: .bold))
+              .foregroundColor(theme.accentHover)
+            Text("手机扫码快捷输入")
+              .font(.system(size: 28, weight: .bold, design: .rounded))
+              .foregroundColor(.white)
+          }
+
+          HStack(spacing: 10) {
+            Text("当前输入目标：")
+              .font(.system(size: 16))
+              .foregroundColor(.white.opacity(0.7))
+            Text(prompt)
+              .font(.system(size: 17, weight: .bold))
+              .foregroundColor(.white)
+              .padding(.horizontal, 12)
+              .padding(.vertical, 4)
+              .background(theme.accent.opacity(0.55))
+              .clipShape(Capsule())
+              .overlay(
+                Capsule()
+                  .stroke(theme.accentHover, lineWidth: 1)
+              )
+          }
+
+          Text("1. 使用手机相机、微信或浏览器扫描左侧二维码（或直接访问下方局域网地址）：")
+            .font(.system(size: 15))
+            .foregroundColor(.white.opacity(0.82))
+
+          Text(portalUrl)
+            .font(.system(size: 20, weight: .heavy, design: .monospaced))
+            .foregroundColor(.yellow)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(Color.white.opacity(0.08))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+          Text("2. 在手机网页顶部「电视端万能扫码快捷输入」框中粘贴或打字并点击发送，文字将自动填入当前电视输入框并自动关闭本窗口。")
+            .font(.system(size: 14))
+            .foregroundColor(.white.opacity(0.68))
+            .fixedSize(horizontal: false, vertical: true)
+
+          HStack(spacing: 16) {
+            Button {
+              onClose()
+            } label: {
+              Label("返回 / 关闭扫码窗", systemImage: "xmark.circle.fill")
+            }
+            .buttonStyle(TvApplePillButtonStyle(isPrimary: true))
+            .focused($closeBtnFocused)
+          }
+          .padding(.top, 6)
+        }
+      }
+      .padding(42)
+      .frame(width: 960)
+      .background(.regularMaterial)
+      .clipShape(RoundedRectangle(cornerRadius: 30, style: .continuous))
+      .overlay(
+        RoundedRectangle(cornerRadius: 30, style: .continuous)
+          .stroke(theme.accentHover.opacity(0.55), lineWidth: 1.5)
+      )
+      .shadow(color: .black.opacity(0.6), radius: 32, y: 14)
+      .focusSection()
+    }
+    .onAppear {
+      appState.startLanInputServer()
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+        closeBtnFocused = true
+      }
+    }
+    .onExitCommand {
+      onClose()
+    }
+  }
+}
+
+struct TvQrInputTriggerButton: View {
+  @EnvironmentObject var appState: TvAppState
+  let prompt: String
+  var placeholder: String = ""
+  var labelText: String = "扫码输入"
+  var compact: Bool = true
+  let onReceive: (String) -> Void
+
+  var body: some View {
+    Button {
+      appState.presentLanQuickInput(prompt: prompt, placeholder: placeholder) { text in
+        onReceive(text)
+      }
+    } label: {
+      HStack(spacing: 6) {
+        Image(systemName: "qrcode.viewfinder")
+          .font(.system(size: compact ? 15 : 17, weight: .bold))
+        Text(labelText)
+          .font(.system(size: compact ? 14 : 16, weight: .semibold))
+      }
+    }
+    .buttonStyle(TvApplePillButtonStyle(compact: compact))
+  }
+}
+
+extension View {
+  func withTvLanQuickInputOverlay(_ appState: TvAppState) -> some View {
+    self.overlay {
+      if appState.showLanQuickInputModal {
+        TvLanQuickInputModalView(
+          prompt: appState.activeLanQuickInputPrompt,
+          placeholder: appState.activeLanQuickInputPlaceholder,
+          onClose: {
+            appState.showLanQuickInputModal = false
+          }
+        )
+        .environmentObject(appState)
+      }
+    }
+  }
+}
+
+struct TvInlineQrInputCard: View {
+  @EnvironmentObject var appState: TvAppState
+  let title: String
+  let subtitle: String
+  var qrSize: CGFloat = 156
+
+  var body: some View {
+    let theme = appState.activeTheme
+    let portalUrl = appState.lanInputUrl.isEmpty
+      ? "http://\(TvAppState.localLanIPv4Address() ?? "127.0.0.1"):18088"
+      : appState.lanInputUrl
+
+    VStack(spacing: 12) {
+      TvQRCodeImageView(content: portalUrl, size: qrSize)
+        .shadow(color: .black.opacity(0.35), radius: 12, y: 6)
+
+      Text(title)
+        .font(.system(size: 16, weight: .bold))
+        .foregroundColor(theme.accentHover)
+
+      Text(subtitle)
+        .font(.system(size: 12))
+        .foregroundColor(.white.opacity(0.68))
+        .multilineTextAlignment(.center)
+        .frame(maxWidth: 220)
+
+      Text(portalUrl)
+        .font(.system(size: 11, weight: .bold, design: .monospaced))
+        .foregroundColor(.yellow.opacity(0.92))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+        .background(Color.white.opacity(0.08))
+        .clipShape(Capsule())
+    }
+    .padding(22)
+    .background(.ultraThinMaterial)
+    .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+    .overlay(
+      RoundedRectangle(cornerRadius: 24, style: .continuous)
+        .stroke(theme.accentHover.opacity(0.35), lineWidth: 1)
+    )
+    .onAppear {
+      appState.startLanInputServer()
+    }
+  }
+}
+
 // MARK: - Login Screen (Apple tvOS Frosted Glass Card)
 
 struct TvLoginView: View {
@@ -562,8 +884,15 @@ struct TvLoginView: View {
   @State private var urlInput: String = ""
   @State private var passwordInput: String = ""
 
+  private enum LoginFocusField: Hashable {
+    case url
+    case password
+    case submit
+  }
+  @FocusState private var focusedField: LoginFocusField?
+
   var body: some View {
-    VStack(spacing: 30) {
+    VStack(spacing: 26) {
       ZStack {
         Circle()
           .fill(
@@ -573,18 +902,18 @@ struct TvLoginView: View {
               endPoint: .bottomTrailing
             )
           )
-          .frame(width: 108, height: 108)
+          .frame(width: 92, height: 92)
           .shadow(color: Color.blue.opacity(0.45), radius: 24, y: 10)
 
         Image(systemName: "play.tv.fill")
-          .font(.system(size: 48, weight: .bold))
+          .font(.system(size: 42, weight: .bold))
           .foregroundColor(.white)
       }
 
       VStack(spacing: 8) {
         HStack(spacing: 12) {
           Text("流光视频 · Apple TV")
-            .font(.system(size: 42, weight: .bold, design: .rounded))
+            .font(.system(size: 38, weight: .bold, design: .rounded))
             .foregroundColor(.white)
           Text(appState.appFullVersion)
             .font(.system(size: 16, weight: .bold, design: .monospaced))
@@ -595,59 +924,116 @@ struct TvLoginView: View {
             .clipShape(Capsule(style: .continuous))
         }
         Text("连接您的流光视频服务端，畅享影视点播、电视直播、Telegram 频道画廊与 115 网盘")
-          .font(.system(size: 20))
+          .font(.system(size: 18))
           .foregroundColor(.white.opacity(0.68))
       }
 
-      VStack(alignment: .leading, spacing: 18) {
-        Text("服务器地址")
-          .font(.callout)
-          .foregroundColor(.white.opacity(0.7))
-        TextField("https://jp2.linsionwinwin.top:8081", text: $urlInput)
-          .frame(width: 720)
-
-        Text("访问密码")
-          .font(.callout)
-          .foregroundColor(.white.opacity(0.7))
-        SecureField("输入服务端密码", text: $passwordInput)
-          .frame(width: 720)
-      }
-      .padding(34)
-      .background(.ultraThinMaterial)
-      .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
-      .overlay(
-        RoundedRectangle(cornerRadius: 28, style: .continuous)
-          .stroke(Color.white.opacity(0.16), lineWidth: 1)
-      )
-
-      if let err = appState.statusBanner {
-        Text(err)
-          .font(.callout)
-          .foregroundColor(Color(red: 1.0, green: 0.42, blue: 0.40))
-      }
-
-      Button {
-        Task {
-          _ = await appState.loginAndBootstrap(url: urlInput, password: passwordInput)
-        }
-      } label: {
-        HStack(spacing: 12) {
-          if appState.isBootstrapping {
-            ProgressView()
-          } else {
-            Image(systemName: "arrow.right.circle.fill")
+      HStack(alignment: .center, spacing: 26) {
+        VStack(alignment: .leading, spacing: 18) {
+          VStack(alignment: .leading, spacing: 8) {
+            Text("服务器地址")
+              .font(.callout)
+              .foregroundColor(.white.opacity(0.78))
+            HStack(spacing: 14) {
+              TextField("https://jp2.linsionwinwin.top:8081", text: $urlInput)
+                .frame(width: 540)
+                .focused($focusedField, equals: .url)
+              TvQrInputTriggerButton(
+                prompt: "流光服务端地址",
+                placeholder: "https://jp2.linsionwinwin.top:8081",
+                labelText: "扫码填地址"
+              ) { text in
+                urlInput = text
+              }
+            }
+            .focusSection()
           }
-          Text(appState.isBootstrapping ? "正在连接服务器..." : "连接并进入")
+
+          VStack(alignment: .leading, spacing: 8) {
+            Text("访问密码")
+              .font(.callout)
+              .foregroundColor(.white.opacity(0.78))
+            HStack(spacing: 14) {
+              SecureField("输入服务端密码", text: $passwordInput)
+                .frame(width: 540)
+                .focused($focusedField, equals: .password)
+              TvQrInputTriggerButton(
+                prompt: "流光服务端访问密码",
+                placeholder: "输入访问密码",
+                labelText: "扫码填密码"
+              ) { text in
+                passwordInput = text
+              }
+            }
+            .focusSection()
+          }
+
+          if let err = appState.statusBanner {
+            Text(err)
+              .font(.callout)
+              .foregroundColor(Color(red: 1.0, green: 0.42, blue: 0.40))
+          }
+
+          HStack(spacing: 16) {
+            Button {
+              Task {
+                _ = await appState.loginAndBootstrap(url: urlInput, password: passwordInput)
+              }
+            } label: {
+              HStack(spacing: 12) {
+                if appState.isBootstrapping {
+                  ProgressView()
+                } else {
+                  Image(systemName: "arrow.right.circle.fill")
+                }
+                Text(appState.isBootstrapping ? "正在连接服务器..." : "连接并进入")
+              }
+              .frame(width: 320)
+            }
+            .buttonStyle(TvApplePillButtonStyle(isPrimary: true))
+            .disabled(appState.isBootstrapping)
+            .focused($focusedField, equals: .submit)
+
+            Button {
+              urlInput = appState.serverUrl
+              passwordInput = appState.authSecret
+            } label: {
+              Label("重置默认", systemImage: "arrow.uturn.backward")
+            }
+            .buttonStyle(TvApplePillButtonStyle())
+          }
+          .padding(.top, 6)
+          .focusSection()
         }
-        .frame(width: 340)
+        .padding(32)
+        .frame(width: 760)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .overlay(
+          RoundedRectangle(cornerRadius: 28, style: .continuous)
+            .stroke(Color.white.opacity(0.16), lineWidth: 1)
+        )
+
+        TvInlineQrInputCard(
+          title: "📱 手机扫码一键连接",
+          subtitle: "手机扫码可在网页上直接填写服务器地址与密码并一键登录",
+          qrSize: 168
+        )
       }
-      .buttonStyle(TvApplePillButtonStyle(isPrimary: true))
-      .disabled(appState.isBootstrapping)
     }
-    .padding(56)
+    .padding(42)
     .onAppear {
       urlInput = appState.serverUrl
       passwordInput = appState.authSecret
+      appState.startLanInputServer()
+      appState.activeLanQuickInputPrompt = "流光服务端地址"
+      appState.activeLanQuickInputPlaceholder = "https://..."
+      appState.activeLanQuickInputReceiver = { text in
+        urlInput = text
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+        focusedField = urlInput.isEmpty ? .url : .submit
+      }
     }
   }
 }
@@ -1253,26 +1639,51 @@ struct TvVodExpandedCategoryDrawerView: View {
     .sheet(isPresented: $showFilterSheet) {
       ZStack {
         TvAmbientBackdropView(imageUrl: appState.ambientBackdropUrl)
-        VStack(spacing: 28) {
-          Text("筛选分类标签名称")
-            .font(.largeTitle.bold())
-          TextField("输入分类名称（如：动作、科幻、短剧、动漫）...", text: $appState.vodCategoryFilterQuery)
-            .frame(width: 680)
-          HStack(spacing: 20) {
-            if !appState.vodCategoryFilterQuery.isEmpty {
-              Button("清空筛选") {
-                appState.vodCategoryFilterQuery = ""
+        HStack(spacing: 34) {
+          VStack(spacing: 24) {
+            Text("筛选分类标签名称")
+              .font(.largeTitle.bold())
+            HStack(spacing: 14) {
+              TextField("输入分类名称（如：动作、科幻、短剧、动漫）...", text: $appState.vodCategoryFilterQuery)
+                .frame(width: 580)
+              TvQrInputTriggerButton(
+                prompt: "筛选分类标签名称",
+                placeholder: "如：动作、科幻、短剧、动漫"
+              ) { text in
+                appState.vodCategoryFilterQuery = text
                 showFilterSheet = false
               }
-              .buttonStyle(TvApplePillButtonStyle())
             }
-            Button("确定") {
-              showFilterSheet = false
+            HStack(spacing: 20) {
+              if !appState.vodCategoryFilterQuery.isEmpty {
+                Button("清空筛选") {
+                  appState.vodCategoryFilterQuery = ""
+                  showFilterSheet = false
+                }
+                .buttonStyle(TvApplePillButtonStyle())
+              }
+              Button("确定") {
+                showFilterSheet = false
+              }
+              .buttonStyle(TvApplePillButtonStyle(isPrimary: true))
             }
-            .buttonStyle(TvApplePillButtonStyle(isPrimary: true))
           }
+          TvInlineQrInputCard(
+            title: "📱 手机扫码筛选分类",
+            subtitle: "扫码输入分类关键词即可立即过滤",
+            qrSize: 150
+          )
         }
-        .padding(60)
+        .padding(54)
+      }
+      .onAppear {
+        appState.startLanInputServer()
+        appState.activeLanQuickInputPrompt = "筛选分类标签名称"
+        appState.activeLanQuickInputPlaceholder = "如：动作、科幻、短剧、动漫"
+        appState.activeLanQuickInputReceiver = { text in
+          appState.vodCategoryFilterQuery = text
+          showFilterSheet = false
+        }
       }
     }
   }
@@ -1443,7 +1854,7 @@ struct TvVodPosterCard: View {
       }
       .frame(width: 245)
     }
-    .buttonStyle(.card)
+    .buttonStyle(TvApplePosterCardButtonStyle())
     .onChange(of: isFocused) { focused in
       if focused {
         onFocusedAtIndex(index)
@@ -1494,7 +1905,14 @@ struct TvSourcePickerSheet: View {
           Spacer()
 
           TextField("搜索站点...", text: $filterText)
-            .frame(width: 300)
+            .frame(width: 260)
+
+          TvQrInputTriggerButton(
+            prompt: "搜索片源站点",
+            placeholder: "输入站点名称或域名"
+          ) { text in
+            filterText = text
+          }
 
           Button("关闭") { isPresented = false }
             .buttonStyle(TvApplePillButtonStyle(compact: true))
@@ -1550,6 +1968,7 @@ struct TvSourcePickerSheet: View {
       }
       .padding(36)
     }
+    .withTvLanQuickInputOverlay(appState)
   }
 }
 
@@ -1562,34 +1981,79 @@ struct TvSearchSheet: View {
     ZStack {
       TvAmbientBackdropView(imageUrl: appState.ambientBackdropUrl)
 
-      VStack(spacing: 30) {
-        Text("全网影视搜索")
-          .font(.largeTitle.bold())
+      HStack(spacing: 38) {
+        VStack(spacing: 28) {
+          Text("全网影视搜索")
+            .font(.largeTitle.bold())
 
-        TextField("输入片名、主演或导演...", text: $keyword)
-          .frame(width: 760)
-
-        Toggle("启用多站并发聚合搜索（同时检索前 18 个可用源）", isOn: $appState.isAggregateSearch)
-          .frame(width: 760)
-
-        HStack(spacing: 24) {
-          Button("取消") { isPresented = false }
-            .buttonStyle(TvApplePillButtonStyle())
+          HStack(spacing: 14) {
+            TextField("输入片名、主演或导演...", text: $keyword)
+              .frame(width: 600)
+            TvQrInputTriggerButton(
+              prompt: "全网影视搜索关键词",
+              placeholder: "输入片名、主演或导演",
+              compact: false
+            ) { text in
+              keyword = text
+              appState.searchKeyword = text
+              isPresented = false
+              Task { await appState.performSearch() }
+            }
+          }
+          .focusSection()
 
           Button {
-            appState.searchKeyword = keyword
-            isPresented = false
-            Task { await appState.performSearch() }
+            appState.isAggregateSearch.toggle()
           } label: {
-            Label("立即搜索", systemImage: "magnifyingglass")
+            HStack(spacing: 12) {
+              Image(systemName: appState.isAggregateSearch ? "checkmark.circle.fill" : "circle")
+                .foregroundColor(appState.isAggregateSearch ? .green : .white.opacity(0.6))
+              Text("启用多站并发聚合搜索（同时检索前 18 个可用源）")
+              Spacer()
+              Text(appState.isAggregateSearch ? "已启用" : "单站搜索")
+                .font(.system(size: 15, weight: .bold))
+            }
+            .frame(width: 680)
           }
-          .buttonStyle(TvApplePillButtonStyle(isPrimary: true))
+          .buttonStyle(TvApplePillButtonStyle(isSelected: appState.isAggregateSearch, isPrimary: appState.isAggregateSearch))
+          .focusSection()
+
+          HStack(spacing: 24) {
+            Button("取消") { isPresented = false }
+              .buttonStyle(TvApplePillButtonStyle())
+
+            Button {
+              appState.searchKeyword = keyword
+              isPresented = false
+              Task { await appState.performSearch() }
+            } label: {
+              Label("立即搜索", systemImage: "magnifyingglass")
+            }
+            .buttonStyle(TvApplePillButtonStyle(isPrimary: true))
+          }
+          .focusSection()
         }
+
+        TvInlineQrInputCard(
+          title: "📱 手机扫码搜片",
+          subtitle: "手机扫码输入片名或演员，发送后电视将立即自动检索",
+          qrSize: 170
+        )
       }
-      .padding(60)
+      .padding(54)
     }
+    .withTvLanQuickInputOverlay(appState)
     .onAppear {
       keyword = appState.searchKeyword
+      appState.startLanInputServer()
+      appState.activeLanQuickInputPrompt = "全网影视搜索关键词"
+      appState.activeLanQuickInputPlaceholder = "输入片名、主演或导演"
+      appState.activeLanQuickInputReceiver = { text in
+        keyword = text
+        appState.searchKeyword = text
+        isPresented = false
+        Task { await appState.performSearch() }
+      }
     }
   }
 }
@@ -3629,6 +4093,7 @@ struct TvLiveSourcePickerSheet: View {
       }
       .padding(36)
     }
+    .withTvLanQuickInputOverlay(appState)
   }
 }
 
@@ -3645,25 +4110,53 @@ struct TvLiveSearchSheet: View {
       )
       .ignoresSafeArea()
 
-      VStack(spacing: 28) {
-        Text("搜索直播频道")
-          .font(.largeTitle.bold())
-        TextField("输入频道名称（如 CCTV、湖南卫视、翡翠台）...", text: $appState.liveSearchKeyword)
-          .frame(width: 720)
-        HStack(spacing: 20) {
-          Button("清空关键词") {
-            appState.liveSearchKeyword = ""
-            isPresented = false
+      HStack(spacing: 38) {
+        VStack(spacing: 28) {
+          Text("搜索直播频道")
+            .font(.largeTitle.bold())
+          HStack(spacing: 14) {
+            TextField("输入频道名称（如 CCTV、湖南卫视、翡翠台）...", text: $appState.liveSearchKeyword)
+              .frame(width: 600)
+            TvQrInputTriggerButton(
+              prompt: "搜索直播频道名称",
+              placeholder: "如 CCTV、湖南卫视、翡翠台",
+              compact: false
+            ) { text in
+              appState.liveSearchKeyword = text
+              isPresented = false
+            }
           }
-          .buttonStyle(TvApplePillButtonStyle())
+          HStack(spacing: 20) {
+            Button("清空关键词") {
+              appState.liveSearchKeyword = ""
+              isPresented = false
+            }
+            .buttonStyle(TvApplePillButtonStyle())
 
-          Button("完成") {
-            isPresented = false
+            Button("完成") {
+              isPresented = false
+            }
+            .buttonStyle(TvApplePillButtonStyle(isPrimary: true))
           }
-          .buttonStyle(TvApplePillButtonStyle(isPrimary: true))
         }
+
+        TvInlineQrInputCard(
+          title: "📱 手机扫码搜台",
+          subtitle: "手机扫码输入电视频道名，发送后自动过滤频道列表",
+          qrSize: 165
+        )
       }
-      .padding(60)
+      .padding(54)
+    }
+    .withTvLanQuickInputOverlay(appState)
+    .onAppear {
+      appState.startLanInputServer()
+      appState.activeLanQuickInputPrompt = "搜索直播频道名称"
+      appState.activeLanQuickInputPlaceholder = "如 CCTV、湖南卫视、翡翠台"
+      appState.activeLanQuickInputReceiver = { text in
+        appState.liveSearchKeyword = text
+        isPresented = false
+      }
     }
   }
 }
@@ -3954,18 +4447,26 @@ struct TvTelegramDialogsSidebarView: View {
 
     VStack(spacing: 0) {
       // Top Search & Quick Actions Bar
-      HStack(spacing: 10) {
+      HStack(spacing: 8) {
         HStack(spacing: 8) {
           Image(systemName: "magnifyingglass")
-            .font(.system(size: 18))
+            .font(.system(size: 16))
             .foregroundColor(TvTelegramPalette.textMuted)
           TextField("搜索会话或频道", text: $appState.telegramChatFilter)
-            .font(.system(size: 18))
+            .font(.system(size: 16))
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(TvTelegramPalette.searchFill)
         .clipShape(Capsule())
+
+        TvQrInputTriggerButton(
+          prompt: "搜索 Telegram 会话或频道",
+          placeholder: "输入频道或群组名",
+          labelText: "扫码"
+        ) { text in
+          appState.telegramChatFilter = text
+        }
 
         if unreadTotal > 0 {
           Button {
@@ -4316,6 +4817,12 @@ struct TvTelegramConversationPaneView: View {
             Image(systemName: "magnifyingglass")
               .foregroundColor(TvTelegramPalette.textMuted)
             TextField("搜索当前会话中的消息文本、文件名或歌手...", text: $appState.telegramMessageKeyword)
+            TvQrInputTriggerButton(
+              prompt: "搜索当前会话中的消息",
+              placeholder: "输入关键词、文件名或歌手"
+            ) { text in
+              appState.telegramMessageKeyword = text
+            }
             if !appState.telegramMessageKeyword.isEmpty {
               Text("匹配 \(appState.filteredTelegramMessages.count) 条")
                 .font(.caption)
@@ -4728,7 +5235,7 @@ struct TvTelegramAlbumBubbleView: View {
               }
               .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             }
-            .buttonStyle(.card)
+            .buttonStyle(TvApplePosterCardButtonStyle())
           }
         }
 
@@ -5141,7 +5648,7 @@ struct TvTelegramAttachmentCardView: View {
           .frame(width: 520, height: 292)
           .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         }
-        .buttonStyle(.card)
+        .buttonStyle(TvApplePosterCardButtonStyle())
 
         // Action Strip under Video/Photo
         HStack(spacing: 12) {
@@ -5388,7 +5895,7 @@ struct TvTelegramBottomComposeBar: View {
         .background(TvTelegramPalette.composeBg)
       } else {
         // Writable Chat Compose Bar
-        HStack(spacing: 14) {
+        HStack(spacing: 12) {
           Button(action: onOpenEmojiSheet) {
             Label("表情与快捷语", systemImage: "face.smiling")
           }
@@ -5398,6 +5905,13 @@ struct TvTelegramBottomComposeBar: View {
             .onChange(of: composeText) { newVal in
               appState.telegramDrafts[appState.draftKey(for: chat)] = newVal
             }
+
+          TvQrInputTriggerButton(
+            prompt: "发送消息至「\(chat.title)」",
+            placeholder: "在手机输入要发送的消息内容"
+          ) { text in
+            composeText = text
+          }
 
           Button {
             let text = composeText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -5547,7 +6061,7 @@ struct TvTelegramRightInfoDrawerView: View {
                   }
                   .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                 }
-                .buttonStyle(.card)
+                .buttonStyle(TvApplePosterCardButtonStyle())
               }
             }
             .padding(14)
@@ -5648,7 +6162,7 @@ struct TvTelegramMiniPlayerOverlay: View {
         .frame(width: 420, height: 236)
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
       }
-      .buttonStyle(.card)
+      .buttonStyle(TvApplePosterCardButtonStyle())
 
       HStack(spacing: 10) {
         Text(message.attachment?.displayName ?? chat.title)
@@ -6032,9 +6546,15 @@ struct TvTelegramAccountConfigSheet: View {
             }
           }
 
-          HStack(spacing: 16) {
+          HStack(spacing: 14) {
             TextField("新增多账号备注名", text: $newAccountName)
-              .frame(width: 400)
+              .frame(width: 340)
+            TvQrInputTriggerButton(
+              prompt: "Telegram 多账号备注名",
+              placeholder: "如：主力号 / 影视频道号"
+            ) { text in
+              newAccountName = text
+            }
             Button("新增账号槽位") {
               guard !newAccountName.isEmpty else { return }
               Task {
@@ -6049,11 +6569,13 @@ struct TvTelegramAccountConfigSheet: View {
 
           Divider()
 
-          HStack(spacing: 16) {
+          HStack(spacing: 14) {
             TextField("API ID (例如 123456)", text: $tgApiId)
-              .frame(width: 320)
+              .frame(width: 250)
+            TvQrInputTriggerButton(prompt: "Telegram API ID", placeholder: "纯数字 API ID", labelText: "扫码ID") { tgApiId = $0 }
             TextField("API Hash", text: $tgApiHash)
-              .frame(width: 520)
+              .frame(width: 390)
+            TvQrInputTriggerButton(prompt: "Telegram API Hash", placeholder: "32位 API Hash", labelText: "扫码Hash") { tgApiHash = $0 }
             Button("保存 API 配置") {
               guard let id = Int(tgApiId), !tgApiHash.isEmpty else { return }
               Task {
@@ -6069,9 +6591,10 @@ struct TvTelegramAccountConfigSheet: View {
             .buttonStyle(TvApplePillButtonStyle(compact: true))
           }
 
-          HStack(spacing: 16) {
+          HStack(spacing: 12) {
             TextField("手机号 (+86...)", text: $tgPhone)
-              .frame(width: 340)
+              .frame(width: 260)
+            TvQrInputTriggerButton(prompt: "Telegram 手机号", placeholder: "+86138...", labelText: "扫码号") { tgPhone = $0 }
             Button("发送验证码") {
               guard !tgPhone.isEmpty else { return }
               Task {
@@ -6086,9 +6609,11 @@ struct TvTelegramAccountConfigSheet: View {
             .buttonStyle(TvApplePillButtonStyle(compact: true))
 
             TextField("验证码", text: $tgCode)
-              .frame(width: 220)
+              .frame(width: 170)
+            TvQrInputTriggerButton(prompt: "Telegram 登录验证码", placeholder: "5位验证码", labelText: "扫码码") { tgCode = $0 }
             SecureField("两步验证密码 (选填)", text: $tgPassword)
-              .frame(width: 280)
+              .frame(width: 220)
+            TvQrInputTriggerButton(prompt: "Telegram 两步验证密码", placeholder: "2FA 密码", labelText: "扫码2FA") { tgPassword = $0 }
             Button("验证并登录") {
               guard !tgCode.isEmpty else { return }
               Task {
@@ -6112,6 +6637,7 @@ struct TvTelegramAccountConfigSheet: View {
         .padding(48)
       }
     }
+    .withTvLanQuickInputOverlay(appState)
   }
 }
 
@@ -6247,7 +6773,7 @@ struct TvFavoritesHistorySectionView: View {
                   }
                   .frame(width: 245)
                 }
-                .buttonStyle(.card)
+                .buttonStyle(TvApplePosterCardButtonStyle())
               }
             }
             .focusSection()
@@ -6291,8 +6817,21 @@ struct TvDownloadsSectionView: View {
 
             HStack(spacing: 12) {
               TextField("输入 M3U8 / MP4 直链地址...", text: $newUrl)
+              TvQrInputTriggerButton(
+                prompt: "下载任务直链地址 (M3U8 / MP4)",
+                placeholder: "https://.../index.m3u8"
+              ) { text in
+                newUrl = text
+              }
               TextField("任务文件名", text: $newName)
-                .frame(width: 280)
+                .frame(width: 240)
+              TvQrInputTriggerButton(
+                prompt: "下载任务保存文件名",
+                placeholder: "输入影片名称",
+                labelText: "扫码命名"
+              ) { text in
+                newName = text
+              }
               Button {
                 guard !newUrl.isEmpty else { return }
                 let name = newName.isEmpty ? "TV下载_\(Int(Date().timeIntervalSince1970))" : newName
@@ -6312,6 +6851,13 @@ struct TvDownloadsSectionView: View {
 
             HStack(spacing: 12) {
               TextField("输入包含视频的网页 URL 或分享文本进行智能嗅探...", text: $snifferInput)
+              TvQrInputTriggerButton(
+                prompt: "网页视频嗅探链接或分享文本",
+                placeholder: "粘贴网页 URL 或分享口令"
+              ) { text in
+                snifferInput = text
+                Task { await appState.extractWebVideoCandidates(input: text) }
+              }
               Button {
                 Task { await appState.extractWebVideoCandidates(input: snifferInput) }
               } label: {
@@ -6816,6 +7362,10 @@ struct TvMediaLibrarySectionView: View {
       TvMusicFolderPickerSheet()
         .environmentObject(appState)
     }
+    .sheet(isPresented: $appState.showMusicPlaylistManagerSheet) {
+      TvMusicPlaylistManagerSheet()
+        .environmentObject(appState)
+    }
     .sheet(item: $appState.activeArchiveMusicBrowserEntry) { archEntry in
       TvArchiveMusicBrowserSheet(archiveEntry: archEntry)
         .environmentObject(appState)
@@ -7180,14 +7730,22 @@ struct TvMediaLibrarySectionView: View {
             Image(systemName: "xmark.circle.fill")
               .foregroundColor(.white.opacity(0.6))
           }
-          .buttonStyle(.plain)
+          .buttonStyle(TvApplePillButtonStyle(compact: true))
         }
       }
       .padding(.horizontal, 12)
       .padding(.vertical, 6)
-      .frame(width: 290)
+      .frame(width: 260)
       .background(Color.white.opacity(0.08))
       .clipShape(Capsule())
+
+      TvQrInputTriggerButton(
+        prompt: "搜索当前目录文件或文件夹",
+        placeholder: "输入文件名关键词",
+        labelText: "扫码搜"
+      ) { text in
+        appState.fileSearchKeyword = text
+      }
 
       // Category Filter Pills
       ForEach(TvFileCategoryFilter.allCases, id: \.self) { cat in
@@ -7921,29 +8479,39 @@ struct TvMediaLibrarySectionView: View {
         }
 
         VStack(alignment: .leading, spacing: 10) {
-          TextField("显示名称（例如：家庭 AList / NAS WebDAV / CloudDrive2）", text: $mountNameInput)
+          HStack(spacing: 12) {
+            TextField("显示名称（例如：家庭 AList / NAS WebDAV / CloudDrive2）", text: $mountNameInput)
+              .font(.system(size: 16))
+            TvQrInputTriggerButton(prompt: "存储挂载显示名称", placeholder: "如：家庭 AList", labelText: "扫码名") { mountNameInput = $0 }
+          }
+          HStack(spacing: 12) {
+            TextField(
+              mountKind == .alist
+                ? "AList / OpenList 地址（例如 http://192.168.1.10:5244）"
+                : "WebDAV 完整地址（例如 http://192.168.1.10:5244/dav）",
+              text: $mountUrlInput
+            )
             .font(.system(size: 16))
-          TextField(
-            mountKind == .alist
-              ? "AList / OpenList 地址（例如 http://192.168.1.10:5244）"
-              : "WebDAV 完整地址（例如 http://192.168.1.10:5244/dav）",
-            text: $mountUrlInput
-          )
-          .font(.system(size: 16))
-
-          HStack(spacing: 14) {
-            TextField("用户名（选填，游客留空）", text: $mountUserInput)
-              .font(.system(size: 16))
-            SecureField("密码（选填）", text: $mountPassInput)
-              .font(.system(size: 16))
+            TvQrInputTriggerButton(prompt: "\(mountKind.title) 服务地址", placeholder: "http://192.168.1.10:5244", labelText: "扫码地址") { mountUrlInput = $0 }
           }
 
-          HStack(spacing: 14) {
+          HStack(spacing: 12) {
+            TextField("用户名（选填，游客留空）", text: $mountUserInput)
+              .font(.system(size: 16))
+            TvQrInputTriggerButton(prompt: "\(mountKind.title) 用户名", placeholder: "admin", labelText: "扫码账号") { mountUserInput = $0 }
+            SecureField("密码（选填）", text: $mountPassInput)
+              .font(.system(size: 16))
+            TvQrInputTriggerButton(prompt: "\(mountKind.title) 密码", placeholder: "输入密码", labelText: "扫码密码") { mountPassInput = $0 }
+          }
+
+          HStack(spacing: 12) {
             TextField("默认起始路径（默认 /）", text: $mountRootPathInput)
               .font(.system(size: 16))
+            TvQrInputTriggerButton(prompt: "默认起始路径", placeholder: "/", labelText: "扫码路径") { mountRootPathInput = $0 }
             if mountKind == .alist {
               TextField("AList Token（选填，已填账号密码可留空）", text: $mountTokenInput)
                 .font(.system(size: 16))
+              TvQrInputTriggerButton(prompt: "AList Token", placeholder: "alist-...", labelText: "扫码Token") { mountTokenInput = $0 }
             }
           }
         }
@@ -8230,10 +8798,26 @@ struct TvMediaLibrarySectionView: View {
       VStack(alignment: .leading, spacing: 16) {
         Label("新建远程链接离线下载 (支持 HTTP / M3U8 / Magnet 磁力链)", systemImage: "arrow.down.doc.fill")
           .font(.system(size: 21, weight: .bold))
-        TextField("粘贴下载链接 (https://... 或 .m3u8 或 magnet:?xt=...)", text: $remoteDownloadUrlInput)
-          .font(.system(size: 16))
-        TextField("保存文件名（选填，留空自动识别）", text: $remoteDownloadNameInput)
-          .font(.system(size: 16))
+        HStack(spacing: 12) {
+          TextField("粘贴下载链接 (https://... 或 .m3u8 或 magnet:?xt=...)", text: $remoteDownloadUrlInput)
+            .font(.system(size: 16))
+          TvQrInputTriggerButton(
+            prompt: "远程离线下载链接",
+            placeholder: "https://... 或 magnet:?xt=..."
+          ) { text in
+            remoteDownloadUrlInput = text
+          }
+        }
+        HStack(spacing: 12) {
+          TextField("保存文件名（选填，留空自动识别）", text: $remoteDownloadNameInput)
+            .font(.system(size: 16))
+          TvQrInputTriggerButton(
+            prompt: "离线下载保存文件名",
+            placeholder: "输入保存文件名"
+          ) { text in
+            remoteDownloadNameInput = text
+          }
+        }
         HStack(spacing: 14) {
           Button {
             guard !remoteDownloadUrlInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
@@ -8277,8 +8861,16 @@ struct TvMediaLibrarySectionView: View {
       VStack(alignment: .leading, spacing: 16) {
         Label("在「\(appState.activeStorageMount.name)」当前目录新建文件夹", systemImage: "folder.badge.plus")
           .font(.system(size: 21, weight: .bold))
-        TextField("输入新文件夹名称", text: $newFolderNameInput)
-          .font(.system(size: 16))
+        HStack(spacing: 12) {
+          TextField("输入新文件夹名称", text: $newFolderNameInput)
+            .font(.system(size: 16))
+          TvQrInputTriggerButton(
+            prompt: "新建文件夹名称",
+            placeholder: "输入新文件夹名称"
+          ) { text in
+            newFolderNameInput = text
+          }
+        }
         HStack(spacing: 14) {
           Button {
             let name = newFolderNameInput
@@ -8319,8 +8911,16 @@ struct TvMediaLibrarySectionView: View {
       VStack(alignment: .leading, spacing: 16) {
         Label("重命名：\(entry.name)", systemImage: "pencil.circle.fill")
           .font(.system(size: 21, weight: .bold))
-        TextField("输入新名称", text: $renameInputText)
-          .font(.system(size: 16))
+        HStack(spacing: 12) {
+          TextField("输入新名称", text: $renameInputText)
+            .font(.system(size: 16))
+          TvQrInputTriggerButton(
+            prompt: "重命名「\(entry.name)」",
+            placeholder: entry.name
+          ) { text in
+            renameInputText = text
+          }
+        }
         HStack(spacing: 14) {
           Button {
             let target = entry
@@ -9841,10 +10441,16 @@ struct TvProxySectionView: View {
           .font(.system(size: 14))
           .foregroundColor(.white.opacity(0.65))
 
-        TextField("订阅备注名称（选填，如：主力机场 / 备用专线）", text: $subNameDraft)
-          .frame(width: 760)
-        TextField("订阅地址 https://... 或 clash://...", text: $subUrlDraft)
-          .frame(width: 760)
+        HStack(spacing: 12) {
+          TextField("订阅备注名称（选填，如：主力机场 / 备用专线）", text: $subNameDraft)
+            .frame(width: 640)
+          TvQrInputTriggerButton(prompt: "代理订阅备注名称", placeholder: "如：主力机场") { subNameDraft = $0 }
+        }
+        HStack(spacing: 12) {
+          TextField("订阅地址 https://... 或 clash://...", text: $subUrlDraft)
+            .frame(width: 640)
+          TvQrInputTriggerButton(prompt: "代理订阅地址 URL", placeholder: "https://...") { subUrlDraft = $0 }
+        }
 
         HStack(spacing: 16) {
           Button("取消") { showSubEditorSheet = false }
@@ -9867,6 +10473,7 @@ struct TvProxySectionView: View {
       }
       .padding(44)
     }
+    .withTvLanQuickInputOverlay(appState)
   }
 
   @ViewBuilder
@@ -9880,8 +10487,16 @@ struct TvProxySectionView: View {
           .font(.system(size: 14))
           .foregroundColor(.white.opacity(0.65))
 
-        TextField("在此粘贴节点链接...", text: $pasteNodesDraft)
-          .frame(width: 780)
+        HStack(spacing: 12) {
+          TextField("在此粘贴节点链接...", text: $pasteNodesDraft)
+            .frame(width: 660)
+          TvQrInputTriggerButton(
+            prompt: "粘贴代理节点链接",
+            placeholder: "vmess://, vless://, ss://, trojan://, hy2://"
+          ) { text in
+            pasteNodesDraft = text
+          }
+        }
 
         HStack(spacing: 16) {
           Button("取消") { showPasteNodesSheet = false }
@@ -9899,6 +10514,7 @@ struct TvProxySectionView: View {
       }
       .padding(44)
     }
+    .withTvLanQuickInputOverlay(appState)
   }
 
   @ViewBuilder
@@ -9917,13 +10533,18 @@ struct TvProxySectionView: View {
           }
         }
 
-        TextField("节点名称（如：香港 IEPL 01）", text: $manualNodeName)
-          .frame(width: 680)
-        HStack(spacing: 14) {
+        HStack(spacing: 12) {
+          TextField("节点名称（如：香港 IEPL 01）", text: $manualNodeName)
+            .frame(width: 560)
+          TvQrInputTriggerButton(prompt: "代理节点名称", placeholder: "如：香港 IEPL 01") { manualNodeName = $0 }
+        }
+        HStack(spacing: 12) {
           TextField("服务器地址 (IP 或域名)", text: $manualNodeHost)
-            .frame(width: 480)
+            .frame(width: 390)
+          TvQrInputTriggerButton(prompt: "节点服务器 IP 或域名", placeholder: "hk.example.com", labelText: "扫码地址") { manualNodeHost = $0 }
           TextField("端口", text: $manualNodePort)
-            .frame(width: 180)
+            .frame(width: 140)
+          TvQrInputTriggerButton(prompt: "节点端口", placeholder: "1080", labelText: "扫码端口") { manualNodePort = $0 }
         }
 
         HStack(spacing: 16) {
@@ -9947,6 +10568,7 @@ struct TvProxySectionView: View {
       }
       .padding(44)
     }
+    .withTvLanQuickInputOverlay(appState)
   }
 
   @ViewBuilder
@@ -9976,6 +10598,7 @@ struct TvProxySectionView: View {
       }
       .padding(44)
     }
+    .withTvLanQuickInputOverlay(appState)
   }
 
   @ViewBuilder
@@ -10131,11 +10754,48 @@ struct TvProxyNodeCompactCard: View {
   }
 }
 
-// MARK: - 8. System Settings, Theme Switcher & 115 Cloud Drive Section View
+// MARK: - 8. System Settings, Theme Switcher & 115 Cloud Drive Section View (Redesigned Apple tvOS Settings Hub)
+
+private enum TvSettingsCategoryTab: String, CaseIterable, Identifiable {
+  case server = "server"
+  case playback = "playback"
+  case cloud115 = "cloud115"
+  case appearance = "appearance"
+
+  var id: String { rawValue }
+
+  var title: String {
+    switch self {
+    case .server: return "服务端与连接"
+    case .playback: return "播放与观影偏好"
+    case .cloud115: return "115 网盘直连"
+    case .appearance: return "主题外观与关于"
+    }
+  }
+
+  var subtitle: String {
+    switch self {
+    case .server: return "服务器地址、密码与扫码快配"
+    case .playback: return "广告过滤、直连策略与片头片尾"
+    case .cloud115: return "115 App 扫码与手机粘贴 Cookie"
+    case .appearance: return "5 款影院配色与系统端口诊断"
+    }
+  }
+
+  var iconName: String {
+    switch self {
+    case .server: return "server.rack"
+    case .playback: return "film.stack.fill"
+    case .cloud115: return "icloud.and.arrow.down.fill"
+    case .appearance: return "paintpalette.fill"
+    }
+  }
+}
 
 struct TvSettingsSectionView: View {
   @EnvironmentObject var appState: TvAppState
 
+  @State private var selectedTab: TvSettingsCategoryTab = .server
   @State private var urlInput: String = ""
   @State private var secretInput: String = ""
   @State private var adFilter: Bool = true
@@ -10143,229 +10803,206 @@ struct TvSettingsSectionView: View {
   @State private var introSec: Int = 0
   @State private var outroSec: Int = 0
   @State private var cookie115Input: String = ""
-  @FocusState private var focusedSettingsTopId: String?
+  @FocusState private var focusedSidebarTab: TvSettingsCategoryTab?
+
+  private var portalUrl: String {
+    appState.lanInputUrl.isEmpty
+      ? "http://\(TvAppState.localLanIPv4Address() ?? "127.0.0.1"):18088"
+      : appState.lanInputUrl
+  }
+
+  private func persistCurrentPreferences(showToast: Bool = true, reloadBootstrap: Bool = false) {
+    appState.saveConfig(
+      newUrl: urlInput,
+      newSecret: secretInput,
+      adFilter: adFilter,
+      directPlayback: directPlay,
+      introSec: introSec,
+      outroSec: outroSec
+    )
+    if showToast {
+      appState.showToast("设置已保存")
+    }
+    if reloadBootstrap {
+      Task { await appState.bootstrapAll() }
+    }
+  }
 
   var body: some View {
-    ScrollViewReader { scrollProxy in
-      ScrollView {
-        VStack(alignment: .leading, spacing: 26) {
-          // 1. Original App Theme Color Switcher Card (5 Presets)
-          VStack(alignment: .leading, spacing: 18) {
-            HStack {
-              Label("外观与主题配色（原应用 5 款经典影院主题）", systemImage: "paintpalette.fill")
-                .font(.title3.bold())
-              Spacer()
-              Text("当前版本：\(appState.appFullVersion)")
-                .font(.system(size: 15, weight: .bold, design: .monospaced))
-                .foregroundColor(.white.opacity(0.92))
-                .padding(.horizontal, 12)
-                .padding(.vertical, 5)
-                .background(appState.activeTheme.accent.opacity(0.22))
-                .clipShape(Capsule(style: .continuous))
-                .overlay(
-                  Capsule(style: .continuous)
-                    .stroke(appState.activeTheme.accentHover.opacity(0.5), lineWidth: 1)
+    let theme = appState.activeTheme
+
+    HStack(alignment: .top, spacing: 28) {
+      // Left Navigation Rail
+      VStack(alignment: .leading, spacing: 16) {
+        // System Header Summary Card
+        VStack(alignment: .leading, spacing: 10) {
+          HStack(spacing: 12) {
+            ZStack {
+              RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(
+                  LinearGradient(
+                    colors: [theme.accentHover, theme.accent],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                  )
                 )
-              Text("当前：\(appState.activeTheme.name) · \(appState.activeTheme.subtitle)")
-                .font(.callout)
-                .foregroundColor(appState.activeTheme.accentHover)
+                .frame(width: 46, height: 46)
+              Image(systemName: "gearshape.2.fill")
+                .font(.system(size: 22, weight: .bold))
+                .foregroundColor(.white)
             }
 
-            HStack(spacing: 18) {
-              ForEach(TvThemePalette.presets) { preset in
-                let isSelected = (appState.themeId == preset.id)
-                Button {
-                  appState.setTheme(preset.id)
-                } label: {
-                  VStack(alignment: .leading, spacing: 12) {
-                    HStack(spacing: 10) {
-                      ZStack {
-                        Circle()
-                          .fill(preset.bgPrimary)
-                          .frame(width: 36, height: 36)
-                          .overlay(Circle().stroke(Color.white.opacity(0.25), lineWidth: 1))
-                        Circle()
-                          .fill(preset.accent)
-                          .frame(width: 20, height: 20)
-                      }
-                      Text(preset.name)
-                        .font(.system(size: 20, weight: .bold))
-                        .foregroundColor(.white)
-                        .lineLimit(1)
-                      Spacer()
-                      if isSelected {
-                        Image(systemName: "checkmark.circle.fill")
-                          .font(.system(size: 22))
-                          .foregroundColor(preset.accentHover)
-                      }
-                    }
-
-                    Text(preset.subtitle)
-                      .font(.system(size: 14, weight: .medium))
-                      .foregroundColor(.white.opacity(0.68))
-                      .lineLimit(1)
-                  }
-                  .padding(18)
-                  .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .buttonStyle(TvAppleSurfaceButtonStyle(isSelected: isSelected, cornerRadius: 18))
-                .focused($focusedSettingsTopId, equals: preset.id)
-              }
+            VStack(alignment: .leading, spacing: 2) {
+              Text("系统设置中心")
+                .font(.system(size: 22, weight: .bold, design: .rounded))
+                .foregroundColor(.white)
+              Text(appState.appFullVersion)
+                .font(.system(size: 13, weight: .bold, design: .monospaced))
+                .foregroundColor(theme.accentHover)
             }
-          }
-          .padding(28)
-          .background(.ultraThinMaterial)
-          .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
-          .id("settings_top_anchor")
-          .focusSection()
-
-          // 2. Server & Playback Preferences Card
-          VStack(alignment: .leading, spacing: 18) {
-            HStack {
-              Text("服务器连接与播放器优化")
-                .font(.title3.bold())
-              Spacer()
-              if !appState.lanInputUrl.isEmpty {
-                Text("📱 手机扫码快捷配置：\(appState.lanInputUrl)")
-                  .font(.caption.monospaced())
-                  .foregroundColor(appState.activeTheme.accentHover)
-              }
-            }
-
-            HStack(spacing: 16) {
-              TextField("服务器地址", text: $urlInput)
-              SecureField("访问密码", text: $secretInput)
-                .frame(width: 360)
-            }
-
-            Toggle("启用 M3U8 切片广告智能过滤（自动剥离 #EXT-X-DISCONTINUITY 插播广告）", isOn: $adFilter)
-            Toggle("优先客户端直连播放（失败自动无缝回退服务端代理）", isOn: $directPlay)
-
-            HStack(spacing: 20) {
-              Button("跳过片头：\(introSec) 秒") {
-                introSec = (introSec + 15) % 150
-              }
-              .buttonStyle(TvApplePillButtonStyle(compact: true))
-
-              Button("跳过片尾：\(outroSec) 秒") {
-                outroSec = (outroSec + 15) % 180
-              }
-              .buttonStyle(TvApplePillButtonStyle(compact: true))
-
-              Spacer()
-
-              Button("保存并重新加载") {
-                appState.saveConfig(
-                  newUrl: urlInput,
-                  newSecret: secretInput,
-                  adFilter: adFilter,
-                  directPlayback: directPlay,
-                  introSec: introSec,
-                  outroSec: outroSec
-                )
-                appState.showToast("设置已保存")
-                Task { await appState.bootstrapAll() }
-              }
-              .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
-
-              Button("退出登录") {
-                appState.logout()
-              }
-              .buttonStyle(TvApplePillButtonStyle(isDestructive: true, compact: true))
-            }
-          }
-          .padding(28)
-          .background(.ultraThinMaterial)
-          .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
-          .focusSection()
-
-          // 3. 115 Cloud Drive Card
-          VStack(alignment: .leading, spacing: 18) {
-            HStack {
-              Text("115 网盘账号连接")
-                .font(.title3.bold())
-              Spacer()
-              Text(appState.is115LoggedIn ? "已登录 (\(appState.user115Name))" : "未登录")
-                .foregroundColor(appState.is115LoggedIn ? .green : .orange)
-            }
-
-            HStack(spacing: 16) {
-              TextField("粘贴 115 Cookie (UID=...; CID=...; SEID=...)", text: $cookie115Input)
-              Button("Cookie 登录") {
-                guard !cookie115Input.isEmpty else { return }
-                let ck = cookie115Input
-                cookie115Input = ""
-                Task {
-                  await appState.save115Cookie(ck)
-                  appState.showToast("已更新本地与服务端 115 Cookie")
-                }
-              }
-              .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
-
-              Button("获取扫码二维码") {
-                Task { await appState.start115QrCode(forceRefresh: true) }
-              }
-              .buttonStyle(TvApplePillButtonStyle(compact: true))
-
-              if !appState.qr115Token.isEmpty {
-                Button("刷新状态") {
-                  Task { await appState.poll115QrCodeOnce() }
-                }
-                .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
-              }
-            }
-
-            if !appState.qr115Content.isEmpty || !appState.qr115ImageUrl.isEmpty {
-              HStack(spacing: 24) {
-                if !appState.qr115Content.isEmpty {
-                  TvQRCodeImageView(content: appState.qr115Content, size: 170)
-                } else {
-                  TvRemoteImage(rawUrl: appState.qr115ImageUrl, placeholderIcon: "qrcode", contentMode: .fit)
-                    .frame(width: 180, height: 180)
-                    .background(Color.white)
-                    .cornerRadius(16)
-                }
-                Text(appState.qr115StatusText)
-                  .font(.callout)
-              }
-            }
-          }
-          .padding(28)
-          .background(.ultraThinMaterial)
-          .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
-          .focusSection()
-
-          // 4. App Version & Runtime Info Card
-          HStack(spacing: 20) {
-            Label("流光视频 Apple TV 原生客户端", systemImage: "appletv.fill")
-              .font(.headline)
-              .foregroundColor(.white)
-            Text(appState.appFullVersion)
-              .font(.system(size: 16, weight: .bold, design: .monospaced))
-              .foregroundColor(appState.activeTheme.accentHover)
-              .padding(.horizontal, 12)
-              .padding(.vertical, 5)
-              .background(appState.activeTheme.accent.opacity(0.2))
-              .clipShape(Capsule(style: .continuous))
             Spacer()
-            Text("tvOS \(UIDevice.current.systemVersion) · 本地代理端口 127.0.0.1:\(TvLocalProxyTunnelServer.shared.port) · HLS 加速端口 127.0.0.1:\(TvLocalHlsProxyServer.shared.port)")
-              .font(.caption.monospaced())
-              .foregroundColor(.white.opacity(0.68))
           }
-          .padding(.horizontal, 28)
-          .padding(.vertical, 20)
-          .background(.ultraThinMaterial)
-          .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+
+          HStack(spacing: 8) {
+            HStack(spacing: 5) {
+              Circle()
+                .fill(appState.isAuthenticated ? Color.green : Color.orange)
+                .frame(width: 8, height: 8)
+              Text(appState.isAuthenticated ? "服务端已连接" : "未连接")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(.white.opacity(0.85))
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(Color.white.opacity(0.08))
+            .clipShape(Capsule())
+
+            HStack(spacing: 5) {
+              Circle()
+                .fill(appState.is115LoggedIn ? Color.green : Color.secondary)
+                .frame(width: 8, height: 8)
+              Text(appState.is115LoggedIn ? "115 已登录" : "115 未登录")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(.white.opacity(0.85))
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(Color.white.opacity(0.08))
+            .clipShape(Capsule())
+          }
         }
-        .padding(.horizontal, 56)
-        .padding(.vertical, 24)
-      }
-      .onChange(of: appState.pageScrollToTopTrigger) { _ in
-        focusedSettingsTopId = appState.themeId
-        withAnimation(.easeInOut(duration: 0.25)) {
-          scrollProxy.scrollTo("settings_top_anchor", anchor: .top)
+        .padding(18)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay(
+          RoundedRectangle(cornerRadius: 22, style: .continuous)
+            .stroke(Color.white.opacity(0.14), lineWidth: 1)
+        )
+
+        // Category Tab Buttons
+        VStack(spacing: 10) {
+          ForEach(TvSettingsCategoryTab.allCases) { tab in
+            let isSelected = (selectedTab == tab)
+            Button {
+              withAnimation(.easeInOut(duration: 0.2)) {
+                selectedTab = tab
+              }
+            } label: {
+              HStack(spacing: 14) {
+                ZStack {
+                  RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(isSelected ? theme.accent : Color.white.opacity(0.08))
+                    .frame(width: 42, height: 42)
+                  Image(systemName: tab.iconName)
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundColor(isSelected ? .white : theme.accentHover)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                  Text(tab.title)
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                  Text(tab.subtitle)
+                    .font(.system(size: 12))
+                    .foregroundColor(.white.opacity(0.62))
+                    .lineLimit(1)
+                }
+
+                Spacer()
+
+                Image(systemName: "chevron.right")
+                  .font(.system(size: 14, weight: .bold))
+                  .foregroundColor(isSelected ? theme.accentHover : .white.opacity(0.3))
+              }
+              .padding(.horizontal, 14)
+              .padding(.vertical, 12)
+            }
+            .buttonStyle(TvAppleSurfaceButtonStyle(isSelected: isSelected, cornerRadius: 16))
+            .focused($focusedSidebarTab, equals: tab)
+          }
         }
+        .focusSection()
+
+        Spacer(minLength: 0)
+
+        // Always-Visible Compact Mobile QR Assistant Card
+        HStack(spacing: 14) {
+          TvQRCodeImageView(content: portalUrl, size: 96)
+
+          VStack(alignment: .leading, spacing: 5) {
+            Label("手机扫码遥控中心", systemImage: "iphone.radiowaves.left.and.right")
+              .font(.system(size: 14, weight: .bold))
+              .foregroundColor(theme.accentHover)
+            Text("扫码可在手机端一键配服、粘贴 115 Cookie、导入代理与快捷打字")
+              .font(.system(size: 11))
+              .foregroundColor(.white.opacity(0.68))
+              .fixedSize(horizontal: false, vertical: true)
+            Text(portalUrl)
+              .font(.system(size: 11, weight: .bold, design: .monospaced))
+              .foregroundColor(.yellow)
+              .lineLimit(1)
+          }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(
+          RoundedRectangle(cornerRadius: 20, style: .continuous)
+            .stroke(theme.accentHover.opacity(0.3), lineWidth: 1)
+        )
       }
+      .frame(width: 390)
+
+      // Right Content Panel
+      ScrollView {
+        VStack(alignment: .leading, spacing: 22) {
+          switch selectedTab {
+          case .server:
+            serverSettingsPanel(theme: theme)
+          case .playback:
+            playbackSettingsPanel(theme: theme)
+          case .cloud115:
+            cloud115SettingsPanel(theme: theme)
+          case .appearance:
+            appearanceSettingsPanel(theme: theme)
+          }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+      }
+      .focusSection()
+    }
+    .padding(.horizontal, 52)
+    .padding(.vertical, 22)
+    .onChange(of: appState.pageScrollToTopTrigger) { _ in
+      focusedSidebarTab = selectedTab
+    }
+    .onChange(of: appState.serverUrl) { newVal in
+      if !newVal.isEmpty { urlInput = newVal }
+    }
+    .onChange(of: appState.authSecret) { newVal in
+      if !newVal.isEmpty { secretInput = newVal }
     }
     .onAppear {
       urlInput = appState.serverUrl
@@ -10375,6 +11012,658 @@ struct TvSettingsSectionView: View {
       introSec = appState.skipIntroSeconds
       outroSec = appState.skipOutroSeconds
       appState.startLanInputServer()
+    }
+  }
+
+  // MARK: - Tab 1: Server & Connection Panel
+
+  @ViewBuilder
+  private func serverSettingsPanel(theme: TvThemePalette) -> some View {
+    HStack(alignment: .top, spacing: 24) {
+      VStack(alignment: .leading, spacing: 20) {
+        HStack {
+          VStack(alignment: .leading, spacing: 4) {
+            Label("流光服务端连接配置", systemImage: "server.rack")
+              .font(.system(size: 24, weight: .bold))
+              .foregroundColor(.white)
+            Text("配置流光视频后端服务器地址与访问密码，支持遥控器输入或手机扫码一键下发")
+              .font(.system(size: 14))
+              .foregroundColor(.white.opacity(0.65))
+          }
+          Spacer()
+        }
+
+        // Current status bar
+        HStack(spacing: 16) {
+          Image(systemName: appState.isAuthenticated ? "checkmark.shield.fill" : "exclamationmark.triangle.fill")
+            .font(.system(size: 24))
+            .foregroundColor(appState.isAuthenticated ? .green : .orange)
+
+          VStack(alignment: .leading, spacing: 2) {
+            Text(appState.isAuthenticated ? "当前已连接至：\(appState.serverUrl)" : "当前尚未连接有效服务端")
+              .font(.system(size: 15, weight: .bold))
+              .foregroundColor(.white)
+              .lineLimit(1)
+            Text("已加载 \(appState.vodSources.count) 个影视站点 · \(appState.liveChannels.count) 个直播频道 · \(appState.favorites.count) 部收藏")
+              .font(.system(size: 13))
+              .foregroundColor(.white.opacity(0.68))
+          }
+          Spacer()
+        }
+        .padding(16)
+        .background(Color.white.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+
+        // Server URL Input
+        VStack(alignment: .leading, spacing: 8) {
+          Text("服务器地址 (HTTP / HTTPS)")
+            .font(.system(size: 15, weight: .semibold))
+            .foregroundColor(.white.opacity(0.85))
+          HStack(spacing: 12) {
+            TextField("例如 https://jp2.linsionwinwin.top:8081", text: $urlInput)
+            TvQrInputTriggerButton(
+              prompt: "流光服务端地址",
+              placeholder: "https://jp2.linsionwinwin.top:8081",
+              labelText: "扫码填地址"
+            ) { text in
+              urlInput = text
+            }
+          }
+          .focusSection()
+        }
+
+        // Password Input
+        VStack(alignment: .leading, spacing: 8) {
+          Text("服务端访问密码")
+            .font(.system(size: 15, weight: .semibold))
+            .foregroundColor(.white.opacity(0.85))
+          HStack(spacing: 12) {
+            SecureField("输入服务端访问密码（若无密码可留空）", text: $secretInput)
+            TvQrInputTriggerButton(
+              prompt: "流光服务端访问密码",
+              placeholder: "输入访问密码",
+              labelText: "扫码填密码"
+            ) { text in
+              secretInput = text
+            }
+          }
+          .focusSection()
+        }
+
+        Divider().background(Color.white.opacity(0.15))
+
+        // Action Buttons
+        HStack(spacing: 16) {
+          Button {
+            persistCurrentPreferences(showToast: true, reloadBootstrap: true)
+          } label: {
+            Label("保存并重新加载数据", systemImage: "arrow.triangle.2.circlepath.circle.fill")
+          }
+          .buttonStyle(TvApplePillButtonStyle(isPrimary: true))
+
+          Button {
+            urlInput = appState.serverUrl
+            secretInput = appState.authSecret
+            appState.showToast("已恢复为当前生效配置")
+          } label: {
+            Label("重置输入", systemImage: "arrow.uturn.backward")
+          }
+          .buttonStyle(TvApplePillButtonStyle())
+
+          Spacer()
+
+          Button {
+            appState.logout()
+          } label: {
+            Label("退出登录", systemImage: "rectangle.portrait.and.arrow.right")
+          }
+          .buttonStyle(TvApplePillButtonStyle(isDestructive: true))
+        }
+        .focusSection()
+      }
+      .padding(28)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .background(.ultraThinMaterial)
+      .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+      .overlay(
+        RoundedRectangle(cornerRadius: 26, style: .continuous)
+          .stroke(Color.white.opacity(0.14), lineWidth: 1)
+      )
+
+      // Right QR Card
+      TvInlineQrInputCard(
+        title: "📱 扫码一键配服",
+        subtitle: "手机扫码打开局域网配置页，可同时填写服务器地址与密码并一键推送至 Apple TV",
+        qrSize: 185
+      )
+    }
+  }
+
+  // MARK: - Tab 2: Playback & Viewing Preferences Panel
+
+  @ViewBuilder
+  private func playbackSettingsPanel(theme: TvThemePalette) -> some View {
+    VStack(alignment: .leading, spacing: 18) {
+      HStack {
+        VStack(alignment: .leading, spacing: 4) {
+          Label("播放器与观影体验优化", systemImage: "film.stack.fill")
+            .font(.system(size: 24, weight: .bold))
+            .foregroundColor(.white)
+          Text("自定义 HLS 广告切片过滤、直连回退策略以及剧集自动跳过片头片尾时长")
+            .font(.system(size: 14))
+            .foregroundColor(.white.opacity(0.65))
+        }
+        Spacer()
+        Button {
+          persistCurrentPreferences(showToast: true, reloadBootstrap: false)
+        } label: {
+          Label("保存播放设置", systemImage: "checkmark.circle.fill")
+        }
+        .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+      }
+
+      // Row 1: M3U8 Ad Filter
+      HStack(spacing: 18) {
+        ZStack {
+          RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .fill(theme.accent.opacity(0.2))
+            .frame(width: 52, height: 52)
+          Image(systemName: "wand.and.stars")
+            .font(.system(size: 22, weight: .bold))
+            .foregroundColor(theme.accentHover)
+        }
+
+        VStack(alignment: .leading, spacing: 4) {
+          Text("M3U8 切片广告智能过滤")
+            .font(.system(size: 18, weight: .bold))
+            .foregroundColor(.white)
+          Text("自动分析 HLS 播放列表并剥离 #EXT-X-DISCONTINUITY 异常插播广告切片")
+            .font(.system(size: 13))
+            .foregroundColor(.white.opacity(0.65))
+        }
+
+        Spacer()
+
+        Button {
+          adFilter.toggle()
+          persistCurrentPreferences(showToast: true, reloadBootstrap: false)
+        } label: {
+          HStack(spacing: 8) {
+            Image(systemName: adFilter ? "checkmark.circle.fill" : "circle")
+              .foregroundColor(adFilter ? .green : .white.opacity(0.5))
+            Text(adFilter ? "已开启" : "已关闭")
+              .font(.system(size: 16, weight: .bold))
+          }
+          .frame(width: 120)
+        }
+        .buttonStyle(TvApplePillButtonStyle(isSelected: adFilter, isPrimary: adFilter, compact: true))
+      }
+      .padding(20)
+      .background(Color.white.opacity(0.06))
+      .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+
+      // Row 2: Direct Play Priority
+      HStack(spacing: 18) {
+        ZStack {
+          RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .fill(Color.blue.opacity(0.2))
+            .frame(width: 52, height: 52)
+          Image(systemName: "bolt.horizontal.circle.fill")
+            .font(.system(size: 22, weight: .bold))
+            .foregroundColor(Color(red: 0.38, green: 0.78, blue: 1.0))
+        }
+
+        VStack(alignment: .leading, spacing: 4) {
+          Text("优先客户端直连播放")
+            .font(.system(size: 18, weight: .bold))
+            .foregroundColor(.white)
+          Text("Apple TV 直接请求片源地址以获得最高起播速度；当遇到防盗链或跨域限制时自动无缝回退服务端代理")
+            .font(.system(size: 13))
+            .foregroundColor(.white.opacity(0.65))
+        }
+
+        Spacer()
+
+        Button {
+          directPlay.toggle()
+          persistCurrentPreferences(showToast: true, reloadBootstrap: false)
+        } label: {
+          HStack(spacing: 8) {
+            Image(systemName: directPlay ? "checkmark.circle.fill" : "circle")
+              .foregroundColor(directPlay ? .green : .white.opacity(0.5))
+            Text(directPlay ? "已开启" : "已关闭")
+              .font(.system(size: 16, weight: .bold))
+          }
+          .frame(width: 120)
+        }
+        .buttonStyle(TvApplePillButtonStyle(isSelected: directPlay, isPrimary: directPlay, compact: true))
+      }
+      .padding(20)
+      .background(Color.white.opacity(0.06))
+      .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+
+      // Row 3: Skip Intro
+      HStack(spacing: 18) {
+        ZStack {
+          RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .fill(Color.purple.opacity(0.2))
+            .frame(width: 52, height: 52)
+          Image(systemName: "forward.end.fill")
+            .font(.system(size: 22, weight: .bold))
+            .foregroundColor(Color(red: 0.78, green: 0.56, blue: 1.0))
+        }
+
+        VStack(alignment: .leading, spacing: 4) {
+          Text("自动跳过片头时长")
+            .font(.system(size: 18, weight: .bold))
+            .foregroundColor(.white)
+          Text("点播剧集起播时自动跳过的片头秒数（0 秒表示不跳过）")
+            .font(.system(size: 13))
+            .foregroundColor(.white.opacity(0.65))
+        }
+
+        Spacer()
+
+        HStack(spacing: 10) {
+          Button("-15秒") {
+            introSec = max(0, introSec - 15)
+            persistCurrentPreferences(showToast: false)
+          }
+          .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+          Text("\(introSec) 秒")
+            .font(.system(size: 18, weight: .heavy, design: .monospaced))
+            .foregroundColor(theme.accentHover)
+            .frame(width: 86, alignment: .center)
+
+          Button("+15秒") {
+            introSec = min(300, introSec + 15)
+            persistCurrentPreferences(showToast: false)
+          }
+          .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+          if introSec > 0 {
+            Button("清零") {
+              introSec = 0
+              persistCurrentPreferences(showToast: false)
+            }
+            .buttonStyle(TvApplePillButtonStyle(compact: true))
+          }
+        }
+      }
+      .padding(20)
+      .background(Color.white.opacity(0.06))
+      .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+
+      // Row 4: Skip Outro
+      HStack(spacing: 18) {
+        ZStack {
+          RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .fill(Color.orange.opacity(0.2))
+            .frame(width: 52, height: 52)
+          Image(systemName: "forward.frame.fill")
+            .font(.system(size: 22, weight: .bold))
+            .foregroundColor(.orange)
+        }
+
+        VStack(alignment: .leading, spacing: 4) {
+          Text("自动跳过片尾时长")
+            .font(.system(size: 18, weight: .bold))
+            .foregroundColor(.white)
+          Text("距离本集结束剩余指定秒数时自动连播下一集（0 秒表示播放至结束）")
+            .font(.system(size: 13))
+            .foregroundColor(.white.opacity(0.65))
+        }
+
+        Spacer()
+
+        HStack(spacing: 10) {
+          Button("-15秒") {
+            outroSec = max(0, outroSec - 15)
+            persistCurrentPreferences(showToast: false)
+          }
+          .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+          Text("\(outroSec) 秒")
+            .font(.system(size: 18, weight: .heavy, design: .monospaced))
+            .foregroundColor(theme.accentHover)
+            .frame(width: 86, alignment: .center)
+
+          Button("+15秒") {
+            outroSec = min(300, outroSec + 15)
+            persistCurrentPreferences(showToast: false)
+          }
+          .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+          if outroSec > 0 {
+            Button("清零") {
+              outroSec = 0
+              persistCurrentPreferences(showToast: false)
+            }
+            .buttonStyle(TvApplePillButtonStyle(compact: true))
+          }
+        }
+      }
+      .padding(20)
+      .background(Color.white.opacity(0.06))
+      .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+    }
+    .padding(28)
+    .background(.ultraThinMaterial)
+    .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+    .overlay(
+      RoundedRectangle(cornerRadius: 26, style: .continuous)
+        .stroke(Color.white.opacity(0.14), lineWidth: 1)
+    )
+  }
+
+  // MARK: - Tab 3: 115 Cloud Drive Panel
+
+  @ViewBuilder
+  private func cloud115SettingsPanel(theme: TvThemePalette) -> some View {
+    VStack(alignment: .leading, spacing: 20) {
+      // Header & Login Status Banner
+      HStack(spacing: 16) {
+        ZStack {
+          RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .fill(appState.is115LoggedIn ? Color.green.opacity(0.22) : Color.orange.opacity(0.22))
+            .frame(width: 52, height: 52)
+          Image(systemName: appState.is115LoggedIn ? "checkmark.icloud.fill" : "exclamationmark.icloud.fill")
+            .font(.system(size: 24, weight: .bold))
+            .foregroundColor(appState.is115LoggedIn ? .green : .orange)
+        }
+
+        VStack(alignment: .leading, spacing: 3) {
+          Text("115 网盘原画直连与云音乐挂载")
+            .font(.system(size: 22, weight: .bold))
+            .foregroundColor(.white)
+          Text(
+            appState.is115LoggedIn
+              ? "当前已登录账号：\(appState.user115Name)（支持 115 视频原画直连与无损音乐压缩包在线播放）"
+              : "当前未登录 115 网盘，可任选下方「115 官方 App 扫码」或「手机扫码粘贴 Cookie」完成连接"
+          )
+          .font(.system(size: 13))
+          .foregroundColor(appState.is115LoggedIn ? .green : .white.opacity(0.7))
+        }
+
+        Spacer()
+
+        Button {
+          Task { await appState.start115QrCode(forceRefresh: true) }
+        } label: {
+          Label("获取 / 刷新 115 二维码", systemImage: "qrcode")
+        }
+        .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+      }
+      .padding(22)
+      .background(.ultraThinMaterial)
+      .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+      .overlay(
+        RoundedRectangle(cornerRadius: 24, style: .continuous)
+          .stroke(Color.white.opacity(0.14), lineWidth: 1)
+      )
+
+      // Two-Column Login Methods
+      HStack(alignment: .top, spacing: 22) {
+        // Method 1: Official 115 App QR Scan
+        VStack(alignment: .leading, spacing: 16) {
+          Label("方式一：115 官方手机 App 扫码登录", systemImage: "qrcode.viewfinder")
+            .font(.system(size: 18, weight: .bold))
+            .foregroundColor(theme.accentHover)
+
+          Text("打开手机上的「115 生活 / 115 网盘 App」扫描下方二维码，并在手机上点击确认授权。")
+            .font(.system(size: 13))
+            .foregroundColor(.white.opacity(0.68))
+
+          HStack(spacing: 22) {
+            if !appState.qr115Content.isEmpty {
+              TvQRCodeImageView(content: appState.qr115Content, size: 176)
+            } else if !appState.qr115ImageUrl.isEmpty {
+              TvRemoteImage(rawUrl: appState.qr115ImageUrl, placeholderIcon: "qrcode", contentMode: .fit)
+                .frame(width: 180, height: 180)
+                .background(Color.white)
+                .cornerRadius(16)
+            } else {
+              VStack(spacing: 12) {
+                Image(systemName: "qrcode")
+                  .font(.system(size: 46))
+                  .foregroundColor(.white.opacity(0.35))
+                Text("点击下方按钮生成二维码")
+                  .font(.system(size: 13))
+                  .foregroundColor(.white.opacity(0.55))
+              }
+              .frame(width: 176, height: 176)
+              .background(Color.white.opacity(0.06))
+              .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            }
+
+            VStack(alignment: .leading, spacing: 12) {
+              Text(appState.qr115StatusText.isEmpty ? "等待获取登录二维码..." : appState.qr115StatusText)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundColor(.white.opacity(0.9))
+                .fixedSize(horizontal: false, vertical: true)
+
+              Button {
+                Task { await appState.start115QrCode(forceRefresh: true) }
+              } label: {
+                Label("生成新二维码", systemImage: "arrow.clockwise")
+              }
+              .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+              if !appState.qr115Token.isEmpty {
+                Button {
+                  Task { await appState.poll115QrCodeOnce() }
+                } label: {
+                  Label("已扫码，立即验证", systemImage: "checkmark.seal.fill")
+                }
+                .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+              }
+            }
+          }
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .overlay(
+          RoundedRectangle(cornerRadius: 24, style: .continuous)
+            .stroke(Color.white.opacity(0.14), lineWidth: 1)
+        )
+
+        // Method 2: Cookie Paste or Phone QR Input
+        VStack(alignment: .leading, spacing: 16) {
+          Label("方式二：手机扫码粘贴 Cookie", systemImage: "key.radiowaves.forward.fill")
+            .font(.system(size: 18, weight: .bold))
+            .foregroundColor(theme.accentHover)
+
+          Text("支持直接用手机扫描左下角遥控二维码，在手机网页上粘贴 115 Cookie（包含 UID、CID、SEID），将同步保存至 Apple TV 本地与流光服务端。")
+            .font(.system(size: 13))
+            .foregroundColor(.white.opacity(0.68))
+
+          HStack(spacing: 12) {
+            TextField("粘贴 115 Cookie (UID=...; CID=...; SEID=...)", text: $cookie115Input)
+            TvQrInputTriggerButton(
+              prompt: "115 网盘 Cookie (UID=...; CID=...; SEID=...)",
+              placeholder: "粘贴包含 UID/CID/SEID 的 Cookie",
+              labelText: "扫码粘贴"
+            ) { text in
+              cookie115Input = text
+              Task {
+                await appState.save115Cookie(text)
+                appState.showToast("已通过手机扫码更新 115 Cookie")
+              }
+            }
+          }
+          .focusSection()
+
+          HStack(spacing: 14) {
+            Button {
+              guard !cookie115Input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+              let ck = cookie115Input
+              cookie115Input = ""
+              Task {
+                await appState.save115Cookie(ck)
+                appState.showToast("已更新本地与服务端 115 Cookie")
+              }
+            } label: {
+              Label("保存并登录 Cookie", systemImage: "checkmark.circle.fill")
+            }
+            .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+
+            if !cookie115Input.isEmpty {
+              Button("清空输入框") {
+                cookie115Input = ""
+              }
+              .buttonStyle(TvApplePillButtonStyle(compact: true))
+            }
+          }
+          .focusSection()
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .overlay(
+          RoundedRectangle(cornerRadius: 24, style: .continuous)
+            .stroke(Color.white.opacity(0.14), lineWidth: 1)
+        )
+      }
+    }
+  }
+
+  // MARK: - Tab 4: Appearance & System Diagnostics Panel
+
+  @ViewBuilder
+  private func appearanceSettingsPanel(theme: TvThemePalette) -> some View {
+    VStack(alignment: .leading, spacing: 22) {
+      // Theme Switcher Card
+      VStack(alignment: .leading, spacing: 18) {
+        HStack {
+          VStack(alignment: .leading, spacing: 4) {
+            Label("影院级主题配色（5 款原生高对比度主题）", systemImage: "paintpalette.fill")
+              .font(.system(size: 24, weight: .bold))
+              .foregroundColor(.white)
+            Text("当前生效主题：\(theme.name) · \(theme.subtitle)（也可随时点击顶部导航栏右侧胶囊快捷切换）")
+              .font(.system(size: 14))
+              .foregroundColor(theme.accentHover)
+          }
+          Spacer()
+        }
+
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 240, maximum: 290), spacing: 16)], spacing: 16) {
+          ForEach(TvThemePalette.presets) { preset in
+            let isSelected = (appState.themeId == preset.id)
+            Button {
+              appState.setTheme(preset.id)
+            } label: {
+              VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 12) {
+                  ZStack {
+                    Circle()
+                      .fill(preset.bgPrimary)
+                      .frame(width: 40, height: 40)
+                      .overlay(Circle().stroke(Color.white.opacity(0.28), lineWidth: 1))
+                    Circle()
+                      .fill(preset.accent)
+                      .frame(width: 22, height: 22)
+                  }
+                  VStack(alignment: .leading, spacing: 2) {
+                    Text(preset.name)
+                      .font(.system(size: 19, weight: .bold))
+                      .foregroundColor(.white)
+                      .lineLimit(1)
+                    Text(preset.subtitle)
+                      .font(.system(size: 12, weight: .medium))
+                      .foregroundColor(.white.opacity(0.68))
+                      .lineLimit(1)
+                  }
+                  Spacer()
+                  if isSelected {
+                    Image(systemName: "checkmark.circle.fill")
+                      .font(.system(size: 22))
+                      .foregroundColor(preset.accentHover)
+                  }
+                }
+              }
+              .padding(18)
+              .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(TvAppleSurfaceButtonStyle(isSelected: isSelected, cornerRadius: 18))
+          }
+        }
+      }
+      .padding(28)
+      .background(.ultraThinMaterial)
+      .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+      .overlay(
+        RoundedRectangle(cornerRadius: 26, style: .continuous)
+          .stroke(Color.white.opacity(0.14), lineWidth: 1)
+      )
+
+      // Runtime & Diagnostics Card
+      VStack(alignment: .leading, spacing: 16) {
+        Label("Apple TV 运行环境与本地加速服务状态", systemImage: "appletv.fill")
+          .font(.system(size: 20, weight: .bold))
+          .foregroundColor(.white)
+
+        HStack(spacing: 16) {
+          VStack(alignment: .leading, spacing: 6) {
+            Text("客户端与系统版本")
+              .font(.system(size: 13, weight: .semibold))
+              .foregroundColor(.white.opacity(0.6))
+            Text("流光视频 \(appState.appFullVersion)")
+              .font(.system(size: 17, weight: .bold, design: .monospaced))
+              .foregroundColor(theme.accentHover)
+            Text("Apple tvOS \(UIDevice.current.systemVersion)")
+              .font(.system(size: 13, design: .monospaced))
+              .foregroundColor(.white.opacity(0.75))
+          }
+          .padding(18)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .background(Color.white.opacity(0.06))
+          .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+
+          VStack(alignment: .leading, spacing: 6) {
+            Text("本地代理与 HLS 加速端口")
+              .font(.system(size: 13, weight: .semibold))
+              .foregroundColor(.white.opacity(0.6))
+            Text("代理隧道 127.0.0.1:\(TvLocalProxyTunnelServer.shared.port)")
+              .font(.system(size: 15, weight: .bold, design: .monospaced))
+              .foregroundColor(.green)
+            Text("HLS 缓冲 127.0.0.1:\(TvLocalHlsProxyServer.shared.port)")
+              .font(.system(size: 13, design: .monospaced))
+              .foregroundColor(.white.opacity(0.75))
+          }
+          .padding(18)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .background(Color.white.opacity(0.06))
+          .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+
+          VStack(alignment: .leading, spacing: 6) {
+            Text("局域网手机快配与存储")
+              .font(.system(size: 13, weight: .semibold))
+              .foregroundColor(.white.opacity(0.6))
+            Text(portalUrl)
+              .font(.system(size: 15, weight: .bold, design: .monospaced))
+              .foregroundColor(.yellow)
+              .lineLimit(1)
+            Text("已挂载 \(appState.storageMounts.count) 个存储源 · \(appState.savedMusicPlaylists.count) 个音乐歌单")
+              .font(.system(size: 13))
+              .foregroundColor(.white.opacity(0.75))
+          }
+          .padding(18)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .background(Color.white.opacity(0.06))
+          .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        }
+      }
+      .padding(28)
+      .background(.ultraThinMaterial)
+      .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+      .overlay(
+        RoundedRectangle(cornerRadius: 26, style: .continuous)
+          .stroke(Color.white.opacity(0.14), lineWidth: 1)
+      )
     }
   }
 }
@@ -10397,7 +11686,7 @@ struct TvCloudMusicBottomDockBar: View {
   }
 
   var body: some View {
-    if let track = appState.currentCloudMusicTrack {
+    if appState.isCloudMusicSessionDocked, let track = appState.currentCloudMusicTrack {
       let theme = appState.activeTheme
       let meta = TvAppState.parseCloudTrackMetadata(
         track,
@@ -10515,7 +11804,11 @@ struct TvCloudMusicBottomDockBar: View {
           .buttonStyle(TvApplePillButtonStyle(compact: true))
 
           Button {
-            appState.showCloudMusicFullscreen = true
+            if appState.selectedSection == .mediaLibrary {
+              appState.showCloudMusicFullscreen = true
+            } else {
+              appState.selectedSection = .music
+            }
           } label: {
             Label("黑胶歌词厅 (\(appState.cloudMusicCurrentIndex + 1)/\(appState.cloudMusicQueue.count))", systemImage: "opticaldisc.fill")
               .foregroundColor(theme.accentHover)
@@ -10563,352 +11856,503 @@ struct TvCloudMusicBottomDockBar: View {
   }
 }
 
+struct TvRotatingVinylDiscView: View {
+  let isPlaying: Bool
+  let coverImage: UIImage?
+  let discOuter: CGFloat
+  let coverSize: CGFloat
+  let isCompact: Bool
+  let theme: TvThemePalette
+
+  var body: some View {
+    TimelineView(.animation(minimumInterval: 0.04, paused: !isPlaying)) { context in
+      let angle = isPlaying
+        ? (context.date.timeIntervalSinceReferenceDate * 18.0).truncatingRemainder(dividingBy: 360.0)
+        : 0.0
+      ZStack {
+        Circle()
+          .fill(
+            AngularGradient(
+              colors: [
+                Color(white: 0.07),
+                Color(white: 0.18),
+                Color(white: 0.07),
+                Color(white: 0.18),
+                Color(white: 0.07)
+              ],
+              center: .center
+            )
+          )
+          .frame(width: discOuter, height: discOuter)
+          .overlay(Circle().stroke(theme.accent.opacity(0.35), lineWidth: 3))
+          .shadow(color: .black.opacity(0.75), radius: 20)
+
+        Circle().stroke(Color.white.opacity(0.07), lineWidth: 1).frame(width: discOuter * 0.86, height: discOuter * 0.86)
+        Circle().stroke(Color.white.opacity(0.07), lineWidth: 1).frame(width: discOuter * 0.74, height: discOuter * 0.74)
+        Circle().stroke(Color.white.opacity(0.07), lineWidth: 1).frame(width: discOuter * 0.62, height: discOuter * 0.62)
+
+        if let cover = coverImage {
+          Image(uiImage: cover)
+            .resizable()
+            .scaledToFill()
+            .frame(width: coverSize, height: coverSize)
+            .clipShape(Circle())
+            .overlay(
+              Circle().stroke(theme.accent.opacity(0.75), lineWidth: 3)
+            )
+        } else {
+          Circle()
+            .fill(
+              LinearGradient(
+                colors: [
+                  theme.accent,
+                  theme.accentHover,
+                  theme.bgElevated
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+              )
+            )
+            .frame(width: coverSize, height: coverSize)
+            .overlay(
+              Image(systemName: "music.quarternote.3")
+                .font(.system(size: isCompact ? 46 : 54, weight: .bold))
+                .foregroundColor(.white.opacity(0.9))
+            )
+            .overlay(
+              Circle().stroke(theme.accent.opacity(0.75), lineWidth: 3)
+            )
+        }
+
+        Circle()
+          .fill(theme.bgPrimary)
+          .frame(width: 16, height: 16)
+          .overlay(Circle().stroke(Color.white.opacity(0.4), lineWidth: 2))
+      }
+      .rotationEffect(.degrees(angle))
+    }
+  }
+}
+
 struct TvCloudMusicFullscreenHallView: View {
   @EnvironmentObject var appState: TvAppState
   var isStandaloneSection: Bool = false
 
   @State private var rightPaneTab: Int = 0 // 0 = 实时同步歌词, 1 = 播放队列
-  @State private var vinylAngle: Double = 0
+  @State private var queuePageIndex: Int = 0
+  private let queuePageSize: Int = 100
   @State private var currentSpeedText: String = "↓ 0 KB/s"
   @FocusState private var initialFocus: String?
 
-  private let spinTimer = Timer.publish(every: 0.05, on: .main, in: .common).autoconnect()
+  private let speedPollTimer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
 
   var body: some View {
     let theme = appState.activeTheme
-    ZStack {
-      // Theme-reactive concert hall backdrop
-      TvAmbientBackdropView(imageUrl: appState.ambientBackdropUrl)
-      LinearGradient(
-        colors: [
-          theme.bgPrimary.opacity(0.92),
-          theme.bgElevated.opacity(0.88),
-          theme.bgCard.opacity(0.92)
-        ],
-        startPoint: .topLeading,
-        endPoint: .bottomTrailing
-      )
-      .ignoresSafeArea()
+    GeometryReader { hallGeo in
+      let availW = hallGeo.size.width
+      let availH = hallGeo.size.height
+      let isCompactH = availH < 980
 
-      if let cover = appState.cloudMusicCoverImage {
-        Image(uiImage: cover)
-          .resizable()
-          .scaledToFill()
-          .frame(maxWidth: .infinity, maxHeight: .infinity)
-          .blur(radius: 90)
-          .opacity(0.22)
-          .ignoresSafeArea()
-      }
-
-      if appState.isScanningMusicFolders {
-        VStack(spacing: 18) {
-          ProgressView()
-            .scaleEffect(1.6)
-          Text(appState.scanningMusicStatusText.isEmpty ? "正在扫描音乐文件夹与压缩包..." : appState.scanningMusicStatusText)
-            .font(.system(size: 22, weight: .bold))
-            .foregroundColor(.white)
-          Text("支持递归扫描 115 网盘 / AList / WebDAV 子文件夹及 .zip / .tar 压缩包内的音乐")
-            .font(.system(size: 16))
-            .foregroundColor(.white.opacity(0.65))
-        }
-      } else if let track = appState.currentCloudMusicTrack {
-        let meta = TvAppState.parseCloudTrackMetadata(
-          track,
-          fallbackArtist: appState.mountDisplayName(for: track)
+      ZStack {
+        // Theme-reactive concert hall backdrop
+        TvAmbientBackdropView(imageUrl: appState.ambientBackdropUrl)
+        LinearGradient(
+          colors: [
+            theme.bgPrimary.opacity(0.92),
+            theme.bgElevated.opacity(0.88),
+            theme.bgCard.opacity(0.92)
+          ],
+          startPoint: .topLeading,
+          endPoint: .bottomTrailing
         )
-        let ratio = appState.cloudMusicDuration > 0
-          ? min(max(0, appState.cloudMusicPosition / appState.cloudMusicDuration), 1.0)
-          : 0
+        .frame(width: availW, height: availH)
+        .clipped()
 
-        VStack(spacing: 14) {
-          // 1. Top Header Bar
-          HStack(spacing: 12) {
-            HStack(spacing: 8) {
-              Image(systemName: "opticaldisc.fill")
-                .font(.system(size: 20, weight: .bold))
-                .foregroundColor(.white)
-              Text("流光 Hi-Fi 云端黑胶音乐厅")
-                .font(.system(size: 18, weight: .heavy))
-                .foregroundColor(.white)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 7)
-            .background(
-              LinearGradient(
-                colors: [
-                  theme.accent,
-                  theme.accentHover
-                ],
-                startPoint: .leading,
-                endPoint: .trailing
+        if let cover = appState.cloudMusicCoverImage {
+          Image(uiImage: cover)
+            .resizable()
+            .scaledToFill()
+            .frame(width: availW, height: availH)
+            .blur(radius: 70)
+            .opacity(0.20)
+            .clipped()
+            .allowsHitTesting(false)
+        }
+
+        if appState.isScanningMusicFolders {
+          VStack(spacing: 18) {
+            ProgressView()
+              .scaleEffect(1.6)
+            Text(appState.scanningMusicStatusText.isEmpty ? "正在扫描音乐文件夹与压缩包..." : appState.scanningMusicStatusText)
+              .font(.system(size: 22, weight: .bold))
+              .foregroundColor(.white)
+            Text("支持递归扫描 115 网盘 / AList / WebDAV 子文件夹及 .zip / .tar 压缩包内的音乐")
+              .font(.system(size: 16))
+              .foregroundColor(.white.opacity(0.65))
+          }
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if let track = appState.currentCloudMusicTrack {
+          let meta = TvAppState.parseCloudTrackMetadata(
+            track,
+            fallbackArtist: appState.mountDisplayName(for: track)
+          )
+          let ratio = appState.cloudMusicDuration > 0
+            ? min(max(0, appState.cloudMusicPosition / appState.cloudMusicDuration), 1.0)
+            : 0
+
+          VStack(spacing: isCompactH ? 10 : 14) {
+            // 1. Top Header Bar
+            HStack(spacing: 10) {
+              HStack(spacing: 8) {
+                Image(systemName: "opticaldisc.fill")
+                  .font(.system(size: 18, weight: .bold))
+                  .foregroundColor(.white)
+                Text("流光 Hi-Fi 云端黑胶音乐厅")
+                  .font(.system(size: 17, weight: .heavy))
+                  .foregroundColor(.white)
+                  .lineLimit(1)
+              }
+              .padding(.horizontal, 14)
+              .padding(.vertical, 6)
+              .background(
+                LinearGradient(
+                  colors: [
+                    theme.accent,
+                    theme.accentHover
+                  ],
+                  startPoint: .leading,
+                  endPoint: .trailing
+                )
               )
-            )
-            .clipShape(Capsule())
+              .clipShape(Capsule())
+              .fixedSize(horizontal: true, vertical: false)
 
-            Button {
-              appState.showMusicFolderPickerSheet = true
-            } label: {
-              Label("自选文件夹 / 压缩包随机播放", systemImage: "folder.badge.plus")
-            }
-            .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
-
-            if appState.cloudMusicQueue.count > 1 {
               Button {
-                appState.shuffleCurrentCloudMusicQueue()
+                appState.showMusicFolderPickerSheet = true
               } label: {
-                Label("重新随机打乱 (\(appState.cloudMusicQueue.count)首)", systemImage: "shuffle")
+                Label("自选目录/压缩包", systemImage: "folder.badge.plus")
+              }
+              .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+              .fixedSize(horizontal: true, vertical: false)
+
+              Button {
+                appState.showMusicPlaylistManagerSheet = true
+              } label: {
+                Label("列表管理 (\(appState.savedMusicPlaylists.count))", systemImage: "music.note.list")
               }
               .buttonStyle(TvApplePillButtonStyle(compact: true))
-            }
+              .fixedSize(horizontal: true, vertical: false)
 
-            Text("存储源：\(appState.mountDisplayName(for: track))")
-              .font(.system(size: 14, weight: .bold))
-              .foregroundColor(theme.accentHover)
-              .padding(.horizontal, 12)
-              .padding(.vertical, 6)
+              if !appState.cloudMusicQueue.isEmpty {
+                Button {
+                  _ = appState.saveCurrentCloudMusicQueueAsPlaylist(name: "")
+                } label: {
+                  Label("存为歌单", systemImage: "plus.rectangle.on.folder.fill")
+                }
+                .buttonStyle(TvApplePillButtonStyle(compact: true))
+                .fixedSize(horizontal: true, vertical: false)
+              }
+
+              if appState.cloudMusicQueue.count > 1 {
+                Button {
+                  appState.shuffleCurrentCloudMusicQueue()
+                } label: {
+                  Label("随机打乱 (\(appState.cloudMusicQueue.count)首)", systemImage: "shuffle")
+                }
+                .buttonStyle(TvApplePillButtonStyle(compact: true))
+                .fixedSize(horizontal: true, vertical: false)
+              }
+
+              Text("存储源：\(appState.mountDisplayName(for: track))")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundColor(theme.accentHover)
+                .lineLimit(1)
+                .padding(.horizontal, 11)
+                .padding(.vertical, 5)
+                .background(Color.white.opacity(0.08))
+                .clipShape(Capsule())
+
+              Text("\(meta.qualityTag) · \(track.formattedSize)")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundColor(Color(red: 0.98, green: 0.75, blue: 0.14))
+                .lineLimit(1)
+                .padding(.horizontal, 11)
+                .padding(.vertical, 5)
+                .background(Color(red: 0.96, green: 0.62, blue: 0.04).opacity(0.18))
+                .clipShape(Capsule())
+                .fixedSize(horizontal: true, vertical: false)
+
+              Spacer(minLength: 8)
+
+              HStack(spacing: 6) {
+                Circle()
+                  .fill(appState.isCloudMusicPlaying ? Color.green : Color.gray)
+                  .frame(width: 8, height: 8)
+                Text(currentSpeedText)
+                  .font(.system(size: 13, weight: .bold, design: .monospaced))
+                  .foregroundColor(.white)
+                  .lineLimit(1)
+              }
+              .padding(.horizontal, 11)
+              .padding(.vertical, 5)
               .background(Color.white.opacity(0.08))
               .clipShape(Capsule())
+              .fixedSize(horizontal: true, vertical: false)
 
-            Text("\(meta.qualityTag) · \(track.formattedSize)")
-              .font(.system(size: 14, weight: .bold))
-              .foregroundColor(Color(red: 0.98, green: 0.75, blue: 0.14))
-              .padding(.horizontal, 12)
-              .padding(.vertical, 6)
-              .background(Color(red: 0.96, green: 0.62, blue: 0.04).opacity(0.18))
-              .clipShape(Capsule())
-
-            Spacer()
-
-            HStack(spacing: 6) {
-              Circle()
-                .fill(appState.isCloudMusicPlaying ? Color.green : Color.gray)
-                .frame(width: 8, height: 8)
-              Text(currentSpeedText)
-                .font(.system(size: 14, weight: .bold, design: .monospaced))
-                .foregroundColor(.white)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(Color.white.opacity(0.08))
-            .clipShape(Capsule())
-
-            if !isStandaloneSection {
-              Button {
-                appState.showCloudMusicFullscreen = false
-              } label: {
-                Label("收起至音乐栏 (边听边逛目录)", systemImage: "chevron.down.circle.fill")
-              }
-              .buttonStyle(TvApplePillButtonStyle(compact: true))
-            }
-          }
-          .focusSection()
-
-          if !appState.savedMusicFolders.isEmpty {
-            savedMusicFoldersQuickStrip()
-              .focusSection()
-          }
-
-          // 2. Main Concert Hall Content: Left Vinyl Turntable + Right Synchronized Lyrics / Queue
-          HStack(spacing: 32) {
-            leftVinylTurntablePane(track: track, meta: meta)
-
-            // Right Pane: Synchronized LRC Lyrics & Playlist Queue
-            VStack(alignment: .leading, spacing: 14) {
-              HStack(spacing: 12) {
+              if !isStandaloneSection {
                 Button {
-                  rightPaneTab = 0
+                  appState.showCloudMusicFullscreen = false
                 } label: {
-                  Label("实时同步歌词", systemImage: "quote.bubble.fill")
+                  Label("收起至音乐栏", systemImage: "chevron.down.circle.fill")
                 }
-                .buttonStyle(TvApplePillButtonStyle(isPrimary: rightPaneTab == 0, compact: true))
-
-                Button {
-                  rightPaneTab = 1
-                } label: {
-                  Label("播放队列 (\(appState.cloudMusicQueue.count))", systemImage: "music.note.list")
-                }
-                .buttonStyle(TvApplePillButtonStyle(isPrimary: rightPaneTab == 1, compact: true))
-
-                Spacer()
-
-                if rightPaneTab == 0 && !appState.cloudMusicLyricsSource.isEmpty {
-                  Text(appState.cloudMusicLyricsSource)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(theme.accentHover)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                    .background(theme.accent.opacity(0.18))
-                    .clipShape(Capsule())
-                }
+                .buttonStyle(TvApplePillButtonStyle(compact: true))
+                .fixedSize(horizontal: true, vertical: false)
               }
-              .focusSection()
-
-              if rightPaneTab == 0 {
-                lyricsPaneView()
-                  .focusSection()
-              } else {
-                playlistQueuePaneView()
-                  .focusSection()
-              }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding(22)
-            .background(theme.bgCard.opacity(0.55))
-            .overlay(
-              RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .stroke(theme.accent.opacity(0.22), lineWidth: 1)
-            )
-            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-          }
-          .frame(maxHeight: .infinity)
-
-          // 3. Bottom Hi-Fi Transport Deck
-          VStack(spacing: 12) {
-            HStack(spacing: 14) {
-              Text(TvCloudMusicBottomDockBar.formatTime(appState.cloudMusicPosition))
-                .font(.system(size: 15, weight: .bold, design: .monospaced))
-                .foregroundColor(.white.opacity(0.8))
-                .frame(width: 80, alignment: .leading)
-
-              GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                  Capsule()
-                    .fill(Color.white.opacity(0.14))
-                    .frame(height: 8)
-                  Capsule()
-                    .fill(
-                      LinearGradient(
-                        colors: [
-                          theme.accent,
-                          theme.accentHover
-                        ],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                      )
-                    )
-                    .frame(width: max(8, geo.size.width * ratio), height: 8)
-                }
-              }
-              .frame(height: 8)
-
-              Text(TvCloudMusicBottomDockBar.formatTime(appState.cloudMusicDuration))
-                .font(.system(size: 15, weight: .bold, design: .monospaced))
-                .foregroundColor(.white.opacity(0.8))
-                .frame(width: 80, alignment: .trailing)
-            }
-
-            HStack(spacing: 16) {
-              Button {
-                appState.cycleCloudMusicPlayMode()
-              } label: {
-                Label(appState.cloudMusicPlayModeLabel, systemImage: appState.cloudMusicPlayModeIcon)
-              }
-              .buttonStyle(TvApplePillButtonStyle(compact: true))
-
-              Button {
-                appState.cycleCloudMusicSpeed()
-              } label: {
-                Text(String(format: "倍速 %.2gx", appState.cloudMusicSpeed))
-              }
-              .buttonStyle(TvApplePillButtonStyle(compact: true))
-
-              Spacer()
-
-              Button {
-                appState.seekCloudMusicRelative(delta: -10)
-              } label: {
-                Label("-10秒", systemImage: "gobackward.10")
-              }
-              .buttonStyle(TvApplePillButtonStyle(compact: true))
-
-              Button {
-                appState.stepCloudMusicTrack(delta: -1)
-              } label: {
-                Label("上一首", systemImage: "backward.fill")
-              }
-              .buttonStyle(TvApplePillButtonStyle(compact: true))
-
-              Button {
-                appState.toggleCloudMusicPlayPause()
-              } label: {
-                Label(
-                  appState.isCloudMusicPlaying ? "暂停" : "播放",
-                  systemImage: appState.isCloudMusicPlaying ? "pause.fill" : "play.fill"
-                )
-                .font(.system(size: 18, weight: .heavy))
-                .padding(.horizontal, 12)
-              }
-              .buttonStyle(TvApplePillButtonStyle(isPrimary: true))
-              .focused($initialFocus, equals: "music_play_pause")
-
-              Button {
-                appState.stepCloudMusicTrack(delta: 1)
-              } label: {
-                Label("下一首", systemImage: "forward.fill")
-              }
-              .buttonStyle(TvApplePillButtonStyle(compact: true))
-
-              Button {
-                appState.seekCloudMusicRelative(delta: 10)
-              } label: {
-                Label("+10秒", systemImage: "goforward.10")
-              }
-              .buttonStyle(TvApplePillButtonStyle(compact: true))
-
-              Spacer()
-
-              Button {
-                rightPaneTab = (rightPaneTab == 0) ? 1 : 0
-              } label: {
-                Label(
-                  rightPaneTab == 0 ? "查看队列 (\(appState.cloudMusicQueue.count))" : "查看同步歌词",
-                  systemImage: rightPaneTab == 0 ? "music.note.list" : "quote.bubble.fill"
-                )
-              }
-              .buttonStyle(TvApplePillButtonStyle(compact: true))
 
               Button {
                 appState.stopCloudMusicPlayer()
               } label: {
-                Label("停止退出", systemImage: "stop.fill")
+                Label("退出播放", systemImage: "power")
               }
               .buttonStyle(TvApplePillButtonStyle(isDestructive: true, compact: true))
+              .fixedSize(horizontal: true, vertical: false)
             }
+            .focusSection()
+
+            if !appState.savedMusicPlaylists.isEmpty || !appState.savedMusicFolders.isEmpty {
+              savedMusicFoldersQuickStrip()
+                .focusSection()
+            }
+
+            // 2. Main Concert Hall Content: Left Vinyl Turntable + Right Synchronized Lyrics / Queue
+            HStack(spacing: 24) {
+              leftVinylTurntablePane(track: track, meta: meta, isCompact: isCompactH)
+
+              // Right Pane: Synchronized LRC Lyrics & Playlist Queue
+              VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 12) {
+                  Button {
+                    rightPaneTab = 0
+                  } label: {
+                    Label("实时同步歌词", systemImage: "quote.bubble.fill")
+                  }
+                  .buttonStyle(TvApplePillButtonStyle(isPrimary: rightPaneTab == 0, compact: true))
+
+                  Button {
+                    rightPaneTab = 1
+                  } label: {
+                    Label("播放队列 (\(appState.cloudMusicQueue.count))", systemImage: "music.note.list")
+                  }
+                  .buttonStyle(TvApplePillButtonStyle(isPrimary: rightPaneTab == 1, compact: true))
+
+                  Spacer()
+
+                  if rightPaneTab == 0 && !appState.cloudMusicLyricsSource.isEmpty {
+                    Text(appState.cloudMusicLyricsSource)
+                      .font(.system(size: 13, weight: .semibold))
+                      .foregroundColor(theme.accentHover)
+                      .lineLimit(1)
+                      .padding(.horizontal, 10)
+                      .padding(.vertical, 4)
+                      .background(theme.accent.opacity(0.18))
+                      .clipShape(Capsule())
+                  }
+                }
+                .focusSection()
+
+                if rightPaneTab == 0 {
+                  lyricsPaneView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipped()
+                    .focusSection()
+                } else {
+                  playlistQueuePaneView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipped()
+                    .focusSection()
+                }
+              }
+              .frame(maxWidth: .infinity, maxHeight: .infinity)
+              .padding(18)
+              .background(theme.bgCard.opacity(0.55))
+              .overlay(
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                  .stroke(theme.accent.opacity(0.22), lineWidth: 1)
+              )
+              .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            // 3. Bottom Hi-Fi Transport Deck
+            VStack(spacing: 10) {
+              HStack(spacing: 14) {
+                Text(TvCloudMusicBottomDockBar.formatTime(appState.cloudMusicPosition))
+                  .font(.system(size: 14, weight: .bold, design: .monospaced))
+                  .foregroundColor(.white.opacity(0.8))
+                  .frame(width: 78, alignment: .leading)
+
+                GeometryReader { geo in
+                  ZStack(alignment: .leading) {
+                    Capsule()
+                      .fill(Color.white.opacity(0.14))
+                      .frame(height: 7)
+                    Capsule()
+                      .fill(
+                        LinearGradient(
+                          colors: [
+                            theme.accent,
+                            theme.accentHover
+                          ],
+                          startPoint: .leading,
+                          endPoint: .trailing
+                        )
+                      )
+                      .frame(width: max(8, geo.size.width * ratio), height: 7)
+                  }
+                }
+                .frame(height: 7)
+
+                Text(TvCloudMusicBottomDockBar.formatTime(appState.cloudMusicDuration))
+                  .font(.system(size: 14, weight: .bold, design: .monospaced))
+                  .foregroundColor(.white.opacity(0.8))
+                  .frame(width: 78, alignment: .trailing)
+              }
+
+              HStack(spacing: 14) {
+                Button {
+                  appState.cycleCloudMusicPlayMode()
+                } label: {
+                  Label(appState.cloudMusicPlayModeLabel, systemImage: appState.cloudMusicPlayModeIcon)
+                }
+                .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+                Button {
+                  appState.cycleCloudMusicSpeed()
+                } label: {
+                  Text(String(format: "倍速 %.2gx", appState.cloudMusicSpeed))
+                }
+                .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+                Spacer()
+
+                Button {
+                  appState.seekCloudMusicRelative(delta: -10)
+                } label: {
+                  Label("-10秒", systemImage: "gobackward.10")
+                }
+                .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+                Button {
+                  appState.stepCloudMusicTrack(delta: -1)
+                } label: {
+                  Label("上一首", systemImage: "backward.fill")
+                }
+                .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+                Button {
+                  appState.toggleCloudMusicPlayPause()
+                } label: {
+                  Label(
+                    appState.isCloudMusicPlaying ? "暂停" : "播放",
+                    systemImage: appState.isCloudMusicPlaying ? "pause.fill" : "play.fill"
+                  )
+                  .font(.system(size: 17, weight: .heavy))
+                  .padding(.horizontal, 10)
+                }
+                .buttonStyle(TvApplePillButtonStyle(isPrimary: true))
+                .focused($initialFocus, equals: "music_play_pause")
+
+                Button {
+                  appState.stepCloudMusicTrack(delta: 1)
+                } label: {
+                  Label("下一首", systemImage: "forward.fill")
+                }
+                .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+                Button {
+                  appState.seekCloudMusicRelative(delta: 10)
+                } label: {
+                  Label("+10秒", systemImage: "goforward.10")
+                }
+                .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+                Spacer()
+
+                Button {
+                  rightPaneTab = (rightPaneTab == 0) ? 1 : 0
+                } label: {
+                  Label(
+                    rightPaneTab == 0 ? "查看队列 (\(appState.cloudMusicQueue.count))" : "查看同步歌词",
+                    systemImage: rightPaneTab == 0 ? "music.note.list" : "quote.bubble.fill"
+                  )
+                }
+                .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+                Button {
+                  appState.stopCloudMusicPlayer()
+                } label: {
+                  Label("停止退出", systemImage: "stop.fill")
+                }
+                .buttonStyle(TvApplePillButtonStyle(isDestructive: true, compact: true))
+              }
+            }
+            .padding(.horizontal, 22)
+            .padding(.vertical, 12)
+            .background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .focusSection()
           }
-          .padding(.horizontal, 26)
-          .padding(.vertical, 16)
-          .background(.ultraThinMaterial)
-          .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-          .focusSection()
+          .padding(.horizontal, 40)
+          .padding(.top, isStandaloneSection ? 6 : 18)
+          .padding(.bottom, 16)
+          .frame(width: availW, height: availH)
+          .clipped()
+        } else {
+          standaloneEmptyMusicLauncher()
+            .frame(width: availW, height: availH)
+            .clipped()
         }
-        .padding(.horizontal, 48)
-        .padding(.vertical, 24)
-      } else {
-        standaloneEmptyMusicLauncher()
       }
+      .frame(width: availW, height: availH)
+      .clipped()
     }
     .sheet(isPresented: $appState.showMusicFolderPickerSheet) {
       TvMusicFolderPickerSheet()
+        .environmentObject(appState)
+    }
+    .sheet(isPresented: $appState.showMusicPlaylistManagerSheet) {
+      TvMusicPlaylistManagerSheet()
         .environmentObject(appState)
     }
     .sheet(item: $appState.activeArchiveMusicBrowserEntry) { archEntry in
       TvArchiveMusicBrowserSheet(archiveEntry: archEntry)
         .environmentObject(appState)
     }
-    .onReceive(spinTimer) { _ in
-      if appState.isCloudMusicPlaying {
-        vinylAngle = (vinylAngle + 0.9).truncatingRemainder(dividingBy: 360.0)
-      }
+    .onReceive(speedPollTimer) { _ in
       let bps = TvNetworkSpeedMonitor.shared.recentDownstreamBytesPerSecond
+      let nextText: String
       if bps >= 1024 * 1024 {
-        currentSpeedText = String(format: "↓ %.2f MB/s", bps / (1024.0 * 1024.0))
+        nextText = String(format: "↓ %.2f MB/s", bps / (1024.0 * 1024.0))
       } else if bps > 512 {
-        currentSpeedText = String(format: "↓ %.0f KB/s", bps / 1024.0)
+        nextText = String(format: "↓ %.0f KB/s", bps / 1024.0)
       } else {
-        currentSpeedText = "↓ 0 KB/s"
+        nextText = "↓ 0 KB/s"
+      }
+      if currentSpeedText != nextText {
+        currentSpeedText = nextText
+      }
+    }
+    .onChange(of: appState.cloudMusicCurrentIndex) { newIdx in
+      guard newIdx >= 0 else { return }
+      let targetPage = newIdx / queuePageSize
+      if queuePageIndex != targetPage {
+        queuePageIndex = targetPage
       }
     }
     .onAppear {
+      if appState.cloudMusicCurrentIndex >= 0 {
+        queuePageIndex = appState.cloudMusicCurrentIndex / queuePageSize
+      }
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
         initialFocus = "music_play_pause"
       }
@@ -10927,36 +12371,57 @@ struct TvCloudMusicFullscreenHallView: View {
   private func savedMusicFoldersQuickStrip() -> some View {
     ScrollView(.horizontal, showsIndicators: false) {
       HStack(spacing: 10) {
-        Label("常用音乐源:", systemImage: "star.fill")
-          .font(.system(size: 13, weight: .bold))
-          .foregroundColor(.yellow)
+        if !appState.savedMusicPlaylists.isEmpty {
+          Label("播放列表:", systemImage: "music.note.list")
+            .font(.system(size: 13, weight: .bold))
+            .foregroundColor(appState.activeTheme.accentHover)
 
-        Button {
-          Task {
-            _ = await appState.scanAndPlayMusicFoldersOrArchives(
-              sources: appState.savedMusicFolders,
-              shuffle: true,
-              openFullscreen: false
-            )
+          ForEach(appState.savedMusicPlaylists) { pl in
+            let isCur = (pl.id == appState.activeMusicPlaylistId)
+            Button {
+              appState.switchAndPlayMusicPlaylist(pl.id, shuffle: false)
+            } label: {
+              Label(
+                "\(pl.name) (\(pl.tracks.count)首)",
+                systemImage: pl.id == "default_playlist" ? "pin.fill" : "music.note.list"
+              )
+            }
+            .buttonStyle(TvApplePillButtonStyle(isSelected: isCur, isPrimary: isCur, compact: true))
           }
-        } label: {
-          Label("全部随机播放 (\(appState.savedMusicFolders.count))", systemImage: "shuffle")
         }
-        .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
 
-        ForEach(appState.savedMusicFolders) { item in
+        if !appState.savedMusicFolders.isEmpty {
+          Label("常用目录:", systemImage: "star.fill")
+            .font(.system(size: 13, weight: .bold))
+            .foregroundColor(.yellow)
+
           Button {
             Task {
               _ = await appState.scanAndPlayMusicFoldersOrArchives(
-                sources: [item],
+                sources: appState.savedMusicFolders,
                 shuffle: true,
                 openFullscreen: false
               )
             }
           } label: {
-            Label("\(item.mountName): \(item.title)", systemImage: item.isArchive ? "doc.zipper" : "folder.fill")
+            Label("全部随机 (\(appState.savedMusicFolders.count))", systemImage: "shuffle")
           }
-          .buttonStyle(TvApplePillButtonStyle(compact: true))
+          .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+
+          ForEach(appState.savedMusicFolders) { item in
+            Button {
+              Task {
+                _ = await appState.scanAndPlayMusicFoldersOrArchives(
+                  sources: [item],
+                  shuffle: true,
+                  openFullscreen: false
+                )
+              }
+            } label: {
+              Label("\(item.mountName): \(item.title)", systemImage: item.isArchive ? "doc.zipper" : "folder.fill")
+            }
+            .buttonStyle(TvApplePillButtonStyle(compact: true))
+          }
         }
       }
       .padding(.vertical, 2)
@@ -11009,6 +12474,16 @@ struct TvCloudMusicFullscreenHallView: View {
         .buttonStyle(TvApplePillButtonStyle(isPrimary: true))
         .focused($initialFocus, equals: "music_play_pause")
 
+        if !appState.savedMusicPlaylists.isEmpty {
+          Button {
+            appState.showMusicPlaylistManagerSheet = true
+          } label: {
+            Label("播放已保存列表 (\(appState.savedMusicPlaylists.count)个)", systemImage: "music.note.list")
+              .font(.system(size: 18, weight: .bold))
+          }
+          .buttonStyle(TvApplePillButtonStyle())
+        }
+
         if !appState.savedMusicFolders.isEmpty {
           Button {
             Task {
@@ -11027,7 +12502,7 @@ struct TvCloudMusicFullscreenHallView: View {
       }
       .focusSection()
 
-      if !appState.savedMusicFolders.isEmpty {
+      if !appState.savedMusicPlaylists.isEmpty || !appState.savedMusicFolders.isEmpty {
         savedMusicFoldersQuickStrip()
           .padding(.horizontal, 60)
           .focusSection()
@@ -11049,78 +12524,31 @@ struct TvCloudMusicFullscreenHallView: View {
   @ViewBuilder
   private func leftVinylTurntablePane(
     track: TvFileEntry,
-    meta: (title: String, artist: String, qualityTag: String)
+    meta: (title: String, artist: String, qualityTag: String),
+    isCompact: Bool = false
   ) -> some View {
     let theme = appState.activeTheme
     let tick = Int(appState.cloudMusicPosition * 5.5)
-    VStack(spacing: 18) {
+    let discOuter: CGFloat = isCompact ? 290 : 340
+    let discGlow: CGFloat = discOuter + 32
+    let coverSize: CGFloat = isCompact ? 140 : 164
+    let armHeight: CGFloat = isCompact ? 112 : 132
+
+    VStack(spacing: isCompact ? 12 : 16) {
       ZStack {
         Circle()
           .fill(theme.accent.opacity(appState.isCloudMusicPlaying ? 0.24 : 0.07))
-          .frame(width: 390, height: 390)
-          .blur(radius: 28)
+          .frame(width: discGlow, height: discGlow)
+          .blur(radius: 24)
 
-        ZStack {
-          Circle()
-            .fill(
-              AngularGradient(
-                colors: [
-                  Color(white: 0.07),
-                  Color(white: 0.18),
-                  Color(white: 0.07),
-                  Color(white: 0.18),
-                  Color(white: 0.07)
-                ],
-                center: .center
-              )
-            )
-            .frame(width: 350, height: 350)
-            .overlay(Circle().stroke(theme.accent.opacity(0.35), lineWidth: 3))
-            .shadow(color: .black.opacity(0.75), radius: 24)
-
-          Circle().stroke(Color.white.opacity(0.07), lineWidth: 1).frame(width: 300, height: 300)
-          Circle().stroke(Color.white.opacity(0.07), lineWidth: 1).frame(width: 258, height: 258)
-          Circle().stroke(Color.white.opacity(0.07), lineWidth: 1).frame(width: 216, height: 216)
-
-          if let cover = appState.cloudMusicCoverImage {
-            Image(uiImage: cover)
-              .resizable()
-              .scaledToFill()
-              .frame(width: 168, height: 168)
-              .clipShape(Circle())
-              .overlay(
-                Circle().stroke(theme.accent.opacity(0.75), lineWidth: 3)
-              )
-          } else {
-            Circle()
-              .fill(
-                LinearGradient(
-                  colors: [
-                    theme.accent,
-                    theme.accentHover,
-                    theme.bgElevated
-                  ],
-                  startPoint: .topLeading,
-                  endPoint: .bottomTrailing
-                )
-              )
-              .frame(width: 168, height: 168)
-              .overlay(
-                Image(systemName: "music.quarternote.3")
-                  .font(.system(size: 56, weight: .bold))
-                  .foregroundColor(.white.opacity(0.9))
-              )
-              .overlay(
-                Circle().stroke(theme.accent.opacity(0.75), lineWidth: 3)
-              )
-          }
-
-          Circle()
-            .fill(theme.bgPrimary)
-            .frame(width: 18, height: 18)
-            .overlay(Circle().stroke(Color.white.opacity(0.4), lineWidth: 2))
-        }
-        .rotationEffect(.degrees(vinylAngle))
+        TvRotatingVinylDiscView(
+          isPlaying: appState.isCloudMusicPlaying,
+          coverImage: appState.cloudMusicCoverImage,
+          discOuter: discOuter,
+          coverSize: coverSize,
+          isCompact: isCompact,
+          theme: theme
+        )
 
         VStack(alignment: .trailing, spacing: 0) {
           HStack {
@@ -11128,34 +12556,34 @@ struct TvCloudMusicFullscreenHallView: View {
             ZStack(alignment: .topTrailing) {
               Circle()
                 .fill(Color(white: 0.25))
-                .frame(width: 32, height: 32)
+                .frame(width: 30, height: 30)
                 .overlay(
                   Circle()
                     .fill(theme.accent)
-                    .frame(width: 14, height: 14)
+                    .frame(width: 13, height: 13)
                 )
               RoundedRectangle(cornerRadius: 3)
                 .fill(Color(white: 0.85))
-                .frame(width: 6, height: 135)
-                .offset(x: -13, y: 16)
+                .frame(width: 6, height: armHeight)
+                .offset(x: -12, y: 15)
                 .rotationEffect(.degrees(appState.isCloudMusicPlaying ? 24 : 4), anchor: .top)
                 .animation(.easeInOut(duration: 0.45), value: appState.isCloudMusicPlaying)
             }
           }
           Spacer()
         }
-        .frame(width: 390, height: 370)
+        .frame(width: discGlow, height: discOuter + 16)
       }
 
-      VStack(spacing: 6) {
+      VStack(spacing: 4) {
         Text(meta.title)
-          .font(.system(size: 26, weight: .heavy))
+          .font(.system(size: isCompact ? 22 : 25, weight: .heavy))
           .foregroundColor(.white)
           .multilineTextAlignment(.center)
           .lineLimit(2)
 
         Text("\(meta.artist) · \(appState.cloudMusicSubtitle.isEmpty ? track.formattedSize : appState.cloudMusicSubtitle)")
-          .font(.system(size: 16, weight: .medium))
+          .font(.system(size: isCompact ? 14 : 15, weight: .medium))
           .foregroundColor(.white.opacity(0.72))
           .lineLimit(1)
       }
@@ -11174,13 +12602,13 @@ struct TvCloudMusicFullscreenHallView: View {
                 endPoint: .top
               )
             )
-            .frame(width: 5, height: barH)
+            .frame(width: 5, height: isCompact ? min(barH, 30) : barH)
             .animation(.easeOut(duration: 0.15), value: tick)
         }
       }
-      .frame(height: 38)
+      .frame(height: isCompact ? 30 : 36)
     }
-    .frame(width: 520)
+    .frame(width: isCompact ? 440 : 480)
   }
 
   @ViewBuilder
@@ -11226,32 +12654,29 @@ struct TvCloudMusicFullscreenHallView: View {
                     .foregroundColor(
                       isCurrent
                         ? theme.accentHover
-                        : .white.opacity(0.32)
+                        : .white.opacity(0.45)
                     )
                     .frame(width: 62, alignment: .leading)
 
                   Text(line.text)
-                    .font(.system(size: isCurrent ? 23 : 17, weight: isCurrent ? .heavy : .medium))
+                    .font(.system(size: isCurrent ? 22 : 17, weight: isCurrent ? .heavy : .medium))
                     .foregroundColor(
                       isCurrent
                         ? theme.accentHover
-                        : .white.opacity(0.62)
+                        : .white.opacity(0.78)
                     )
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity)
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
-                .background(
-                  RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(isCurrent ? theme.accent.opacity(0.18) : Color.clear)
-                )
               }
-              .buttonStyle(.plain)
+              .buttonStyle(TvAppleSurfaceButtonStyle(isSelected: isCurrent, cornerRadius: 14))
               .id(idx)
             }
           }
-          .padding(.vertical, 90)
+          .padding(.vertical, 60)
+          .padding(.horizontal, 6)
         }
         .onChange(of: activeIdx) { newIdx in
           guard newIdx >= 0 else { return }
@@ -11266,81 +12691,297 @@ struct TvCloudMusicFullscreenHallView: View {
   @ViewBuilder
   private func playlistQueuePaneView() -> some View {
     let theme = appState.activeTheme
-    ScrollViewReader { proxy in
-      ScrollView {
-        LazyVStack(spacing: 8) {
-          ForEach(Array(appState.cloudMusicQueue.enumerated()), id: \.offset) { idx, item in
-            let isCurrent = (idx == appState.cloudMusicCurrentIndex)
-            let meta = TvAppState.parseCloudTrackMetadata(
-              item,
-              fallbackArtist: appState.mountDisplayName(for: item)
-            )
-            HStack(spacing: 12) {
-              Button {
-                appState.playCloudMusicQueueIndex(idx)
-              } label: {
-                HStack(spacing: 12) {
-                  if isCurrent {
-                    Image(systemName: "waveform")
-                      .font(.system(size: 18, weight: .bold))
-                      .foregroundColor(theme.accentHover)
-                      .frame(width: 32)
-                  } else {
-                    Text(String(format: "%02d", idx + 1))
-                      .font(.system(size: 14, weight: .bold, design: .monospaced))
-                      .foregroundColor(.white.opacity(0.5))
-                      .frame(width: 32)
-                  }
+    let totalCount = appState.cloudMusicQueue.count
+    let pageCount = max(1, (totalCount + queuePageSize - 1) / queuePageSize)
+    let safePage = min(max(0, queuePageIndex), pageCount - 1)
+    let pageStart = safePage * queuePageSize
+    let pageEnd = min(totalCount, pageStart + queuePageSize)
 
-                  VStack(alignment: .leading, spacing: 3) {
-                    Text(meta.title)
-                      .font(.system(size: 16, weight: isCurrent ? .heavy : .semibold))
-                      .foregroundColor(isCurrent ? theme.accentHover : .white)
-                      .lineLimit(1)
-                    Text("\(meta.artist) · \(appState.mountDisplayName(for: item)) · \(item.formattedSize)")
-                      .font(.system(size: 12))
-                      .foregroundColor(.white.opacity(0.6))
-                      .lineLimit(1)
+    VStack(alignment: .leading, spacing: 8) {
+      if pageCount > 1 {
+        ScrollView(.horizontal, showsIndicators: false) {
+          HStack(spacing: 8) {
+            Text("分段浏览:")
+              .font(.system(size: 12, weight: .bold))
+              .foregroundColor(.white.opacity(0.65))
+
+            ForEach(0..<pageCount, id: \.self) { pIdx in
+              let s = pIdx * queuePageSize + 1
+              let e = min(totalCount, (pIdx + 1) * queuePageSize)
+              let isCurPage = (pIdx == safePage)
+              let hasPlayingTrack = (appState.cloudMusicCurrentIndex >= s - 1 && appState.cloudMusicCurrentIndex < e)
+              Button {
+                queuePageIndex = pIdx
+              } label: {
+                HStack(spacing: 4) {
+                  if hasPlayingTrack {
+                    Image(systemName: "waveform")
+                      .font(.system(size: 11, weight: .bold))
+                  }
+                  Text("\(s)-\(e)")
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                }
+              }
+              .buttonStyle(TvApplePillButtonStyle(isSelected: isCurPage, isPrimary: isCurPage, compact: true))
+            }
+          }
+          .padding(.vertical, 2)
+        }
+      }
+
+      ScrollViewReader { proxy in
+        ScrollView {
+          LazyVStack(spacing: 8) {
+            if pageStart < pageEnd {
+              ForEach(pageStart..<pageEnd, id: \.self) { idx in
+                let item = appState.cloudMusicQueue[idx]
+                let isCurrent = (idx == appState.cloudMusicCurrentIndex)
+                let mountTitle = appState.mountDisplayName(for: item)
+                let meta = TvAppState.parseCloudTrackMetadata(
+                  item,
+                  fallbackArtist: mountTitle
+                )
+                let subtitleParts: [String] = {
+                  var parts: [String] = []
+                  if !meta.artist.isEmpty {
+                    parts.append(meta.artist)
+                  }
+                  if !mountTitle.isEmpty && mountTitle != meta.artist {
+                    parts.append(mountTitle)
+                  }
+                  parts.append(item.formattedSize)
+                  return parts
+                }()
+
+                Button {
+                  appState.playCloudMusicQueueIndex(idx)
+                } label: {
+                  HStack(spacing: 12) {
+                    if isCurrent {
+                      Image(systemName: "waveform")
+                        .font(.system(size: 18, weight: .bold))
+                        .foregroundColor(theme.accentHover)
+                        .frame(width: 36)
+                    } else {
+                      Text(String(format: "%02d", idx + 1))
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.65))
+                        .frame(width: 36)
+                    }
+
+                    VStack(alignment: .leading, spacing: 3) {
+                      Text(meta.title)
+                        .font(.system(size: 16, weight: isCurrent ? .heavy : .semibold))
+                        .foregroundColor(isCurrent ? theme.accentHover : .white)
+                        .lineLimit(1)
+                      Text(subtitleParts.joined(separator: " · "))
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundColor(.white.opacity(0.70))
+                        .lineLimit(1)
+                    }
+
+                    Spacer()
+
+                    Text(meta.qualityTag)
+                      .font(.system(size: 11, weight: .bold))
+                      .foregroundColor(theme.accentHover)
+                      .padding(.horizontal, 8)
+                      .padding(.vertical, 3)
+                      .background(Color.white.opacity(0.10))
+                      .clipShape(Capsule())
+                  }
+                  .padding(.horizontal, 14)
+                  .padding(.vertical, 10)
+                }
+                .buttonStyle(TvAppleSurfaceButtonStyle(isSelected: isCurrent, cornerRadius: 14))
+                .contextMenu {
+                  Button {
+                    appState.playCloudMusicQueueIndex(idx)
+                  } label: {
+                    Label("立即播放此曲目", systemImage: "play.fill")
+                  }
+                  Button(role: .destructive) {
+                    appState.removeCloudMusicTrackAt(idx)
+                  } label: {
+                    Label("从播放队列移除", systemImage: "trash")
+                  }
+                }
+                .id("queue_\(idx)")
+              }
+            }
+          }
+          .padding(.vertical, 6)
+          .padding(.horizontal, 6)
+        }
+        .onAppear {
+          let cur = appState.cloudMusicCurrentIndex
+          if cur >= 0 && cur < totalCount {
+            let targetPage = cur / queuePageSize
+            if queuePageIndex != targetPage {
+              queuePageIndex = targetPage
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+              proxy.scrollTo("queue_\(cur)", anchor: .center)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// MARK: - Music Playlist Manager Sheet (播放列表 / 歌单管理)
+
+struct TvMusicPlaylistManagerSheet: View {
+  @EnvironmentObject var appState: TvAppState
+  @State private var newPlaylistName: String = ""
+
+  var body: some View {
+    let theme = appState.activeTheme
+    ZStack {
+      TvAmbientBackdropView(imageUrl: appState.ambientBackdropUrl)
+      VStack(alignment: .leading, spacing: 18) {
+        HStack(spacing: 14) {
+          Label("播放列表 / 歌单管理", systemImage: "music.note.list")
+            .font(.system(size: 26, weight: .heavy))
+            .foregroundColor(theme.accentHover)
+
+          Text("每次播放的默认列表会自动永久保存，无需重新选目录")
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundColor(.white.opacity(0.72))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .background(Color.white.opacity(0.08))
+            .clipShape(Capsule())
+
+          Spacer()
+
+          Button("关闭窗口") {
+            appState.showMusicPlaylistManagerSheet = false
+          }
+          .buttonStyle(TvApplePillButtonStyle(compact: true))
+        }
+        .focusSection()
+
+        if !appState.cloudMusicQueue.isEmpty {
+          HStack(spacing: 12) {
+            TextField("输入新歌单名称 (留空则自动命名)...", text: $newPlaylistName)
+              .font(.system(size: 15))
+              .padding(.horizontal, 14)
+              .padding(.vertical, 8)
+              .background(Color.white.opacity(0.08))
+              .clipShape(Capsule())
+
+            TvQrInputTriggerButton(
+              prompt: "新建音乐歌单名称",
+              placeholder: "如：车载无损精选 / 周杰伦合集"
+            ) { text in
+              newPlaylistName = text
+            }
+
+            Button {
+              _ = appState.saveCurrentCloudMusicQueueAsPlaylist(name: newPlaylistName)
+              newPlaylistName = ""
+            } label: {
+              Label("将当前列表 (\(appState.cloudMusicQueue.count)首) 另存为新歌单", systemImage: "plus.rectangle.on.folder.fill")
+            }
+            .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+          }
+          .focusSection()
+        }
+
+        if appState.savedMusicPlaylists.isEmpty {
+          VStack(spacing: 14) {
+            Image(systemName: "music.note.list")
+              .font(.system(size: 46))
+              .foregroundColor(.white.opacity(0.35))
+            Text("暂无已保存的播放列表")
+              .font(.system(size: 20, weight: .bold))
+              .foregroundColor(.white.opacity(0.8))
+            Text("选择任意音乐目录或压缩包播放后，系统会自动为您永久保存默认播放列表")
+              .font(.system(size: 15))
+              .foregroundColor(.white.opacity(0.55))
+          }
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+          ScrollView {
+            LazyVStack(spacing: 10) {
+              ForEach(appState.savedMusicPlaylists) { pl in
+                let isCurrent = (pl.id == appState.activeMusicPlaylistId)
+                HStack(spacing: 14) {
+                  Image(systemName: pl.id == "default_playlist" ? "pin.fill" : "music.note.list")
+                    .font(.system(size: 20, weight: .bold))
+                    .foregroundColor(isCurrent ? theme.accentHover : .white.opacity(0.75))
+                    .frame(width: 32)
+
+                  VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                      Text(pl.name)
+                        .font(.system(size: 18, weight: .heavy))
+                        .foregroundColor(isCurrent ? theme.accentHover : .white)
+                      if isCurrent {
+                        Text("当前列表")
+                          .font(.system(size: 11, weight: .bold))
+                          .foregroundColor(.white)
+                          .padding(.horizontal, 8)
+                          .padding(.vertical, 2)
+                          .background(theme.accent)
+                          .clipShape(Capsule())
+                      }
+                    }
+                    Text("共 \(pl.tracks.count) 首歌曲\(pl.id == "default_playlist" ? " · 每次播放自动同步保存" : "")")
+                      .font(.system(size: 13))
+                      .foregroundColor(.white.opacity(0.68))
                   }
 
                   Spacer()
 
-                  Text(meta.qualityTag)
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundColor(theme.accentHover)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(Color.white.opacity(0.08))
-                    .clipShape(Capsule())
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .background(
-                  RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(isCurrent ? theme.accent.opacity(0.22) : Color.white.opacity(0.04))
-                )
-              }
-              .buttonStyle(.plain)
+                  Button {
+                    appState.showMusicPlaylistManagerSheet = false
+                    appState.switchAndPlayMusicPlaylist(pl.id, shuffle: false)
+                  } label: {
+                    Label("顺序播放", systemImage: "play.fill")
+                  }
+                  .buttonStyle(TvApplePillButtonStyle(isPrimary: isCurrent, compact: true))
 
-              Button {
-                appState.removeCloudMusicTrackAt(idx)
-              } label: {
-                Image(systemName: "trash")
-                  .font(.system(size: 14))
+                  Button {
+                    appState.showMusicPlaylistManagerSheet = false
+                    appState.switchAndPlayMusicPlaylist(pl.id, shuffle: true)
+                  } label: {
+                    Label("随机播放", systemImage: "shuffle")
+                  }
+                  .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+                  if pl.id != "default_playlist" || appState.savedMusicPlaylists.count > 1 {
+                    Button {
+                      appState.deleteSavedMusicPlaylist(pl.id)
+                    } label: {
+                      Label("删除", systemImage: "trash")
+                    }
+                    .buttonStyle(TvApplePillButtonStyle(isDestructive: true, compact: true))
+                  }
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 14)
+                .background(isCurrent ? theme.accent.opacity(0.20) : Color.white.opacity(0.06))
+                .overlay(
+                  RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(isCurrent ? theme.accent : Color.white.opacity(0.12), lineWidth: isCurrent ? 2 : 1)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
               }
-              .buttonStyle(TvApplePillButtonStyle(compact: true))
             }
-            .id("queue_\(idx)")
+            .padding(.vertical, 6)
           }
-        }
-        .padding(.vertical, 6)
-      }
-      .onAppear {
-        if appState.cloudMusicCurrentIndex >= 0 {
-          proxy.scrollTo("queue_\(appState.cloudMusicCurrentIndex)", anchor: .center)
+          .focusSection()
         }
       }
+      .padding(32)
+      .frame(width: min(UIScreen.main.bounds.width - 160, 1380), height: min(UIScreen.main.bounds.height - 140, 820))
+      .background(.regularMaterial)
+      .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
     }
+    .withTvLanQuickInputOverlay(appState)
   }
 }
 
@@ -11353,10 +12994,17 @@ struct TvMusicFolderPickerSheet: View {
   @State private var currentTitle: String = "根目录"
   @State private var breadcrumbs: [(path: String, title: String)] = []
   @State private var entries: [TvFileEntry] = []
+  @State private var searchQuery: String = ""
   @State private var isLoading: Bool = false
   @State private var errorText: String? = nil
   @State private var includeSubfolders: Bool = true
   @State private var selectedItems: [TvSavedMusicFolderItem] = []
+
+  private var filteredEntries: [TvFileEntry] {
+    let kw = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !kw.isEmpty else { return entries }
+    return entries.filter { $0.name.lowercased().contains(kw) }
+  }
 
   @discardableResult
   private func stepBackFolderIfPossible() -> Bool {
@@ -11368,14 +13016,28 @@ struct TvMusicFolderPickerSheet: View {
 
   var body: some View {
     let theme = appState.activeTheme
+    let dirCount = entries.filter { $0.isDir }.count
+    let archiveCount = entries.filter { !$0.isDir && $0.isStreamableMusicArchive }.count
+    let audioCount = entries.filter { !$0.isDir && $0.isAudio }.count
+
     ZStack {
       TvAmbientBackdropView(imageUrl: appState.ambientBackdropUrl)
       VStack(alignment: .leading, spacing: 14) {
-        HStack {
+        HStack(spacing: 14) {
           Label("自选音乐文件夹 / 压缩包随机播放", systemImage: "folder.badge.plus")
             .font(.system(size: 24, weight: .heavy))
             .foregroundColor(theme.accentHover)
+
+          Text("共 \(entries.count) 项（\(dirCount) 个文件夹 · \(archiveCount) 个压缩包 · \(audioCount) 首音频）")
+            .font(.system(size: 13, weight: .bold))
+            .foregroundColor(.white.opacity(0.72))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .background(Color.white.opacity(0.08))
+            .clipShape(Capsule())
+
           Spacer()
+
           if breadcrumbs.count >= 2 {
             Button {
               _ = stepBackFolderIfPossible()
@@ -11384,11 +13046,19 @@ struct TvMusicFolderPickerSheet: View {
             }
             .buttonStyle(TvApplePillButtonStyle(compact: true))
           }
+          Button {
+            loadDirectory(path: currentPath, title: currentTitle, pushCrumb: false)
+          } label: {
+            Label("刷新目录", systemImage: "arrow.clockwise")
+          }
+          .buttonStyle(TvApplePillButtonStyle(compact: true))
+
           Button("关闭窗口") {
             appState.showMusicFolderPickerSheet = false
           }
           .buttonStyle(TvApplePillButtonStyle(compact: true))
         }
+        .focusSection()
 
         // 1. Storage Mount Switcher
         ScrollView(.horizontal, showsIndicators: false) {
@@ -11427,7 +13097,7 @@ struct TvMusicFolderPickerSheet: View {
           .focusSection()
         }
 
-        // 3. Breadcrumbs & Add Current Folder
+        // 3. Breadcrumbs & Search & Add Current Folder
         HStack(spacing: 10) {
           if breadcrumbs.count >= 2 {
             Button {
@@ -11453,6 +13123,36 @@ struct TvMusicFolderPickerSheet: View {
             }
           }
           Spacer()
+
+          HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+              .foregroundColor(.white.opacity(0.6))
+            TextField("快速筛选文件夹或音乐...", text: $searchQuery)
+              .font(.system(size: 14))
+            if !searchQuery.isEmpty {
+              Button {
+                searchQuery = ""
+              } label: {
+                Image(systemName: "xmark.circle.fill")
+                  .foregroundColor(.white.opacity(0.65))
+              }
+              .buttonStyle(TvApplePillButtonStyle(compact: true))
+            }
+          }
+          .padding(.horizontal, 12)
+          .padding(.vertical, 6)
+          .frame(width: 250)
+          .background(Color.white.opacity(0.08))
+          .clipShape(Capsule())
+
+          TvQrInputTriggerButton(
+            prompt: "筛选音乐文件夹或曲目",
+            placeholder: "输入歌手、专辑或歌名",
+            labelText: "扫码筛"
+          ) { text in
+            searchQuery = text
+          }
+
           if let m = selectedMount {
             let curItem = currentDirAsSavedItem(mount: m)
             Button {
@@ -11478,7 +13178,7 @@ struct TvMusicFolderPickerSheet: View {
           if isLoading {
             VStack(spacing: 12) {
               ProgressView()
-              Text("正在加载目录...")
+              Text("正在完整加载目录与全部分页文件夹...")
                 .font(.system(size: 15))
                 .foregroundColor(.white.opacity(0.7))
             }
@@ -11493,20 +13193,31 @@ struct TvMusicFolderPickerSheet: View {
               .buttonStyle(TvApplePillButtonStyle(compact: true))
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+          } else if filteredEntries.isEmpty {
+            VStack(spacing: 12) {
+              Image(systemName: "folder.badge.questionmark")
+                .font(.system(size: 40))
+                .foregroundColor(.white.opacity(0.4))
+              Text(searchQuery.isEmpty ? "当前目录下暂无子文件夹或音频文件" : "未找到匹配「\(searchQuery)」的文件夹或音频")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundColor(.white.opacity(0.75))
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
           } else {
             ScrollView {
               LazyVStack(spacing: 8) {
-                ForEach(entries) { entry in
+                ForEach(filteredEntries) { entry in
                   directoryEntryRow(entry: entry, theme: theme)
                 }
               }
               .padding(.vertical, 6)
+              .padding(.horizontal, 4)
             }
           }
         }
-        .frame(maxHeight: 410)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(12)
-        .background(Color.black.opacity(0.26))
+        .background(Color.black.opacity(0.28))
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .focusSection()
 
@@ -11530,6 +13241,15 @@ struct TvMusicFolderPickerSheet: View {
             )
           }
           .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+          if !selectedItems.isEmpty {
+            Button {
+              selectedItems.removeAll()
+            } label: {
+              Label("清空已选 (\(selectedItems.count))", systemImage: "xmark.circle")
+            }
+            .buttonStyle(TvApplePillButtonStyle(compact: true))
+          }
 
           Spacer()
 
@@ -11572,11 +13292,12 @@ struct TvMusicFolderPickerSheet: View {
         }
         .focusSection()
       }
-      .padding(32)
-      .frame(width: 1180)
+      .padding(28)
+      .frame(width: min(UIScreen.main.bounds.width - 100, 1620), height: min(UIScreen.main.bounds.height - 80, 940))
       .background(.regularMaterial)
       .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
     }
+    .withTvLanQuickInputOverlay(appState)
     .onAppear {
       appState.musicFolderPickerBackHandler = {
         stepBackFolderIfPossible()
@@ -11607,14 +13328,17 @@ struct TvMusicFolderPickerSheet: View {
         size: entry.size,
         pickcode115: entry.pickcode115
       )
-      let isSelectable = entry.isDir || entry.isStreamableMusicArchive
+      let isSelectable = entry.isDir || entry.isStreamableMusicArchive || entry.isAudio
       let checked = isSelectable && isItemSelected(item)
+      let audioMeta = entry.isAudio
+        ? TvAppState.parseCloudTrackMetadata(entry, fallbackArtist: currentTitle)
+        : nil
 
       HStack(spacing: 12) {
         Button {
           if entry.isDir {
             loadDirectory(path: entry.path, title: entry.name)
-          } else if entry.isStreamableMusicArchive {
+          } else if isSelectable {
             toggleItem(item)
           }
         } label: {
@@ -11626,23 +13350,40 @@ struct TvMusicFolderPickerSheet: View {
                   ? .yellow
                   : (entry.isStreamableMusicArchive ? .orange : theme.accentHover)
               )
-            Text(entry.name)
-              .font(.system(size: 16, weight: .semibold))
-              .foregroundColor(.white)
-              .lineLimit(1)
-            Spacer()
+              .frame(width: 26)
+            if let meta = audioMeta {
+              VStack(alignment: .leading, spacing: 2) {
+                Text(meta.title)
+                  .font(.system(size: 16, weight: .bold))
+                  .foregroundColor(.white)
+                  .lineLimit(1)
+                Text(meta.artist.isEmpty ? entry.name : "\(meta.artist) · \(entry.name)")
+                  .font(.system(size: 12.5))
+                  .foregroundColor(.white.opacity(0.68))
+                  .lineLimit(1)
+              }
+              .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+              Text(entry.name)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundColor(.white)
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
             Text(
               entry.isDir
-                ? "点击进入子目录"
-                : (entry.isStreamableMusicArchive ? "音乐压缩包 · \(entry.formattedSize)" : "音频 · \(entry.formattedSize)")
+                ? "文件夹 · 点击进入"
+                : (entry.isStreamableMusicArchive ? "音乐压缩包 · \(entry.formattedSize)" : "\(audioMeta?.qualityTag ?? "音频") · \(entry.formattedSize)")
             )
             .font(.system(size: 13))
-            .foregroundColor(.white.opacity(0.6))
+            .foregroundColor(.white.opacity(0.68))
+            .fixedSize(horizontal: true, vertical: false)
           }
           .padding(.horizontal, 14)
-          .padding(.vertical, 8)
+          .padding(.vertical, 10)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(TvAppleSurfaceButtonStyle(isSelected: checked, cornerRadius: 14))
 
         if isSelectable {
           Button {
@@ -11652,13 +13393,15 @@ struct TvMusicFolderPickerSheet: View {
           }
           .buttonStyle(TvApplePillButtonStyle(isPrimary: checked, compact: true))
 
-          Button {
-            appState.toggleSavedMusicFolder(item)
-          } label: {
-            Image(systemName: appState.isMusicFolderSaved(mountId: mount.id, path: entry.path) ? "star.fill" : "star")
-              .foregroundColor(.yellow)
+          if entry.isDir || entry.isStreamableMusicArchive {
+            Button {
+              appState.toggleSavedMusicFolder(item)
+            } label: {
+              Image(systemName: appState.isMusicFolderSaved(mountId: mount.id, path: entry.path) ? "star.fill" : "star")
+                .foregroundColor(.yellow)
+            }
+            .buttonStyle(TvApplePillButtonStyle(compact: true))
           }
-          .buttonStyle(TvApplePillButtonStyle(compact: true))
         }
       }
     }
@@ -11673,17 +13416,36 @@ struct TvMusicFolderPickerSheet: View {
     default: root = mount.rootPath
     }
     let startPath = (initialPathOverride != nil && !initialPathOverride!.isEmpty) ? initialPathOverride! : root
-    breadcrumbs = [(root, mount.name)]
-    if startPath != root {
-      breadcrumbs.append((startPath, startPath))
+    if mount.kind == .cloud115 && startPath != "0" && !appState.cloud115Breadcrumbs.isEmpty {
+      breadcrumbs = appState.cloud115Breadcrumbs.map { (path: $0.cid, title: $0.name) }
+      if breadcrumbs.last?.path != startPath {
+        breadcrumbs.append((startPath, "当前目录"))
+      }
+    } else {
+      breadcrumbs = [(root, mount.name)]
+      if startPath != root {
+        let segs = startPath.split(separator: "/").map(String.init)
+        if mount.kind != .cloud115 && !segs.isEmpty {
+          for i in 0..<segs.count {
+            let partial = "/" + segs.prefix(i + 1).joined(separator: "/")
+            if partial != root {
+              breadcrumbs.append((partial, segs[i]))
+            }
+          }
+        } else {
+          breadcrumbs.append((startPath, startPath))
+        }
+      }
     }
-    loadDirectory(path: startPath, title: mount.name, pushCrumb: false)
+    let curTitle = breadcrumbs.last?.title ?? mount.name
+    loadDirectory(path: startPath, title: curTitle, pushCrumb: false)
   }
 
   private func loadDirectory(path: String, title: String, pushCrumb: Bool = true) {
     guard let mount = selectedMount else { return }
     isLoading = true
     errorText = nil
+    searchQuery = ""
     currentPath = path
     currentTitle = title
     if pushCrumb {
@@ -11697,6 +13459,10 @@ struct TvMusicFolderPickerSheet: View {
       do {
         var list = try await appState.listDirectoryForMount(mount: mount, path: path)
         list = list.filter { $0.isDir || $0.isAudio || $0.isStreamableMusicArchive }
+        list.sort { a, b in
+          if a.isDir != b.isDir { return a.isDir && !b.isDir }
+          return a.name.localizedStandardCompare(b.name) == .orderedAscending
+        }
         self.entries = list
         self.isLoading = false
       } catch {
@@ -11827,7 +13593,10 @@ struct TvArchiveMusicBrowserSheet: View {
           ScrollView {
             LazyVStack(spacing: 8) {
               ForEach(Array(audioEntries.enumerated()), id: \.element.id) { idx, track in
-                let meta = TvAppState.parseCloudTrackMetadata(track)
+                let meta = TvAppState.parseCloudTrackMetadata(
+                  track,
+                  fallbackArtist: (archiveEntry.name as NSString).deletingPathExtension
+                )
                 Button {
                   let target = archiveEntry
                   appState.activeArchiveMusicBrowserEntry = nil
@@ -11853,9 +13622,9 @@ struct TvArchiveMusicBrowserSheet: View {
                         .font(.system(size: 17, weight: .bold))
                         .foregroundColor(.white)
                         .lineLimit(1)
-                      Text("\(track.archiveInnerPath) · \(track.formattedSize)")
+                      Text("\(meta.artist.isEmpty ? track.archiveInnerPath : "\(meta.artist) · \(track.archiveInnerPath)") · \(track.formattedSize)")
                         .font(.system(size: 13))
-                        .foregroundColor(.white.opacity(0.6))
+                        .foregroundColor(.white.opacity(0.68))
                         .lineLimit(1)
                     }
                     Spacer()
@@ -11869,19 +13638,19 @@ struct TvArchiveMusicBrowserSheet: View {
                   }
                   .padding(.horizontal, 14)
                   .padding(.vertical, 10)
-                  .background(Color.white.opacity(0.05))
-                  .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 14))
               }
             }
+            .padding(.vertical, 4)
+            .padding(.horizontal, 4)
           }
-          .frame(maxHeight: 420)
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
           .focusSection()
         }
       }
-      .padding(32)
-      .frame(width: 1080)
+      .padding(28)
+      .frame(width: min(UIScreen.main.bounds.width - 120, 1520), height: min(UIScreen.main.bounds.height - 100, 900))
       .background(.regularMaterial)
       .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
     }
