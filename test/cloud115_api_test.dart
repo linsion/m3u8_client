@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:m3u8_client/models/models.dart';
 import 'package:m3u8_client/services/api_client.dart';
 import 'package:m3u8_client/services/local_115_direct_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -40,6 +41,62 @@ class _FixtureApiClient extends Fake implements HttpClient {
 
   @override
   Future<HttpClientRequest> getUrl(Uri url) => client.getUrl(_localUri(url));
+
+  @override
+  Future<HttpClientRequest> openUrl(String method, Uri url) =>
+      client.openUrl(method, _localUri(url));
+}
+
+class _AccelerationApi extends ApiClient {
+  _AccelerationApi(this.onUpload) : super(const ServerConfig());
+
+  final void Function() onUpload;
+  final submissions = <bool>[];
+  final uploads = <String>[];
+
+  @override
+  Future<Map<String, dynamic>> fetch115Status() async => {'Id': 'test'};
+
+  @override
+  Future<ServerSettings> fetchServerSettings() async =>
+      ServerSettings({'eleven_dir_id': '10'});
+
+  @override
+  Future<String?> createDownloadTask({
+    required String url,
+    required String name,
+    Map<String, String>? headers,
+    Map<String, dynamic>? videoContext,
+    String? telegramAccountId,
+    bool forceDuplicate = false,
+  }) async {
+    submissions.add(forceDuplicate);
+    return forceDuplicate ? 'new-task' : 'stale-task';
+  }
+
+  @override
+  Future<List<DownloadTask>> fetchDownloadTasks() async => const [
+    DownloadTask(
+      id: 'stale-task',
+      url: 'https://example.test/source.mp4',
+      name: 'Acceleration episode 1',
+      status: 'Duplicate',
+      outputFile: 'downloads/Acceleration episode 1.mp4',
+    ),
+    DownloadTask(
+      id: 'new-task',
+      url: 'https://example.test/source.mp4',
+      name: 'Acceleration episode 1',
+      status: 'Completed',
+      outputFile: 'downloads/Acceleration episode 1.mp4',
+    ),
+  ];
+
+  @override
+  Future<void> uploadTaskTo115(String id) async {
+    uploads.add(id);
+    onUpload();
+  }
 }
 
 void main() {
@@ -50,10 +107,14 @@ void main() {
   final renameCalls = <Map<String, String>>[];
   String? redirectCookie;
   String? exchangeToken;
+  bool showAccelerationFiles = false;
+  bool acceleratedCopyExists = false;
 
   setUpAll(() async {
     SharedPreferences.setMockInitialValues({
       'm3u8_local_115_cookie_v1': accountCookie,
+      'm3u8_local_115_folder_cid_v1': '10',
+      'm3u8_local_115_folder_name_v1': 'Shows.mp4',
     });
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     addTearDown(() => server.close(force: true));
@@ -87,6 +148,9 @@ void main() {
         case '/webapi.115.com/files/download':
           downloadCalls.add('${request.method} $path');
           response.write('{"file_url":"https://example.test/sample.wav"}');
+        case '/example.test/sample.wav':
+          response.headers.contentType = ContentType('video', 'mp4');
+          response.add(ascii.encode('0000ftypmp42'));
         case '/webapi.115.com/rb/delete':
           deleteCalls.add(form);
           response.write(
@@ -151,6 +215,22 @@ void main() {
                       ]
                       : [
                         {'fc': '0', 'fid': '11', 'pid': '10', 'fn': 'Season 1'},
+                        if (showAccelerationFiles && cid == '10')
+                          {
+                            'fc': '1',
+                            'fid': '30',
+                            'pid': '10',
+                            'fn': 'Acceleration episode 10.mp4',
+                            'pc': 'other-episode',
+                          },
+                        if (acceleratedCopyExists && cid == '10')
+                          {
+                            'fc': '1',
+                            'fid': '31',
+                            'pid': '10',
+                            'fn': 'Acceleration episode 1.mp4',
+                            'pc': 'uploaded-episode',
+                          },
                       ],
             }),
           );
@@ -285,6 +365,55 @@ void main() {
         ),
       );
       expect(deleteCalls, isEmpty);
+    },
+  );
+
+  test(
+    '115 replaces stale duplicates and only uploads the requested task',
+    () async {
+      showAccelerationFiles = true;
+      final api = _AccelerationApi(() => acceleratedCopyExists = true);
+      final errors = <String>[];
+      final stream = await service.run115CloudAccelerationPipeline(
+        api: api,
+        downloadUrl: 'https://example.test/source.mp4',
+        videoName: 'Acceleration episode 1',
+        onError: errors.add,
+      );
+      expect(api.submissions, [false, true]);
+      expect(api.uploads, ['new-task']);
+      expect(stream?.fileName, 'Acceleration episode 1.mp4');
+      expect(errors, isEmpty);
+      expect(service.isAccelerating, isFalse);
+    },
+  );
+
+  test(
+    '115 uses upstream headers when unwrapping the server playback proxy',
+    () {
+      final uri = Uri.https('server.test', '/api/vod/proxy', {
+        'url': 'https://media.test/episode.m3u8',
+        'headers': base64UrlEncode(
+          utf8.encode(
+            jsonEncode({
+              'Authorization': 'Bearer media-token',
+              'Referer': 'https://media.test/',
+            }),
+          ),
+        ),
+      });
+      final result = Local115DirectService.unwrapDownloadTargetUrlAndHeaders(
+        uri.toString(),
+        {
+          'Cookie': 'access_token=server-token',
+          'authorization': 'Bearer server',
+        },
+      );
+      expect(result.url, 'https://media.test/episode.m3u8');
+      expect(result.headers, {
+        'Authorization': 'Bearer media-token',
+        'Referer': 'https://media.test/',
+      });
     },
   );
 }

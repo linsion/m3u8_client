@@ -16193,6 +16193,7 @@ class _TelegramPhotoGalleryDialogState
     if (att == null || !att.isVideo) {
       _galleryOpening = false;
       _activeGalleryStreamUrl = '';
+      _usingGallery115Direct = false;
       await _videoPlayer?.stop();
       if (openSeq != _galleryVideoOpenSeq) return;
       if (mounted) {
@@ -16483,6 +16484,7 @@ class _TelegramPhotoGalleryDialogState
   Future<void> _applyGallery115Stream(Resolved115Stream resolved) async {
     final p = _videoPlayer;
     if (!mounted || p == null) return;
+    final openSeq = ++_galleryVideoOpenSeq;
     _finishGalleryPlaybackTiming();
     final curSec = _videoPosition.inSeconds;
     setState(() {
@@ -16496,15 +16498,16 @@ class _TelegramPhotoGalleryDialogState
       _pendingGalleryResumeSeconds = curSec;
     }
     await p.setVolume(_isMuted ? 0 : _volume);
+    if (!mounted || _galleryVideoOpenSeq != openSeq) return;
     await p.open(
       Media(
         resolved.proxyStreamUrl,
-        httpHeaders:
-            _activeGalleryUsingLocalRelay ? const {} : resolved.headers,
+        httpHeaders: resolved.playbackHeaders,
         start: curSec > 2 ? Duration(seconds: curSec) : null,
       ),
       play: true,
     );
+    if (!mounted || _galleryVideoOpenSeq != openSeq) return;
     if (_playbackSpeed != 1.0) {
       await p.setRate(_playbackSpeed);
     }
@@ -17472,7 +17475,10 @@ class _TelegramPhotoGalleryDialogState
                               headersBuilder: () =>
                                   widget.appState.api.authHeaders,
                               telegramAccountId: widget.accountId,
-                              isUsing115Direct: _usingGallery115Direct,
+                              player: _videoPlayer,
+                              selected115Url: _usingGallery115Direct
+                                  ? _activeGalleryStreamUrl
+                                  : null,
                               overlayStyle: true,
                               compact: isMobileDialog,
                               onResolved: _applyGallery115Stream,
@@ -18469,7 +18475,10 @@ class _TelegramPhotoGalleryDialogState
                                     headersBuilder: () =>
                                         widget.appState.api.authHeaders,
                                     telegramAccountId: widget.accountId,
-                                    isUsing115Direct: _usingGallery115Direct,
+                                    player: _videoPlayer,
+                                    selected115Url: _usingGallery115Direct
+                                        ? _activeGalleryStreamUrl
+                                        : null,
                                     overlayStyle: true,
                                     compact: true,
                                     onResolved: _applyGallery115Stream,

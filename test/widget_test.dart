@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:media_kit/media_kit.dart';
 import 'package:m3u8_client/main.dart';
 import 'package:m3u8_client/models/models.dart';
 import 'package:m3u8_client/services/api_client.dart';
@@ -14,12 +15,75 @@ import 'package:m3u8_client/state/app_state.dart';
 import 'package:m3u8_client/ui/screens/proxy_server_screen.dart';
 import 'package:m3u8_client/ui/theme.dart';
 import 'package:m3u8_client/ui/widgets/mobile_edge_swipe_back.dart';
+import 'package:m3u8_client/ui/widgets/video_115_accelerate_button.dart';
 import 'package:m3u8_client/ui/widgets/video_download_speed_badge.dart';
 import 'package:m3u8_client/ui/widgets/video_proxy_node_selector.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:xterm/xterm.dart';
 
+class _PlaybackIndicatorPlayer extends PlatformPlayer {
+  _PlaybackIndicatorPlayer() : super(configuration: const PlayerConfiguration());
+
+  void showPosition(Media media, Duration position, {bool buffering = false}) {
+    state = state.copyWith(
+      playlist: Playlist([media]),
+      position: position,
+      buffering: buffering,
+    );
+    positionController.add(position);
+  }
+}
+
 void main() {
+  testWidgets('115 playback turns green only after its media starts', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final platform = _PlaybackIndicatorPlayer();
+    final player = Player(platformPlayer: platform);
+    final focus = FocusNode();
+    final api = ApiClient(const ServerConfig());
+    final normal = Media('https://example.test/original.mp4');
+    final accelerated = Media(
+      'http://127.0.0.1:41415/115_stream.mp4',
+      start: const Duration(seconds: 12),
+    );
+    Future<void> showButton(String? url) => tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Video115AccelerateButton(
+            api: api,
+            player: player,
+            selected115Url: url,
+            focusNode: focus,
+            downloadUrlBuilder: () => normal.uri,
+            videoNameBuilder: () => 'Video',
+            onResolved: (_) {},
+          ),
+        ),
+      ),
+    );
+    final status = find.text('115 播放中');
+
+    platform.showPosition(normal, const Duration(seconds: 12));
+    await showButton(accelerated.uri);
+    expect(status, findsNothing);
+    platform.showPosition(accelerated, const Duration(seconds: 12), buffering: true);
+    await tester.pump();
+    expect(status, findsNothing);
+    platform.showPosition(accelerated, const Duration(milliseconds: 12300));
+    await tester.pumpAndSettle();
+    expect(tester.widget<Text>(status).style?.color, const Color(0xFF6EE7B7));
+
+    focus.requestFocus();
+    await tester.pumpAndSettle();
+    expect(tester.widget<Text>(status).style?.color, const Color(0xFF6EE7B7));
+    await showButton(null);
+    expect(status, findsNothing);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    focus.dispose();
+    await player.dispose();
+  });
+
   test('VodDetail.parsePlayGroups parses multi-line CMS play urls accurately', () {
     final groups = VodDetail.parsePlayGroups(
       r'hnzym3u8$$$hnm3u8',

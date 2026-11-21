@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:media_kit/media_kit.dart';
 
 import '../../services/api_client.dart';
 import '../../services/local_115_direct_service.dart';
@@ -14,7 +15,8 @@ class Video115AccelerateButton extends StatefulWidget {
   final String Function() videoNameBuilder;
   final Map<String, String> Function()? headersBuilder;
   final String? telegramAccountId;
-  final bool isUsing115Direct;
+  final Player? player;
+  final String? selected115Url;
   final bool compact;
   final bool overlayStyle;
   final FocusNode? focusNode;
@@ -23,7 +25,7 @@ class Video115AccelerateButton extends StatefulWidget {
   final FocusNode? leftFocusNode;
   final FocusNode? rightFocusNode;
   final VoidCallback? onInteraction;
-  final ValueChanged<Resolved115Stream> onResolved;
+  final FutureOr<void> Function(Resolved115Stream) onResolved;
 
   const Video115AccelerateButton({
     super.key,
@@ -33,7 +35,8 @@ class Video115AccelerateButton extends StatefulWidget {
     required this.videoNameBuilder,
     this.headersBuilder,
     this.telegramAccountId,
-    this.isUsing115Direct = false,
+    required this.player,
+    this.selected115Url,
     this.compact = false,
     this.overlayStyle = true,
     this.focusNode,
@@ -52,6 +55,60 @@ class Video115AccelerateButton extends StatefulWidget {
 
 class _Video115AccelerateButtonState extends State<Video115AccelerateButton> {
   bool _isFocused = false;
+  bool _confirmed115Playback = false;
+  StreamSubscription<Duration>? _positionSub;
+
+  @override
+  void initState() {
+    super.initState();
+    _observe115Playback();
+  }
+
+  @override
+  void didUpdateWidget(covariant Video115AccelerateButton oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.player != widget.player ||
+        oldWidget.selected115Url != widget.selected115Url) {
+      _observe115Playback();
+    }
+  }
+
+  void _observe115Playback() {
+    _positionSub?.cancel();
+    _positionSub = null;
+    _confirmed115Playback = false;
+    final player = widget.player;
+    final sourceUrl = widget.selected115Url;
+    if (player == null || sourceUrl == null) return;
+
+    bool hasStarted(Duration position) {
+      final state = player.state;
+      final playlist = state.playlist;
+      if (playlist.index < 0 || playlist.index >= playlist.medias.length) {
+        return false;
+      }
+      final media = playlist.medias[playlist.index];
+      return media.uri == sourceUrl &&
+          position > Duration.zero &&
+          position != media.start &&
+          !state.buffering;
+    }
+
+    _confirmed115Playback = hasStarted(player.state.position);
+    if (_confirmed115Playback) return;
+    _positionSub = player.stream.position.listen((position) {
+      if (!mounted || !hasStarted(position)) return;
+      _positionSub?.cancel();
+      _positionSub = null;
+      setState(() => _confirmed115Playback = true);
+    });
+  }
+
+  @override
+  void dispose() {
+    _positionSub?.cancel();
+    super.dispose();
+  }
 
   Future<void> _handleTap() async {
     widget.onInteraction?.call();
@@ -104,7 +161,14 @@ class _Video115AccelerateButtonState extends State<Video115AccelerateButton> {
     );
 
     if (resolved != null && mounted) {
-      widget.onResolved(resolved);
+      try {
+        await widget.onResolved(resolved);
+      } catch (error) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('切换到 115 播放失败：$error')),
+        );
+      }
     }
   }
 
@@ -114,18 +178,18 @@ class _Video115AccelerateButtonState extends State<Video115AccelerateButton> {
     return ListenableBuilder(
       listenable: svc,
       builder: (context, _) {
-        final active = widget.isUsing115Direct;
+        final active = _confirmed115Playback;
         final running = svc.isAccelerating;
         final label = active
-            ? (widget.compact ? '⚡115直连' : '⚡ 115直连中')
+            ? '115 播放中'
             : (running
                 ? '⚡ 115加速中...'
                 : (widget.compact ? '⚡115加速' : '⚡ 115加速播放'));
 
-        final bgColor = _isFocused
-            ? VideoPlatformTheme.accent
-            : (active
-                ? const Color(0xFF10B981).withValues(alpha: 0.25)
+        final bgColor = active
+            ? const Color(0xFF10B981).withValues(alpha: _isFocused ? 0.42 : 0.28)
+            : (_isFocused
+                ? VideoPlatformTheme.accent
                 : (widget.overlayStyle
                     ? const Color(0xAA000000)
                     : VideoPlatformTheme.bgElevated));
@@ -138,9 +202,7 @@ class _Video115AccelerateButtonState extends State<Video115AccelerateButton> {
                     ? Colors.white.withValues(alpha: 0.22)
                     : VideoPlatformTheme.borderSubtle));
 
-        final fgColor = _isFocused
-            ? Colors.white
-            : (active ? const Color(0xFF6EE7B7) : Colors.white);
+        final fgColor = active ? const Color(0xFF6EE7B7) : Colors.white;
 
         return Focus(
           focusNode: widget.focusNode,
@@ -182,7 +244,9 @@ class _Video115AccelerateButtonState extends State<Video115AccelerateButton> {
             return KeyEventResult.ignored;
           },
           child: Tooltip(
-            message: '先由服务器高速下载并上传至 115 网盘，再从本地直连 115 国内 CDN 流畅播放',
+            message: active
+                ? '当前视频来自 115 网盘'
+                : '先由服务器下载并上传至 115 网盘，再从 115 直连播放',
             child: Material(
               color: Colors.transparent,
               child: InkWell(
@@ -478,38 +542,39 @@ Future<Resolved115Stream?> show115AccelerationProgressDialog({
   String? telegramAccountId,
 }) async {
   final svc = Local115DirectService.instance;
-  Resolved115Stream? resolvedStream;
   String? pipelineError;
   bool dialogActive = true;
-
-  BuildContext? activeDialogCtx;
-
-  unawaited(
-    svc
-        .run115CloudAccelerationPipeline(
-      api: api,
-      downloadUrl: downloadUrl,
-      fallbackDownloadUrls: fallbackDownloadUrls,
-      videoName: videoName,
-      headers: headers,
-      telegramAccountId: telegramAccountId,
-      onError: (err) {
-        pipelineError = err;
-      },
-    )
-        .then((res) {
-      resolvedStream = res;
-      if (dialogActive && activeDialogCtx != null && activeDialogCtx!.mounted) {
-        Navigator.of(activeDialogCtx!).pop(res);
-      }
-    }),
-  );
+  bool started = false;
+  bool finished = false;
 
   final out = await showDialog<Resolved115Stream?>(
     context: context,
     barrierDismissible: false,
     builder: (dialogCtx) {
-      activeDialogCtx = dialogCtx;
+      if (!started) {
+        started = true;
+        WidgetsBinding.instance.addPostFrameCallback((_) async {
+          if (!dialogActive || !dialogCtx.mounted) return;
+          Resolved115Stream? resolved;
+          try {
+            resolved = await svc.run115CloudAccelerationPipeline(
+              api: api,
+              downloadUrl: downloadUrl,
+              fallbackDownloadUrls: fallbackDownloadUrls,
+              videoName: videoName,
+              headers: headers,
+              telegramAccountId: telegramAccountId,
+              onError: (error) => pipelineError = error,
+            );
+          } catch (error) {
+            pipelineError = '115 加速失败：$error';
+          }
+          finished = true;
+          if (dialogActive && dialogCtx.mounted) {
+            Navigator.of(dialogCtx).pop(resolved);
+          }
+        });
+      }
       return ListenableBuilder(
         listenable: svc,
         builder: (ctx, _) {
@@ -604,7 +669,9 @@ Future<Resolved115Stream?> show115AccelerationProgressDialog({
               TextButton.icon(
                 onPressed: () {
                   dialogActive = false;
-                  svc.cancelAcceleration();
+                  if (!finished && svc.isAccelerating) {
+                    svc.cancelAcceleration();
+                  }
                   Navigator.of(dialogCtx).pop(null);
                 },
                 icon: const Icon(Icons.close_rounded, size: 16),
@@ -618,10 +685,13 @@ Future<Resolved115Stream?> show115AccelerationProgressDialog({
   );
 
   dialogActive = false;
+  if (!finished && svc.isAccelerating) {
+    svc.cancelAcceleration();
+  }
   if (pipelineError != null && context.mounted) {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(pipelineError!)),
     );
   }
-  return out ?? resolvedStream;
+  return out;
 }

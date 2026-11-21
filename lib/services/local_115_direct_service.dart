@@ -355,27 +355,17 @@ class Local115DirectService extends ChangeNotifier {
 
     String resolvedCid = '';
     try {
-      final listUri = Uri.parse(
-        'https://webapi.115.com/files?aid=1&cid=0&o=user_ptime&asc=0&offset=0&limit=115&show_dir=1&format=json',
-      );
-      final root = await _getJson(listUri, timeout: const Duration(seconds: 12));
-      if (root is Map<String, dynamic> && root['data'] is List) {
-        for (final item in root['data'] as List) {
-          if (item is! Map<String, dynamic>) continue;
-          final fid = (item['fid'] ?? item['file_id'] ?? '').toString().trim();
-          final cid =
-              (item['cid'] ?? item['category_id'] ?? '').toString().trim();
-          final name =
-              (item['n'] ?? item['ns'] ?? item['file_name'] ?? '').toString().trim();
-          final isDir = (fid.isEmpty || fid == '0') &&
-              cid.isNotEmpty &&
-              cid != '0';
-          if (isDir && name.toLowerCase() == folderName.toLowerCase()) {
-            resolvedCid = cid;
-            break;
-          }
-        }
-      }
+      final root = await list115Directory(cid: '0');
+      resolvedCid =
+          root.entries
+              .where(
+                (item) =>
+                    item.isDir &&
+                    item.name.trim().toLowerCase() == folderName.toLowerCase(),
+              )
+              .firstOrNull
+              ?.cid115 ??
+          '';
     } catch (_) {}
 
     if (resolvedCid.isEmpty) {
@@ -386,8 +376,9 @@ class Local115DirectService extends ChangeNotifier {
           timeout: const Duration(seconds: 12),
         );
         if (addRes is Map<String, dynamic>) {
-          final directCid =
-              (addRes['cid'] ?? addRes['file_id'] ?? '').toString().trim();
+          final directCid = (addRes['cid'] ?? addRes['file_id'] ?? '')
+              .toString()
+              .trim();
           if (directCid.isNotEmpty && directCid != '0') {
             resolvedCid = directCid;
           } else if (addRes['data'] is Map<String, dynamic>) {
@@ -405,12 +396,14 @@ class Local115DirectService extends ChangeNotifier {
     }
 
     if (resolvedCid.isNotEmpty && resolvedCid != '0') {
-      _targetFolderCid = resolvedCid;
-      try {
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setString(_prefTargetFolderCidKey, resolvedCid);
-      } catch (_) {}
-      notifyListeners();
+      if (_targetFolderCid != resolvedCid) {
+        _targetFolderCid = resolvedCid;
+        try {
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setString(_prefTargetFolderCidKey, resolvedCid);
+        } catch (_) {}
+        notifyListeners();
+      }
       if (syncToServerApi != null) {
         await _syncFolderCidToServer(syncToServerApi, resolvedCid);
       }
@@ -420,7 +413,11 @@ class Local115DirectService extends ChangeNotifier {
     return _targetFolderCid.isNotEmpty ? _targetFolderCid : '0';
   }
 
-  Future<void> _syncFolderCidToServer(ApiClient api, String targetCid) async {
+  Future<void> _syncFolderCidToServer(
+    ApiClient api,
+    String targetCid, {
+    bool throwOnFailure = false,
+  }) async {
     if (targetCid.isEmpty || targetCid == '0') return;
     try {
       final settings = await api.fetchServerSettings();
@@ -430,7 +427,9 @@ class Local115DirectService extends ChangeNotifier {
         map['eleven_dir_id'] = targetCid;
         await api.saveServerSettings(map);
       }
-    } catch (_) {}
+    } catch (_) {
+      if (throwOnFailure) rethrow;
+    }
   }
 
   Future<void> move115FileToFolder({
@@ -765,219 +764,99 @@ class Local115DirectService extends ChangeNotifier {
   /// and resolves its official 115 domestic CDN direct playback URL.
   Future<Resolved115Stream?> findAndResolveDirectPlayUrl({
     required List<String> keywords,
-    DateTime? allowNewestRecentFallbackAfter,
+    bool searchAccount = true,
   }) async {
     await ensureInitialized();
     if (!hasLocalCookie) return null;
-
-    final accelCid = await ensureAccelerationFolderCid();
-
-    final cleanKeywords = keywords
+    final names = keywords
         .map(_cleanMatchToken)
-        .where((s) => s.isNotEmpty)
-        .toList();
+        .where((name) => name.isNotEmpty)
+        .toSet();
+    if (names.isEmpty) return null;
 
-    final candidateFiles = <Map<String, dynamic>>[];
     final seenPickcodes = <String>{};
-
-    void appendFiles(List<dynamic>? rawList, {bool fromTargetFolder = false}) {
-      if (rawList == null) return;
-      for (final item in rawList) {
-        if (item is! Map<String, dynamic>) continue;
-        final pc = (item['pc'] ?? item['pick_code'] ?? '').toString().trim();
-        final fid = (item['fid'] ?? item['file_id'] ?? '').toString().trim();
-        if (pc.isNotEmpty && fid.isNotEmpty && seenPickcodes.add(pc)) {
-          final copy = Map<String, dynamic>.from(item);
-          if (fromTargetFolder) {
-            copy['_from_target_folder'] = true;
+    Future<Resolved115Stream?> resolveMatches(
+      Iterable<FileEntry> entries,
+    ) async {
+      for (final name in names) {
+        for (final entry in entries) {
+          if (!entry.isVideo ||
+              entry.pickcode115.isEmpty ||
+              _cleanMatchToken(entry.name) != name ||
+              !seenPickcodes.add(entry.pickcode115)) {
+            continue;
           }
-          candidateFiles.add(copy);
-        }
-      }
-    }
-
-    // 1. Priority 0ms lookup: List the designated 115 acceleration folder (`/流光115加速`) directly
-    // (bypasses 115's search indexing delay so newly uploaded files are found immediately)
-    if (accelCid.isNotEmpty && accelCid != '0') {
-      try {
-        final targetUri = Uri.parse(
-          'https://webapi.115.com/files?aid=1&cid=$accelCid&o=user_ptime&asc=0&offset=0&limit=45&show_dir=1&format=json',
-        );
-        final targetRoot =
-            await _getJson(targetUri, timeout: const Duration(seconds: 12));
-        if (targetRoot is Map<String, dynamic> && targetRoot['data'] is List) {
-          appendFiles(
-            targetRoot['data'] as List,
-            fromTargetFolder: true,
+          final stream = await resolve115VideoPlayback(
+            pickcode: entry.pickcode115,
+            fileName: entry.name,
+            extension: entry.normalizedExt,
           );
-        }
-      } catch (_) {}
-    }
-
-    // 2. Also list newest files in root (`cid=0`) and `/流光115加速` or `/115open` directory sorted by `user_ptime` desc
-    try {
-      final rootUri = Uri.parse(
-        'https://webapi.115.com/files?aid=1&cid=0&o=user_ptime&asc=0&offset=0&limit=50&show_dir=1&format=json',
-      );
-      final root = await _getJson(rootUri, timeout: const Duration(seconds: 12));
-      if (root is Map<String, dynamic> && root['data'] is List) {
-        final rootEntries = root['data'] as List;
-        appendFiles(rootEntries);
-        final targetLower = targetFolderName.toLowerCase();
-        for (final entry in rootEntries) {
-          if (entry is! Map<String, dynamic>) continue;
-          final fid = (entry['fid'] ?? '').toString();
-          final cid = (entry['cid'] ?? '').toString();
-          final name = (entry['n'] ?? '').toString().toLowerCase();
-          if (fid.isEmpty &&
-              cid.isNotEmpty &&
-              cid != accelCid &&
-              (name == targetLower ||
-                  name == '115open' ||
-                  name.contains('115') ||
-                  name.contains('download'))) {
-            final subUri = Uri.parse(
-              'https://webapi.115.com/files?aid=1&cid=$cid&o=user_ptime&asc=0&offset=0&limit=40&show_dir=1&format=json',
-            );
-            final subRoot =
-                await _getJson(subUri, timeout: const Duration(seconds: 12));
-            if (subRoot is Map<String, dynamic> && subRoot['data'] is List) {
-              appendFiles(
-                subRoot['data'] as List,
-                fromTargetFolder: name == targetLower,
-              );
-            }
-          }
+          if (stream != null) return stream;
         }
       }
-    } catch (_) {}
+      return null;
+    }
 
-    // 3. Search by keyword via `webapi.115.com/files/search`
-    for (final kw in keywords.take(3)) {
-      final trimmed = kw.trim();
-      if (trimmed.isEmpty) continue;
-      final uri = Uri.parse('https://webapi.115.com/files/search').replace(
-        queryParameters: <String, String>{
-          'aid': '1',
-          'cid': '0',
-          'search_value': trimmed,
-          'type': '4',
-          'offset': '0',
-          'limit': '25',
-          'format': 'json',
-          'show_dir': '1',
-        },
-      );
+    Future<List<FileEntry>> directory(String cid) async {
       try {
-        final root = await _getJson(uri, timeout: const Duration(seconds: 12));
-        if (root is Map<String, dynamic> && root['data'] is List) {
-          appendFiles(root['data'] as List);
-        }
+        return (await list115Directory(cid: cid, maxPages: 1)).entries;
+      } catch (_) {
+        return const [];
+      }
+    }
+
+    List<FileEntry>? root;
+    var targetCid = _targetFolderCid;
+    if (targetCid.isEmpty || targetCid == '0') {
+      root = await directory('0');
+      targetCid =
+          root
+              .where((item) => item.isDir && item.name == targetFolderName)
+              .firstOrNull
+              ?.cid115 ??
+          '';
+    }
+    if (targetCid.isNotEmpty && targetCid != '0') {
+      final stream = await resolveMatches(await directory(targetCid));
+      if (stream != null) return stream;
+    }
+
+    final rootStream = await resolveMatches(root ?? await directory('0'));
+    if (rootStream != null || !searchAccount) return rootStream;
+
+    for (final keyword
+        in keywords
+            .map((value) => value.trim())
+            .where((value) => value.isNotEmpty)
+            .toSet()
+            .take(4)) {
+      final uri = Uri.https('webapi.115.com', '/files/search', {
+        'aid': '1',
+        'cid': '0',
+        'search_value': keyword,
+        'type': '4',
+        'limit': '25',
+        'show_dir': '0',
+      });
+      try {
+        final result = await _getJson(uri);
+        if (result is! Map || result['data'] is! List) continue;
+        final entries = (result['data'] as List)
+            .whereType<Map<String, dynamic>>()
+            .map(
+              (raw) => _decode115Entry(
+                raw,
+                parentCid: (raw['pid'] ?? raw['cid'] ?? raw['parent_id'] ?? '0')
+                    .toString(),
+                mountId: 'builtin_115',
+              ),
+            )
+            .whereType<FileEntry>();
+        final stream = await resolveMatches(entries);
+        if (stream != null) return stream;
       } catch (_) {}
     }
-
-    if (candidateFiles.isEmpty) return null;
-
-    // 4. Match file by normalized name or newest uploaded timestamp
-    Map<String, dynamic>? matchedItem;
-    for (final item in candidateFiles) {
-      final rawName = (item['n'] ?? item['file_name'] ?? '').toString();
-      final cleanName = _cleanMatchToken(rawName);
-      if (cleanName.isEmpty) continue;
-      if (cleanKeywords.any((kw) => _matchesCleanKeyword(cleanName, kw))) {
-        matchedItem = item;
-        break;
-      }
-    }
-
-    if (matchedItem == null && allowNewestRecentFallbackAfter != null) {
-      final minEpoch =
-          (allowNewestRecentFallbackAfter.millisecondsSinceEpoch ~/ 1000) - 90;
-      for (final item in candidateFiles) {
-        final tp = int.tryParse(
-              (item['tp'] ?? item['te'] ?? item['tu'] ?? item['t'] ?? 0)
-                  .toString(),
-            ) ??
-            0;
-        final iv = int.tryParse((item['iv'] ?? 0).toString()) ?? 0;
-        final ico = (item['ico'] ?? '').toString().toLowerCase();
-        final isVideo = iv == 1 ||
-            const {
-              'mp4',
-              'f4v',
-              'mkv',
-              'ts',
-              'mov',
-              'flv',
-              'avi',
-              'rmvb',
-              'wmv',
-              'webm',
-            }.contains(ico);
-        if (isVideo && tp >= minEpoch) {
-          matchedItem = item;
-          break;
-        }
-      }
-      // If uploaded via 115 Rapid Upload (秒传) into the designated acceleration folder (`/流光115加速`),
-      // 115 may preserve the original rapid-upload timestamp; fall back to the top video in `/流光115加速`
-      if (matchedItem == null) {
-        for (final item in candidateFiles) {
-          if (item['_from_target_folder'] != true) continue;
-          final iv = int.tryParse((item['iv'] ?? 0).toString()) ?? 0;
-          final ico = (item['ico'] ?? '').toString().toLowerCase();
-          final isVideo = iv == 1 ||
-              const {
-                'mp4',
-                'f4v',
-                'mkv',
-                'ts',
-                'mov',
-                'flv',
-                'avi',
-                'rmvb',
-                'wmv',
-                'webm',
-              }.contains(ico);
-          if (isVideo) {
-            matchedItem = item;
-            break;
-          }
-        }
-      }
-    }
-
-    if (matchedItem == null) return null;
-    final pickcode =
-        (matchedItem['pc'] ?? matchedItem['pick_code'] ?? '').toString().trim();
-    final fid =
-        (matchedItem['fid'] ?? matchedItem['file_id'] ?? '').toString().trim();
-    final itemCid =
-        (matchedItem['cid'] ?? matchedItem['parent_id'] ?? '').toString().trim();
-    final fileName =
-        (matchedItem['n'] ?? matchedItem['file_name'] ?? '115 视频').toString();
-    if (pickcode.isEmpty) return null;
-
-    // If the file landed in 115 root (`cid == 0`, e.g. via CloudDrive2 FUSE mount),
-    // automatically move it into the designated folder (`/流光115加速`)
-    if ((itemCid.isEmpty || itemCid == '0') &&
-        accelCid.isNotEmpty &&
-        accelCid != '0' &&
-        fid.isNotEmpty) {
-      unawaited(move115FileToFolder(fid: fid, targetCid: accelCid));
-    }
-
-    final ico = (matchedItem['ico'] ?? '').toString().trim().toLowerCase();
-    final nameLower = fileName.toLowerCase();
-    final dotIdx = nameLower.lastIndexOf('.');
-    final rawExt = ico.isNotEmpty
-        ? '.$ico'
-        : (dotIdx > 0 ? nameLower.substring(dotIdx) : '.mp4');
-    return resolve115VideoPlayback(
-      pickcode: pickcode,
-      fileName: fileName,
-      extension: rawExt,
-    );
+    return null;
   }
 
   Future<Resolved115Stream?> resolve115VideoPlayback({
@@ -2035,7 +1914,7 @@ class Local115DirectService extends ChangeNotifier {
   /// server proxy URL (`/api/vod/proxy?url=...&headers=...`), or inline TVBox pipe header (`url|User-Agent=...&Referer=...`)
   /// into its real remote upstream URL and merged HTTP headers so the backend server or 115 offline cloud can download it.
   static ({String url, Map<String, String> headers})
-      unwrapDownloadTargetUrlAndHeaders(
+  unwrapDownloadTargetUrlAndHeaders(
     String rawUrl, [
     Map<String, String> baseHeaders = const {},
   ]) {
@@ -2104,10 +1983,12 @@ class Local115DirectService extends ChangeNotifier {
         }
         if (encU.isNotEmpty) {
           try {
-            final decU = utf8.decode(
-              base64Url.decode(base64Url.normalize(encU)),
-              allowMalformed: true,
-            ).trim();
+            final decU = utf8
+                .decode(
+                  base64Url.decode(base64Url.normalize(encU)),
+                  allowMalformed: true,
+                )
+                .trim();
             if (decU.isNotEmpty && decU != currentUrl) {
               currentUrl = decU;
               continue;
@@ -2135,6 +2016,14 @@ class Local115DirectService extends ChangeNotifier {
       if (uri.path.endsWith('/api/vod/proxy')) {
         final innerU = (uri.queryParameters['url'] ?? '').trim();
         final encH = (uri.queryParameters['headers'] ?? '').trim();
+        // Drop headers for the backend before merging the upstream headers.
+        mergedHeaders.removeWhere(
+          (key, _) => const {
+            'authorization',
+            'x-auth-secret',
+            'cookie',
+          }.contains(key.toLowerCase()),
+        );
         if (encH.isNotEmpty) {
           try {
             final hJson = utf8.decode(
@@ -2153,9 +2042,6 @@ class Local115DirectService extends ChangeNotifier {
             }
           } catch (_) {}
         }
-        // Remove backend server auth headers when unwrapping to a third-party VOD CDN URL
-        mergedHeaders.remove('Authorization');
-        mergedHeaders.remove('X-Auth-Secret');
         if (innerU.startsWith('http://') || innerU.startsWith('https://')) {
           currentUrl = innerU;
           continue;
@@ -2185,7 +2071,6 @@ class Local115DirectService extends ChangeNotifier {
     required int pipelineId,
     required List<String> candidateUrls,
     required List<String> searchKeywords,
-    required DateTime pipelineStartedAt,
   }) async {
     if (!hasLocalCookie) return null;
     final uid = _extractUidFromCookie();
@@ -2221,8 +2106,7 @@ class Local115DirectService extends ChangeNotifier {
 
     final accelCid = await ensureAccelerationFolderCid();
     String sign = '';
-    String timeStr =
-        (DateTime.now().millisecondsSinceEpoch ~/ 1000).toString();
+    String timeStr = (DateTime.now().millisecondsSinceEpoch ~/ 1000).toString();
     try {
       final spaceRes = await _getJson(
         Uri.parse('https://115.com/?ct=offline&ac=space&_=$timeStr'),
@@ -2263,7 +2147,8 @@ class Local115DirectService extends ChangeNotifier {
             timeout: const Duration(seconds: 12),
           );
           if (res is Map<String, dynamic>) {
-            final state = res['state'] == true ||
+            final state =
+                res['state'] == true ||
                 res['state'] == 1 ||
                 res['errcode'] == 0 ||
                 res['errno'] == 0;
@@ -2295,7 +2180,6 @@ class Local115DirectService extends ChangeNotifier {
       // 1. Check if 115 offline task already completed (often 0.5s instant cloud hit!)
       final resolved = await findAndResolveDirectPlayUrl(
         keywords: mergedKeywords,
-        allowNewestRecentFallbackAfter: pipelineStartedAt,
       );
       if (pipelineId != _activePipelineId) return null;
       if (resolved != null) {
@@ -2325,18 +2209,20 @@ class Local115DirectService extends ChangeNotifier {
           if (matchedLixian != null) {
             final status =
                 int.tryParse((matchedLixian['status'] ?? 0).toString()) ?? 0;
-            final pct = double.tryParse(
+            final pct =
+                double.tryParse(
                   (matchedLixian['percentDone'] ??
                           matchedLixian['percent'] ??
                           0)
                       .toString(),
                 ) ??
                 0.0;
-            final fileId = (matchedLixian['file_id'] ??
-                    matchedLixian['delete_file_id'] ??
-                    '')
-                .toString()
-                .trim();
+            final fileId =
+                (matchedLixian['file_id'] ??
+                        matchedLixian['delete_file_id'] ??
+                        '')
+                    .toString()
+                    .trim();
             _stageTitle = '阶段 2/3 · 115 官方云端正在离线下载该视频...';
             _progress = 0.68 + (pct.clamp(0.0, 100.0) / 100.0) * 0.22;
             _detailText =
@@ -2365,12 +2251,8 @@ class Local115DirectService extends ChangeNotifier {
     return null;
   }
 
-  /// Full 3-stage pipeline with automatic URL unwrapping, stale-failed-task recovery,
-  /// multi-line candidate failover, and 115 official Cloud Offline Download (`离线下载`) fallback:
-  /// 1) Checks if the video is already in 115 Cloud Drive (`/流光115加速` priority, instant switch if found)
-  /// 2) Unwraps any local loopback (`127.0.0.1`) / `/api/vod/proxy` / inline header URL, instructs the server to download (`POST /api/download`),
-  ///    automatically retries or switches to backup candidate URLs if a line fails on the server, and falls back to 115 Cloud Offline Download if all server lines fail
-  /// 3) Waits for 115 upload (`Uploading` / `/api/115/upload/:id` / CloudDrive2 sync), then resolves the official 115 domestic CDN direct link locally
+  /// Reuses an exact cloud match or downloads, uploads, and checks the file
+  /// produced by the submitted server task.
   Future<Resolved115Stream?> run115CloudAccelerationPipeline({
     required ApiClient api,
     required String downloadUrl,
@@ -2382,406 +2264,291 @@ class Local115DirectService extends ChangeNotifier {
   }) async {
     await ensureInitialized();
     final pipelineId = ++_activePipelineId;
-    final cleanName = videoName
-        .replaceAll('/', '_')
-        .replaceAll(':', '_')
-        .trim();
+    final cleanName = videoName.replaceAll(RegExp(r'[/\\:]'), '_').trim();
     final taskTitle = cleanName.isEmpty
-        ? '115加速_${DateTime.now().millisecondsSinceEpoch ~/ 1000}'
+        ? '115加速_${DateTime.now().millisecondsSinceEpoch}'
         : cleanName;
+    bool cancelled() => pipelineId != _activePipelineId;
+
+    void update(String title, String detail, double progress) {
+      if (cancelled()) return;
+      _stageTitle = title;
+      _detailText = detail;
+      _progress = progress;
+      notifyListeners();
+    }
 
     _isAccelerating = true;
-    _stageTitle = '正在检索 115 网盘是否已存在该视频...';
-    _detailText = taskTitle;
-    _progress = 0.06;
-    notifyListeners();
+    update('正在 115 网盘查找当前视频', taskTitle, 0.06);
 
-    final pipelineStartedAt = DateTime.now();
-
-    // Ensure backend server also has our local 115 Cookie and designated target folder (`eleven_dir_id`)
-    if (hasLocalCookie) {
-      try {
-        await api.login115WithCookie(_cookie);
-      } catch (_) {}
-      try {
-        await ensureAccelerationFolderCid(syncToServerApi: api);
-      } catch (_) {}
-    }
-
-    // Step 1: Fast-check if the video already exists in the user's 115 Cloud Drive
-    final existing = await findAndResolveDirectPlayUrl(
-      keywords: [taskTitle, videoName],
-    );
-    if (pipelineId != _activePipelineId) return null;
-    if (existing != null) {
-      _progress = 1.0;
-      _isAccelerating = false;
-      notifyListeners();
-      return existing;
-    }
-
-    // Build ordered, deduplicated list of unwrapped candidate upstream URLs + headers
-    final candidates = <({String url, Map<String, String> headers})>[];
-    final seenUrls = <String>{};
-
-    void addCandidate(String rawU, Map<String, String> baseH) {
-      final unwrapped = unwrapDownloadTargetUrlAndHeaders(rawU, baseH);
-      final u = unwrapped.url.trim();
-      if (u.isEmpty) return;
-      // Never send a local 127.0.0.1 / file:// loopback URL to the remote backend server!
-      if (u.contains('://127.0.0.1') ||
-          u.contains('://localhost') ||
-          u.startsWith('file://')) {
-        return;
+    try {
+      if (!hasLocalCookie) {
+        throw const ApiException('请先登录 115 网盘账号');
       }
-      if (seenUrls.add(u)) {
-        candidates.add((url: u, headers: unwrapped.headers));
-      }
-    }
+      final lookupNames = <String>{taskTitle, videoName};
+      final existing = await findAndResolveDirectPlayUrl(
+        keywords: lookupNames.toList(),
+      );
+      if (cancelled()) return null;
+      if (existing != null) return existing;
 
-    addCandidate(downloadUrl, headers);
-    for (final fb in fallbackDownloadUrls) {
-      addCandidate(fb, headers);
-    }
-
-    if (candidates.isEmpty) {
-      _isAccelerating = false;
-      notifyListeners();
-      onError?.call('无法提取有效的远程视频源链接（当前为本地环回地址），请切换线路后重试');
-      return null;
-    }
-
-    String? matchedTaskId;
-    String matchedOutputFile = '';
-    String matchedTaskName = taskTitle;
-    String lastServerFailureReason = '';
-    bool serverDownloadSucceeded = false;
-
-    // Step 2 & 3: Try each candidate URL on the backend server (with automatic cleanup/retry of stale Failed tasks)
-    for (var cIdx = 0; cIdx < candidates.length; cIdx++) {
-      if (pipelineId != _activePipelineId) return null;
-      final candidate = candidates[cIdx];
-      final lineLabel = candidates.length > 1
-          ? ' (线路 ${cIdx + 1}/${candidates.length})'
-          : '';
-
-      _stageTitle = cIdx == 0
-          ? '阶段 1/3 · 正在提交服务器高速下载任务...'
-          : '阶段 1/3 · 当前线路下载失败，正在自动切换备用线路 (${cIdx + 1}/${candidates.length})...';
-      _detailText = '$taskTitle$lineLabel';
-      _progress = 0.10;
-      notifyListeners();
-
-      // Pre-clean any stale Failed task with the same name or URL so `/api/download` doesn't attach to an old Failed task
-      try {
-        final existingTasks = await api.fetchDownloadTasks();
-        for (final t in existingTasks) {
-          if ((t.name == taskTitle || t.url == candidate.url) &&
-              t.status == 'Failed') {
-            try {
-              await api.deleteDownloadTask(t.id, deleteFiles: true);
-            } catch (_) {}
-          }
+      final candidates = <String, Map<String, String>>{};
+      for (final raw in [downloadUrl, ...fallbackDownloadUrls]) {
+        final source = unwrapDownloadTargetUrlAndHeaders(raw, headers);
+        final uri = Uri.tryParse(source.url);
+        if (uri == null ||
+            !const {'http', 'https', 'magnet', 'ed2k'}.contains(uri.scheme) ||
+            (const {'http', 'https'}.contains(uri.scheme) &&
+                uri.host.isEmpty) ||
+            uri.host == 'localhost' ||
+            InternetAddress.tryParse(uri.host)?.isLoopback == true) {
+          continue;
         }
-      } catch (_) {}
-
-      String? createdTaskId;
-      try {
-        createdTaskId = await api.createDownloadTask(
-          url: candidate.url,
-          name: taskTitle,
-          headers: candidate.headers,
-          telegramAccountId: telegramAccountId,
-          forceDuplicate: cIdx > 0,
-        );
-      } catch (e) {
-        lastServerFailureReason = '$e';
-        continue;
+        candidates.putIfAbsent(source.url, () => source.headers);
+      }
+      if (candidates.isEmpty) {
+        throw const ApiException('当前播放线路没有可供服务端下载的地址');
       }
 
-      matchedTaskId = createdTaskId;
-      bool didTriggerManual115Upload = false;
-      bool didRetryFailedTaskOnce = false;
-      bool candidateFailed = false;
-
-      for (var pollTick = 0; pollTick < 600; pollTick++) {
-        if (pipelineId != _activePipelineId) return null;
-        List<dynamic> tasks = const [];
+      var failure = '服务器未完成当前视频的下载';
+      var serverReady = false;
+      try {
+        final folder = await ensureAccelerationFolderCid(forceVerify: true);
+        if (cancelled()) return null;
+        if (!hasLocalCookie) {
+          throw const ApiException('115 登录已过期，请重新登录');
+        }
+        if (folder == '0') {
+          throw ApiException('无法找到或创建 115 加速目录 /$targetFolderName');
+        }
+        Map<String, dynamic>? account;
         try {
-          tasks = await api.fetchDownloadTasks();
-        } catch (_) {}
-        if (pipelineId != _activePipelineId) return null;
-
-        dynamic matchedTask;
-        if (matchedTaskId != null && matchedTaskId.isNotEmpty) {
-          for (final t in tasks) {
-            if (t.id == matchedTaskId) {
-              matchedTask = t;
-              break;
-            }
-          }
+          account = await api.fetch115Status();
+        } on ApiException catch (error) {
+          if (error.statusCode != HttpStatus.unauthorized) rethrow;
         }
-        if (matchedTask == null) {
-          // Prefer non-Failed task matching url or name
-          for (final t in tasks) {
-            if ((t.url == candidate.url || t.name == taskTitle) &&
-                t.status != 'Failed') {
-              matchedTask = t;
-              matchedTaskId = t.id;
-              break;
-            }
+        if (cancelled()) return null;
+        final localUid = _extractUidFromCookie();
+        if (!hasLocalCookie || localUid.isEmpty) {
+          throw const ApiException('115 登录已过期，请重新登录');
+        }
+        final accountId =
+            account?['Id'] ?? account?['user_id'] ?? account?['uid'];
+        if (accountId?.toString() != localUid) {
+          await api.login115WithCookie(_cookie);
+          if (cancelled()) return null;
+        }
+        await _syncFolderCidToServer(api, folder, throwOnFailure: true);
+        serverReady = true;
+      } catch (error) {
+        failure = '服务端 115 上传准备失败：$error';
+      }
+
+      var serverHasVideo = false;
+      if (serverReady) {
+        for (final candidate in candidates.entries) {
+          if (cancelled()) return null;
+          update('阶段 1/3 · 正在提交下载任务', taskTitle, 0.10);
+          var forced = false;
+          var retried = false;
+          var duplicateRetryPolls = 0;
+          var uploadRequested = false;
+          var missingPolls = 0;
+          var uploadedPolls = 0;
+
+          Future<String?> submit({required bool force}) {
+            return api.createDownloadTask(
+              url: candidate.key,
+              name: taskTitle,
+              headers: candidate.value,
+              telegramAccountId: telegramAccountId,
+              forceDuplicate: force,
+            );
           }
-          if (matchedTask == null) {
-            for (final t in tasks) {
-              if (t.url == candidate.url || t.name == taskTitle) {
-                matchedTask = t;
-                matchedTaskId = t.id;
+
+          String? taskId;
+          try {
+            taskId = await submit(force: false);
+          } catch (error) {
+            failure = '提交下载任务失败：$error';
+            continue;
+          }
+          if (taskId == null) {
+            failure = '服务器未返回下载任务 ID';
+            continue;
+          }
+
+          pollTask:
+          for (var poll = 0; poll < 600 && !cancelled(); poll++) {
+            DownloadTask? task;
+            var listedTasks = false;
+            try {
+              final tasks = await api.fetchDownloadTasks();
+              listedTasks = true;
+              task = tasks.where((item) => item.id == taskId).firstOrNull;
+            } catch (error) {
+              failure = '获取下载任务失败：$error';
+            }
+            if (cancelled()) return null;
+
+            if (task == null) {
+              if (++missingPolls >= 4) {
+                if (listedTasks && !forced) {
+                  forced = true;
+                  update('阶段 1/3 · 下载任务已不存在，正在重新提交', taskTitle, 0.10);
+                  try {
+                    final freshId = await submit(force: true);
+                    if (cancelled()) return null;
+                    if (freshId != null) {
+                      taskId = freshId;
+                      missingPolls = 0;
+                      continue;
+                    }
+                  } catch (error) {
+                    failure = '重新提交下载任务失败：$error';
+                    break;
+                  }
+                }
+                if (listedTasks) failure = '服务器未找到已提交的下载任务';
+                break;
+              }
+            } else {
+              missingPolls = 0;
+              final outputName = task.outputFile
+                  .replaceAll('\\', '/')
+                  .split('/')
+                  .last;
+              final taskNames = <String>{
+                if (outputName.isNotEmpty) outputName,
+                if (task.name.isNotEmpty) task.name,
+                ...lookupNames,
+              };
+              final progress = task.progress.clamp(0.0, 100.0) / 100;
+
+              if (task.status == 'Duplicate' || task.status == 'Completed') {
+                final stream = await findAndResolveDirectPlayUrl(
+                  keywords: taskNames.toList(),
+                  searchAccount: !uploadRequested || uploadedPolls % 5 == 4,
+                );
+                if (cancelled()) return null;
+                if (stream != null) return stream;
+              }
+
+              try {
+                switch (task.status) {
+                  case 'Duplicate':
+                    if (!forced) {
+                      forced = true;
+                      update('阶段 1/3 · 115 未找到重复任务的文件，正在重新下载', taskTitle, 0.10);
+                      final freshId = await submit(force: true);
+                      if (cancelled()) return null;
+                      if (freshId != null && freshId != taskId) {
+                        taskId = freshId;
+                        continue;
+                      }
+                    }
+                    if (!retried) {
+                      retried = true;
+                      await api.retryDownloadTask(task.id);
+                    } else if (++duplicateRetryPolls >= 4) {
+                      failure = '重复任务的文件已不可用，服务器未能重新下载';
+                      break pollTask;
+                    }
+                    break;
+                  case 'Completed':
+                    serverHasVideo = true;
+                    update('阶段 3/3 · 正在核对 115 中的当前视频', task.name, 0.92);
+                    if (!uploadRequested) {
+                      uploadRequested = true;
+                      update('阶段 2/3 · 正在请求服务器上传至 115', task.name, 0.76);
+                      try {
+                        await api.uploadTaskTo115(task.id);
+                      } on ApiException catch (error) {
+                        if (task.outputFile.isEmpty ||
+                            !const {
+                              HttpStatus.notFound,
+                              HttpStatus.methodNotAllowed,
+                            }.contains(error.statusCode)) {
+                          rethrow;
+                        }
+                        await api.uploadFileTo115(task.outputFile);
+                      }
+                    } else if (++uploadedPolls >= 20) {
+                      final reason = task.error.trim();
+                      failure = reason.isEmpty
+                          ? '上传后未在 115 网盘找到当前视频'
+                          : '115 上传失败：$reason';
+                      break pollTask;
+                    }
+                    break;
+                  case 'Uploading':
+                    final pct = task.progress.toStringAsFixed(1);
+                    update(
+                      '阶段 2/3 · 正在上传至 115',
+                      '上传进度 $pct% · ${task.name}',
+                      0.72 + progress * 0.18,
+                    );
+                    break;
+                  case 'Downloading':
+                  case 'Pending':
+                    update(
+                      '阶段 1/3 · 正在下载视频',
+                      '下载进度 ${task.progress.toStringAsFixed(1)}% · ${task.formattedSpeed}',
+                      0.10 + progress * 0.58,
+                    );
+                    break;
+                  case 'Converting':
+                    update('阶段 1/3 · 正在封装 MP4', task.name, 0.70);
+                    break;
+                  case 'Failed':
+                    final reason = task.error.trim();
+                    failure = reason.isEmpty
+                        ? (uploadRequested ? '115 上传失败' : '服务器下载失败')
+                        : reason;
+                    if (!uploadRequested && !retried && outputName.isEmpty) {
+                      retried = true;
+                      await api.retryDownloadTask(task.id);
+                      break;
+                    }
+                    break pollTask;
+                  default:
+                    failure = '服务器任务状态无法识别：${task.status}';
+                    break pollTask;
+                }
+              } catch (error) {
+                failure = uploadRequested
+                    ? '115 上传请求失败：$error'
+                    : '重新下载失败：$error';
                 break;
               }
             }
+
+            await Future<void>.delayed(const Duration(milliseconds: 1200));
           }
+          if (serverHasVideo) break;
         }
-
-        if (matchedTask != null) {
-          matchedOutputFile = matchedTask.outputFile;
-          matchedTaskName = matchedTask.name;
-          final status = matchedTask.status as String;
-          final prog = (matchedTask.progress as double).clamp(1.0, 99.5);
-
-          if (status == 'Pending' || status == 'Downloading') {
-            _stageTitle = '阶段 1/3 · 服务器正在高速下载该视频$lineLabel...';
-            _progress = 0.10 + (prog / 100.0) * 0.58;
-            final segInfo = matchedTask.totalSegments > 0
-                ? ' · 分片 ${matchedTask.downloadedSegments}/${matchedTask.totalSegments}'
-                : '';
-            _detailText =
-                '下载进度 ${prog.toStringAsFixed(1)}% · 速度 ${matchedTask.formattedSpeed}$segInfo';
-            notifyListeners();
-          } else if (status == 'Converting') {
-            _stageTitle = '阶段 1/3 · 服务器正在无损转封装 MP4...';
-            _progress = 0.70;
-            _detailText = '即将自动上传至 115 网盘';
-            notifyListeners();
-          } else if (status == 'Uploading') {
-            _stageTitle = '阶段 2/3 · 服务器正在上传视频至 115 网盘...';
-            _progress = 0.72 + (prog / 100.0) * 0.18;
-            _detailText =
-                '上传 115 进度 ${prog.toStringAsFixed(1)}% · ${matchedTask.name}';
-            notifyListeners();
-          } else if (status == 'Completed' || status == 'Duplicate') {
-            serverDownloadSucceeded = true;
-            final quickCheckKeywords = <String>[
-              if (matchedOutputFile.isNotEmpty)
-                matchedOutputFile.split('/').last,
-              if (matchedTaskName.isNotEmpty) matchedTaskName,
-              taskTitle,
-              videoName,
-            ];
-            final alreadyIn115 = await findAndResolveDirectPlayUrl(
-              keywords: quickCheckKeywords,
-              allowNewestRecentFallbackAfter: pipelineStartedAt,
-            );
-            if (pipelineId != _activePipelineId) return null;
-            if (alreadyIn115 != null) {
-              _progress = 1.0;
-              _isAccelerating = false;
-              notifyListeners();
-              return alreadyIn115;
-            }
-
-            if (!didTriggerManual115Upload) {
-              didTriggerManual115Upload = true;
-              final errStr = (matchedTask.error as String).toLowerCase();
-              if (errStr.contains('115') || matchedOutputFile.isNotEmpty) {
-                _stageTitle =
-                    '阶段 2/3 · 正在同步视频至 115 网盘 (/$targetFolderName)...';
-                _progress = 0.76;
-                _detailText = '正在触发 115 秒传 / 接口上传...';
-                notifyListeners();
-                try {
-                  await api.uploadTaskTo115(matchedTask.id);
-                } catch (_) {}
-                if (matchedOutputFile.isNotEmpty) {
-                  try {
-                    await api.uploadFileTo115(matchedOutputFile);
-                  } catch (_) {}
-                }
-                await Future<void>.delayed(const Duration(milliseconds: 1200));
-                try {
-                  final refreshed = await api.fetchDownloadTasks();
-                  final reTask = refreshed
-                      .where((x) => x.id == matchedTask.id)
-                      .firstOrNull;
-                  if (reTask != null && reTask.status == 'Uploading') {
-                    continue;
-                  }
-                } catch (_) {}
-              }
-            }
-            break;
-          } else if (status == 'Failed') {
-            final errText = (matchedTask.error as String).trim();
-            lastServerFailureReason =
-                errText.isEmpty ? '视频源连接被拒绝或超时' : errText;
-
-            // Check if the file actually finished downloading (`outputFile` exists or error is only a 115 upload warning)
-            if (matchedOutputFile.isNotEmpty && !didTriggerManual115Upload) {
-              didTriggerManual115Upload = true;
-              _stageTitle =
-                  '阶段 2/3 · 正在重新上传视频至 115 网盘 (/$targetFolderName)...';
-              _progress = 0.76;
-              _detailText = '正在触发 115 秒传 / 接口上传...';
-              notifyListeners();
-              try {
-                await api.uploadTaskTo115(matchedTask.id);
-              } catch (_) {}
-              try {
-                await api.uploadFileTo115(matchedOutputFile);
-              } catch (_) {}
-              await Future<void>.delayed(const Duration(milliseconds: 1500));
-              final postUpload = await findAndResolveDirectPlayUrl(
-                keywords: [
-                  matchedOutputFile.split('/').last,
-                  matchedTaskName,
-                  taskTitle,
-                  videoName,
-                ],
-                allowNewestRecentFallbackAfter: pipelineStartedAt,
-              );
-              if (pipelineId != _activePipelineId) return null;
-              if (postUpload != null) {
-                _progress = 1.0;
-                _isAccelerating = false;
-                notifyListeners();
-                return postUpload;
-              }
-            }
-
-            // If this is the first failure on pollTick <= 1 (e.g. attached to a stale task or transient hiccup), retry once on server
-            if (!didRetryFailedTaskOnce && cIdx == candidates.length - 1) {
-              didRetryFailedTaskOnce = true;
-              _stageTitle = '阶段 1/3 · 服务器下载遇到波动，正在自动重试...';
-              _detailText = lastServerFailureReason;
-              notifyListeners();
-              try {
-                await api.retryDownloadTask(matchedTask.id);
-                await Future<void>.delayed(const Duration(milliseconds: 1500));
-                continue;
-              } catch (_) {}
-            }
-
-            candidateFailed = true;
-            break;
-          }
-        } else if (pollTick >= 4) {
-          serverDownloadSucceeded = true;
-          break;
-        }
-
-        await Future<void>.delayed(const Duration(milliseconds: 1200));
       }
 
-      if (serverDownloadSucceeded && !candidateFailed) {
-        break;
+      if (cancelled()) return null;
+      if (!serverHasVideo) {
+        final offline = await _try115CloudOfflineLixianFallback(
+          pipelineId: pipelineId,
+          candidateUrls: candidates.keys.toList(),
+          searchKeywords: lookupNames.toList(),
+        );
+        if (cancelled()) return null;
+        if (offline != null) return offline;
       }
-    }
-
-    if (pipelineId != _activePipelineId) return null;
-
-    final keywords = <String>[
-      if (matchedOutputFile.isNotEmpty)
-        matchedOutputFile.split('/').last,
-      if (matchedTaskName.isNotEmpty) matchedTaskName,
-      taskTitle,
-      videoName,
-    ];
-
-    // If all server download candidates failed, try 115 Official Cloud Offline Download (`离线下载` `add_task_url`)
-    // and check if the file is already available in 115 Cloud Drive!
-    if (!serverDownloadSucceeded) {
-      final lixianResolved = await _try115CloudOfflineLixianFallback(
-        pipelineId: pipelineId,
-        candidateUrls: candidates.map((c) => c.url).toList(),
-        searchKeywords: keywords,
-        pipelineStartedAt: pipelineStartedAt,
-      );
-      if (pipelineId != _activePipelineId) return null;
-      if (lixianResolved != null) {
-        _progress = 1.0;
-        _isAccelerating = false;
-        notifyListeners();
-        return lixianResolved;
-      }
-
-      // One final check in 115 Cloud Drive in case a background sync or existing file matched
-      final finalCheck = await findAndResolveDirectPlayUrl(
-        keywords: keywords,
-        allowNewestRecentFallbackAfter: pipelineStartedAt,
-      );
-      if (pipelineId != _activePipelineId) return null;
-      if (finalCheck != null) {
-        _progress = 1.0;
-        _isAccelerating = false;
-        notifyListeners();
-        return finalCheck;
-      }
-
-      _isAccelerating = false;
-      notifyListeners();
-      final errDetail = lastServerFailureReason.isEmpty
-          ? '当前视频源防盗链限制了海外服务器下载，建议切换其他播放线路后再试'
-          : lastServerFailureReason;
-      onError?.call('服务器下载失败：$errDetail');
+      throw ApiException(failure);
+    } catch (error) {
+      if (!cancelled()) onError?.call('$error');
       return null;
-    }
-
-    // Step 4: Poll local 115 Cloud Drive to get the official 115 domestic CDN direct URL
-    _stageTitle = '阶段 3/3 · 正在从本地连接 115 获取高速直链...';
-    _progress = 0.92;
-    notifyListeners();
-
-    for (var attempt = 0; attempt < 25; attempt++) {
-      if (pipelineId != _activePipelineId) return null;
-      _detailText = attempt == 0
-          ? '正在通过本地网络请求 115 官方直链...'
-          : '正在等待 115 网盘完成文件索引 (${attempt + 1}/25)...';
-      notifyListeners();
-
-      final resolved115 = await findAndResolveDirectPlayUrl(
-        keywords: keywords,
-        allowNewestRecentFallbackAfter: pipelineStartedAt,
-      );
-      if (pipelineId != _activePipelineId) return null;
-      if (resolved115 != null) {
-        _progress = 1.0;
+    } finally {
+      if (!cancelled()) {
         _isAccelerating = false;
         notifyListeners();
-        return resolved115;
       }
-
-      if (matchedTaskId != null && matchedTaskId.isNotEmpty) {
-        try {
-          final tasks = await api.fetchDownloadTasks();
-          final t = tasks.where((x) => x.id == matchedTaskId).firstOrNull;
-          if (t != null && t.status == 'Uploading') {
-            final upPct = t.progress.clamp(1.0, 99.5);
-            _stageTitle = '阶段 2/3 · 服务器正在上传视频至 115 网盘...';
-            _progress = 0.72 + (upPct / 100.0) * 0.20;
-            _detailText =
-                '上传 115 进度 ${upPct.toStringAsFixed(1)}% · ${t.name}';
-            notifyListeners();
-          }
-        } catch (_) {}
-      }
-
-      await Future<void>.delayed(const Duration(milliseconds: 1500));
     }
-
-    if (pipelineId != _activePipelineId) return null;
-    _isAccelerating = false;
-    notifyListeners();
-    onError?.call('暂未在 115 网盘中找到已上传文件，请确认 115 账号已登录且空间充足');
-    return null;
   }
 
   Future<dynamic> _getJson(
@@ -2856,37 +2623,6 @@ class Local115DirectService extends ChangeNotifier {
     }
     s = s.replaceAll(RegExp(r'[《》【】\[\]\(\)（）\-—_·:\s]+'), '');
     return s.toLowerCase().trim();
-  }
-
-  static bool _matchesCleanKeyword(String cleanName, String cleanKw) {
-    if (cleanName.isEmpty || cleanKw.isEmpty) return false;
-    if (cleanName == cleanKw ||
-        cleanName.contains(cleanKw) ||
-        cleanKw.contains(cleanName)) {
-      return true;
-    }
-    // Also match when VOD detail title is "有五个姐姐的我第06集" vs 115 file "有五个姐姐的我第二季6"
-    String normEpisodeNum(String input) {
-      return input.replaceAllMapped(
-        RegExp(r'第0*(\d+)[集话期]?'),
-        (m) => m.group(1) ?? '',
-      );
-    }
-
-    final n1 = normEpisodeNum(cleanName);
-    final n2 = normEpisodeNum(cleanKw);
-    if (n1 == n2 || n1.contains(n2) || n2.contains(n1)) {
-      return true;
-    }
-    // Strip "第X季" if one side has season and the other doesn't
-    final s1 = n1.replaceAll(RegExp(r'第[一二三四五六七八九十\d]+季'), '');
-    final s2 = n2.replaceAll(RegExp(r'第[一二三四五六七八九十\d]+季'), '');
-    if (s1.length >= 2 &&
-        s2.length >= 2 &&
-        (s1 == s2 || s1.contains(s2) || s2.contains(s1))) {
-      return true;
-    }
-    return false;
   }
 
   // MARK: - 115 Cloud Drive Directory Browser & File Operations for Multi-Storage File Manager
@@ -3031,77 +2767,16 @@ class Local115DirectService extends ChangeNotifier {
     if (rawItems != null) {
       for (final item in rawItems) {
         if (item is! Map<String, dynamic>) continue;
-        final fid = (item['fid'] ?? '').toString().trim();
-        final itemCid = (item['cid'] ?? '').toString().trim();
-        final hasValidFid = fid.isNotEmpty && fid != '0';
-        // Android uses fid for both files and folders, with fc marking the type.
-        // The web listings identify folders by cid and omit fid.
-        final isDir = switch (item['fc']?.toString()) {
-          '0' => true,
-          '1' => false,
-          _ => !hasValidFid && itemCid.isNotEmpty && itemCid != '0',
-        };
-        final folderCid = hasValidFid ? fid : itemCid;
-        if (isDir &&
-            (folderCid.isEmpty || folderCid == '0' || folderCid == cleanCid)) {
+        final entry = _decode115Entry(item, parentCid: cleanCid, mountId: mountId);
+        if (entry == null ||
+            !seenEntryKeys.add('${entry.isDir}::${entry.path}::${entry.name}')) {
           continue;
         }
-        final name = (item['n'] ?? item['ns'] ?? item['fn'] ?? '未命名').toString();
-        final size = int.tryParse((item['s'] ?? item['fs'] ?? 0).toString()) ?? 0;
-        final pickcode =
-            (item['pc'] ?? item['pick_code'] ?? '').toString().trim();
-        final ico = (item['ico'] ?? '').toString().toLowerCase().trim().replaceAll('.', '');
-        final is115Video =
-            (int.tryParse((item['iv'] ?? 0).toString()) ?? 0) == 1 ||
-            item['vdi'] != null;
-        String ext = '';
-        if (!isDir) {
-          final dot = name.lastIndexOf('.');
-          if (dot > 0 && dot < name.length - 1) {
-            ext = name.substring(dot).toLowerCase();
-          } else if (ico.isNotEmpty) {
-            ext = '.$ico';
-          } else if (is115Video) {
-            ext = '.mp4';
-          }
+        if (entry.isDir) {
+          _cidParentMap[entry.cid115] = cleanCid;
+          _cidNameMap[entry.cid115] = entry.name;
         }
-        final ts = int.tryParse(
-              (item['te'] ?? item['tp'] ?? item['t'] ?? 0).toString(),
-            ) ??
-            0;
-        String modStr = (item['te'] ?? '').toString();
-        if (ts > 100000) {
-          final dt = DateTime.fromMillisecondsSinceEpoch(ts * 1000);
-          modStr =
-              '${dt.year}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')} '
-              '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
-        }
-        final thumb = (item['u'] ?? '').toString();
-        final entryPath = isDir ? folderCid : (hasValidFid ? fid : pickcode);
-        if (!seenEntryKeys.add('${isDir ? "D" : "F"}::$entryPath::$name')) {
-          continue;
-        }
-        if (isDir) {
-          _cidParentMap[folderCid] = cleanCid;
-          _cidNameMap[folderCid] = name;
-        }
-        entries.add(
-          FileEntry(
-            name: name,
-            path: entryPath,
-            size: size,
-            modTime: modStr,
-            isDir: isDir,
-            isMp4: !isDir && (ext == '.mp4' || (is115Video && ext.isEmpty)),
-            ext: ext,
-            mountId: mountId,
-            sourceKind: StorageSourceKind.cloud115,
-            thumbUrl: thumb,
-            pickcode115: pickcode,
-            fid115: isDir ? folderCid : fid,
-            cid115: isDir ? folderCid : cleanCid,
-          ),
-        );
+        entries.add(entry);
       }
     }
 
@@ -3110,6 +2785,84 @@ class Local115DirectService extends ChangeNotifier {
       parent: cleanCid == '0' ? '' : resolvedParent,
       root: '0',
       entries: entries,
+    );
+  }
+
+  FileEntry? _decode115Entry(
+    Map<String, dynamic> item, {
+    required String parentCid,
+    required String mountId,
+  }) {
+    final fid = (item['fid'] ?? item['file_id'] ?? '').toString().trim();
+    final itemCid = (item['cid'] ?? item['category_id'] ?? '')
+        .toString()
+        .trim();
+    final hasValidFid = fid.isNotEmpty && fid != '0';
+    // Android uses fid for both files and folders, with fc marking the type.
+    // The web listings identify folders by cid and omit fid.
+    final isDir = switch (item['fc']?.toString()) {
+      '0' => true,
+      '1' => false,
+      _ => !hasValidFid && itemCid.isNotEmpty && itemCid != '0',
+    };
+    final folderCid = hasValidFid ? fid : itemCid;
+    if (isDir &&
+        (folderCid.isEmpty || folderCid == '0' || folderCid == parentCid)) {
+      return null;
+    }
+    final name =
+        (item['n'] ?? item['ns'] ?? item['fn'] ?? item['file_name'] ?? '未命名')
+            .toString();
+    final size =
+        int.tryParse(
+          (item['s'] ?? item['fs'] ?? item['file_size'] ?? 0).toString(),
+        ) ??
+        0;
+    final pickcode = (item['pc'] ?? item['pick_code'] ?? '').toString().trim();
+    final ico = (item['ico'] ?? '').toString().toLowerCase().trim().replaceAll(
+      '.',
+      '',
+    );
+    final is115Video =
+        (int.tryParse((item['iv'] ?? 0).toString()) ?? 0) == 1 ||
+        item['vdi'] != null;
+    String ext = '';
+    if (!isDir) {
+      final dot = name.lastIndexOf('.');
+      if (dot > 0 && dot < name.length - 1) {
+        ext = name.substring(dot).toLowerCase();
+      } else if (ico.isNotEmpty) {
+        ext = '.$ico';
+      } else if (is115Video) {
+        ext = '.mp4';
+      }
+    }
+    final ts =
+        int.tryParse((item['te'] ?? item['tp'] ?? item['t'] ?? 0).toString()) ??
+        0;
+    String modStr = (item['te'] ?? '').toString();
+    if (ts > 100000) {
+      final dt = DateTime.fromMillisecondsSinceEpoch(ts * 1000);
+      modStr =
+          '${dt.year}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')} '
+          '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+    }
+    final thumb = (item['u'] ?? '').toString();
+    final entryPath = isDir ? folderCid : (hasValidFid ? fid : pickcode);
+    return FileEntry(
+      name: name,
+      path: entryPath,
+      size: size,
+      modTime: modStr,
+      isDir: isDir,
+      isMp4: !isDir && (ext == '.mp4' || (is115Video && ext.isEmpty)),
+      ext: ext,
+      mountId: mountId,
+      sourceKind: StorageSourceKind.cloud115,
+      thumbUrl: thumb,
+      pickcode115: pickcode,
+      fid115: isDir ? folderCid : fid,
+      cid115: isDir ? folderCid : parentCid,
     );
   }
 

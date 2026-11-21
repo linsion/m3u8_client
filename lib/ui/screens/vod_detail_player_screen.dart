@@ -881,6 +881,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
 
     setState(() {
       _currentEpisode = episode;
+      _using115Direct = false;
       _isResolvingPlay = true;
       _hasRenderedFirstFrame = false;
       _videoWidth = 0;
@@ -1078,6 +1079,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
 
     if (mounted) {
       setState(() {
+        _using115Direct = false;
         _hasRenderedFirstFrame =
             (_player.state.width ?? 0) > 0 || _player.state.position > Duration.zero;
       });
@@ -1085,7 +1087,6 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
 
     _activeStreamUrl = finalMediaTarget;
     _activeStreamHeaders = headers;
-    _using115Direct = false;
     final startOffset = (!_hasAppliedInitialSeek && _pendingSeekSeconds > 3)
         ? Duration(seconds: _pendingSeekSeconds.round())
         : null;
@@ -1120,10 +1121,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
   String _resolveCurrent115DownloadUrl() {
     final resolved = _resolvedPlayback;
     if (resolved != null && resolved.directUrl.trim().isNotEmpty) {
-      return Local115DirectService.unwrapDownloadTargetUrlAndHeaders(
-        resolved.directUrl.trim(),
-        _activeStreamHeaders,
-      ).url;
+      return resolved.directUrl.trim();
     }
     if (_activeStreamUrl.trim().isNotEmpty) {
       final unwrapped = Local115DirectService.unwrapDownloadTargetUrlAndHeaders(
@@ -1131,13 +1129,10 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         _activeStreamHeaders,
       ).url;
       if (unwrapped.isNotEmpty && !unwrapped.contains('127.0.0.1')) {
-        return unwrapped;
+        return _activeStreamUrl.trim();
       }
     }
-    return Local115DirectService.unwrapDownloadTargetUrlAndHeaders(
-      _currentEpisode?.rawUrl.trim() ?? '',
-      _activeStreamHeaders,
-    ).url;
+    return _currentEpisode?.rawUrl.trim() ?? '';
   }
 
   List<String> _resolveFallback115DownloadUrls() {
@@ -1154,8 +1149,8 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         return;
       }
       if (u.startsWith('http://') || u.startsWith('https://')) {
-        if (!result.contains(u)) {
-          result.add(u);
+        if (!result.contains(raw)) {
+          result.add(raw);
         }
       }
     }
@@ -1177,13 +1172,12 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         if (i == _selectedGroupIndex) continue;
         final grp = detail.playGroups[i];
         if (grp.episodes.isEmpty) continue;
-        final match = grp.episodes.firstWhere(
-          (e) => e.title == curEp.title,
-          orElse: () => curEp.index < grp.episodes.length
-              ? grp.episodes[curEp.index]
-              : grp.episodes.first,
-        );
-        addIfValid(match.rawUrl);
+        final match =
+            grp.episodes.where((e) => e.title == curEp.title).firstOrNull ??
+            (curEp.index < grp.episodes.length
+                ? grp.episodes[curEp.index]
+                : null);
+        if (match != null) addIfValid(match.rawUrl);
       }
     }
     return result;
@@ -1201,31 +1195,32 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
 
   Future<void> _applyResolved115Stream(Resolved115Stream resolved) async {
     if (!mounted) return;
-    _playAttemptSessionId++;
+    final attempt = ++_playAttemptSessionId;
     _startupWatchdogTimer?.cancel();
     _bufferingLagTimer?.cancel();
     final curSec = _player.state.position.inSeconds;
     setState(() {
       _using115Direct = true;
       _activeStreamUrl = resolved.proxyStreamUrl;
-      _activeStreamHeaders = resolved.headers;
+      _activeStreamHeaders = resolved.playbackHeaders;
       _playError = null;
       _isResolvingPlay = false;
     });
-    final isLocalProxy = resolved.proxyStreamUrl.contains('127.0.0.1');
     await _applyVodStreamHeaders(
-      resolved.headers,
+      resolved.playbackHeaders,
       streamUrl: resolved.proxyStreamUrl,
       bypassClientProxy: true,
     );
+    if (!mounted || attempt != _playAttemptSessionId) return;
     await _player.open(
       Media(
         resolved.proxyStreamUrl,
-        httpHeaders: isLocalProxy ? const {} : resolved.headers,
+        httpHeaders: resolved.playbackHeaders,
         start: curSec > 2 ? Duration(seconds: curSec) : null,
       ),
       play: true,
     );
+    if (!mounted || attempt != _playAttemptSessionId) return;
     if (_playbackSpeed != 1.0) {
       await _player.setRate(_playbackSpeed);
     }
@@ -1512,6 +1507,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         ScenarioRouteMode.serverRelay;
     setState(() {
       _useServerProxy = isRelayMode;
+      _using115Direct = false;
       _bypassClientProxyForCurrentEpisode = false;
       _clientProxyRetryCountForEpisode = 0;
       _hasRenderedFirstFrame = false;
@@ -1557,6 +1553,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       streamUrl: _activeStreamUrl,
       headers: _activeStreamHeaders,
       isLive: false,
+      is115Playback: _using115Direct,
       vodSource: _activeSource,
       vodId: _activeVodId,
       vodTitle: title,
@@ -2624,7 +2621,10 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                       _resolveFallback115DownloadUrls,
                                   videoNameBuilder: _resolveCurrent115VideoName,
                                   headersBuilder: () => _activeStreamHeaders,
-                                  isUsing115Direct: _using115Direct,
+                                  player: _player,
+                                  selected115Url: _using115Direct
+                                      ? _activeStreamUrl
+                                      : null,
                                   overlayStyle: false,
                                   compact: isNarrow,
                                   onResolved: _applyResolved115Stream,
@@ -3189,7 +3189,10 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                   _resolveFallback115DownloadUrls,
                               videoNameBuilder: _resolveCurrent115VideoName,
                               headersBuilder: () => _activeStreamHeaders,
-                              isUsing115Direct: _using115Direct,
+                              player: _player,
+                              selected115Url: _using115Direct
+                                  ? _activeStreamUrl
+                                  : null,
                               overlayStyle: false,
                               compact: false,
                               onResolved: _applyResolved115Stream,
@@ -4068,7 +4071,10 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                     _resolveFallback115DownloadUrls,
                                 videoNameBuilder: _resolveCurrent115VideoName,
                                 headersBuilder: () => _activeStreamHeaders,
-                                isUsing115Direct: _using115Direct,
+                                player: _player,
+                                selected115Url: _using115Direct
+                                    ? _activeStreamUrl
+                                    : null,
                                 overlayStyle: isFullscreen,
                                 compact: true,
                                 onResolved: _applyResolved115Stream,
@@ -4584,7 +4590,10 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                   _resolveFallback115DownloadUrls,
                               videoNameBuilder: _resolveCurrent115VideoName,
                               headersBuilder: () => _activeStreamHeaders,
-                              isUsing115Direct: _using115Direct,
+                              player: _player,
+                              selected115Url: _using115Direct
+                                  ? _activeStreamUrl
+                                  : null,
                               overlayStyle: true,
                               compact: screenSize.width < 520,
                               onResolved: _applyResolved115Stream,

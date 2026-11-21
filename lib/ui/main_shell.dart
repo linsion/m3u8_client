@@ -10,6 +10,7 @@ import 'package:media_kit_video/media_kit_video.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../models/models.dart';
+import '../services/local_115_direct_service.dart';
 import '../services/proxy_routing_service.dart';
 import '../state/app_state.dart';
 import 'screens/downloads_screen.dart';
@@ -3483,6 +3484,11 @@ class _FloatingMiniPlayerOverlayState
   bool _userPaused = false;
   bool _isRecovering = false;
   int _playbackOpenSequence = 0;
+  Resolved115Stream? _acceleratedStream;
+  bool get _is115Playback =>
+      _acceleratedStream != null || widget.session.is115Playback;
+  String get _selectedStreamUrl =>
+      _acceleratedStream?.proxyStreamUrl ?? widget.session.streamUrl;
   int _consecutiveRecoveries = 0;
   Duration _lastKnownPosition = Duration.zero;
   Duration _lastKnownDuration = Duration.zero;
@@ -3525,7 +3531,9 @@ class _FloatingMiniPlayerOverlayState
   @override
   void didUpdateWidget(covariant _FloatingMiniPlayerOverlay oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.session.streamUrl != widget.session.streamUrl) {
+    if (oldWidget.session.streamUrl != widget.session.streamUrl ||
+        oldWidget.session.is115Playback != widget.session.is115Playback) {
+      _acceleratedStream = null;
       _userPaused = false;
       _isRecovering = false;
       _consecutiveRecoveries = 0;
@@ -3636,14 +3644,18 @@ class _FloatingMiniPlayerOverlayState
       _pendingSeekSeconds = overrideResumeSeconds;
       _hasAppliedInitialSeek = false;
     }
-    var streamUrl = _unwrapRelayUrlIfNeeded(widget.session.streamUrl);
+    final is115Playback = _is115Playback;
+    final headers = _acceleratedStream?.playbackHeaders ?? widget.session.headers;
+    var streamUrl = is115Playback
+        ? _selectedStreamUrl
+        : _unwrapRelayUrlIfNeeded(_selectedStreamUrl);
     final scenario = _playbackScenario;
-    if (scenario != RequestScenario.liveStream) {
+    if (!is115Playback && scenario != RequestScenario.liveStream) {
       final relayed = await widget.appState.proxyService
           .resolveProxiedStreamUrl(
             scenario,
             streamUrl,
-            headers: widget.session.headers,
+            headers: headers,
             cleanM3u8Ads:
                 scenario == RequestScenario.vodStream &&
                 widget.appState.vodFilterM3u8Ads,
@@ -3663,7 +3675,6 @@ class _FloatingMiniPlayerOverlayState
 
     try {
       final dynamic platform = _player.platform;
-      final headers = widget.session.headers;
       final ua =
           headers['User-Agent'] ??
           headers['user-agent'] ??
@@ -3675,7 +3686,7 @@ class _FloatingMiniPlayerOverlayState
       await platform.setProperty('referrer', ref);
       if (!isCurrent()) return;
 
-      if (usingLocalStreamRelay) {
+      if (is115Playback || usingLocalStreamRelay) {
         await platform.setProperty('http-proxy', '');
       } else {
         final proxyUrl = await widget.appState.proxyService
@@ -3695,7 +3706,7 @@ class _FloatingMiniPlayerOverlayState
     await _player.open(
       Media(
         streamUrl,
-        httpHeaders: usingLocalStreamRelay ? const {} : widget.session.headers,
+        httpHeaders: usingLocalStreamRelay ? const {} : headers,
       ),
       play: !_userPaused,
     );
@@ -4037,24 +4048,21 @@ class _FloatingMiniPlayerOverlayState
                             downloadUrlBuilder: () => widget.session.streamUrl,
                             videoNameBuilder: () => widget.session.title,
                             headersBuilder: () => widget.session.headers,
+                            player: _player,
+                            selected115Url: _is115Playback
+                                ? _selectedStreamUrl
+                                : null,
                             compact: true,
                             overlayStyle: true,
                             onResolved: (resolved) async {
                               if (!mounted) return;
                               final curSec = _player.state.position.inSeconds;
-                              await _player.open(
-                                Media(
-                                  resolved.proxyStreamUrl,
-                                  httpHeaders: resolved.proxyStreamUrl
-                                          .contains('127.0.0.1')
-                                      ? const {}
-                                      : resolved.headers,
-                                  start: curSec > 2
-                                      ? Duration(seconds: curSec)
-                                      : null,
-                                ),
-                                play: true,
-                              );
+                              _recoveryTimer?.cancel();
+                              _isRecovering = false;
+                              _userPaused = false;
+                              _lastKnownDuration = Duration.zero;
+                              setState(() => _acceleratedStream = resolved);
+                              await _startPlayback(overrideResumeSeconds: curSec);
                             },
                           ),
                         ],
@@ -4067,6 +4075,9 @@ class _FloatingMiniPlayerOverlayState
                           onProxyChanged: (_) {
                             _recoveryTimer?.cancel();
                             _isRecovering = false;
+                            if (_acceleratedStream != null) {
+                              setState(() => _acceleratedStream = null);
+                            }
                             final resume = widget.session.isLive
                                 ? null
                                 : _lastKnownPosition.inSeconds;

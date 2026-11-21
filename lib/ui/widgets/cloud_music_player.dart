@@ -789,11 +789,13 @@ class CloudMusicController extends ChangeNotifier {
   int _openSeq = 0;
   bool _handlingCompletion = false;
   bool _retriedCurrentTrack = false;
-  bool _prefsLoaded = false;
+  late final Future<void> _initialLoad;
+  Future<void> _playlistWrite = Future.value();
+  int _scanSeq = 0;
 
   CloudMusicController._internal() {
     _initNativeMediaSessionHandler();
-    _loadSavedMusicFoldersAndMounts();
+    _initialLoad = _loadSavedMusicFoldersAndMounts(restorePlaylists: true);
   }
 
   void _initNativeMediaSessionHandler() {
@@ -911,9 +913,6 @@ class CloudMusicController extends ChangeNotifier {
 
   void bindAppState(AppState appState) {
     _boundAppState = appState;
-    if (!_prefsLoaded) {
-      unawaited(_loadSavedMusicFoldersAndMounts());
-    }
   }
 
   Player? get player => _player;
@@ -951,8 +950,9 @@ class CloudMusicController extends ChangeNotifier {
       _savedPlaylists.where((p) => p.id == _activePlaylistId).firstOrNull;
   String get activePlaylistName => activePlaylist?.name ?? '默认播放列表';
 
-  Future<void> _loadSavedMusicFoldersAndMounts() async {
-    _prefsLoaded = true;
+  Future<void> _loadSavedMusicFoldersAndMounts({
+    bool restorePlaylists = false,
+  }) async {
     final builtIn = <StorageMount>[
       const StorageMount(
         id: 'builtin_server',
@@ -1004,158 +1004,117 @@ class CloudMusicController extends ChangeNotifier {
         }
       }
 
-      final rawPlaylists = prefs.getString(_prefSavedMusicPlaylistsKey);
-      if (rawPlaylists != null && rawPlaylists.isNotEmpty) {
-        final decoded = jsonDecode(rawPlaylists);
-        if (decoded is List) {
-          _savedPlaylists = decoded
-              .whereType<Map<String, dynamic>>()
-              .map(SavedMusicPlaylist.fromJson)
-              .toList();
+      if (restorePlaylists) {
+        _loadPlaylists(prefs);
+        final track = currentTrack;
+        if (track != null) {
+          unawaited(_loadCoverAndLyricsForTrack(track, _openSeq));
         }
       }
-      final savedActiveId = prefs.getString(_prefActiveMusicPlaylistIdKey);
-      if (savedActiveId != null && savedActiveId.isNotEmpty) {
-        _activePlaylistId = savedActiveId;
-      }
-
-      if (_queue.isEmpty) {
-        final rawDefaultQueue = prefs.getString(_prefDefaultMusicQueueKey);
-        if (rawDefaultQueue != null && rawDefaultQueue.isNotEmpty) {
-          final decoded = jsonDecode(rawDefaultQueue);
-          if (decoded is List) {
-            final restoredQueue = decoded
-                .whereType<Map<String, dynamic>>()
-                .map(FileEntry.fromJson)
-                .toList();
-            if (restoredQueue.isNotEmpty) {
-              _queue = restoredQueue;
-              final savedIdx = prefs.getInt(_prefDefaultMusicIndexKey) ?? 0;
-              _currentIndex = savedIdx.clamp(0, _queue.length - 1);
-            }
-          }
-        }
-        final rawDefaultSources = prefs.getString(_prefDefaultMusicSourcesKey);
-        if (rawDefaultSources != null && rawDefaultSources.isNotEmpty) {
-          final decoded = jsonDecode(rawDefaultSources);
-          if (decoded is List) {
-            _currentQueueSources = decoded
-                .whereType<Map<String, dynamic>>()
-                .map(SavedMusicFolderItem.fromJson)
-                .toList();
-          }
-        }
-        if (_queue.isEmpty && _savedPlaylists.isNotEmpty) {
-          final targetPl = _savedPlaylists
-                  .where((p) => p.id == _activePlaylistId)
-                  .firstOrNull ??
-              _savedPlaylists.first;
-          if (targetPl.tracks.isNotEmpty) {
-            _activePlaylistId = targetPl.id;
-            _queue = List<FileEntry>.from(targetPl.tracks);
-            _currentIndex =
-                targetPl.currentIndex.clamp(0, _queue.length - 1);
-            _currentQueueSources =
-                List<SavedMusicFolderItem>.from(targetPl.sources);
-          }
-        }
-        if (_queue.isNotEmpty && currentTrack != null) {
-          unawaited(_loadCoverAndLyricsForTrack(currentTrack!, _openSeq));
-        }
-      }
-      _ensureDefaultPlaylistInSync(persist: false);
     } catch (_) {
       _availableMounts = builtIn;
     }
     notifyListeners();
   }
 
-  void _ensureDefaultPlaylistInSync({bool persist = true}) {
-    final nowMs = DateTime.now().millisecondsSinceEpoch;
-    final defaultIdx =
-        _savedPlaylists.indexWhere((p) => p.id == 'default_playlist');
-    if (_queue.isNotEmpty) {
-      final updatedDefault = SavedMusicPlaylist(
-        id: 'default_playlist',
-        name: defaultIdx >= 0
-            ? _savedPlaylists[defaultIdx].name
-            : '默认播放列表',
-        tracks: List<FileEntry>.from(_queue),
-        sources: List<SavedMusicFolderItem>.from(_currentQueueSources),
-        currentIndex: _currentIndex.clamp(0, _queue.length - 1),
-        updatedEpochMs: nowMs,
-      );
-      if (defaultIdx >= 0) {
-        _savedPlaylists[defaultIdx] = updatedDefault;
-      } else {
-        _savedPlaylists.insert(0, updatedDefault);
+  void _loadPlaylists(SharedPreferences prefs) {
+    final rawPlaylists = prefs.getString(_prefSavedMusicPlaylistsKey);
+    if (rawPlaylists != null && rawPlaylists.isNotEmpty) {
+      final decoded = jsonDecode(rawPlaylists);
+      if (decoded is List) {
+        _savedPlaylists =
+            decoded
+                .whereType<Map<String, dynamic>>()
+                .map(SavedMusicPlaylist.fromJson)
+                .toList();
       }
-      if (_activePlaylistId.isEmpty) {
-        _activePlaylistId = 'default_playlist';
-      } else if (_activePlaylistId != 'default_playlist') {
-        final activeIdx =
-            _savedPlaylists.indexWhere((p) => p.id == _activePlaylistId);
-        if (activeIdx >= 0) {
-          _savedPlaylists[activeIdx] = _savedPlaylists[activeIdx].copyWith(
-            tracks: List<FileEntry>.from(_queue),
-            sources: List<SavedMusicFolderItem>.from(_currentQueueSources),
-            currentIndex: _currentIndex.clamp(0, _queue.length - 1),
-            updatedEpochMs: nowMs,
-          );
-        }
+    } else {
+      final rawQueue = prefs.getString(_prefDefaultMusicQueueKey);
+      final rawSources = prefs.getString(_prefDefaultMusicSourcesKey);
+      final legacy = SavedMusicPlaylist.fromJson({
+        'tracks':
+            rawQueue != null && rawQueue.isNotEmpty
+                ? jsonDecode(rawQueue)
+                : null,
+        'sources':
+            rawSources != null && rawSources.isNotEmpty
+                ? jsonDecode(rawSources)
+                : null,
+        'current_index': prefs.getInt(_prefDefaultMusicIndexKey) ?? 0,
+      });
+      if (legacy.tracks.isNotEmpty || legacy.sources.isNotEmpty) {
+        _savedPlaylists.add(legacy);
       }
     }
-    if (persist) {
-      unawaited(_persistDefaultQueueAndPlaylists());
-    }
+    final savedActiveId = prefs.getString(_prefActiveMusicPlaylistIdKey);
+    final selected =
+        _savedPlaylists.where((p) => p.id == savedActiveId).firstOrNull ??
+        _savedPlaylists.where((p) => p.id == 'default_playlist').firstOrNull ??
+        _savedPlaylists.firstOrNull;
+    if (selected != null) _selectPlaylistQueue(selected);
   }
 
-  Future<void> _persistDefaultQueueAndPlaylists() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      if (_queue.isNotEmpty) {
-        await prefs.setString(
-          _prefDefaultMusicQueueKey,
-          jsonEncode(_queue.map((e) => e.toJson()).toList()),
-        );
-        await prefs.setInt(
-          _prefDefaultMusicIndexKey,
-          _currentIndex.clamp(0, _queue.length - 1),
-        );
-        await prefs.setString(
-          _prefDefaultMusicSourcesKey,
-          jsonEncode(_currentQueueSources.map((s) => s.toJson()).toList()),
-        );
-      }
-      await prefs.setString(
-        _prefSavedMusicPlaylistsKey,
-        jsonEncode(_savedPlaylists.map((p) => p.toJson()).toList()),
-      );
-      await prefs.setString(
-        _prefActiveMusicPlaylistIdKey,
-        _activePlaylistId,
-      );
-    } catch (_) {}
+  void _selectPlaylistQueue(SavedMusicPlaylist playlist) {
+    _activePlaylistId = playlist.id;
+    _queue = List<FileEntry>.of(playlist.tracks);
+    _currentIndex =
+        _queue.isEmpty ? -1 : playlist.currentIndex.clamp(0, _queue.length - 1);
+    _currentQueueSources = List<SavedMusicFolderItem>.of(playlist.sources);
   }
 
-  Future<SavedMusicPlaylist> saveCurrentQueueAsPlaylist(String name) async {
-    final cleanName = name.trim().isEmpty
-        ? '歌单 ${_savedPlaylists.length + 1}'
-        : name.trim();
-    final nowMs = DateTime.now().millisecondsSinceEpoch;
-    final pl = SavedMusicPlaylist(
-      id: 'pl_$nowMs',
-      name: cleanName,
-      tracks: List<FileEntry>.from(_queue),
-      sources: List<SavedMusicFolderItem>.from(_currentQueueSources),
-      currentIndex: _queue.isEmpty ? 0 : _currentIndex.clamp(0, _queue.length - 1),
-      updatedEpochMs: nowMs,
+  Future<void> _syncActivePlaylist() {
+    final idx = _savedPlaylists.indexWhere((p) => p.id == _activePlaylistId);
+    final updated = SavedMusicPlaylist(
+      id: _activePlaylistId,
+      name: idx >= 0 ? _savedPlaylists[idx].name : '默认播放列表',
+      tracks: List<FileEntry>.of(_queue),
+      sources: List<SavedMusicFolderItem>.of(_currentQueueSources),
+      currentIndex: math.max(0, _currentIndex),
+      updatedEpochMs: DateTime.now().millisecondsSinceEpoch,
     );
-    _savedPlaylists.add(pl);
-    _activePlaylistId = pl.id;
-    notifyListeners();
-    await _persistDefaultQueueAndPlaylists();
-    return pl;
+    if (idx >= 0) {
+      _savedPlaylists[idx] = updated;
+    } else {
+      _savedPlaylists.insert(0, updated);
+    }
+    return _persistPlaylists();
+  }
+
+  Future<void> _persistPlaylists() {
+    // Keep writes in order when the user switches lists or tracks quickly.
+    final activeId = _activePlaylistId;
+    final playlists = List<SavedMusicPlaylist>.of(_savedPlaylists);
+    _playlistWrite = _playlistWrite.then((_) async {
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString(
+          _prefSavedMusicPlaylistsKey,
+          jsonEncode(playlists.map((p) => p.toJson()).toList()),
+        );
+        await prefs.setString(_prefActiveMusicPlaylistIdKey, activeId);
+      } catch (_) {}
+    });
+    return _playlistWrite;
+  }
+
+  Future<void> createPlaylist(String name) async {
+    final cleanName = name.trim();
+    if (cleanName.isEmpty) return;
+    await _initialLoad;
+    final now = DateTime.now();
+    final playlist = SavedMusicPlaylist(
+      id: 'pl_${now.microsecondsSinceEpoch}',
+      name: cleanName,
+      tracks: const [],
+      sources: const [],
+      currentIndex: 0,
+      updatedEpochMs: now.millisecondsSinceEpoch,
+    );
+    _savedPlaylists.add(playlist);
+    _selectPlaylistQueue(playlist);
+    final persisted = _persistPlaylists();
+    await stopAndClose();
+    await persisted;
   }
 
   Future<void> renameSavedPlaylist(String playlistId, String newName) async {
@@ -1168,21 +1127,29 @@ class CloudMusicController extends ChangeNotifier {
       updatedEpochMs: DateTime.now().millisecondsSinceEpoch,
     );
     notifyListeners();
-    await _persistDefaultQueueAndPlaylists();
+    await _persistPlaylists();
   }
 
   Future<void> deleteSavedPlaylist(String playlistId) async {
+    await _initialLoad;
     if (playlistId == 'default_playlist' && _savedPlaylists.length <= 1) {
       return;
     }
     _savedPlaylists.removeWhere((p) => p.id == playlistId);
     if (_activePlaylistId == playlistId) {
-      _activePlaylistId = _savedPlaylists.isNotEmpty
-          ? _savedPlaylists.first.id
-          : 'default_playlist';
+      final next = _savedPlaylists.firstOrNull;
+      if (next != null) {
+        await switchAndPlayPlaylist(next.id, autoPlay: false);
+        return;
+      }
+      _activePlaylistId = 'default_playlist';
+      _queue = [];
+      _currentIndex = -1;
+      _currentQueueSources = [];
+      await stopAndClose();
     }
     notifyListeners();
-    await _persistDefaultQueueAndPlaylists();
+    await _persistPlaylists();
   }
 
   Future<void> switchAndPlayPlaylist(
@@ -1190,41 +1157,43 @@ class CloudMusicController extends ChangeNotifier {
     bool autoPlay = true,
     bool shuffle = false,
   }) async {
-    final pl = _savedPlaylists.where((p) => p.id == playlistId).firstOrNull;
-    if (pl == null) return;
-    _activePlaylistId = pl.id;
-    _currentQueueSources = List<SavedMusicFolderItem>.from(pl.sources);
-    if (pl.tracks.isEmpty && pl.sources.isNotEmpty) {
+    await _initialLoad;
+    final playlist =
+        _savedPlaylists.where((p) => p.id == playlistId).firstOrNull;
+    if (playlist == null) return;
+    _selectPlaylistQueue(playlist);
+
+    if (autoPlay && _queue.isNotEmpty) {
+      _cancelFolderScan();
+      if (shuffle) {
+        _playMode = 'shuffle';
+        _queue.shuffle(math.Random());
+        _currentIndex = 0;
+      }
+      final persisted = _syncActivePlaylist();
+      await _openCurrentTrack();
+      await persisted;
+      return;
+    }
+
+    final persisted = _persistPlaylists();
+    final stopped = stopAndClose();
+    final seq = _openSeq;
+    await stopped;
+    await persisted;
+    if (seq != _openSeq) return;
+    if (autoPlay && playlist.sources.isNotEmpty) {
       await scanAndPlayFoldersOrArchives(
-        sources: pl.sources,
+        sources: playlist.sources,
         shuffle: shuffle,
       );
-      return;
-    }
-    if (pl.tracks.isEmpty) {
-      notifyListeners();
-      return;
-    }
-    final tracks = List<FileEntry>.from(pl.tracks);
-    if (shuffle) {
-      _playMode = 'shuffle';
-      tracks.shuffle(math.Random());
-      _queue = tracks;
-      _currentIndex = 0;
-    } else {
-      _queue = tracks;
-      _currentIndex = pl.currentIndex.clamp(0, _queue.length - 1);
-    }
-    notifyListeners();
-    await _persistDefaultQueueAndPlaylists();
-    if (autoPlay) {
-      await _openCurrentTrack();
-    } else if (currentTrack != null) {
-      unawaited(_loadCoverAndLyricsForTrack(currentTrack!, _openSeq));
+    } else if (currentTrack case final track?) {
+      unawaited(_loadCoverAndLyricsForTrack(track, seq));
     }
   }
 
   Future<void> refreshAvailableMounts() async {
+    await _initialLoad;
     await _loadSavedMusicFoldersAndMounts();
   }
 
@@ -1414,7 +1383,9 @@ class CloudMusicController extends ChangeNotifier {
     bool includeArchives = true,
   }) async {
     if (sources.isEmpty) return 0;
+    final scan = ++_scanSeq;
     await refreshAvailableMounts();
+    if (scan != _scanSeq) return 0;
 
     _isScanningFolders = true;
     _scanningStatusText = '正在扫描所选目录与压缩包中的音乐...';
@@ -1432,7 +1403,7 @@ class CloudMusicController extends ChangeNotifier {
         int depth,
       ) async {
         final key = '${mount.id}::$folderPath';
-        if (visitedKeys.contains(key)) return;
+        if (scan != _scanSeq || visitedKeys.contains(key)) return;
         visitedKeys.add(key);
 
         _scanningStatusText = '正在扫描「${mount.name} / $folderTitle」... (已发现 ${collectedTracks.length} 首)';
@@ -1444,7 +1415,7 @@ class CloudMusicController extends ChangeNotifier {
         } catch (_) {
           return;
         }
-        if (entries.isEmpty) return;
+        if (scan != _scanSeq || entries.isEmpty) return;
 
         registerDirectoryContext(
           mounts: _availableMounts,
@@ -1453,6 +1424,7 @@ class CloudMusicController extends ChangeNotifier {
 
         final subfolders = <FileEntry>[];
         for (final e in entries) {
+          if (scan != _scanSeq) return;
           if (e.isDir) {
             subfolders.add(e);
           } else if (e.isAudio) {
@@ -1494,9 +1466,9 @@ class CloudMusicController extends ChangeNotifier {
       }
 
       for (final src in sources) {
-        final mount = _availableMounts
-                .where((m) => m.id == src.mountId)
-                .firstOrNull ??
+        if (scan != _scanSeq) return 0;
+        final mount =
+            _availableMounts.where((m) => m.id == src.mountId).firstOrNull ??
             StorageMount(
               id: src.mountId,
               name: src.mountName,
@@ -1562,6 +1534,7 @@ class CloudMusicController extends ChangeNotifier {
         }
       }
 
+      if (scan != _scanSeq) return 0;
       _isScanningFolders = false;
       _scanningStatusText = '';
 
@@ -1581,11 +1554,12 @@ class CloudMusicController extends ChangeNotifier {
       _queue = collectedTracks;
       _currentIndex = 0;
       _currentQueueSources = List<SavedMusicFolderItem>.from(sources);
-      _ensureDefaultPlaylistInSync();
+      unawaited(_syncActivePlaylist());
       notifyListeners();
       await _openCurrentTrack();
       return collectedTracks.length;
     } catch (e) {
+      if (scan != _scanSeq) return 0;
       _isScanningFolders = false;
       _scanningStatusText = '';
       _errorText = '扫描音乐目录失败：$e';
@@ -1601,6 +1575,8 @@ class CloudMusicController extends ChangeNotifier {
     FileEntry? startWithInnerTrack,
     List<StorageMount>? mounts,
   }) async {
+    await _initialLoad;
+    final scan = ++_scanSeq;
     if (mounts != null && mounts.isNotEmpty) {
       for (final m in mounts) {
         _mountNameById[m.id] = m.name;
@@ -1612,10 +1588,12 @@ class CloudMusicController extends ChangeNotifier {
     notifyListeners();
 
     try {
-      final allInner = await CloudArchiveMusicService.instance.inspectArchiveEntries(
-        archiveEntry: archiveEntry,
-        endpointResolver: resolveEntryEndpoint,
-      );
+      final allInner = await CloudArchiveMusicService.instance
+          .inspectArchiveEntries(
+            archiveEntry: archiveEntry,
+            endpointResolver: resolveEntryEndpoint,
+          );
+      if (scan != _scanSeq) return 0;
       _isScanningFolders = false;
       _scanningStatusText = '';
 
@@ -1657,11 +1635,12 @@ class CloudMusicController extends ChangeNotifier {
           pickcode115: archiveEntry.pickcode115,
         ),
       ];
-      _ensureDefaultPlaylistInSync();
+      unawaited(_syncActivePlaylist());
       notifyListeners();
       await _openCurrentTrack();
       return audioTracks.length;
     } catch (e) {
+      if (scan != _scanSeq) return 0;
       _isScanningFolders = false;
       _scanningStatusText = '';
       _errorText = '解析压缩包音乐失败：$e';
@@ -2000,8 +1979,13 @@ class CloudMusicController extends ChangeNotifier {
     required List<StorageMount> mounts,
     bool shuffle = false,
   }) async {
-    registerDirectoryContext(mounts: mounts, directoryEntries: directoryEntries);
-    final audioTracks = directoryEntries.where((e) => !e.isDir && e.isAudio).toList();
+    await _initialLoad;
+    registerDirectoryContext(
+      mounts: mounts,
+      directoryEntries: directoryEntries,
+    );
+    final audioTracks =
+        directoryEntries.where((e) => !e.isDir && e.isAudio).toList();
     if (audioTracks.isEmpty) {
       _queue = [targetTrack];
       _currentIndex = 0;
@@ -2022,7 +2006,7 @@ class CloudMusicController extends ChangeNotifier {
         _currentIndex = 0;
       }
     }
-    _ensureDefaultPlaylistInSync();
+    unawaited(_syncActivePlaylist());
     await _openCurrentTrack();
   }
 
@@ -2032,7 +2016,7 @@ class CloudMusicController extends ChangeNotifier {
     _playMode = 'shuffle';
     _queue.shuffle(math.Random());
     _currentIndex = 0;
-    _ensureDefaultPlaylistInSync();
+    unawaited(_syncActivePlaylist());
     notifyListeners();
     await _openCurrentTrack();
   }
@@ -2043,6 +2027,7 @@ class CloudMusicController extends ChangeNotifier {
     List<FileEntry>? directoryEntries,
     List<StorageMount>? mounts,
   }) async {
+    await _initialLoad;
     if (mounts != null && directoryEntries != null) {
       registerDirectoryContext(mounts: mounts, directoryEntries: directoryEntries);
     }
@@ -2052,7 +2037,7 @@ class CloudMusicController extends ChangeNotifier {
     if (_queue.isEmpty || _currentIndex < 0) {
       _queue = [track];
       _currentIndex = 0;
-      _ensureDefaultPlaylistInSync();
+      unawaited(_syncActivePlaylist());
       await _openCurrentTrack();
       return;
     }
@@ -2063,7 +2048,7 @@ class CloudMusicController extends ChangeNotifier {
         final insertIdx = (_currentIndex + 1).clamp(0, _queue.length);
         _queue.insert(insertIdx, item);
       }
-      _ensureDefaultPlaylistInSync();
+      unawaited(_syncActivePlaylist());
       notifyListeners();
       return;
     }
@@ -2073,7 +2058,7 @@ class CloudMusicController extends ChangeNotifier {
     } else {
       _queue.add(track);
     }
-    _ensureDefaultPlaylistInSync();
+    unawaited(_syncActivePlaylist());
     notifyListeners();
   }
 
@@ -2084,7 +2069,7 @@ class CloudMusicController extends ChangeNotifier {
       return;
     }
     _currentIndex = index;
-    _ensureDefaultPlaylistInSync();
+    unawaited(_syncActivePlaylist());
     await _openCurrentTrack();
   }
 
@@ -2093,7 +2078,7 @@ class CloudMusicController extends ChangeNotifier {
     final removingCurrent = index == _currentIndex;
     _queue.removeAt(index);
     if (_queue.isEmpty) {
-      await stopAndClose();
+      await stopAndClose(clearPersistedQueue: true);
       return;
     }
     if (index < _currentIndex) {
@@ -2102,11 +2087,11 @@ class CloudMusicController extends ChangeNotifier {
       if (_currentIndex >= _queue.length) {
         _currentIndex = 0;
       }
-      _ensureDefaultPlaylistInSync();
+      unawaited(_syncActivePlaylist());
       await _openCurrentTrack();
       return;
     }
-    _ensureDefaultPlaylistInSync();
+    unawaited(_syncActivePlaylist());
     notifyListeners();
   }
 
@@ -2822,8 +2807,8 @@ class CloudMusicController extends ChangeNotifier {
   }
 
   Future<void> togglePlayPause() async {
-    if (currentTrack == null) return;
-    if (_errorText.isNotEmpty || _player == null) {
+    if (currentTrack == null || _isLoadingTrack) return;
+    if (_errorText.isNotEmpty || _player == null || _activeStreamUrl.isEmpty) {
       await _openCurrentTrack(forceRefreshUrl: true);
       return;
     }
@@ -2871,7 +2856,7 @@ class CloudMusicController extends ChangeNotifier {
     } else {
       _currentIndex = (_currentIndex + delta + _queue.length) % _queue.length;
     }
-    _ensureDefaultPlaylistInSync();
+    unawaited(_syncActivePlaylist());
     await _openCurrentTrack();
   }
 
@@ -2906,15 +2891,15 @@ class CloudMusicController extends ChangeNotifier {
           }
         }
         _currentIndex = nextIdx;
-        _ensureDefaultPlaylistInSync();
+        unawaited(_syncActivePlaylist());
         await _openCurrentTrack();
       } else if (_currentIndex + 1 < _queue.length) {
         _currentIndex++;
-        _ensureDefaultPlaylistInSync();
+        unawaited(_syncActivePlaylist());
         await _openCurrentTrack();
       } else if (_playMode == 'repeatAll') {
         _currentIndex = 0;
-        _ensureDefaultPlaylistInSync();
+        unawaited(_syncActivePlaylist());
         await _openCurrentTrack();
       } else {
         _isPlaying = false;
@@ -2948,12 +2933,20 @@ class CloudMusicController extends ChangeNotifier {
     notifyListeners();
   }
 
+  void _cancelFolderScan() {
+    _scanSeq++;
+    _isScanningFolders = false;
+    _scanningStatusText = '';
+  }
+
   Future<void> stopAndClose({bool clearPersistedQueue = false}) async {
     _openSeq++;
-    await _player?.stop();
+    _cancelFolderScan();
+    final stopped = _player?.stop();
     if (clearPersistedQueue) {
       _queue = [];
       _currentIndex = -1;
+      _currentQueueSources = [];
     }
     _isPlaying = false;
     _isLoadingTrack = false;
@@ -2962,21 +2955,21 @@ class CloudMusicController extends ChangeNotifier {
     _position = Duration.zero;
     _duration = Duration.zero;
     _lyrics = const [];
+    _lyricsSourceLabel = '';
+    _isLoadingLyrics = false;
     _coverImageUrl = null;
     _coverImageBytes = null;
+    _activeStreamUrl = '';
+    _activeSubtitle = '';
+    final persisted = clearPersistedQueue ? _syncActivePlaylist() : null;
     notifyListeners();
     unawaited(_clearNativeMediaSession());
+    await stopped;
+    await persisted;
   }
 
-  /// Clears the current queue and starts fresh if the user explicitly wants to empty the current playlist
-  Future<void> clearCurrentPlaylistQueue() async {
-    await stopAndClose(clearPersistedQueue: true);
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.remove(_prefDefaultMusicQueueKey);
-      await prefs.remove(_prefDefaultMusicIndexKey);
-    } catch (_) {}
-  }
+  Future<void> clearCurrentPlaylistQueue() =>
+      stopAndClose(clearPersistedQueue: true);
 }
 
 // =============================================================================
@@ -5292,243 +5285,246 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
     );
   }
 
-  Future<void> _promptSaveCurrentPlaylistDialog() async {
-    if (_ctrl.queue.isEmpty) return;
-    final defaultTitle = _ctrl.activePlaylistId != 'default_playlist'
-        ? '${_ctrl.activePlaylistName} (副本)'
-        : '我的歌单 ${_ctrl.savedPlaylists.length}';
-    final textCtrl = TextEditingController(text: defaultTitle);
-    final createdName = await showDialog<String>(
+  Future<void> _promptCreatePlaylist({BuildContext? managerContext}) async {
+    final name = await _promptPlaylistName();
+    if (!mounted || name == null) return;
+    _showPlaylistQueue();
+    if (managerContext != null && managerContext.mounted) {
+      Navigator.of(managerContext).pop();
+    }
+    await _ctrl.createPlaylist(name);
+  }
+
+  Future<String?> _promptPlaylistName({String? currentName}) {
+    final formKey = GlobalKey<FormState>();
+    var name = currentName ?? '';
+    return showDialog<String>(
       context: context,
       builder: (ctx) {
+        void submit() {
+          if (formKey.currentState!.validate()) {
+            Navigator.of(ctx).pop(name.trim());
+          }
+        }
+
         return AlertDialog(
+          scrollable: true,
           backgroundColor: VideoPlatformTheme.bgElevated,
-          title: const Text(
-            '保存当前列表为歌单',
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                '当前列表共 ${_ctrl.queue.length} 首歌曲（默认列表已自动为您永久保存，您还可以另存为多个独立歌单随时切换）：',
-                style: TextStyle(
-                  fontSize: 12.5,
-                  color: VideoPlatformTheme.textSecondary,
-                ),
+          title: Text(currentName == null ? '新建列表' : '重命名列表'),
+          content: Form(
+            key: formKey,
+            child: TextFormField(
+              initialValue: currentName,
+              autofocus: true,
+              textInputAction: TextInputAction.done,
+              decoration: const InputDecoration(
+                labelText: '列表名称',
+                border: OutlineInputBorder(),
               ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: textCtrl,
-                autofocus: true,
-                decoration: InputDecoration(
-                  labelText: '歌单名称',
-                  hintText: '例如：华语无损精选 / 车载嗨曲',
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                ),
-                onSubmitted: (v) => Navigator.of(ctx).pop(v.trim()),
-              ),
-            ],
+              onChanged: (value) => name = value,
+              onFieldSubmitted: (_) => submit(),
+              validator:
+                  (value) =>
+                      value == null || value.trim().isEmpty ? '请输入列表名称' : null,
+            ),
           ),
           actions: [
             TextButton(
               onPressed: () => Navigator.of(ctx).pop(),
               child: const Text('取消'),
             ),
-            FilledButton.icon(
-              onPressed: () => Navigator.of(ctx).pop(textCtrl.text.trim()),
-              icon: const Icon(Icons.playlist_add_check_rounded, size: 17),
-              label: const Text('保存歌单'),
+            FilledButton(
+              onPressed: submit,
+              child: Text(currentName == null ? '创建' : '保存'),
             ),
           ],
         );
       },
     );
-    if (createdName != null && createdName.isNotEmpty) {
-      await _ctrl.saveCurrentQueueAsPlaylist(createdName);
-    }
+  }
+
+  void _showPlaylistQueue() {
+    _queueFilterCtrl.clear();
+    setState(() {
+      _mobileViewIndex = 2;
+      _rightTabIndex = 1;
+      _queueSearch = '';
+      _queuePageIndex = 0;
+    });
   }
 
   Future<void> _openPlaylistManagerDialog() async {
-    await showDialog<void>(
-      context: context,
-      builder: (ctx) {
-        return ListenableBuilder(
-          listenable: _ctrl,
-          builder: (context, _) {
-            final playlists = _ctrl.savedPlaylists;
-            return AlertDialog(
+    if (MediaQuery.sizeOf(context).width < 820) {
+      await showModalBottomSheet<void>(
+        context: context,
+        backgroundColor: VideoPlatformTheme.bgElevated,
+        showDragHandle: true,
+        isScrollControlled: true,
+        useSafeArea: true,
+        builder:
+            (ctx) => SafeArea(
+              top: false,
+              child: FractionallySizedBox(
+                heightFactor: 0.74,
+                child: _buildPlaylistManager(ctx),
+              ),
+            ),
+      );
+    } else {
+      await showDialog<void>(
+        context: context,
+        builder:
+            (ctx) => Dialog(
               backgroundColor: VideoPlatformTheme.bgElevated,
-              title: Row(
+              child: SizedBox(
+                width: 480,
+                height: 420,
+                child: _buildPlaylistManager(ctx),
+              ),
+            ),
+      );
+    }
+  }
+
+  Widget _buildPlaylistManager(BuildContext managerContext) {
+    return ListenableBuilder(
+      listenable: _ctrl,
+      builder: (context, _) {
+        final playlists = _ctrl.savedPlaylists;
+        return Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 4, 8, 8),
+              child: Row(
                 children: [
-                  Icon(
-                    Icons.library_music_rounded,
-                    color: VideoPlatformTheme.accent,
-                    size: 20,
-                  ),
-                  const SizedBox(width: 8),
-                  const Expanded(
+                  Expanded(
                     child: Text(
-                      '播放列表 / 歌单管理',
-                      style:
-                          TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+                      '播放列表',
+                      style: Theme.of(context).textTheme.titleLarge,
                     ),
                   ),
-                  if (_ctrl.queue.isNotEmpty)
-                    FilledButton.tonalIcon(
-                      onPressed: () {
-                        Navigator.of(ctx).pop();
-                        _promptSaveCurrentPlaylistDialog();
-                      },
-                      icon: const Icon(Icons.add_rounded, size: 16),
-                      label: const Text(
-                        '另存当前列表',
-                        style: TextStyle(fontSize: 12),
-                      ),
-                    ),
+                  IconButton(
+                    tooltip: '关闭',
+                    onPressed: () => Navigator.of(managerContext).pop(),
+                    icon: const Icon(Icons.close_rounded),
+                  ),
                 ],
               ),
-              content: SizedBox(
-                width: 520,
-                height: 360,
-                child: playlists.isEmpty
-                    ? Center(
-                        child: Text(
-                          '暂无已保存的播放列表，选择目录播放后将自动保存默认列表',
-                          style: TextStyle(
-                            fontSize: 13,
-                            color: VideoPlatformTheme.textSecondary,
-                          ),
-                        ),
-                      )
-                    : ListView.separated(
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+              child: SizedBox(
+                width: double.infinity,
+                child: FilledButton.icon(
+                  onPressed:
+                      () =>
+                          _promptCreatePlaylist(managerContext: managerContext),
+                  icon: const Icon(Icons.add_rounded),
+                  label: const Text('新建列表'),
+                ),
+              ),
+            ),
+            Divider(height: 1, color: VideoPlatformTheme.borderSubtle),
+            Expanded(
+              child:
+                  playlists.isEmpty
+                      ? const Center(child: Text('暂无播放列表'))
+                      : ListView.builder(
+                        padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
                         itemCount: playlists.length,
-                        separatorBuilder: (_, __) => const SizedBox(height: 8),
-                        itemBuilder: (context, idx) {
-                          final pl = playlists[idx];
-                          final isActive = pl.id == _ctrl.activePlaylistId;
-                          return Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 12,
-                              vertical: 10,
+                        itemBuilder: (context, index) {
+                          final playlist = playlists[index];
+                          final isActive =
+                              playlist.id == _ctrl.activePlaylistId;
+                          final canPlay =
+                              playlist.tracks.isNotEmpty ||
+                              playlist.sources.isNotEmpty;
+
+                          void select({bool shuffle = false}) {
+                            Navigator.of(managerContext).pop();
+                            _showPlaylistQueue();
+                            if (!isActive ||
+                                shuffle ||
+                                (canPlay && !_ctrl.hasActiveSession)) {
+                              unawaited(
+                                _ctrl.switchAndPlayPlaylist(
+                                  playlist.id,
+                                  shuffle: shuffle,
+                                ),
+                              );
+                            }
+                          }
+
+                          return ListTile(
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(12),
                             ),
-                            decoration: BoxDecoration(
-                              color: isActive
-                                  ? VideoPlatformTheme.accent
-                                      .withValues(alpha: 0.16)
-                                  : VideoPlatformTheme.bgCard,
-                              borderRadius: BorderRadius.circular(10),
-                              border: Border.all(
-                                color: isActive
-                                    ? VideoPlatformTheme.accent
-                                    : VideoPlatformTheme.borderSubtle,
-                              ),
+                            selected: isActive,
+                            selectedColor: VideoPlatformTheme.accent,
+                            selectedTileColor: VideoPlatformTheme.accent
+                                .withValues(alpha: 0.12),
+                            leading: Icon(
+                              isActive
+                                  ? Icons.check_circle_rounded
+                                  : Icons.queue_music_rounded,
                             ),
-                            child: Row(
-                              children: [
-                                Icon(
-                                  pl.id == 'default_playlist'
-                                      ? Icons.push_pin_rounded
-                                      : Icons.queue_music_rounded,
-                                  size: 18,
-                                  color: isActive
-                                      ? VideoPlatformTheme.accent
-                                      : VideoPlatformTheme.textSecondary,
-                                ),
-                                const SizedBox(width: 10),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        pl.name,
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: TextStyle(
-                                          fontSize: 13.5,
-                                          fontWeight: FontWeight.w700,
-                                          color: VideoPlatformTheme.textPrimary,
-                                        ),
-                                      ),
-                                      const SizedBox(height: 2),
-                                      Text(
-                                        '共 ${pl.tracks.length} 首歌曲${pl.id == 'default_playlist' ? ' · 每次播放自动同步保存' : ''}',
-                                        style: TextStyle(
-                                          fontSize: 11.5,
-                                          color:
-                                              VideoPlatformTheme.textSecondary,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                                TextButton.icon(
-                                  onPressed: () {
-                                    Navigator.of(ctx).pop();
-                                    _ctrl.switchAndPlayPlaylist(
-                                      pl.id,
-                                      autoPlay: true,
-                                      shuffle: false,
+                            title: Text(
+                              playlist.name,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            subtitle: Text(
+                              '${isActive ? '当前列表 · ' : ''}${playlist.tracks.length} 首',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            onTap: select,
+                            trailing: PopupMenuButton<String>(
+                              tooltip: '列表操作',
+                              onSelected: (action) async {
+                                switch (action) {
+                                  case 'shuffle':
+                                    select(shuffle: true);
+                                  case 'rename':
+                                    final name = await _promptPlaylistName(
+                                      currentName: playlist.name,
                                     );
-                                  },
-                                  icon: const Icon(
-                                    Icons.play_arrow_rounded,
-                                    size: 16,
-                                  ),
-                                  label: const Text(
-                                    '播放',
-                                    style: TextStyle(fontSize: 12),
-                                  ),
-                                ),
-                                TextButton.icon(
-                                  onPressed: () {
-                                    Navigator.of(ctx).pop();
-                                    _ctrl.switchAndPlayPlaylist(
-                                      pl.id,
-                                      autoPlay: true,
-                                      shuffle: true,
+                                    if (name != null) {
+                                      await _ctrl.renameSavedPlaylist(
+                                        playlist.id,
+                                        name,
+                                      );
+                                    }
+                                  case 'delete':
+                                    await _ctrl.deleteSavedPlaylist(
+                                      playlist.id,
                                     );
-                                  },
-                                  icon: const Icon(
-                                    Icons.shuffle_rounded,
-                                    size: 15,
-                                  ),
-                                  label: const Text(
-                                    '随机',
-                                    style: TextStyle(fontSize: 12),
-                                  ),
-                                ),
-                                if (pl.id != 'default_playlist' ||
-                                    playlists.length > 1)
-                                  IconButton(
-                                    tooltip: '删除此歌单',
-                                    visualDensity: VisualDensity.compact,
-                                    onPressed: () =>
-                                        _ctrl.deleteSavedPlaylist(pl.id),
-                                    icon: Icon(
-                                      Icons.delete_outline_rounded,
-                                      size: 17,
-                                      color: VideoPlatformTheme.danger,
+                                }
+                              },
+                              itemBuilder:
+                                  (_) => [
+                                    if (canPlay)
+                                      const PopupMenuItem(
+                                        value: 'shuffle',
+                                        child: Text('随机播放'),
+                                      ),
+                                    const PopupMenuItem(
+                                      value: 'rename',
+                                      child: Text('重命名'),
                                     ),
-                                  ),
-                              ],
+                                    if (playlist.id != 'default_playlist' ||
+                                        playlists.length > 1)
+                                      const PopupMenuItem(
+                                        value: 'delete',
+                                        child: Text('删除列表'),
+                                      ),
+                                  ],
                             ),
                           );
                         },
                       ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(ctx).pop(),
-                  child: const Text('关闭'),
-                ),
-              ],
-            );
-          },
+            ),
+          ],
         );
       },
     );
@@ -5595,6 +5591,39 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
           final progress = (posMs / durMs).clamp(0.0, 1.0);
           final screenW = MediaQuery.sizeOf(context).width;
           final isWide = screenW >= 820;
+          final showMobileQueue =
+              !isWide &&
+              (_mobileViewIndex == 2 ||
+                  (track == null && _ctrl.activePlaylist != null));
+          final queueKeyboardVisible = showMobileQueue &&
+              (MediaQuery.viewInsetsOf(context).bottom > 0 ||
+                  View.of(context).viewInsets.bottom > 0);
+
+          final Widget content;
+          if (_ctrl.isScanningFolders) {
+            content = _buildScanningStatusBody();
+          } else if (showMobileQueue) {
+            content = _buildMobilePlaylistQueue();
+          } else if (track == null) {
+            content = _ctrl.activePlaylist == null
+                ? _buildEmptyStandaloneLauncherBody(isWide: isWide)
+                : Center(
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.all(20),
+                      child: _buildEmptyPlaylistState(showName: true),
+                    ),
+                  );
+          } else if (isWide) {
+            content = Row(
+              children: [
+                Expanded(flex: 5, child: _buildVinylTurntablePane(track, meta)),
+                Container(width: 1, color: VideoPlatformTheme.borderSubtle),
+                Expanded(flex: 6, child: _buildRightLyricsAndQueuePane(track)),
+              ],
+            );
+          } else {
+            content = _buildMobileActivePaneBody(track, meta);
+          }
 
           return Container(
             decoration: BoxDecoration(
@@ -5611,43 +5640,18 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
             child: Column(
               children: [
                 _buildHeaderBar(track, meta, isWide: isWide),
-                if (_ctrl.savedPlaylists.isNotEmpty ||
-                    _ctrl.savedMusicFolders.isNotEmpty)
+                if (!showMobileQueue &&
+                    ((isWide && _ctrl.savedPlaylists.isNotEmpty) ||
+                        _ctrl.savedMusicFolders.isNotEmpty))
                   _buildSavedMusicFoldersStrip(isWide: isWide),
                 if (!isWide && track != null && !_ctrl.isScanningFolders)
                   _buildMobileThreePaneSwitcherBar(),
                 Divider(height: 1, color: VideoPlatformTheme.borderSubtle),
-                Expanded(
-                  child: _ctrl.isScanningFolders
-                      ? _buildScanningStatusBody()
-                      : (track == null
-                          ? _buildEmptyStandaloneLauncherBody(isWide: isWide)
-                          : (isWide
-                              ? Row(
-                                  children: [
-                                    Expanded(
-                                      flex: 5,
-                                      child: _buildVinylTurntablePane(
-                                        track,
-                                        meta,
-                                      ),
-                                    ),
-                                    Container(
-                                      width: 1,
-                                      color: VideoPlatformTheme.borderSubtle,
-                                    ),
-                                    Expanded(
-                                      flex: 6,
-                                      child: _buildRightLyricsAndQueuePane(
-                                        track,
-                                      ),
-                                    ),
-                                  ],
-                                )
-                              : _buildMobileActivePaneBody(track, meta))),
-                ),
-                Divider(height: 1, color: VideoPlatformTheme.borderSubtle),
-                _buildBottomControlDeck(progress, isWide: isWide),
+                Expanded(child: content),
+                if (track != null && !queueKeyboardVisible) ...[
+                  Divider(height: 1, color: VideoPlatformTheme.borderSubtle),
+                  _buildBottomControlDeck(progress, isWide: isWide),
+                ],
               ],
             ),
           );
@@ -5658,9 +5662,9 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
 
   Widget _buildMobileThreePaneSwitcherBar() {
     final items = [
-      (0, Icons.album_rounded, '黑胶封面'),
-      (1, Icons.lyrics_rounded, '同步歌词'),
-      (2, Icons.queue_music_rounded, '播放队列 (${_ctrl.queue.length})'),
+      (0, Icons.album_rounded, '封面'),
+      (1, Icons.lyrics_rounded, '歌词'),
+      (2, Icons.queue_music_rounded, '播放列表'),
     ];
     return Container(
       width: double.infinity,
@@ -5756,9 +5760,6 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
   ) {
     if (_mobileViewIndex == 1) {
       return _buildSynchronizedLyricsView();
-    }
-    if (_mobileViewIndex == 2) {
-      return _buildPlaylistQueueView(track);
     }
 
     // Mobile View 0: Full-height responsive Vinyl Turntable + Live 2-Line Lyrics Card
@@ -5979,57 +5980,93 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
     ({String title, String artist, String qualityTag}) meta, {
     required bool isWide,
   }) {
+    if (!isWide) {
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(8, 4, 8, 4),
+        child: Row(
+          children: [
+            if (!widget.isStandalonePage)
+              IconButton(
+                tooltip: '收起播放器',
+                icon: const Icon(Icons.keyboard_arrow_down_rounded),
+                onPressed: () => Navigator.of(context).pop(),
+              ),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.only(left: 8),
+                child: Text(
+                  '音乐厅',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+              ),
+            ),
+            IconButton(
+              focusNode: _topPickerBtnFocusNode,
+              tooltip: '选择音乐',
+              onPressed: _openFolderAndArchivePicker,
+              icon: const Icon(Icons.create_new_folder_outlined),
+            ),
+            TextButton(
+              onPressed: _openPlaylistManagerDialog,
+              child: const Text('列表管理'),
+            ),
+            if (track != null)
+              IconButton(
+                tooltip: '退出播放',
+                onPressed: _exitMusicPlayer,
+                icon: const Icon(Icons.power_settings_new_rounded),
+              ),
+          ],
+        ),
+      );
+    }
     return Padding(
-      padding: EdgeInsets.fromLTRB(
-        isWide ? 20 : 12,
-        isWide ? 12 : 8,
-        isWide ? 16 : 12,
-        isWide ? 10 : 8,
-      ),
+      padding: const EdgeInsets.fromLTRB(20, 12, 16, 10),
       child: SingleChildScrollView(
         scrollDirection: Axis.horizontal,
         child: Row(
           children: [
-            if (isWide) ...[
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: [
-                      VideoPlatformTheme.accent,
-                      VideoPlatformTheme.accentHover,
-                    ],
-                  ),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: const Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.album_rounded, size: 16, color: Colors.white),
-                    SizedBox(width: 6),
-                    Text(
-                      '流光 Hi-Fi 云端音乐厅',
-                      style: TextStyle(
-                        fontSize: 12.5,
-                        fontWeight: FontWeight.w800,
-                        color: Colors.white,
-                      ),
-                    ),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [
+                    VideoPlatformTheme.accent,
+                    VideoPlatformTheme.accentHover,
                   ],
                 ),
+                borderRadius: BorderRadius.circular(8),
               ),
-              const SizedBox(width: 10),
-            ],
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.album_rounded, size: 16, color: Colors.white),
+                  SizedBox(width: 6),
+                  Text(
+                    '流光 Hi-Fi 云端音乐厅',
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w800,
+                      color: Colors.white,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 10),
             FilledButton.icon(
               focusNode: _topPickerBtnFocusNode,
               autofocus: track == null,
               onPressed: _openFolderAndArchivePicker,
               icon: const Icon(Icons.create_new_folder_rounded, size: 15),
               label: Text(
-                isWide ? '自选文件夹 / 压缩包随机播放' : '自选目录/压缩包',
-                style:
-                    const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+                '自选文件夹 / 压缩包随机播放',
+                style: const TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                ),
               ),
             ),
             const SizedBox(width: 8),
@@ -6037,32 +6074,23 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
               onPressed: _openPlaylistManagerDialog,
               icon: const Icon(Icons.library_music_rounded, size: 15),
               label: Text(
-                isWide
-                    ? '列表管理 (${_ctrl.savedPlaylists.length})'
-                    : '列表 (${_ctrl.savedPlaylists.length})',
+                '列表管理 (${_ctrl.savedPlaylists.length})',
                 style: const TextStyle(fontSize: 12),
               ),
             ),
-            if (_ctrl.queue.isNotEmpty) ...[
-              const SizedBox(width: 8),
-              OutlinedButton.icon(
-                onPressed: _promptSaveCurrentPlaylistDialog,
-                icon: const Icon(Icons.playlist_add_check_rounded, size: 16),
-                label: Text(
-                  isWide ? '存为歌单' : '存列表',
-                  style: const TextStyle(fontSize: 12),
-                ),
-              ),
-            ],
+            const SizedBox(width: 8),
+            OutlinedButton.icon(
+              onPressed: _promptCreatePlaylist,
+              icon: const Icon(Icons.playlist_add_rounded, size: 16),
+              label: const Text('新建列表', style: TextStyle(fontSize: 12)),
+            ),
             if (_ctrl.queue.length > 1) ...[
               const SizedBox(width: 8),
               OutlinedButton.icon(
                 onPressed: _ctrl.shuffleCurrentQueue,
                 icon: const Icon(Icons.shuffle_rounded, size: 15),
                 label: Text(
-                  isWide
-                      ? '重新随机打乱 (${_ctrl.queue.length}首)'
-                      : '随机打乱 (${_ctrl.queue.length})',
+                  '重新随机打乱 (${_ctrl.queue.length}首)',
                   style: const TextStyle(fontSize: 12),
                 ),
               ),
@@ -6105,7 +6133,7 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                 ),
               ),
             ],
-            if (_ctrl.player != null && track != null && isWide) ...[
+            if (_ctrl.player != null && track != null) ...[
               const SizedBox(width: 12),
               VideoDownloadSpeedBadge(
                 player: _ctrl.player!,
@@ -6117,7 +6145,7 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                 onPressed: () => Navigator.of(context).pop(),
                 icon: const Icon(Icons.keyboard_arrow_down_rounded, size: 17),
                 label: Text(
-                  isWide ? '收起至底部 (边听边逛目录)' : '收起',
+                  '收起至底部 (边听边逛目录)',
                   style: const TextStyle(fontSize: 12),
                 ),
               ),
@@ -6136,7 +6164,7 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                 ),
                 icon: const Icon(Icons.power_settings_new_rounded, size: 15),
                 label: Text(
-                  isWide ? '退出播放' : '退出',
+                  '退出播放',
                   style: const TextStyle(
                     fontSize: 12,
                     fontWeight: FontWeight.w700,
@@ -6582,7 +6610,7 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                       ),
                     ),
                   ),
-                  if (_ctrl.savedPlaylists.isNotEmpty)
+                  if (isWide && _ctrl.savedPlaylists.isNotEmpty)
                     OutlinedButton.icon(
                       style: OutlinedButton.styleFrom(
                         minimumSize: const Size(160, 40),
@@ -6898,9 +6926,10 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
         ),
         Divider(height: 1, color: VideoPlatformTheme.borderSubtle),
         Expanded(
-          child: _rightTabIndex == 0
-              ? _buildSynchronizedLyricsView()
-              : _buildPlaylistQueueView(currentTrack),
+          child:
+              _rightTabIndex == 0
+                  ? _buildSynchronizedLyricsView()
+                  : _buildPlaylistQueueView(),
         ),
       ],
     );
@@ -7113,16 +7142,200 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
     );
   }
 
-  Widget _buildPlaylistQueueView(FileEntry currentTrack) {
-    final kw = _queueSearch.trim().toLowerCase();
-    final allMatching = <({int index, FileEntry entry})>[];
-    for (int i = 0; i < _ctrl.queue.length; i++) {
-      final e = _ctrl.queue[i];
-      if (kw.isEmpty || e.name.toLowerCase().contains(kw)) {
-        allMatching.add((index: i, entry: e));
-      }
-    }
+  List<({int index, FileEntry entry})> _matchingQueueTracks() {
+    final search = _queueSearch.trim().toLowerCase();
+    return [
+      for (final (index, entry) in _ctrl.queue.indexed)
+        if (search.isEmpty || entry.name.toLowerCase().contains(search))
+          (index: index, entry: entry),
+    ];
+  }
 
+  Widget _buildMobilePlaylistQueue() {
+    final items = _matchingQueueTracks();
+    final count = _ctrl.queue.length;
+    final accent = VideoPlatformTheme.accent;
+    final theme = Theme.of(context);
+    return Material(
+      type: MaterialType.transparency,
+      child: CustomScrollView(
+        key: PageStorageKey('music-queue-${_ctrl.activePlaylistId}'),
+        keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+        slivers: [
+          SliverPadding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+            sliver: SliverToBoxAdapter(
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          _ctrl.activePlaylistName,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.titleLarge,
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          '$count 首',
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: VideoPlatformTheme.textSecondary,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (count > 1)
+                    IconButton(
+                      tooltip: '随机播放列表',
+                      icon: const Icon(Icons.shuffle_rounded),
+                      onPressed: _ctrl.shuffleCurrentQueue,
+                    ),
+                ],
+              ),
+            ),
+          ),
+          if (count > 0)
+            SliverPadding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+              sliver: SliverToBoxAdapter(
+                child: TextField(
+                  controller: _queueFilterCtrl,
+                  onChanged:
+                      (value) => setState(() {
+                        _queueSearch = value;
+                        _queuePageIndex = 0;
+                      }),
+                  textInputAction: TextInputAction.search,
+                  decoration: InputDecoration(
+                    hintText: '搜索歌曲',
+                    prefixIcon: const Icon(Icons.search_rounded),
+                    suffixIcon:
+                        _queueSearch.isEmpty
+                            ? null
+                            : IconButton(
+                              tooltip: '清除搜索',
+                              icon: const Icon(Icons.clear_rounded),
+                              onPressed: () {
+                                _queueFilterCtrl.clear();
+                                setState(() => _queueSearch = '');
+                              },
+                            ),
+                    filled: true,
+                    fillColor: VideoPlatformTheme.bgCard,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide.none,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          if (items.isEmpty)
+            SliverFillRemaining(
+              hasScrollBody: false,
+              child: Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(20),
+                  child:
+                      count == 0
+                          ? _buildEmptyPlaylistState()
+                          : const Text('未找到匹配的歌曲'),
+                ),
+              ),
+            )
+          else
+            SliverPadding(
+              padding: const EdgeInsets.fromLTRB(8, 0, 8, 12),
+              sliver: SliverList.builder(
+                itemCount: items.length,
+                itemBuilder: (context, index) {
+                  final item = items[index];
+                  final isCurrent = item.index == _ctrl.currentIndex;
+                  final metadata = CloudMusicController.parseTrackMetadata(
+                    item.entry,
+                    fallbackArtist: _ctrl.mountNameFor(item.entry),
+                  );
+                  return ListTile(
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    selected: isCurrent,
+                    selectedColor: accent,
+                    selectedTileColor: accent.withValues(alpha: 0.12),
+                    leading: Icon(
+                      isCurrent
+                          ? Icons.equalizer_rounded
+                          : Icons.music_note_rounded,
+                      size: 20,
+                    ),
+                    title: Text(
+                      metadata.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    subtitle: Text(
+                      metadata.artist,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    onTap: () => _ctrl.playQueueIndex(item.index),
+                    trailing: PopupMenuButton<String>(
+                      tooltip: '曲目操作',
+                      itemBuilder:
+                          (_) => const [
+                            PopupMenuItem(
+                              value: 'remove',
+                              child: Text('从列表移除'),
+                            ),
+                          ],
+                      onSelected: (_) => _ctrl.removeTrackAt(item.index),
+                    ),
+                  );
+                },
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEmptyPlaylistState({bool showName = false}) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(
+          Icons.queue_music_rounded,
+          size: 36,
+          color: VideoPlatformTheme.accent,
+        ),
+        const SizedBox(height: 12),
+        if (showName) ...[
+          Text(
+            _ctrl.activePlaylistName,
+            textAlign: TextAlign.center,
+            style: Theme.of(context).textTheme.titleLarge,
+          ),
+          const SizedBox(height: 4),
+        ],
+        Text(
+          _ctrl.errorText.isEmpty ? '此列表还没有歌曲' : _ctrl.errorText,
+          textAlign: TextAlign.center,
+        ),
+        const SizedBox(height: 12),
+        FilledButton.icon(
+          onPressed: _openFolderAndArchivePicker,
+          icon: const Icon(Icons.add_rounded),
+          label: const Text('添加音乐'),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildPlaylistQueueView() {
+    final allMatching = _matchingQueueTracks();
     final totalCount = allMatching.length;
     final pageCount = math.max(1, (totalCount + _queuePageSize - 1) ~/ _queuePageSize);
     final safePage = _queuePageIndex.clamp(0, pageCount - 1);
@@ -7181,9 +7394,9 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
               ),
               const SizedBox(width: 6),
               OutlinedButton.icon(
-                onPressed: _promptSaveCurrentPlaylistDialog,
-                icon: const Icon(Icons.playlist_add_check_rounded, size: 15),
-                label: const Text('另存歌单', style: TextStyle(fontSize: 12)),
+                onPressed: _promptCreatePlaylist,
+                icon: const Icon(Icons.playlist_add_rounded, size: 15),
+                label: const Text('新建列表', style: TextStyle(fontSize: 12)),
               ),
               const SizedBox(width: 6),
               IconButton(
@@ -7600,7 +7813,7 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
           ),
           if (isCompactDeck)
             Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               children: [
                 IconButton(
                   tooltip:
@@ -7611,17 +7824,6 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                     CloudMusicBottomDockBar.playModeIcon(_ctrl.playMode),
                     size: 20,
                     color: VideoPlatformTheme.accent,
-                  ),
-                ),
-                IconButton(
-                  tooltip: '快退 5 秒',
-                  visualDensity: VisualDensity.compact,
-                  onPressed: () =>
-                      _ctrl.seekRelative(const Duration(seconds: -5)),
-                  icon: Icon(
-                    Icons.replay_5_rounded,
-                    color: VideoPlatformTheme.textSecondary,
-                    size: 21,
                   ),
                 ),
                 IconButton(
@@ -7703,74 +7905,34 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                     size: 28,
                   ),
                 ),
-                IconButton(
-                  tooltip: '快进 5 秒',
-                  visualDensity: VisualDensity.compact,
-                  onPressed: () =>
-                      _ctrl.seekRelative(const Duration(seconds: 5)),
-                  icon: Icon(
-                    Icons.forward_5_rounded,
-                    color: VideoPlatformTheme.textSecondary,
-                    size: 21,
-                  ),
-                ),
-                StatefulBuilder(
-                  builder: (spdCtx, setSpdState) {
-                    return InkWell(
-                      borderRadius: BorderRadius.circular(14),
-                      onFocusChange: (_) {
-                        if (spdCtx.mounted) setSpdState(() {});
-                      },
-                      onTap: _ctrl.cycleSpeed,
-                      child: Builder(
-                        builder: (ctx) {
-                          final isFocused = Focus.of(ctx).hasPrimaryFocus;
-                          return Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 8,
-                              vertical: 5,
-                            ),
-                            decoration: BoxDecoration(
-                              color: isFocused
-                                  ? VideoPlatformTheme.accent
-                                      .withValues(alpha: 0.34)
-                                  : VideoPlatformTheme.bgCard,
-                              borderRadius: BorderRadius.circular(14),
-                              border: Border.all(
-                                color: isFocused
-                                    ? const Color(0xFFFFE066)
-                                    : VideoPlatformTheme.borderStrong,
-                                width: isFocused ? 2.2 : 1.0,
-                              ),
-                            ),
-                            child: Text(
-                              '${_ctrl.speed}x',
-                              style: TextStyle(
-                                fontSize: 11.5,
-                                height: 1.2,
-                                fontWeight: FontWeight.w700,
-                                color: isFocused
-                                    ? Colors.white
-                                    : VideoPlatformTheme.textPrimary,
-                              ),
-                            ),
-                          );
-                        },
-                      ),
-                    );
+                PopupMenuButton<String>(
+                  tooltip: '更多播放控制',
+                  onSelected: (action) {
+                    switch (action) {
+                      case 'rewind':
+                        _ctrl.seekRelative(const Duration(seconds: -5));
+                      case 'forward':
+                        _ctrl.seekRelative(const Duration(seconds: 5));
+                      case 'speed':
+                        _ctrl.cycleSpeed();
+                    }
                   },
+                  itemBuilder:
+                      (_) => [
+                        const PopupMenuItem(
+                          value: 'rewind',
+                          child: Text('快退 5 秒'),
+                        ),
+                        const PopupMenuItem(
+                          value: 'forward',
+                          child: Text('快进 5 秒'),
+                        ),
+                        PopupMenuItem(
+                          value: 'speed',
+                          child: Text('倍速 ${_ctrl.speed}x'),
+                        ),
+                      ],
                 ),
-                if (_ctrl.currentTrack != null)
-                  IconButton(
-                    tooltip: '停止并退出播放',
-                    visualDensity: VisualDensity.compact,
-                    onPressed: _exitMusicPlayer,
-                    icon: Icon(
-                      Icons.power_settings_new_rounded,
-                      color: VideoPlatformTheme.danger,
-                      size: 21,
-                    ),
-                  ),
               ],
             )
           else

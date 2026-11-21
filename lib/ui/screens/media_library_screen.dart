@@ -565,6 +565,7 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
               subtitle: resolved.subtitle,
               streamUrl: resolved.url,
               headers: resolved.headers,
+              is115Playback: initial115 != null,
             ),
           );
           ScaffoldMessenger.of(context).showSnackBar(
@@ -585,13 +586,14 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
             fallback115: initial115 == null
                 ? null
                 : () => resolve115(useCloudTranscode: !initial115.isTranscoded),
-            onEnterMiniPlayer: (posSec, url, headers) {
+            onEnterMiniPlayer: (posSec, url, headers, is115Playback) {
               widget.appState.startMiniPlayer(
                 MiniPlayerSession(
                   title: entry.name,
                   subtitle: resolved.subtitle,
                   streamUrl: url,
                   headers: headers,
+                  is115Playback: is115Playback,
                   initialPositionSeconds: posSec,
                 ),
               );
@@ -4524,8 +4526,12 @@ class _MediaFilePlayerDialog extends StatefulWidget {
   final String streamUrl;
   final Map<String, String> headers;
   final Future<Resolved115Stream?> Function()? fallback115;
-  final void Function(int position, String url, Map<String, String> headers)?
-      onEnterMiniPlayer;
+  final void Function(
+    int position,
+    String url,
+    Map<String, String> headers,
+    bool is115Playback,
+  )? onEnterMiniPlayer;
 
   const _MediaFilePlayerDialog({
     required this.api,
@@ -4610,8 +4616,10 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
         final alternate = await fallback();
         if (!mounted) return;
         if (alternate != null && alternate.proxyStreamUrl != _activeUrl) {
-          _activeUrl = alternate.proxyStreamUrl;
-          _activeHeaders = alternate.playbackHeaders;
+          setState(() {
+            _activeUrl = alternate.proxyStreamUrl;
+            _activeHeaders = alternate.playbackHeaders;
+          });
           _tryingFallback = false;
           await _openActiveStream(position: position);
           return;
@@ -4734,15 +4742,18 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
                       downloadUrlBuilder: () => widget.streamUrl,
                       videoNameBuilder: () => widget.title,
                       headersBuilder: () => widget.headers,
-                      isUsing115Direct: _using115Direct,
+                      player: _player,
+                      selected115Url: _using115Direct ? _activeUrl : null,
                       compact: true,
                       overlayStyle: false,
                       onResolved: (resolved) async {
                         if (!mounted) return;
                         final curSec = _player.state.position.inSeconds;
-                        setState(() => _using115Direct = true);
-                        _activeUrl = resolved.proxyStreamUrl;
-                        _activeHeaders = resolved.playbackHeaders;
+                        setState(() {
+                          _using115Direct = true;
+                          _activeUrl = resolved.proxyStreamUrl;
+                          _activeHeaders = resolved.playbackHeaders;
+                        });
                         await _openActiveStream(
                           position: curSec > 2 ? Duration(seconds: curSec) : null,
                         );
@@ -4850,7 +4861,12 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
                         onPressed: () {
                           final posSec = _player.state.position.inSeconds;
                           Navigator.of(context).pop();
-                          widget.onEnterMiniPlayer!(posSec, _activeUrl, _activeHeaders);
+                          widget.onEnterMiniPlayer!(
+                            posSec,
+                            _activeUrl,
+                            _activeHeaders,
+                            _using115Direct,
+                          );
                         },
                       ),
                     IconButton(

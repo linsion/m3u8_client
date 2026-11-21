@@ -28,6 +28,7 @@ class MiniPlayerSession {
   final Map<String, String> headers;
   final int initialPositionSeconds;
   final bool isLive;
+  final bool is115Playback;
   final VodItem? vodItem;
   final String? sourceKey;
   final String? sourceName;
@@ -47,6 +48,7 @@ class MiniPlayerSession {
     this.headers = const {},
     this.initialPositionSeconds = 0,
     this.isLive = false,
+    this.is115Playback = false,
     this.vodItem,
     this.sourceKey,
     this.sourceName,
