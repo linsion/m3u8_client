@@ -2110,6 +2110,19 @@ proxies:
     expect(find.text('发送中...'), findsNothing);
     expect(find.text('已发送'), findsOneWidget);
 
+    // 3. Verify "删除好友" / "退出群组" is NOT shown in the bottom send bar and is collapsed by default in the top header
+    expect(find.text('删除好友'), findsNothing);
+    expect(find.byTooltip('展开删除好友'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('展开删除好友'));
+    await tester.pump();
+    expect(find.text('删除好友'), findsOneWidget);
+    expect(find.byTooltip('折叠删除好友'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('折叠删除好友'));
+    await tester.pump();
+    expect(find.text('删除好友'), findsNothing);
+
     appState.dispose();
   });
 

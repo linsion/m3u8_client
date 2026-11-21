@@ -148,6 +148,18 @@ class SavedMusicPlaylist {
   }
 }
 
+class AiMusicCategoryDraft {
+  final String name;
+  final String description;
+  final List<FileEntry> tracks;
+
+  const AiMusicCategoryDraft({
+    required this.name,
+    this.description = '',
+    required this.tracks,
+  });
+}
+
 typedef CloudEndpointResolver = Future<
     ({
       String url,
@@ -750,6 +762,15 @@ class CloudMusicController extends ChangeNotifier with WidgetsBindingObserver {
   CloudEndpointResolver? _customEndpointResolver;
   AppState? _boundAppState;
 
+  @visibleForTesting
+  Future<List<FileEntry>> Function(StorageMount mount, String path)?
+      customDirectoryLister;
+
+  @visibleForTesting
+  Future<String> Function(String prompt)? customAiCompletionHandler;
+
+  AppState? get boundAppState => _boundAppState;
+
   Player? _player;
   StreamSubscription<bool>? _playingSub;
   StreamSubscription<Duration>? _positionSub;
@@ -804,8 +825,12 @@ class CloudMusicController extends ChangeNotifier with WidgetsBindingObserver {
   int _openSeq = 0;
   bool _handlingCompletion = false;
   bool _retriedCurrentTrack = false;
-  late Future<void> _initialLoad;
-  Future<void> _playlistWrite = Future.value();
+  bool _initialLoadDone = false;
+  Future<void>? _initialLoadFuture;
+  Future<void> get _initialLoad => _initialLoadDone
+      ? Future<void>.value()
+      : (_initialLoadFuture ?? Future<void>.value());
+  Future<void>? _playlistWrite;
   int _scanSeq = 0;
 
   CloudMusicController._internal() {
@@ -813,7 +838,11 @@ class CloudMusicController extends ChangeNotifier with WidgetsBindingObserver {
       WidgetsBinding.instance.addObserver(this);
     } catch (_) {}
     _initNativeMediaSessionHandler();
-    _initialLoad = _loadSavedMusicFoldersAndMounts(restorePlaylists: true);
+    _initialLoadFuture =
+        _loadSavedMusicFoldersAndMounts(restorePlaylists: true).whenComplete(() {
+          _initialLoadDone = true;
+          _initialLoadFuture = null;
+        });
   }
 
   @override
@@ -1162,7 +1191,7 @@ class CloudMusicController extends ChangeNotifier with WidgetsBindingObserver {
     // Keep writes in order when the user switches lists or tracks quickly.
     final activeId = _activePlaylistId;
     final playlists = List<SavedMusicPlaylist>.of(_savedPlaylists);
-    _playlistWrite = _playlistWrite.then((_) async {
+    Future<void> writeNow() async {
       try {
         final prefs = await SharedPreferences.getInstance();
         await prefs.setString(
@@ -1171,8 +1200,18 @@ class CloudMusicController extends ChangeNotifier with WidgetsBindingObserver {
         );
         await prefs.setString(_prefActiveMusicPlaylistIdKey, activeId);
       } catch (_) {}
-    });
-    return _playlistWrite;
+    }
+
+    final prev = _playlistWrite;
+    late final Future<void> current;
+    current = (prev == null ? writeNow() : prev.then((_) => writeNow()))
+        .whenComplete(() {
+          if (identical(_playlistWrite, current)) {
+            _playlistWrite = null;
+          }
+        });
+    _playlistWrite = current;
+    return current;
   }
 
   Future<void> createPlaylist(String name) async {
@@ -1193,6 +1232,49 @@ class CloudMusicController extends ChangeNotifier with WidgetsBindingObserver {
     final persisted = _persistPlaylists();
     await stopAndClose();
     await persisted;
+  }
+
+  /// Creates a new saved playlist pre-populated with [tracks] and [sources],
+  /// persists it, and optionally switches to it / plays it immediately.
+  Future<SavedMusicPlaylist> createPlaylistWithTracks({
+    required String name,
+    required List<FileEntry> tracks,
+    List<SavedMusicFolderItem> sources = const [],
+    bool switchToPlaylist = true,
+    bool autoPlay = false,
+    bool shuffle = false,
+  }) async {
+    await _initialLoad;
+    final cleanName = name.trim().isEmpty ? '新建播放列表' : name.trim();
+    final now = DateTime.now();
+    final orderedTracks = List<FileEntry>.of(tracks);
+    if (shuffle && orderedTracks.length > 1) {
+      orderedTracks.shuffle(math.Random());
+    }
+    final playlist = SavedMusicPlaylist(
+      id: 'pl_${now.microsecondsSinceEpoch}_${_savedPlaylists.length}',
+      name: cleanName,
+      tracks: orderedTracks,
+      sources: List<SavedMusicFolderItem>.of(sources),
+      currentIndex: 0,
+      updatedEpochMs: now.millisecondsSinceEpoch,
+    );
+    _savedPlaylists.add(playlist);
+    if (switchToPlaylist) {
+      _selectPlaylistQueue(playlist);
+      if (shuffle) {
+        _playMode = 'shuffle';
+      }
+    }
+    notifyListeners();
+    final persisted = _persistPlaylists();
+    if (switchToPlaylist && autoPlay && orderedTracks.isNotEmpty) {
+      await _openCurrentTrack(forceRefreshUrl: true);
+    } else if (switchToPlaylist && !autoPlay) {
+      unawaited(stopAndClose());
+    }
+    await persisted;
+    return playlist;
   }
 
   Future<void> renameSavedPlaylist(String playlistId, String newName) async {
@@ -1413,6 +1495,9 @@ class CloudMusicController extends ChangeNotifier with WidgetsBindingObserver {
     StorageMount mount,
     String path,
   ) async {
+    if (customDirectoryLister != null) {
+      return await customDirectoryLister!(mount, path);
+    }
     switch (mount.kind) {
       case StorageSourceKind.server:
         final api = _boundAppState?.api;
@@ -1493,6 +1578,630 @@ class CloudMusicController extends ChangeNotifier with WidgetsBindingObserver {
       } catch (_) {}
     }
     return entries;
+  }
+
+  /// Recursively scans selected folders and/or `.zip`/`.tar` archives across 115, AList, WebDAV, Server, and Local Cache,
+  /// and returns all discovered audio files without interrupting active playback.
+  Future<List<FileEntry>> collectTracksFromSources({
+    required List<SavedMusicFolderItem> sources,
+    bool includeSubfolders = true,
+    bool includeArchives = true,
+    void Function(String statusText, int foundCount)? onProgress,
+  }) async {
+    if (sources.isEmpty) return const [];
+    await refreshAvailableMounts();
+    final collectedTracks = <FileEntry>[];
+    final seenTrackKeys = <String>{};
+    final visitedDirs = <String>{};
+
+    void addTrackIfNew(FileEntry track) {
+      final trackKey =
+          '${track.mountId}::${track.path}::${track.archiveInnerPath}';
+      if (seenTrackKeys.add(trackKey)) {
+        collectedTracks.add(track);
+      }
+    }
+
+    Future<void> scanFolderRecursive(
+      StorageMount mount,
+      String folderPath,
+      String folderTitle,
+      int depth,
+    ) async {
+      final key = '${mount.id}::$folderPath';
+      if (visitedDirs.contains(key)) return;
+      visitedDirs.add(key);
+
+      onProgress?.call(
+        '正在扫描「${mount.name} / $folderTitle」... (已发现 ${collectedTracks.length} 首)',
+        collectedTracks.length,
+      );
+
+      List<FileEntry> entries = const [];
+      try {
+        entries = await listDirectoryForMount(mount, folderPath);
+      } catch (_) {
+        return;
+      }
+      if (entries.isEmpty) return;
+
+      registerDirectoryContext(
+        mounts: _availableMounts,
+        directoryEntries: entries,
+      );
+
+      final subfolders = <FileEntry>[];
+      for (final e in entries) {
+        if (e.isDir) {
+          subfolders.add(e);
+        } else if (e.isAudio) {
+          addTrackIfNew(e);
+        } else if (includeArchives && e.isStreamableMusicArchive) {
+          onProgress?.call(
+            '正在解析压缩包「${e.name}」内的音乐... (已发现 ${collectedTracks.length} 首)',
+            collectedTracks.length,
+          );
+          try {
+            final archiveEntries =
+                await CloudArchiveMusicService.instance.inspectArchiveEntries(
+              archiveEntry: e,
+              endpointResolver: resolveEntryEndpoint,
+            );
+            if (archiveEntries.isNotEmpty) {
+              registerDirectoryContext(
+                mounts: _availableMounts,
+                directoryEntries: archiveEntries,
+              );
+              for (final inner in archiveEntries) {
+                if (inner.isAudio) {
+                  addTrackIfNew(inner);
+                }
+              }
+            }
+          } catch (_) {}
+        }
+      }
+
+      if (includeSubfolders &&
+          depth < 5 &&
+          subfolders.isNotEmpty &&
+          collectedTracks.length < 3000) {
+        for (final sub in subfolders) {
+          if (collectedTracks.length >= 3000) break;
+          await scanFolderRecursive(mount, sub.path, sub.name, depth + 1);
+        }
+      }
+    }
+
+    for (final src in sources) {
+      final mount =
+          _availableMounts.where((m) => m.id == src.mountId).firstOrNull ??
+              StorageMount(
+                id: src.mountId,
+                name: src.mountName,
+                kind: src.sourceKind,
+                rootPath: src.path,
+              );
+
+      if (src.isArchive) {
+        onProgress?.call(
+          '正在读取压缩包「${src.title}」曲目列表...',
+          collectedTracks.length,
+        );
+        final archiveFile = FileEntry(
+          name: src.title,
+          path: src.path,
+          size: src.size,
+          modTime: '',
+          isDir: false,
+          isMp4: false,
+          ext: '',
+          mountId: src.mountId,
+          sourceKind: src.sourceKind,
+          pickcode115: src.pickcode115,
+        );
+        try {
+          final archiveEntries =
+              await CloudArchiveMusicService.instance.inspectArchiveEntries(
+            archiveEntry: archiveFile,
+            endpointResolver: resolveEntryEndpoint,
+          );
+          if (archiveEntries.isNotEmpty) {
+            registerDirectoryContext(
+              mounts: _availableMounts,
+              directoryEntries: archiveEntries,
+            );
+            for (final inner in archiveEntries) {
+              if (inner.isAudio) {
+                addTrackIfNew(inner);
+              }
+            }
+          }
+        } catch (_) {}
+      } else {
+        final lowerTitle = src.title.toLowerCase();
+        final lowerPath = src.path.toLowerCase();
+        final dotIdx = lowerTitle.lastIndexOf('.');
+        final titleExt = (dotIdx > 0 && dotIdx < lowerTitle.length - 1)
+            ? lowerTitle.substring(dotIdx)
+            : '';
+        final potentialTrack = FileEntry(
+          name: src.title,
+          path: src.path,
+          size: src.size,
+          modTime: '',
+          isDir: false,
+          isMp4: titleExt == '.mp4',
+          ext: titleExt,
+          mountId: src.mountId,
+          sourceKind: src.sourceKind,
+          pickcode115: src.pickcode115,
+        );
+        if (potentialTrack.isAudio ||
+            RegExp(
+              r'\.(ape|wav|wave|flac|mp3|m4a|aac|ogg|opus|alac|aiff|aif|wma|dsf|dff|wv|tta)$',
+            ).hasMatch(lowerPath)) {
+          addTrackIfNew(potentialTrack);
+        } else {
+          await scanFolderRecursive(mount, src.path, src.title, 0);
+        }
+      }
+    }
+
+    return collectedTracks;
+  }
+
+  /// Splits a raw user query into normalized lowercase search keywords.
+  static List<String> parseSearchKeywords(String rawQuery) {
+    return rawQuery
+        .split(RegExp(r'[\s,，;；、/|]+'))
+        .map((s) => s.trim().toLowerCase())
+        .where((s) => s.isNotEmpty)
+        .toList();
+  }
+
+  /// Filters [tracks] by artist name or keywords (matching song title, parsed artist,
+  /// filename, parent directory path, or archive inner path).
+  static List<FileEntry> filterTracksByArtistOrKeywords({
+    required List<FileEntry> tracks,
+    required String query,
+    bool matchAllKeywords = false,
+  }) {
+    final keywords = parseSearchKeywords(query);
+    if (keywords.isEmpty) return List<FileEntry>.of(tracks);
+
+    final matched = <FileEntry>[];
+    for (final track in tracks) {
+      final meta = parseTrackMetadata(track);
+      final haystack = [
+        track.name,
+        meta.title,
+        meta.artist,
+        track.path,
+        track.archiveInnerPath,
+      ].join(' ').toLowerCase();
+
+      final isMatch = matchAllKeywords
+          ? keywords.every((kw) => haystack.contains(kw))
+          : keywords.any((kw) => haystack.contains(kw));
+      if (isMatch) {
+        matched.add(track);
+      }
+    }
+    return matched;
+  }
+
+  /// Scans specified directories [sources] for songs matching [query] (artist name or keywords),
+  /// and creates a new [SavedMusicPlaylist] from the matched songs.
+  Future<SavedMusicPlaylist?> searchSourcesAndCreatePlaylist({
+    required List<SavedMusicFolderItem> sources,
+    required String query,
+    String? playlistName,
+    bool matchAllKeywords = false,
+    bool includeSubfolders = true,
+    bool includeArchives = true,
+    bool switchToPlaylist = true,
+    bool autoPlay = false,
+    bool shuffle = false,
+    void Function(String statusText, int foundCount)? onProgress,
+  }) async {
+    final allTracks = await collectTracksFromSources(
+      sources: sources,
+      includeSubfolders: includeSubfolders,
+      includeArchives: includeArchives,
+      onProgress: onProgress,
+    );
+    final matched = filterTracksByArtistOrKeywords(
+      tracks: allTracks,
+      query: query,
+      matchAllKeywords: matchAllKeywords,
+    );
+    if (matched.isEmpty) return null;
+
+    final cleanQuery = query.trim();
+    final targetName = (playlistName != null && playlistName.trim().isNotEmpty)
+        ? playlistName.trim()
+        : (cleanQuery.isNotEmpty ? cleanQuery : '目录精选歌单');
+
+    return await createPlaylistWithTracks(
+      name: targetName,
+      tracks: matched,
+      sources: sources,
+      switchToPlaylist: switchToPlaylist,
+      autoPlay: autoPlay,
+      shuffle: shuffle,
+    );
+  }
+
+  /// Analyzes [tracks] using the configured AI model (OpenAI / DeepSeek / Qwen / Gemini / Claude)
+  /// and categorizes them into themed playlists.
+  Future<List<AiMusicCategoryDraft>> analyzeTracksWithAi({
+    required List<FileEntry> tracks,
+    String dimension = 'auto',
+    String customInstruction = '',
+    String? apiKeyOverride,
+    String? providerOverride,
+    String? baseUrlOverride,
+    String? modelOverride,
+  }) async {
+    if (tracks.isEmpty) return const [];
+
+    final dimensionPrompt = switch (dimension) {
+      'artist' =>
+        '按【歌手 / 艺术家】分类：识别歌曲的演唱者或乐队，为每位主要歌手建立专属播放列表（例如：“周杰伦 精选”、“陈奕迅 精选”等）。',
+      'genre' =>
+        '按【音乐曲风 / 流派】分类：根据歌名、歌手风格与目录信息，划分为如“华语流行”、“摇滚热曲”、“民谣治愈”、“古风国风”、“电子动感”、“说唱 R&B”、“纯音乐 / 原声”等播放列表。',
+      'mood' =>
+        '按【情感 / 心情 / 听歌场景】分类：划分为如“深夜抒情治愈”、“运动燃曲 / 动感节奏”、“驾车兜风精选”、“怀旧伤感经典”、“轻松工作学习”等播放列表。',
+      'language' =>
+        '按【语种 / 地区】分类：划分为如“华语国语精选”、“粤语经典金曲”、“欧美英文流行”、“日韩音乐精选”等播放列表。',
+      'era' =>
+        '按【年代 / 时期】分类：划分为如“80/90年代经典老歌”、“00年代黄金华语”、“近年流行热歌”等播放列表。',
+      _ =>
+        '【AI 综合智能归类】：综合分析曲库的歌手、曲风、语种、心情与目录特征，自动划分为 2 到 8 个主题鲜明、最合理的精品播放列表。',
+    };
+
+    final maxPromptTracks = math.min(tracks.length, 450);
+    final trackLines = <String>[];
+    for (int i = 0; i < maxPromptTracks; i++) {
+      final t = tracks[i];
+      final meta = parseTrackMetadata(t);
+      final rawPath =
+          t.archiveInnerPath.isNotEmpty ? t.archiveInnerPath : t.path;
+      final segments = rawPath
+          .split(RegExp(r'[/\\]'))
+          .where((s) => s.isNotEmpty)
+          .toList();
+      final folderHint = segments.length >= 2
+          ? segments.sublist(math.max(0, segments.length - 3), segments.length - 1).join('/')
+          : '';
+      final artistPart = meta.artist.isNotEmpty ? '${meta.artist} - ' : '';
+      final folderPart = folderHint.isNotEmpty ? ' [目录:$folderHint]' : '';
+      trackLines.add('$i|$artistPart${meta.title}$folderPart');
+    }
+
+    const systemPrompt =
+        '你是一位专业的数字音乐库整理与歌单策展 AI 助手。请严格只输出合法的 JSON 对象，不要包含任何额外的解释文字。';
+    final userPrompt = StringBuffer()
+      ..writeln('请对以下音乐目录中的 $maxPromptTracks 首歌曲进行分析并归类生成播放列表。')
+      ..writeln('分类要求：$dimensionPrompt')
+      ..writeln(
+        customInstruction.trim().isNotEmpty
+            ? '用户补充分类要求：${customInstruction.trim()}'
+            : '',
+      )
+      ..writeln('请严格按照以下 JSON 格式返回结果（track_ids 为歌曲对应的数字序号数组）：')
+      ..writeln('{"playlists":[{"name":"播放列表名称","description":"分类简短说明","track_ids":[0,1,2]}]}')
+      ..writeln('\n待分析歌曲列表（格式：序号|歌手 - 歌名 [目录]）：')
+      ..writeln(trackLines.join('\n'));
+
+    String rawResponse;
+    if (customAiCompletionHandler != null) {
+      rawResponse = await customAiCompletionHandler!(userPrompt.toString());
+    } else {
+      rawResponse = await _requestAiChatCompletion(
+        systemPrompt: systemPrompt,
+        userPrompt: userPrompt.toString(),
+        apiKeyOverride: apiKeyOverride,
+        providerOverride: providerOverride,
+        baseUrlOverride: baseUrlOverride,
+        modelOverride: modelOverride,
+      );
+    }
+
+    final parsed = parseAiCategorizationJson(rawResponse, tracks);
+    if (parsed.isEmpty) {
+      throw Exception('AI 返回的分类结果为空或格式无法解析');
+    }
+    return parsed;
+  }
+
+  /// Scans [sources], analyzes the discovered songs with AI according to [dimension]
+  /// and [customInstruction], and creates a [SavedMusicPlaylist] for each AI category.
+  Future<List<SavedMusicPlaylist>> analyzeSourcesAndCreatePlaylistsWithAi({
+    required List<SavedMusicFolderItem> sources,
+    String dimension = 'auto',
+    String customInstruction = '',
+    bool includeSubfolders = true,
+    bool includeArchives = true,
+    bool switchToFirstPlaylist = true,
+    void Function(String statusText, int foundCount)? onProgress,
+  }) async {
+    final allTracks = await collectTracksFromSources(
+      sources: sources,
+      includeSubfolders: includeSubfolders,
+      includeArchives: includeArchives,
+      onProgress: onProgress,
+    );
+    if (allTracks.isEmpty) return const [];
+
+    onProgress?.call('已扫描 ${allTracks.length} 首歌曲，正在请求 AI 智能分类...', allTracks.length);
+    final drafts = await analyzeTracksWithAi(
+      tracks: allTracks,
+      dimension: dimension,
+      customInstruction: customInstruction,
+    );
+
+    final created = <SavedMusicPlaylist>[];
+    for (int i = 0; i < drafts.length; i++) {
+      final draft = drafts[i];
+      if (draft.tracks.isEmpty) continue;
+      final pl = await createPlaylistWithTracks(
+        name: draft.name,
+        tracks: draft.tracks,
+        sources: sources,
+        switchToPlaylist: switchToFirstPlaylist && created.isEmpty,
+        autoPlay: false,
+      );
+      created.add(pl);
+    }
+    return created;
+  }
+
+  Future<String> _requestAiChatCompletion({
+    required String systemPrompt,
+    required String userPrompt,
+    String? apiKeyOverride,
+    String? providerOverride,
+    String? baseUrlOverride,
+    String? modelOverride,
+  }) async {
+    final state = _boundAppState;
+    final apiKey = (apiKeyOverride ?? state?.aiApiKey ?? '').trim();
+    if (apiKey.isEmpty) {
+      throw Exception('未配置 AI API Key，请先在设置或弹窗中填入 AI API Key');
+    }
+
+    final rawProvider = (providerOverride ?? state?.effectiveAiProvider ?? 'openai')
+        .trim()
+        .toLowerCase();
+    final provider = apiKey.startsWith('AIza')
+        ? 'gemini'
+        : (apiKey.startsWith('sk-ant-') ? 'claude' : rawProvider);
+
+    final baseUrl = (baseUrlOverride != null && baseUrlOverride.trim().isNotEmpty)
+        ? baseUrlOverride.trim().replaceAll(RegExp(r'/+$'), '')
+        : (state?.effectiveAiBaseUrl ?? 'https://api.openai.com/v1');
+
+    final model = (modelOverride != null && modelOverride.trim().isNotEmpty)
+        ? modelOverride.trim()
+        : (state?.effectiveAiModel ?? 'gpt-4o-mini');
+
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 20);
+    if (state != null) {
+      client.findProxy = (Uri u) => state.api.buildProxyDirectiveForUri(u);
+    }
+
+    try {
+      late final Uri uri;
+      late final Map<String, String> headers;
+      late final Map<String, dynamic> bodyMap;
+
+      if (provider == 'gemini') {
+        final cleanBase = baseUrl.contains('generativelanguage.googleapis.com')
+            ? baseUrl
+            : 'https://generativelanguage.googleapis.com/v1beta';
+        uri = Uri.parse(
+          '$cleanBase/models/$model:generateContent?key=${Uri.encodeQueryComponent(apiKey)}',
+        );
+        headers = {'Content-Type': 'application/json'};
+        bodyMap = {
+          'contents': [
+            {
+              'parts': [
+                {'text': '$systemPrompt\n\n$userPrompt'},
+              ],
+            },
+          ],
+          'generationConfig': {
+            'temperature': 0.2,
+            'responseMimeType': 'application/json',
+          },
+        };
+      } else if (provider == 'claude') {
+        final endpoint = baseUrl.endsWith('/messages')
+            ? baseUrl
+            : '$baseUrl/messages';
+        uri = Uri.parse(endpoint);
+        headers = {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+        };
+        bodyMap = {
+          'model': model,
+          'max_tokens': 4096,
+          'temperature': 0.2,
+          'system': systemPrompt,
+          'messages': [
+            {'role': 'user', 'content': userPrompt},
+          ],
+        };
+      } else {
+        final endpoint = baseUrl.endsWith('/chat/completions')
+            ? baseUrl
+            : '$baseUrl/chat/completions';
+        uri = Uri.parse(endpoint);
+        headers = {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $apiKey',
+        };
+        bodyMap = {
+          'model': model,
+          'temperature': 0.2,
+          'messages': [
+            {'role': 'system', 'content': systemPrompt},
+            {'role': 'user', 'content': userPrompt},
+          ],
+        };
+      }
+
+      final req = await client.postUrl(uri).timeout(const Duration(seconds: 30));
+      headers.forEach((k, v) => req.headers.set(k, v));
+      final payloadBytes = utf8.encode(jsonEncode(bodyMap));
+      req.contentLength = payloadBytes.length;
+      req.add(payloadBytes);
+
+      final resp = await req.close().timeout(const Duration(seconds: 60));
+      final respBody = await utf8.decoder.bind(resp).join();
+      if (resp.statusCode < 200 || resp.statusCode >= 300) {
+        throw Exception('AI 接口返回错误 (HTTP ${resp.statusCode}): $respBody');
+      }
+
+      final decoded = jsonDecode(respBody);
+      if (decoded is Map<String, dynamic>) {
+        if (provider == 'gemini') {
+          final candidates = decoded['candidates'];
+          if (candidates is List && candidates.isNotEmpty) {
+            final content = candidates.first['content'];
+            final parts = content is Map ? content['parts'] : null;
+            if (parts is List && parts.isNotEmpty) {
+              return (parts.first['text'] ?? '').toString();
+            }
+          }
+        } else if (provider == 'claude') {
+          final content = decoded['content'];
+          if (content is List && content.isNotEmpty) {
+            return (content.first['text'] ?? '').toString();
+          }
+        } else {
+          final choices = decoded['choices'];
+          if (choices is List && choices.isNotEmpty) {
+            final msg = choices.first['message'];
+            if (msg is Map) {
+              return (msg['content'] ?? '').toString();
+            }
+          }
+        }
+      }
+      return respBody;
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  /// Parses an AI JSON categorization response and maps track IDs / names back to [sourceTracks].
+  static List<AiMusicCategoryDraft> parseAiCategorizationJson(
+    String rawResponse,
+    List<FileEntry> sourceTracks,
+  ) {
+    if (rawResponse.trim().isEmpty || sourceTracks.isEmpty) return const [];
+
+    String cleaned = rawResponse.trim();
+    final fenceMatch = RegExp(r'```(?:json)?\s*([\s\S]*?)```').firstMatch(cleaned);
+    if (fenceMatch != null) {
+      cleaned = fenceMatch.group(1)!.trim();
+    } else {
+      final firstBrace = cleaned.indexOf('{');
+      final lastBrace = cleaned.lastIndexOf('}');
+      final firstBracket = cleaned.indexOf('[');
+      final lastBracket = cleaned.lastIndexOf(']');
+      if (firstBrace >= 0 &&
+          lastBrace > firstBrace &&
+          (firstBracket < 0 || firstBrace < firstBracket)) {
+        cleaned = cleaned.substring(firstBrace, lastBrace + 1);
+      } else if (firstBracket >= 0 && lastBracket > firstBracket) {
+        cleaned = cleaned.substring(firstBracket, lastBracket + 1);
+      }
+    }
+
+    dynamic decoded;
+    try {
+      decoded = jsonDecode(cleaned);
+    } catch (_) {
+      return const [];
+    }
+
+    List<dynamic> rawList = const [];
+    if (decoded is List) {
+      rawList = decoded;
+    } else if (decoded is Map) {
+      final candidates =
+          decoded['playlists'] ?? decoded['categories'] ?? decoded['groups'];
+      if (candidates is List) {
+        rawList = candidates;
+      }
+    }
+
+    final results = <AiMusicCategoryDraft>[];
+    for (final item in rawList) {
+      if (item is! Map) continue;
+      final name = (item['name'] ?? item['title'] ?? item['category'] ?? '')
+          .toString()
+          .trim();
+      if (name.isEmpty) continue;
+      final desc = (item['description'] ?? item['reason'] ?? '')
+          .toString()
+          .trim();
+      final rawIds = item['track_ids'] ??
+          item['tracks'] ??
+          item['ids'] ??
+          item['indices'] ??
+          item['songs'];
+      if (rawIds is! List) continue;
+
+      final categoryTracks = <FileEntry>[];
+      final seenIndices = <int>{};
+
+      for (final idItem in rawIds) {
+        int? idx;
+        if (idItem is int) {
+          idx = idItem;
+        } else if (idItem is num) {
+          idx = idItem.toInt();
+        } else if (idItem is String) {
+          idx = int.tryParse(idItem.trim());
+          if (idx == null) {
+            final lower = idItem.trim().toLowerCase();
+            final foundIdx = sourceTracks.indexWhere(
+              (t) =>
+                  t.name.toLowerCase().contains(lower) ||
+                  parseTrackMetadata(t).title.toLowerCase().contains(lower),
+            );
+            if (foundIdx >= 0) idx = foundIdx;
+          }
+        }
+        if (idx != null &&
+            idx >= 0 &&
+            idx < sourceTracks.length &&
+            seenIndices.add(idx)) {
+          categoryTracks.add(sourceTracks[idx]);
+        }
+      }
+
+      if (categoryTracks.isNotEmpty) {
+        results.add(
+          AiMusicCategoryDraft(
+            name: name,
+            description: desc,
+            tracks: categoryTracks,
+          ),
+        );
+      }
+    }
+
+    return results;
   }
 
   /// Recursively scans selected folders and/or `.zip`/`.tar` archives across 115, AList, WebDAV, Server, and Local Cache,
@@ -3353,10 +4062,14 @@ class CloudMusicController extends ChangeNotifier with WidgetsBindingObserver {
     _openSeq++;
     _openWatchdogTimer?.cancel();
     _cancelFolderScan();
-    final stopped = _player
-        ?.stop()
-        .timeout(const Duration(seconds: 2), onTimeout: () {})
-        .catchError((_) {});
+    final shouldStopPlayer =
+        _isPlaying || _isLoadingTrack || _activeStreamUrl.isNotEmpty;
+    final stopped = shouldStopPlayer
+        ? _player
+            ?.stop()
+            .timeout(const Duration(seconds: 2), onTimeout: () {})
+            .catchError((_) {})
+        : null;
     if (clearPersistedQueue) {
       _queue = [];
       _currentIndex = -1;
@@ -4507,6 +5220,50 @@ class _CloudMusicFolderPickerDialogState
             TextButton(
               onPressed: () => Navigator.of(context).pop(),
               child: Text(isMobile ? '关闭' : '关闭窗口'),
+            ),
+            OutlinedButton.icon(
+              onPressed: () async {
+                final targets = _selectedItems.isNotEmpty
+                    ? List<SavedMusicFolderItem>.from(_selectedItems)
+                    : (_activeMount != null
+                        ? [_currentDirectoryAsItem()]
+                        : const <SavedMusicFolderItem>[]);
+                if (targets.isEmpty) return;
+                Navigator.of(context).pop();
+                await showDialog<void>(
+                  context: context,
+                  builder: (_) => CloudMusicSmartPlaylistDialog(
+                    controller: _ctrl,
+                    initialSources: targets,
+                    initialTab: 0,
+                    initialIncludeSubfolders: _includeSubfolders,
+                  ),
+                );
+              },
+              icon: const Icon(Icons.manage_search_rounded, size: 16),
+              label: Text(isMobile ? '搜人名/关键词建表' : '查找人名/关键词新建列表'),
+            ),
+            OutlinedButton.icon(
+              onPressed: () async {
+                final targets = _selectedItems.isNotEmpty
+                    ? List<SavedMusicFolderItem>.from(_selectedItems)
+                    : (_activeMount != null
+                        ? [_currentDirectoryAsItem()]
+                        : const <SavedMusicFolderItem>[]);
+                if (targets.isEmpty) return;
+                Navigator.of(context).pop();
+                await showDialog<void>(
+                  context: context,
+                  builder: (_) => CloudMusicSmartPlaylistDialog(
+                    controller: _ctrl,
+                    initialSources: targets,
+                    initialTab: 1,
+                    initialIncludeSubfolders: _includeSubfolders,
+                  ),
+                );
+              },
+              icon: const Icon(Icons.auto_awesome_rounded, size: 16),
+              label: Text(isMobile ? 'AI 分类建表' : 'AI 分析自动生成列表'),
             ),
             OutlinedButton.icon(
               onPressed: () async {
@@ -5701,6 +6458,27 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
     );
   }
 
+  Future<void> _openSmartPlaylistDialog({
+    int initialTab = 0,
+    List<SavedMusicFolderItem>? initialSources,
+    BuildContext? managerContext,
+  }) async {
+    if (managerContext != null && managerContext.mounted) {
+      Navigator.of(managerContext).pop();
+    }
+    final created = await showDialog<bool>(
+      context: context,
+      builder: (_) => CloudMusicSmartPlaylistDialog(
+        controller: _ctrl,
+        initialTab: initialTab,
+        initialSources: initialSources,
+      ),
+    );
+    if (created == true && mounted) {
+      _showPlaylistQueue();
+    }
+  }
+
   Future<void> _promptCreatePlaylist({BuildContext? managerContext}) async {
     final name = await _promptPlaylistName();
     if (!mounted || name == null) return;
@@ -5829,15 +6607,56 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
             ),
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-              child: SizedBox(
-                width: double.infinity,
-                child: FilledButton.icon(
-                  onPressed:
-                      () =>
+              child: Column(
+                children: [
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton.icon(
+                      onPressed: () =>
                           _promptCreatePlaylist(managerContext: managerContext),
-                  icon: const Icon(Icons.add_rounded),
-                  label: const Text('新建列表'),
-                ),
+                      icon: const Icon(Icons.add_rounded),
+                      label: const Text('新建列表'),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: () => _openSmartPlaylistDialog(
+                            initialTab: 0,
+                            managerContext: managerContext,
+                          ),
+                          icon: const Icon(
+                            Icons.manage_search_rounded,
+                            size: 16,
+                          ),
+                          label: const Text(
+                            '指定目录搜歌建表',
+                            style: TextStyle(fontSize: 12),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: () => _openSmartPlaylistDialog(
+                            initialTab: 1,
+                            managerContext: managerContext,
+                          ),
+                          icon: const Icon(
+                            Icons.auto_awesome_rounded,
+                            size: 16,
+                          ),
+                          label: const Text(
+                            'AI 智能分类建表',
+                            style: TextStyle(fontSize: 12),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
               ),
             ),
             Divider(height: 1, color: VideoPlatformTheme.borderSubtle),
@@ -6435,6 +7254,11 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
               onPressed: _openFolderAndArchivePicker,
               icon: const Icon(Icons.create_new_folder_outlined),
             ),
+            IconButton(
+              tooltip: '指定目录搜歌 / AI 智能建表',
+              onPressed: () => _openSmartPlaylistDialog(initialTab: 0),
+              icon: const Icon(Icons.auto_awesome_rounded),
+            ),
             TextButton(
               onPressed: _openPlaylistManagerDialog,
               child: const Text('列表管理'),
@@ -6510,6 +7334,18 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
               onPressed: _promptCreatePlaylist,
               icon: const Icon(Icons.playlist_add_rounded, size: 16),
               label: const Text('新建列表', style: TextStyle(fontSize: 12)),
+            ),
+            const SizedBox(width: 8),
+            OutlinedButton.icon(
+              onPressed: () => _openSmartPlaylistDialog(initialTab: 0),
+              icon: const Icon(Icons.manage_search_rounded, size: 16),
+              label: const Text('目录搜歌建表', style: TextStyle(fontSize: 12)),
+            ),
+            const SizedBox(width: 8),
+            OutlinedButton.icon(
+              onPressed: () => _openSmartPlaylistDialog(initialTab: 1),
+              icon: const Icon(Icons.auto_awesome_rounded, size: 15),
+              label: const Text('AI 智能分类', style: TextStyle(fontSize: 12)),
             ),
             if (_ctrl.queue.length > 1) ...[
               const SizedBox(width: 8),
@@ -7032,6 +7868,44 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                       '自选文件夹 / 压缩包随机播放',
                       style: TextStyle(
                         fontSize: 13.5,
+                        height: 1.2,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                  OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      minimumSize: const Size(160, 40),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 10,
+                      ),
+                    ),
+                    onPressed: () => _openSmartPlaylistDialog(initialTab: 0),
+                    icon: const Icon(Icons.manage_search_rounded, size: 18),
+                    label: const Text(
+                      '指定目录搜人名/关键词建表',
+                      style: TextStyle(
+                        fontSize: 13,
+                        height: 1.2,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                  OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      minimumSize: const Size(160, 40),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 10,
+                      ),
+                    ),
+                    onPressed: () => _openSmartPlaylistDialog(initialTab: 1),
+                    icon: const Icon(Icons.auto_awesome_rounded, size: 18),
+                    label: const Text(
+                      'AI 智能分析目录分类建表',
+                      style: TextStyle(
+                        fontSize: 13,
                         height: 1.2,
                         fontWeight: FontWeight.w700,
                       ),
@@ -8611,6 +9485,1449 @@ class _AnimatedAudioSpectrumBars extends StatelessWidget {
           );
         }),
       ),
+    );
+  }
+}
+
+// =============================================================================
+// 6. Smart Directory Search (Artist / Keyword) & AI Auto-Categorized Playlist Dialog
+// =============================================================================
+
+class CloudMusicSmartPlaylistDialog extends StatefulWidget {
+  final CloudMusicController controller;
+  final List<SavedMusicFolderItem>? initialSources;
+  final int initialTab; // 0 = 指定目录搜人名/关键词建表, 1 = AI 智能分析目录分类建表
+  final bool initialIncludeSubfolders;
+
+  const CloudMusicSmartPlaylistDialog({
+    super.key,
+    required this.controller,
+    this.initialSources,
+    this.initialTab = 0,
+    this.initialIncludeSubfolders = true,
+  });
+
+  @override
+  State<CloudMusicSmartPlaylistDialog> createState() =>
+      _CloudMusicSmartPlaylistDialogState();
+}
+
+class _CloudMusicSmartPlaylistDialogState
+    extends State<CloudMusicSmartPlaylistDialog> {
+  late int _activeTab;
+  late bool _includeSubfolders;
+  final List<SavedMusicFolderItem> _selectedSources = [];
+
+  // Tab 0: Artist / Keyword Search & Create Playlist
+  final TextEditingController _keywordCtrl = TextEditingController();
+  final TextEditingController _newPlaylistNameCtrl = TextEditingController();
+  bool _playlistNameManuallyEdited = false;
+  bool _matchAllKeywords = false;
+  bool _isSearchingTracks = false;
+  String _searchProgressText = '';
+  String? _searchError;
+  List<FileEntry> _scannedAllTracks = const [];
+  List<FileEntry> _matchedTracks = const [];
+  final Set<String> _uncheckedTrackKeys = {};
+
+  // Tab 1: AI Directory Analysis & Auto-Categorized Playlists
+  String _aiDimension = 'auto';
+  final TextEditingController _aiCustomInstructionCtrl =
+      TextEditingController();
+  bool _showInlineAiConfig = false;
+  String _inlineAiProvider = 'openai';
+  final TextEditingController _inlineAiKeyCtrl = TextEditingController();
+  final TextEditingController _inlineAiBaseUrlCtrl = TextEditingController();
+  final TextEditingController _inlineAiModelCtrl = TextEditingController();
+  bool _isAnalyzingAi = false;
+  String _aiProgressText = '';
+  String? _aiError;
+  List<AiMusicCategoryDraft> _aiDrafts = const [];
+  final Set<int> _selectedAiDraftIndices = {};
+
+  CloudMusicController get _ctrl => widget.controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _activeTab = widget.initialTab.clamp(0, 1);
+    _includeSubfolders = widget.initialIncludeSubfolders;
+    final state = _ctrl.boundAppState;
+    if (state != null) {
+      _inlineAiProvider = state.aiProvider;
+      _inlineAiKeyCtrl.text = state.aiApiKey;
+      _inlineAiBaseUrlCtrl.text = state.aiBaseUrl;
+      _inlineAiModelCtrl.text = state.aiModel;
+      _showInlineAiConfig = !state.hasAiApiKey;
+    }
+    _initDefaultSources();
+  }
+
+  Future<void> _initDefaultSources() async {
+    if (widget.initialSources != null && widget.initialSources!.isNotEmpty) {
+      _selectedSources.addAll(widget.initialSources!);
+      return;
+    }
+    await _ctrl.refreshAvailableMounts();
+    if (!mounted) return;
+    setState(() {
+      if (_ctrl.savedMusicFolders.isNotEmpty) {
+        _selectedSources.addAll(_ctrl.savedMusicFolders);
+      } else if (_ctrl.activePlaylist != null &&
+          _ctrl.activePlaylist!.sources.isNotEmpty) {
+        _selectedSources.addAll(_ctrl.activePlaylist!.sources);
+      } else if (_ctrl.availableMounts.isNotEmpty) {
+        final m = _ctrl.availableMounts.first;
+        _selectedSources.add(
+          SavedMusicFolderItem(
+            mountId: m.id,
+            mountName: m.name,
+            sourceKind: m.kind,
+            path: m.rootPath,
+            title: m.name,
+          ),
+        );
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _keywordCtrl.dispose();
+    _newPlaylistNameCtrl.dispose();
+    _aiCustomInstructionCtrl.dispose();
+    _inlineAiKeyCtrl.dispose();
+    _inlineAiBaseUrlCtrl.dispose();
+    _inlineAiModelCtrl.dispose();
+    super.dispose();
+  }
+
+  String _trackKey(FileEntry e) =>
+      '${e.mountId}::${e.path}::${e.archiveInnerPath}';
+
+  Future<void> _openDirectorySelectorSheet() async {
+    await _ctrl.refreshAvailableMounts();
+    if (!mounted) return;
+    final picked = await showDialog<List<SavedMusicFolderItem>>(
+      context: context,
+      builder: (_) => _SmartPlaylistDirectoryPickerDialog(
+        controller: _ctrl,
+        initialSelected: _selectedSources,
+      ),
+    );
+    if (picked != null && picked.isNotEmpty && mounted) {
+      setState(() {
+        _selectedSources
+          ..clear()
+          ..addAll(picked);
+        _scannedAllTracks = const [];
+      });
+    }
+  }
+
+  Future<void> _runKeywordSearchInSources({bool createImmediately = false}) async {
+    if (_selectedSources.isEmpty) {
+      setState(() => _searchError = '请先至少选择一个要查找的音乐目录');
+      return;
+    }
+    final query = _keywordCtrl.text.trim();
+    if (query.isEmpty) {
+      setState(() => _searchError = '请输入要查找的歌手人名或关键词');
+      return;
+    }
+
+    setState(() {
+      _isSearchingTracks = true;
+      _searchError = null;
+      _searchProgressText = '正在扫描所选目录中的音乐...';
+    });
+
+    try {
+      final allTracks = await _ctrl.collectTracksFromSources(
+        sources: _selectedSources,
+        includeSubfolders: _includeSubfolders,
+        onProgress: (status, count) {
+          if (mounted) {
+            setState(() => _searchProgressText = status);
+          }
+        },
+      );
+      final matched = CloudMusicController.filterTracksByArtistOrKeywords(
+        tracks: allTracks,
+        query: query,
+        matchAllKeywords: _matchAllKeywords,
+      );
+      if (!mounted) return;
+      setState(() {
+        _scannedAllTracks = allTracks;
+        _matchedTracks = matched;
+        _uncheckedTrackKeys.clear();
+        _isSearchingTracks = false;
+        _searchProgressText = '';
+        if (!_playlistNameManuallyEdited ||
+            _newPlaylistNameCtrl.text.trim().isEmpty) {
+          _newPlaylistNameCtrl.text = query;
+        }
+        if (matched.isEmpty) {
+          _searchError =
+              '已在所选目录共扫描 ${allTracks.length} 首歌曲，未找到包含「$query」的歌曲';
+        }
+      });
+
+      if (createImmediately && matched.isNotEmpty) {
+        await _createPlaylistFromMatchedTracks(autoPlay: false);
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isSearchingTracks = false;
+        _searchProgressText = '';
+        _searchError = '扫描目录查找失败：$e';
+      });
+    }
+  }
+
+  Future<void> _createPlaylistFromMatchedTracks({required bool autoPlay}) async {
+    final chosenTracks = _matchedTracks
+        .where((t) => !_uncheckedTrackKeys.contains(_trackKey(t)))
+        .toList();
+    if (chosenTracks.isEmpty) {
+      setState(() => _searchError = '请至少勾选一首歌曲以创建播放列表');
+      return;
+    }
+    final rawName = _newPlaylistNameCtrl.text.trim();
+    final name = rawName.isNotEmpty
+        ? rawName
+        : (_keywordCtrl.text.trim().isNotEmpty
+            ? _keywordCtrl.text.trim()
+            : '目录搜歌歌单');
+
+    final created = await _ctrl.createPlaylistWithTracks(
+      name: name,
+      tracks: chosenTracks,
+      sources: _selectedSources,
+      switchToPlaylist: true,
+      autoPlay: autoPlay,
+    );
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('已新建播放列表「${created.name}」（共 ${created.tracks.length} 首）'),
+      ),
+    );
+    if (Navigator.of(context).canPop()) {
+      Navigator.of(context).pop(true);
+    }
+  }
+
+  Future<void> _saveInlineAiSettings() async {
+    final state = _ctrl.boundAppState;
+    if (state == null) return;
+    await state.saveAiConfig(
+      provider: _inlineAiProvider,
+      apiKey: _inlineAiKeyCtrl.text.trim(),
+      baseUrl: _inlineAiBaseUrlCtrl.text.trim(),
+      model: _inlineAiModelCtrl.text.trim(),
+    );
+    if (!mounted) return;
+    setState(() {
+      if (state.hasAiApiKey) {
+        _showInlineAiConfig = false;
+      }
+      _aiError = null;
+    });
+  }
+
+  Future<void> _runAiDirectoryAnalysis({bool createImmediately = false}) async {
+    if (_selectedSources.isEmpty) {
+      setState(() => _aiError = '请先至少选择一个要分析的音乐目录');
+      return;
+    }
+
+    final state = _ctrl.boundAppState;
+    if (_showInlineAiConfig && _inlineAiKeyCtrl.text.trim().isNotEmpty) {
+      await _saveInlineAiSettings();
+    }
+    final effectiveKey = _inlineAiKeyCtrl.text.trim().isNotEmpty
+        ? _inlineAiKeyCtrl.text.trim()
+        : (state?.aiApiKey ?? '');
+
+    if (effectiveKey.isEmpty && _ctrl.customAiCompletionHandler == null) {
+      setState(() {
+        _showInlineAiConfig = true;
+        _aiError = '请先填写 AI API Key（也可在「设置 -> AI 智能音乐分析与 API Key 设置」中配置）';
+      });
+      return;
+    }
+
+    setState(() {
+      _isAnalyzingAi = true;
+      _aiError = null;
+      _aiProgressText = '正在扫描所选目录曲库...';
+    });
+
+    try {
+      final allTracks = _scannedAllTracks.isNotEmpty
+          ? _scannedAllTracks
+          : await _ctrl.collectTracksFromSources(
+              sources: _selectedSources,
+              includeSubfolders: _includeSubfolders,
+              onProgress: (status, count) {
+                if (mounted) {
+                  setState(() => _aiProgressText = status);
+                }
+              },
+            );
+      if (!mounted) return;
+      if (allTracks.isEmpty) {
+        setState(() {
+          _isAnalyzingAi = false;
+          _aiProgressText = '';
+          _aiError = '所选目录内未找到任何音频文件';
+        });
+        return;
+      }
+
+      setState(() {
+        _scannedAllTracks = allTracks;
+        _aiProgressText =
+            '已扫描 ${allTracks.length} 首歌曲，正在请求 AI 按分类智能规划播放列表...';
+      });
+
+      final drafts = await _ctrl.analyzeTracksWithAi(
+        tracks: allTracks,
+        dimension: _aiDimension,
+        customInstruction: _aiCustomInstructionCtrl.text.trim(),
+        apiKeyOverride: effectiveKey,
+        providerOverride: _inlineAiProvider,
+        baseUrlOverride: _inlineAiBaseUrlCtrl.text.trim(),
+        modelOverride: _inlineAiModelCtrl.text.trim(),
+      );
+      if (!mounted) return;
+      setState(() {
+        _aiDrafts = drafts;
+        _selectedAiDraftIndices
+          ..clear()
+          ..addAll(List<int>.generate(drafts.length, (i) => i));
+        _isAnalyzingAi = false;
+        _aiProgressText = '';
+      });
+
+      if (createImmediately && drafts.isNotEmpty) {
+        await _createSelectedAiPlaylists();
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isAnalyzingAi = false;
+        _aiProgressText = '';
+        _aiError = 'AI 智能分析失败：$e';
+      });
+    }
+  }
+
+  Future<void> _createSelectedAiPlaylists() async {
+    final chosen = [
+      for (int i = 0; i < _aiDrafts.length; i++)
+        if (_selectedAiDraftIndices.contains(i) &&
+            _aiDrafts[i].tracks.isNotEmpty)
+          _aiDrafts[i],
+    ];
+    if (chosen.isEmpty) {
+      setState(() => _aiError = '请至少勾选一个 AI 生成的分类播放列表');
+      return;
+    }
+
+    final createdList = <SavedMusicPlaylist>[];
+    for (int i = 0; i < chosen.length; i++) {
+      final draft = chosen[i];
+      final pl = await _ctrl.createPlaylistWithTracks(
+        name: draft.name,
+        tracks: draft.tracks,
+        sources: _selectedSources,
+        switchToPlaylist: i == 0,
+        autoPlay: false,
+      );
+      createdList.add(pl);
+    }
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          'AI 已自动创建 ${createdList.length} 个分类播放列表：${createdList.map((e) => "「${e.name}」").join("、")}',
+        ),
+      ),
+    );
+    if (Navigator.of(context).canPop()) {
+      Navigator.of(context).pop(true);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final screenSize = MediaQuery.sizeOf(context);
+    final isMobile = screenSize.width < 760;
+
+    return AlertDialog(
+      backgroundColor: VideoPlatformTheme.bgElevated,
+      insetPadding: EdgeInsets.symmetric(
+        horizontal: isMobile ? 10 : 24,
+        vertical: isMobile ? 12 : 20,
+      ),
+      titlePadding: const EdgeInsets.fromLTRB(20, 14, 12, 6),
+      contentPadding: const EdgeInsets.fromLTRB(20, 8, 20, 12),
+      title: Row(
+        children: [
+          Icon(
+            _activeTab == 0
+                ? Icons.manage_search_rounded
+                : Icons.auto_awesome_rounded,
+            color: VideoPlatformTheme.accent,
+            size: 22,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              _activeTab == 0
+                  ? '指定目录按人名 / 关键词查找并新建播放列表'
+                  : 'AI 智能分析指定目录并按分类自动生成播放列表',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: isMobile ? 14.5 : 16,
+                fontWeight: FontWeight.w800,
+                color: VideoPlatformTheme.textPrimary,
+              ),
+            ),
+          ),
+          IconButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            icon: const Icon(Icons.close_rounded, size: 20),
+          ),
+        ],
+      ),
+      content: SizedBox(
+        width: 860,
+        height: (screenSize.height * 0.76).clamp(420.0, 680.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Mode Switcher Tabs
+            Row(
+              children: [
+                Expanded(
+                  child: _buildModeTabButton(
+                    index: 0,
+                    icon: Icons.manage_search_rounded,
+                    label: '按人名 / 关键词搜歌新建列表',
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: _buildModeTabButton(
+                    index: 1,
+                    icon: Icons.auto_awesome_rounded,
+                    label: 'AI 智能分析目录自动分类建表',
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            // Target Directories Bar
+            _buildTargetDirectoriesCard(),
+            const SizedBox(height: 10),
+            Expanded(
+              child: _activeTab == 0
+                  ? _buildKeywordSearchTabBody()
+                  : _buildAiCategorizeTabBody(),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: const Text('关闭'),
+        ),
+        if (_activeTab == 0 && _matchedTracks.isNotEmpty) ...[
+          OutlinedButton.icon(
+            onPressed: () => _createPlaylistFromMatchedTracks(autoPlay: false),
+            icon: const Icon(Icons.playlist_add_check_rounded, size: 17),
+            label: Text(
+              '新建播放列表 (${_matchedTracks.length - _uncheckedTrackKeys.length} 首)',
+            ),
+          ),
+          FilledButton.icon(
+            onPressed: () => _createPlaylistFromMatchedTracks(autoPlay: true),
+            icon: const Icon(Icons.play_arrow_rounded, size: 17),
+            label: const Text('新建列表并立即播放'),
+          ),
+        ],
+        if (_activeTab == 1 && _aiDrafts.isNotEmpty)
+          FilledButton.icon(
+            onPressed: _createSelectedAiPlaylists,
+            icon: const Icon(Icons.auto_awesome_rounded, size: 17),
+            label: Text(
+              '一键生成所选 ${_selectedAiDraftIndices.length} 个分类播放列表',
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildModeTabButton({
+    required int index,
+    required IconData icon,
+    required String label,
+  }) {
+    final selected = _activeTab == index;
+    return InkWell(
+      borderRadius: BorderRadius.circular(10),
+      onTap: () => setState(() => _activeTab = index),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+        decoration: BoxDecoration(
+          color: selected
+              ? VideoPlatformTheme.accent.withValues(alpha: 0.22)
+              : VideoPlatformTheme.bgCard,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(
+            color: selected
+                ? VideoPlatformTheme.accent
+                : VideoPlatformTheme.borderSubtle,
+            width: selected ? 1.5 : 1.0,
+          ),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              icon,
+              size: 16,
+              color: selected
+                  ? VideoPlatformTheme.accent
+                  : VideoPlatformTheme.textSecondary,
+            ),
+            const SizedBox(width: 6),
+            Flexible(
+              child: Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                  color: selected
+                      ? VideoPlatformTheme.accent
+                      : VideoPlatformTheme.textSecondary,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTargetDirectoriesCard() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: VideoPlatformTheme.bgCard,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: VideoPlatformTheme.borderSubtle),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                Icons.folder_open_rounded,
+                size: 16,
+                color: VideoPlatformTheme.warning,
+              ),
+              const SizedBox(width: 6),
+              Text(
+                '指定扫描目录 (${_selectedSources.length} 个):',
+                style: TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w700,
+                  color: VideoPlatformTheme.textPrimary,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _selectedSources.isEmpty
+                    ? Text(
+                        '尚未选择目录，请点击右侧「选择指定目录」',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: VideoPlatformTheme.danger,
+                        ),
+                      )
+                    : SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        child: Row(
+                          children: [
+                            for (int i = 0; i < _selectedSources.length; i++)
+                              Padding(
+                                padding: const EdgeInsets.only(right: 6),
+                                child: InputChip(
+                                  visualDensity: VisualDensity.compact,
+                                  label: Text(
+                                    '${_selectedSources[i].mountName}: ${_selectedSources[i].title}',
+                                    style: const TextStyle(fontSize: 11.5),
+                                  ),
+                                  onDeleted: _selectedSources.length > 1
+                                      ? () => setState(() {
+                                            _selectedSources.removeAt(i);
+                                            _scannedAllTracks = const [];
+                                          })
+                                      : null,
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+              ),
+              const SizedBox(width: 8),
+              OutlinedButton.icon(
+                onPressed: _openDirectorySelectorSheet,
+                icon: const Icon(Icons.create_new_folder_outlined, size: 15),
+                label: const Text('选择指定目录', style: TextStyle(fontSize: 12)),
+              ),
+            ],
+          ),
+          if (_ctrl.savedMusicFolders.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  Text(
+                    '常用目录快选: ',
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: VideoPlatformTheme.textMuted,
+                    ),
+                  ),
+                  for (final fav in _ctrl.savedMusicFolders)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 6),
+                      child: FilterChip(
+                        visualDensity: VisualDensity.compact,
+                        label: Text(
+                          '${fav.mountName}: ${fav.title}',
+                          style: const TextStyle(fontSize: 11),
+                        ),
+                        selected: _selectedSources
+                            .any((s) => s.uniqueKey == fav.uniqueKey),
+                        onSelected: (sel) {
+                          setState(() {
+                            if (sel) {
+                              if (!_selectedSources
+                                  .any((s) => s.uniqueKey == fav.uniqueKey)) {
+                                _selectedSources.add(fav);
+                              }
+                            } else {
+                              _selectedSources.removeWhere(
+                                (s) => s.uniqueKey == fav.uniqueKey,
+                              );
+                            }
+                            _scannedAllTracks = const [];
+                          });
+                        },
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildKeywordSearchTabBody() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              flex: 3,
+              child: TextField(
+                controller: _keywordCtrl,
+                onChanged: (v) {
+                  if (!_playlistNameManuallyEdited) {
+                    _newPlaylistNameCtrl.text = v.trim();
+                  }
+                },
+                onSubmitted: (_) => _runKeywordSearchInSources(),
+                decoration: const InputDecoration(
+                  labelText: '输入指定人名 (歌手) 或关键词',
+                  hintText: '例如：周杰伦、陈奕迅、粤语、无损 (多个词用空格或逗号分隔)',
+                  prefixIcon: Icon(Icons.person_search_rounded, size: 18),
+                  isDense: true,
+                ),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              flex: 2,
+              child: TextField(
+                controller: _newPlaylistNameCtrl,
+                onChanged: (_) => _playlistNameManuallyEdited = true,
+                decoration: const InputDecoration(
+                  labelText: '新建播放列表名称',
+                  hintText: '默认使用查找的人名或关键词',
+                  prefixIcon: Icon(Icons.queue_music_rounded, size: 18),
+                  isDense: true,
+                ),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 10,
+          runSpacing: 6,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            ChoiceChip(
+              visualDensity: VisualDensity.compact,
+              label: const Text('匹配任一关键词 (OR)', style: TextStyle(fontSize: 11.5)),
+              selected: !_matchAllKeywords,
+              onSelected: (_) => setState(() => _matchAllKeywords = false),
+            ),
+            ChoiceChip(
+              visualDensity: VisualDensity.compact,
+              label: const Text('同时包含所有关键词 (AND)', style: TextStyle(fontSize: 11.5)),
+              selected: _matchAllKeywords,
+              onSelected: (_) => setState(() => _matchAllKeywords = true),
+            ),
+            FilterChip(
+              visualDensity: VisualDensity.compact,
+              label: const Text('包含子目录与压缩包', style: TextStyle(fontSize: 11.5)),
+              selected: _includeSubfolders,
+              onSelected: (v) => setState(() {
+                _includeSubfolders = v;
+                _scannedAllTracks = const [];
+              }),
+            ),
+            FilledButton.icon(
+              onPressed: _isSearchingTracks
+                  ? null
+                  : () => _runKeywordSearchInSources(createImmediately: false),
+              icon: const Icon(Icons.search_rounded, size: 16),
+              label: const Text('在指定目录中查找歌曲'),
+            ),
+            OutlinedButton.icon(
+              onPressed: _isSearchingTracks
+                  ? null
+                  : () => _runKeywordSearchInSources(createImmediately: true),
+              icon: const Icon(Icons.playlist_add_rounded, size: 16),
+              label: const Text('查找并直接新建播放列表'),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        if (_isSearchingTracks)
+          Expanded(
+            child: Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  CircularProgressIndicator(color: VideoPlatformTheme.accent),
+                  const SizedBox(height: 12),
+                  Text(
+                    _searchProgressText,
+                    style: TextStyle(color: VideoPlatformTheme.textSecondary),
+                  ),
+                ],
+              ),
+            ),
+          )
+        else if (_searchError != null)
+          Expanded(
+            child: Center(
+              child: Text(
+                _searchError!,
+                style: TextStyle(color: VideoPlatformTheme.danger),
+              ),
+            ),
+          )
+        else if (_matchedTracks.isEmpty)
+          Expanded(
+            child: Center(
+              child: Text(
+                '输入歌手人名（如“周杰伦”、“陈奕迅”）或关键词后，点击「在指定目录中查找歌曲」即可汇总并用找到的歌曲新建播放列表',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 13,
+                  color: VideoPlatformTheme.textMuted,
+                ),
+              ),
+            ),
+          )
+        else
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Text(
+                      '共找到 ${_matchedTracks.length} 首匹配歌曲（已勾选 ${_matchedTracks.length - _uncheckedTrackKeys.length} 首）',
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w700,
+                        color: VideoPlatformTheme.accent,
+                      ),
+                    ),
+                    const Spacer(),
+                    TextButton(
+                      onPressed: () =>
+                          setState(() => _uncheckedTrackKeys.clear()),
+                      child: const Text('全选', style: TextStyle(fontSize: 12)),
+                    ),
+                    TextButton(
+                      onPressed: () => setState(() {
+                        if (_uncheckedTrackKeys.length ==
+                            _matchedTracks.length) {
+                          _uncheckedTrackKeys.clear();
+                        } else {
+                          _uncheckedTrackKeys
+                            ..clear()
+                            ..addAll(_matchedTracks.map(_trackKey));
+                        }
+                      }),
+                      child: const Text('反选', style: TextStyle(fontSize: 12)),
+                    ),
+                  ],
+                ),
+                Expanded(
+                  child: Material(
+                    color: VideoPlatformTheme.bgCard,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      side: BorderSide(color: VideoPlatformTheme.borderSubtle),
+                    ),
+                    clipBehavior: Clip.antiAlias,
+                    child: ListView.separated(
+                      itemCount: _matchedTracks.length,
+                      separatorBuilder: (_, __) => Divider(
+                        height: 1,
+                        color: VideoPlatformTheme.borderSubtle,
+                      ),
+                      itemBuilder: (context, idx) {
+                        final track = _matchedTracks[idx];
+                        final key = _trackKey(track);
+                        final checked = !_uncheckedTrackKeys.contains(key);
+                        final meta = CloudMusicController.parseTrackMetadata(
+                          track,
+                          fallbackArtist: _ctrl.mountNameFor(track),
+                        );
+                        return CheckboxListTile(
+                          dense: true,
+                          value: checked,
+                          activeColor: VideoPlatformTheme.accent,
+                          onChanged: (v) {
+                            setState(() {
+                              if (v == true) {
+                                _uncheckedTrackKeys.remove(key);
+                              } else {
+                                _uncheckedTrackKeys.add(key);
+                              }
+                            });
+                          },
+                          title: Text(
+                            meta.title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          subtitle: Text(
+                            '${meta.artist} · ${track.path} · ${track.formattedSize}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: VideoPlatformTheme.textMuted,
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildAiCategorizeTabBody() {
+    final state = _ctrl.boundAppState;
+    final hasKey =
+        (state?.hasAiApiKey ?? false) || _inlineAiKeyCtrl.text.trim().isNotEmpty;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // AI API Key Status / Inline Configuration Bar
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: BoxDecoration(
+            color: VideoPlatformTheme.bgCard,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: hasKey
+                  ? VideoPlatformTheme.accent.withValues(alpha: 0.45)
+                  : VideoPlatformTheme.warning.withValues(alpha: 0.6),
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Icon(
+                    hasKey ? Icons.verified_rounded : Icons.key_rounded,
+                    size: 16,
+                    color: hasKey
+                        ? VideoPlatformTheme.success
+                        : VideoPlatformTheme.warning,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      hasKey
+                          ? 'AI 接口就绪：${(state?.effectiveAiProvider ?? _inlineAiProvider).toUpperCase()} · 模型：${state?.effectiveAiModel ?? "默认"}'
+                          : '尚未配置 AI API Key（可在下方直接填写，或在「设置」页中配置）',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: hasKey
+                            ? VideoPlatformTheme.textPrimary
+                            : VideoPlatformTheme.warning,
+                      ),
+                    ),
+                  ),
+                  TextButton.icon(
+                    onPressed: () => setState(
+                      () => _showInlineAiConfig = !_showInlineAiConfig,
+                    ),
+                    icon: Icon(
+                      _showInlineAiConfig
+                          ? Icons.expand_less_rounded
+                          : Icons.settings_rounded,
+                      size: 15,
+                    ),
+                    label: Text(
+                      _showInlineAiConfig ? '收起 Key 设置' : '设置 AI API Key',
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                  ),
+                ],
+              ),
+              if (_showInlineAiConfig) ...[
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: [
+                    for (final item in const [
+                      ('openai', 'OpenAI / 兼容'),
+                      ('deepseek', 'DeepSeek'),
+                      ('qwen', '通义千问'),
+                      ('gemini', 'Google Gemini'),
+                      ('claude', 'Claude'),
+                    ])
+                      ChoiceChip(
+                        visualDensity: VisualDensity.compact,
+                        label: Text(
+                          item.$2,
+                          style: const TextStyle(fontSize: 11),
+                        ),
+                        selected: _inlineAiProvider == item.$1,
+                        onSelected: (sel) {
+                          if (sel) {
+                            setState(() => _inlineAiProvider = item.$1);
+                          }
+                        },
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      flex: 3,
+                      child: TextField(
+                        controller: _inlineAiKeyCtrl,
+                        decoration: const InputDecoration(
+                          labelText: 'AI API Key',
+                          hintText: '输入 sk-... 或 AIza...',
+                          isDense: true,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      flex: 2,
+                      child: TextField(
+                        controller: _inlineAiModelCtrl,
+                        decoration: const InputDecoration(
+                          labelText: '模型 (可选)',
+                          hintText: 'gpt-4o-mini / deepseek-chat',
+                          isDense: true,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton(
+                      onPressed: _saveInlineAiSettings,
+                      child: const Text('保存 Key'),
+                    ),
+                  ],
+                ),
+              ],
+            ],
+          ),
+        ),
+        const SizedBox(height: 8),
+        // Classification Dimension Chips
+        Wrap(
+          spacing: 8,
+          runSpacing: 6,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            Text(
+              '分类方式:',
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+                color: VideoPlatformTheme.textSecondary,
+              ),
+            ),
+            for (final dim in const [
+              ('auto', 'AI 综合智能归类'),
+              ('artist', '按歌手 / 艺术家'),
+              ('genre', '按曲风 / 流派'),
+              ('mood', '按心情 / 场景'),
+              ('language', '按语种 / 地区'),
+              ('era', '按年代 / 时期'),
+            ])
+              ChoiceChip(
+                visualDensity: VisualDensity.compact,
+                label: Text(dim.$2, style: const TextStyle(fontSize: 11.5)),
+                selected: _aiDimension == dim.$1,
+                onSelected: (sel) {
+                  if (sel) setState(() => _aiDimension = dim.$1);
+                },
+              ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            Expanded(
+              child: TextField(
+                controller: _aiCustomInstructionCtrl,
+                decoration: const InputDecoration(
+                  labelText: '自定义分类要求 (可选)',
+                  hintText: '例如：帮我按粤语怀旧、周杰伦精选、适合开车听的快歌分成三类',
+                  isDense: true,
+                ),
+              ),
+            ),
+            const SizedBox(width: 10),
+            FilledButton.icon(
+              onPressed: _isAnalyzingAi
+                  ? null
+                  : () => _runAiDirectoryAnalysis(createImmediately: false),
+              icon: const Icon(Icons.auto_awesome_rounded, size: 16),
+              label: const Text('AI 分析目录并预览分类'),
+            ),
+            const SizedBox(width: 8),
+            OutlinedButton.icon(
+              onPressed: _isAnalyzingAi
+                  ? null
+                  : () => _runAiDirectoryAnalysis(createImmediately: true),
+              icon: const Icon(Icons.playlist_add_check_rounded, size: 16),
+              label: const Text('AI 分析并直接生成列表'),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        if (_isAnalyzingAi)
+          Expanded(
+            child: Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  CircularProgressIndicator(color: VideoPlatformTheme.accent),
+                  const SizedBox(height: 12),
+                  Text(
+                    _aiProgressText,
+                    style: TextStyle(color: VideoPlatformTheme.textSecondary),
+                  ),
+                ],
+              ),
+            ),
+          )
+        else if (_aiError != null)
+          Expanded(
+            child: Center(
+              child: Text(
+                _aiError!,
+                textAlign: TextAlign.center,
+                style: TextStyle(color: VideoPlatformTheme.danger),
+              ),
+            ),
+          )
+        else if (_aiDrafts.isEmpty)
+          Expanded(
+            child: Center(
+              child: Text(
+                '选择分类方式后，点击「AI 分析目录并预览分类」，AI 将自动扫描指定目录中的全部歌曲并按分类生成多个播放列表',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 13,
+                  color: VideoPlatformTheme.textMuted,
+                ),
+              ),
+            ),
+          )
+        else
+          Expanded(
+            child: ListView.separated(
+              itemCount: _aiDrafts.length,
+              separatorBuilder: (_, __) => const SizedBox(height: 8),
+              itemBuilder: (context, idx) {
+                final draft = _aiDrafts[idx];
+                final checked = _selectedAiDraftIndices.contains(idx);
+                final previewNames = draft.tracks
+                    .take(6)
+                    .map((t) => CloudMusicController.parseTrackMetadata(t).title)
+                    .join('、');
+
+                return Material(
+                  color: VideoPlatformTheme.bgCard,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10),
+                    side: BorderSide(
+                      color: checked
+                          ? VideoPlatformTheme.accent
+                          : VideoPlatformTheme.borderSubtle,
+                    ),
+                  ),
+                  clipBehavior: Clip.antiAlias,
+                  child: CheckboxListTile(
+                    value: checked,
+                    activeColor: VideoPlatformTheme.accent,
+                    onChanged: (v) {
+                      setState(() {
+                        if (v == true) {
+                          _selectedAiDraftIndices.add(idx);
+                        } else {
+                          _selectedAiDraftIndices.remove(idx);
+                        }
+                      });
+                    },
+                    title: Row(
+                      children: [
+                        Icon(
+                          Icons.queue_music_rounded,
+                          size: 17,
+                          color: VideoPlatformTheme.accent,
+                        ),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            draft.name,
+                            style: const TextStyle(
+                              fontSize: 14,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: VideoPlatformTheme.accent
+                                .withValues(alpha: 0.16),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Text(
+                            '${draft.tracks.length} 首',
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w700,
+                              color: VideoPlatformTheme.accent,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    subtitle: Padding(
+                      padding: const EdgeInsets.only(top: 4),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          if (draft.description.isNotEmpty)
+                            Text(
+                              draft.description,
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: VideoPlatformTheme.textSecondary,
+                              ),
+                            ),
+                          const SizedBox(height: 2),
+                          Text(
+                            '包含曲目：$previewNames${draft.tracks.length > 6 ? " 等 ${draft.tracks.length} 首" : ""}',
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              color: VideoPlatformTheme.textMuted,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _SmartPlaylistDirectoryPickerDialog extends StatefulWidget {
+  final CloudMusicController controller;
+  final List<SavedMusicFolderItem> initialSelected;
+
+  const _SmartPlaylistDirectoryPickerDialog({
+    required this.controller,
+    required this.initialSelected,
+  });
+
+  @override
+  State<_SmartPlaylistDirectoryPickerDialog> createState() =>
+      _SmartPlaylistDirectoryPickerDialogState();
+}
+
+class _SmartPlaylistDirectoryPickerDialogState
+    extends State<_SmartPlaylistDirectoryPickerDialog> {
+  StorageMount? _activeMount;
+  String _currentPath = '/';
+  String _currentTitle = '根目录';
+  final List<({String path, String title})> _breadcrumbs = [];
+  List<FileEntry> _entries = const [];
+  bool _isLoading = false;
+  late final List<SavedMusicFolderItem> _selected;
+
+  @override
+  void initState() {
+    super.initState();
+    _selected = List<SavedMusicFolderItem>.from(widget.initialSelected);
+    if (widget.controller.availableMounts.isNotEmpty) {
+      _selectMount(widget.controller.availableMounts.first);
+    }
+  }
+
+  Future<void> _selectMount(StorageMount mount) async {
+    setState(() {
+      _activeMount = mount;
+      _currentPath = mount.rootPath;
+      _currentTitle = mount.name;
+      _breadcrumbs
+        ..clear()
+        ..add((path: mount.rootPath, title: mount.name));
+    });
+    await _loadDir(mount.rootPath, title: mount.name, pushCrumb: false);
+  }
+
+  Future<void> _loadDir(
+    String path, {
+    required String title,
+    bool pushCrumb = true,
+  }) async {
+    final mount = _activeMount;
+    if (mount == null) return;
+    setState(() {
+      _isLoading = true;
+      _currentPath = path;
+      _currentTitle = title;
+      if (pushCrumb) {
+        final idx = _breadcrumbs.indexWhere((b) => b.path == path);
+        if (idx >= 0) {
+          _breadcrumbs.removeRange(idx + 1, _breadcrumbs.length);
+        } else {
+          _breadcrumbs.add((path: path, title: title));
+        }
+      }
+    });
+    try {
+      final list = await widget.controller.listDirectoryForMount(mount, path);
+      if (!mounted) return;
+      setState(() {
+        _entries = list
+            .where((e) => e.isDir || e.isStreamableMusicArchive)
+            .toList();
+        _isLoading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _isLoading = false);
+    }
+  }
+
+  SavedMusicFolderItem _currentDirItem() {
+    final m = _activeMount!;
+    return SavedMusicFolderItem(
+      mountId: m.id,
+      mountName: m.name,
+      sourceKind: m.kind,
+      path: _currentPath,
+      title: _currentTitle,
+    );
+  }
+
+  void _toggleItem(SavedMusicFolderItem item) {
+    setState(() {
+      final idx = _selected.indexWhere((s) => s.uniqueKey == item.uniqueKey);
+      if (idx >= 0) {
+        _selected.removeAt(idx);
+      } else {
+        _selected.add(item);
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final mounts = widget.controller.availableMounts;
+    final activeMount = _activeMount;
+
+    return AlertDialog(
+      backgroundColor: VideoPlatformTheme.bgElevated,
+      title: const Text('选择要扫描或 AI 分析的音乐目录'),
+      content: SizedBox(
+        width: 660,
+        height: 420,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  for (final m in mounts)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: ChoiceChip(
+                        label: Text(m.name),
+                        selected: activeMount?.id == m.id,
+                        onSelected: (_) => _selectMount(m),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 8),
+            if (activeMount != null)
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      '当前位置：${_breadcrumbs.map((b) => b.title).join(" / ")}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: VideoPlatformTheme.textSecondary,
+                      ),
+                    ),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: () => _toggleItem(_currentDirItem()),
+                    icon: const Icon(Icons.check_box_outlined, size: 15),
+                    label: const Text('勾选当前目录', style: TextStyle(fontSize: 12)),
+                  ),
+                ],
+              ),
+            const SizedBox(height: 8),
+            Expanded(
+              child: _isLoading
+                  ? const Center(child: CircularProgressIndicator())
+                  : ListView.builder(
+                      itemCount: _entries.length,
+                      itemBuilder: (context, idx) {
+                        final e = _entries[idx];
+                        final item = SavedMusicFolderItem(
+                          mountId: activeMount!.id,
+                          mountName: activeMount.name,
+                          sourceKind: activeMount.kind,
+                          path: e.path,
+                          title: e.name,
+                          isArchive: e.isStreamableMusicArchive,
+                          size: e.size,
+                          pickcode115: e.pickcode115,
+                        );
+                        final checked = _selected
+                            .any((s) => s.uniqueKey == item.uniqueKey);
+                        return ListTile(
+                          dense: true,
+                          leading: Icon(
+                            e.isDir
+                                ? Icons.folder_rounded
+                                : Icons.folder_zip_rounded,
+                            color: VideoPlatformTheme.warning,
+                          ),
+                          title: Text(e.name),
+                          onTap: e.isDir
+                              ? () => _loadDir(e.path, title: e.name)
+                              : () => _toggleItem(item),
+                          trailing: Checkbox(
+                            value: checked,
+                            onChanged: (_) => _toggleItem(item),
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          onPressed: () {
+            if (_selected.isEmpty && _activeMount != null) {
+              _selected.add(_currentDirItem());
+            }
+            Navigator.of(context).pop(_selected);
+          },
+          child: Text('确定选择 (${_selected.isEmpty ? 1 : _selected.length})'),
+        ),
+      ],
     );
   }
 }

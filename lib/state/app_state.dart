@@ -139,11 +139,19 @@ class AppState extends ChangeNotifier {
   static const _prefFavoritesClearedAtMsKey = 'm3u8_favorites_cleared_at_ms_v1';
   static const _prefDeletedHistoryKeysKey = 'm3u8_deleted_history_keys_v1';
   static const _prefDeletedFavoritesKeysKey = 'm3u8_deleted_favorites_keys_v1';
+  static const _prefAiProviderKey = 'm3u8_ai_provider_v1';
+  static const _prefAiApiKeyKey = 'm3u8_ai_api_key_v1';
+  static const _prefAiBaseUrlKey = 'm3u8_ai_base_url_v1';
+  static const _prefAiModelKey = 'm3u8_ai_model_v1';
 
   ServerConfig _serverConfig = const ServerConfig();
   late final ApiClient api;
 
   String _themeId = 'ocean_dark';
+  String _aiProvider = 'openai';
+  String _aiApiKey = '';
+  String _aiBaseUrl = '';
+  String _aiModel = '';
   bool _vodFilterM3u8Ads = true;
   int _vodSkipIntroSeconds = 0;
   int _vodSkipOutroSeconds = 0;
@@ -332,6 +340,86 @@ class AppState extends ChangeNotifier {
   // Getters
   ServerConfig get serverConfig => _serverConfig;
   String get themeId => _themeId;
+  String get aiProvider => _aiProvider;
+  String get aiApiKey => _aiApiKey;
+  String get aiBaseUrl => _aiBaseUrl;
+  String get aiModel => _aiModel;
+  bool get hasAiApiKey => _aiApiKey.trim().isNotEmpty;
+
+  String get effectiveAiProvider {
+    final key = _aiApiKey.trim();
+    if (_aiProvider == 'gemini' || key.startsWith('AIza')) {
+      return 'gemini';
+    }
+    if (_aiProvider == 'claude' || key.startsWith('sk-ant-')) {
+      return 'claude';
+    }
+    return _aiProvider.isEmpty ? 'openai' : _aiProvider;
+  }
+
+  String get effectiveAiBaseUrl {
+    final custom = _aiBaseUrl.trim();
+    if (custom.isNotEmpty) {
+      return custom.replaceAll(RegExp(r'/+$'), '');
+    }
+    switch (effectiveAiProvider) {
+      case 'gemini':
+        return 'https://generativelanguage.googleapis.com/v1beta';
+      case 'deepseek':
+        return 'https://api.deepseek.com/v1';
+      case 'qwen':
+        return 'https://dashscope.aliyuncs.com/compatible-mode/v1';
+      case 'claude':
+        return 'https://api.anthropic.com/v1';
+      case 'openai':
+      default:
+        return 'https://api.openai.com/v1';
+    }
+  }
+
+  String get effectiveAiModel {
+    final custom = _aiModel.trim();
+    if (custom.isNotEmpty) return custom;
+    switch (effectiveAiProvider) {
+      case 'gemini':
+        return 'gemini-2.0-flash';
+      case 'deepseek':
+        return 'deepseek-chat';
+      case 'qwen':
+        return 'qwen-plus';
+      case 'claude':
+        return 'claude-3-5-haiku-latest';
+      case 'openai':
+      default:
+        return 'gpt-4o-mini';
+    }
+  }
+
+  Future<void> saveAiConfig({
+    String? provider,
+    required String apiKey,
+    String? baseUrl,
+    String? model,
+  }) async {
+    if (provider != null && provider.trim().isNotEmpty) {
+      _aiProvider = provider.trim();
+    }
+    _aiApiKey = apiKey.trim();
+    if (baseUrl != null) {
+      _aiBaseUrl = baseUrl.trim();
+    }
+    if (model != null) {
+      _aiModel = model.trim();
+    }
+    notifyListeners();
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_prefAiProviderKey, _aiProvider);
+      await prefs.setString(_prefAiApiKeyKey, _aiApiKey);
+      await prefs.setString(_prefAiBaseUrlKey, _aiBaseUrl);
+      await prefs.setString(_prefAiModelKey, _aiModel);
+    } catch (_) {}
+  }
   bool get vodFilterM3u8Ads => _vodFilterM3u8Ads;
   int get vodSkipIntroSeconds => _vodSkipIntroSeconds;
   int get vodSkipOutroSeconds => _vodSkipOutroSeconds;
@@ -502,6 +590,10 @@ class AppState extends ChangeNotifier {
       if (deletedFavs != null) {
         _deletedFavoritesKeys = deletedFavs.toSet();
       }
+      _aiProvider = prefs.getString(_prefAiProviderKey) ?? 'openai';
+      _aiApiKey = prefs.getString(_prefAiApiKeyKey) ?? '';
+      _aiBaseUrl = prefs.getString(_prefAiBaseUrlKey) ?? '';
+      _aiModel = prefs.getString(_prefAiModelKey) ?? '';
 
       // Detect Android TV (Leanback) or Apple TV (tvOS / AirPlay)
       final tvInfo = await TvPlatformService.detectPlatformTvInfo();

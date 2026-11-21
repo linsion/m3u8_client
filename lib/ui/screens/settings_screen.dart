@@ -49,6 +49,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final TextEditingController _cookie115Ctrl = TextEditingController();
   bool _isBusy115 = false;
 
+  // AI Smart Music Categorization state
+  late String _aiProvider;
+  late final TextEditingController _aiApiKeyCtrl;
+  late final TextEditingController _aiBaseUrlCtrl;
+  late final TextEditingController _aiModelCtrl;
+  bool _obscureAiKey = true;
+
   final ScrollController _settingsScrollController = ScrollController();
   final Map<String, FocusNode> _themeCardFocusNodes = {
     for (final p in VideoPlatformTheme.presets)
@@ -63,6 +70,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _secretCtrl = TextEditingController(text: cfg.secret);
     _authMode = cfg.authMode;
     _preferDirectPlayback = cfg.preferDirectPlayback;
+    _aiProvider = widget.appState.aiProvider;
+    _aiApiKeyCtrl = TextEditingController(text: widget.appState.aiApiKey);
+    _aiBaseUrlCtrl = TextEditingController(text: widget.appState.aiBaseUrl);
+    _aiModelCtrl = TextEditingController(text: widget.appState.aiModel);
     widget.appState.activeChildDownFromHeaderHandler = _focusActiveThemeCard;
     _loadBackendSettingsAnd115();
   }
@@ -101,6 +112,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _maxWorkersCtrl.dispose();
     _elevenDirIdCtrl.dispose();
     _cookie115Ctrl.dispose();
+    _aiApiKeyCtrl.dispose();
+    _aiBaseUrlCtrl.dispose();
+    _aiModelCtrl.dispose();
     super.dispose();
   }
 
@@ -984,6 +998,180 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                 setState(() => _disable115Api = v),
                           ),
                         ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              // 3.5. AI Smart Music Analysis & Playlist Categorization Settings
+              _buildSectionCard(
+                title: 'AI 智能音乐分析与 API Key 设置',
+                subtitle:
+                    '用于音乐模块对指定目录进行 AI 分析，按歌手、曲风、情感、语种或年代自动归类并生成播放列表（支持 OpenAI / DeepSeek / 通义千问 / Google Gemini / Claude）',
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        for (final item in const [
+                          ('openai', 'OpenAI / 兼容接口'),
+                          ('deepseek', 'DeepSeek 官方'),
+                          ('qwen', '阿里云通义千问'),
+                          ('gemini', 'Google Gemini'),
+                          ('claude', 'Anthropic Claude'),
+                        ])
+                          ChoiceChip(
+                            label: Text(
+                              item.$2,
+                              style: const TextStyle(fontSize: 12),
+                            ),
+                            selected: _aiProvider == item.$1,
+                            selectedColor:
+                                VideoPlatformTheme.accent.withValues(alpha: 0.25),
+                            onSelected: (sel) {
+                              if (sel) {
+                                setState(() => _aiProvider = item.$1);
+                              }
+                            },
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: _aiApiKeyCtrl,
+                      obscureText: _obscureAiKey,
+                      decoration: InputDecoration(
+                        labelText: 'AI API Key',
+                        hintText: switch (_aiProvider) {
+                          'gemini' => 'AIzaSy...',
+                          'claude' => 'sk-ant-...',
+                          _ => 'sk-...',
+                        },
+                        suffixIcon: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            IconButton(
+                              tooltip: _obscureAiKey ? '显示 API Key' : '隐藏 API Key',
+                              icon: Icon(
+                                _obscureAiKey
+                                    ? Icons.visibility_off_outlined
+                                    : Icons.visibility_outlined,
+                                size: 18,
+                              ),
+                              onPressed: () =>
+                                  setState(() => _obscureAiKey = !_obscureAiKey),
+                            ),
+                            IconButton(
+                              tooltip: '从剪贴板粘贴',
+                              icon: const Icon(
+                                Icons.content_paste_rounded,
+                                size: 18,
+                              ),
+                              onPressed: () async {
+                                final data =
+                                    await Clipboard.getData(Clipboard.kTextPlain);
+                                final text = data?.text?.trim() ?? '';
+                                if (text.isNotEmpty && mounted) {
+                                  setState(() => _aiApiKeyCtrl.text = text);
+                                }
+                              },
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Expanded(
+                          flex: 3,
+                          child: TextField(
+                            controller: _aiBaseUrlCtrl,
+                            decoration: InputDecoration(
+                              labelText: 'AI 接口地址 Base URL (可选，留空自动使用官方默认)',
+                              hintText: switch (_aiProvider) {
+                                'deepseek' => 'https://api.deepseek.com/v1',
+                                'qwen' =>
+                                  'https://dashscope.aliyuncs.com/compatible-mode/v1',
+                                'gemini' =>
+                                  'https://generativelanguage.googleapis.com/v1beta',
+                                'claude' => 'https://api.anthropic.com/v1',
+                                _ => 'https://api.openai.com/v1',
+                              },
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          flex: 2,
+                          child: TextField(
+                            controller: _aiModelCtrl,
+                            decoration: InputDecoration(
+                              labelText: 'AI 模型名称 (可选，留空默认)',
+                              hintText: switch (_aiProvider) {
+                                'deepseek' => 'deepseek-chat',
+                                'qwen' => 'qwen-plus',
+                                'gemini' => 'gemini-2.0-flash',
+                                'claude' => 'claude-3-5-haiku-latest',
+                                _ => 'gpt-4o-mini',
+                              },
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Wrap(
+                      spacing: 12,
+                      runSpacing: 8,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        FilledButton.icon(
+                          onPressed: () async {
+                            final messenger = ScaffoldMessenger.of(context);
+                            await state.saveAiConfig(
+                              provider: _aiProvider,
+                              apiKey: _aiApiKeyCtrl.text.trim(),
+                              baseUrl: _aiBaseUrlCtrl.text.trim(),
+                              model: _aiModelCtrl.text.trim(),
+                            );
+                            if (!mounted) return;
+                            messenger.showSnackBar(
+                              SnackBar(
+                                content: Text(
+                                  state.hasAiApiKey
+                                      ? 'AI API Key 与模型配置已保存 (${state.effectiveAiModel})'
+                                      : '已清空 AI API Key 配置',
+                                ),
+                              ),
+                            );
+                          },
+                          icon: const Icon(Icons.auto_awesome_rounded, size: 16),
+                          label: const Text('保存 AI 设置'),
+                        ),
+                        if (state.hasAiApiKey)
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.check_circle_rounded,
+                                size: 16,
+                                color: VideoPlatformTheme.success,
+                              ),
+                              const SizedBox(width: 4),
+                              Text(
+                                '已配置 AI Key · 当前模型：${state.effectiveAiModel}',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: VideoPlatformTheme.success,
+                                ),
+                              ),
+                            ],
+                          ),
                       ],
                     ),
                   ],

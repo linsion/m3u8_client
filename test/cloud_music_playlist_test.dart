@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:m3u8_client/models/models.dart';
+import 'package:m3u8_client/state/app_state.dart';
 import 'package:m3u8_client/ui/widgets/cloud_music_player.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -182,4 +183,202 @@ void main() {
     await tester.pumpAndSettle();
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets(
+    'Music module searches specified directory by artist or keywords to create playlist and AI categorizes directory tracks into playlists with configured AI API key',
+    (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      final appState = AppState();
+      addTearDown(appState.dispose);
+
+      // 1. Verify setting and persisting AI API Key in AppState (as used by SettingsScreen)
+      await appState.saveAiConfig(
+        provider: 'deepseek',
+        apiKey: 'sk-test-music-ai-key-123456',
+        baseUrl: 'https://api.deepseek.com/v1',
+        model: 'deepseek-chat',
+      );
+      expect(appState.hasAiApiKey, isTrue);
+      expect(appState.aiApiKey, 'sk-test-music-ai-key-123456');
+      expect(appState.effectiveAiProvider, 'deepseek');
+      expect(appState.effectiveAiModel, 'deepseek-chat');
+
+      final prefs = await SharedPreferences.getInstance();
+      expect(
+        prefs.getString('m3u8_ai_api_key_v1'),
+        'sk-test-music-ai-key-123456',
+      );
+
+      // 2. Set up fake directory tree for a specified music directory (/华语精选)
+      final controller = CloudMusicController(appState: appState);
+      controller.customDirectoryLister = (mount, path) async {
+        if (path == '/华语精选') {
+          return const [
+            FileEntry(
+              name: '周杰伦',
+              path: '/华语精选/周杰伦',
+              size: 0,
+              modTime: '',
+              isDir: true,
+              isMp4: false,
+              ext: '',
+            ),
+            FileEntry(
+              name: '陈奕迅 - 富士山下 (粤语经典).flac',
+              path: '/华语精选/陈奕迅 - 富士山下 (粤语经典).flac',
+              size: 32000000,
+              modTime: '',
+              isDir: false,
+              isMp4: false,
+              ext: '.flac',
+            ),
+            FileEntry(
+              name: '陈奕迅 - 浮夸 (粤语Live).flac',
+              path: '/华语精选/陈奕迅 - 浮夸 (粤语Live).flac',
+              size: 35000000,
+              modTime: '',
+              isDir: false,
+              isMp4: false,
+              ext: '.flac',
+            ),
+            FileEntry(
+              name: 'Beyond - 海阔天空 (粤语摇滚).flac',
+              path: '/华语精选/Beyond - 海阔天空 (粤语摇滚).flac',
+              size: 38000000,
+              modTime: '',
+              isDir: false,
+              isMp4: false,
+              ext: '.flac',
+            ),
+          ];
+        }
+        if (path == '/华语精选/周杰伦') {
+          return const [
+            FileEntry(
+              name: '01. 七里香.flac',
+              path: '/华语精选/周杰伦/01. 七里香.flac',
+              size: 29000000,
+              modTime: '',
+              isDir: false,
+              isMp4: false,
+              ext: '.flac',
+            ),
+            FileEntry(
+              name: '02. 夜曲.flac',
+              path: '/华语精选/周杰伦/02. 夜曲.flac',
+              size: 27000000,
+              modTime: '',
+              isDir: false,
+              isMp4: false,
+              ext: '.flac',
+            ),
+          ];
+        }
+        return const [];
+      };
+      addTearDown(() {
+        controller.customDirectoryLister = null;
+        controller.customAiCompletionHandler = null;
+      });
+
+      const targetDir = SavedMusicFolderItem(
+        mountId: 'builtin_server',
+        mountName: '流光服务端',
+        sourceKind: StorageSourceKind.server,
+        path: '/华语精选',
+        title: '华语精选',
+      );
+
+      // 3. Test searching the specified directory by artist name ('周杰伦') and creating a new playlist
+      final jayPlaylist = await controller.searchSourcesAndCreatePlaylist(
+        sources: const [targetDir],
+        query: '周杰伦',
+        playlistName: '周杰伦专场',
+        autoPlay: false,
+      );
+      expect(jayPlaylist, isNotNull);
+      expect(jayPlaylist!.name, '周杰伦专场');
+      expect(
+        jayPlaylist.tracks.map((t) => t.name).toList(),
+        ['01. 七里香.flac', '02. 夜曲.flac'],
+      );
+      expect(controller.activePlaylistId, jayPlaylist.id);
+
+      // 4. Test searching the specified directory by keyword ('粤语') via CloudMusicSmartPlaylistDialog UI
+      tester.view.devicePixelRatio = 1;
+      tester.view.physicalSize = const Size(1280, 900);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      addTearDown(tester.view.resetPhysicalSize);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: ThemeData.dark(),
+          home: Scaffold(
+            body: CloudMusicSmartPlaylistDialog(
+              controller: controller,
+              initialSources: const [targetDir],
+              initialTab: 0,
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.enterText(
+        find.widgetWithText(TextField, '输入指定人名 (歌手) 或关键词'),
+        '粤语',
+      );
+      await tester.pump();
+      await tester.tap(find.text('在指定目录中查找歌曲'));
+      await tester.pumpAndSettle();
+
+      // Should find the 3 Cantonese songs in /华语精选
+      expect(find.textContaining('共找到 3 首匹配歌曲'), findsOneWidget);
+      expect(find.text('富士山下 (粤语经典)'), findsOneWidget);
+      expect(find.text('浮夸 (粤语Live)'), findsOneWidget);
+      expect(find.text('海阔天空 (粤语摇滚)'), findsOneWidget);
+
+      await tester.tap(find.text('新建播放列表 (3 首)'));
+      await tester.pumpAndSettle();
+
+      expect(controller.activePlaylistName, '粤语');
+      expect(controller.queue.length, 3);
+
+      // 5. Test AI analysis on the specified directory to automatically categorize and generate playlists
+      String capturedAiPrompt = '';
+      controller.customAiCompletionHandler = (prompt) async {
+        capturedAiPrompt = prompt;
+        return '''
+```json
+{
+  "playlists": [
+    {
+      "name": "AI · 粤语经典金曲",
+      "description": "陈奕迅与Beyond粤语代表作",
+      "track_ids": [0, 1, 2]
+    },
+    {
+      "name": "AI · 周杰伦华语流行",
+      "description": "周杰伦经典主打歌",
+      "track_ids": [3, 4]
+    }
+  ]
+}
+```
+''';
+      };
+
+      final aiCreated = await controller.analyzeSourcesAndCreatePlaylistsWithAi(
+        sources: const [targetDir],
+        dimension: 'genre',
+        customInstruction: '按粤语经典与周杰伦华语流行分类',
+      );
+      expect(capturedAiPrompt, contains('按粤语经典与周杰伦华语流行分类'));
+      expect(aiCreated.length, 2);
+      expect(aiCreated[0].name, 'AI · 粤语经典金曲');
+      expect(aiCreated[0].tracks.length, 3);
+      expect(aiCreated[1].name, 'AI · 周杰伦华语流行');
+      expect(aiCreated[1].tracks.length, 2);
+    },
+  );
 }

@@ -358,8 +358,6 @@ class _TelegramScreenState extends State<TelegramScreen> {
   final GlobalKey _conversationBottomBarKey = GlobalKey();
   final FocusNode _headerConversationActionFocusNode =
       FocusNode(debugLabel: 'TgHeaderConvAction');
-  final FocusNode _bottomConversationActionFocusNode =
-      FocusNode(debugLabel: 'TgBottomConvAction');
 
   static const MethodChannel _nativeUtilsChannel = MethodChannel(
     'com.linsion.m3u8_client/native_utils',
@@ -367,6 +365,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
   final bool _isSendingMessage = false;
   bool _showScrollToBottomBtn = false;
+  bool _isHeaderDangerActionExpanded = false;
   DateTime _lastLoadOlderAt = DateTime.fromMillisecondsSinceEpoch(0);
   String _statusBanner = '正在连接 Telegram...';
   bool _statusIsError = false;
@@ -1456,7 +1455,6 @@ class _TelegramScreenState extends State<TelegramScreen> {
     _messageScrollController.dispose();
     _composeFocusNode.dispose();
     _headerConversationActionFocusNode.dispose();
-    _bottomConversationActionFocusNode.dispose();
     super.dispose();
   }
 
@@ -1731,7 +1729,6 @@ class _TelegramScreenState extends State<TelegramScreen> {
       }
       if (_focusFirstInContainer(
         _conversationHeaderContainerKey,
-        preferred: _headerConversationActionFocusNode,
       )) {
         return KeyEventResult.handled;
       }
@@ -1761,7 +1758,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
       }
       if (_focusFirstInContainer(
         _conversationBottomBarKey,
-        preferred: _bottomConversationActionFocusNode,
+        preferred: _composeFocusNode,
       )) {
         return KeyEventResult.handled;
       }
@@ -2525,7 +2522,10 @@ class _TelegramScreenState extends State<TelegramScreen> {
   }
 
   Future<void> _selectChat(TelegramChat chat) async {
-    if (_selectedChat?.peer != chat.peer) _inlinePlaybackOwner.value = null;
+    if (_selectedChat?.peer != chat.peer) {
+      _inlinePlaybackOwner.value = null;
+      _isHeaderDangerActionExpanded = false;
+    }
     _userExitedChat = false;
     _saveCurrentDraft();
     _saveCurrentChatToMemoryCache();
@@ -6405,25 +6405,6 @@ class _TelegramScreenState extends State<TelegramScreen> {
                       color: tg.textSecondary,
                     ),
                   ),
-                  if (_selectedChat != null &&
-                      _selectedChat!.conversationActionLabel.isNotEmpty) ...[
-                    const SizedBox(width: 2),
-                    _buildTvFocusableActionChip(
-                      icon: _selectedChat!.conversationActionType ==
-                              'delete_contact'
-                          ? Icons.person_remove_outlined
-                          : Icons.logout_rounded,
-                      label: null,
-                      tooltip: _selectedChat!.conversationActionLabel,
-                      textColor: const Color(0xFFE54D42),
-                      bgColor: const Color(0x22E54D42),
-                      compact: true,
-                      onTap: () => _confirmAndPerformConversationAction(
-                        tg,
-                        _selectedChat!,
-                      ),
-                    ),
-                  ],
                 ],
               ),
             ),
@@ -7500,20 +7481,50 @@ class _TelegramScreenState extends State<TelegramScreen> {
                         ),
                         if (chat.conversationActionLabel.isNotEmpty) ...[
                           const SizedBox(width: 6),
-                          _buildTvFocusableActionChip(
-                            focusNode: _headerConversationActionFocusNode,
-                            icon: chat.conversationActionType ==
-                                    'delete_contact'
-                                ? Icons.person_remove_outlined
-                                : Icons.logout_rounded,
-                            label: chat.conversationActionLabel,
-                            tooltip: chat.conversationActionLabel,
-                            textColor: const Color(0xFFFF6B6B),
-                            bgColor: const Color(0x28E54D42),
-                            compact: true,
-                            onTap: () =>
-                                _confirmAndPerformConversationAction(tg, chat),
-                          ),
+                          if (!_isHeaderDangerActionExpanded)
+                            _buildTvFocusableActionChip(
+                              icon: Icons.more_horiz_rounded,
+                              label: null,
+                              tooltip: '展开${chat.conversationActionLabel}',
+                              textColor: tg.textSecondary,
+                              bgColor: tg.searchFill,
+                              compact: true,
+                              onTap: () => setState(
+                                () => _isHeaderDangerActionExpanded = true,
+                              ),
+                            )
+                          else ...[
+                            _buildTvFocusableActionChip(
+                              focusNode: _headerConversationActionFocusNode,
+                              icon: chat.conversationActionType ==
+                                      'delete_contact'
+                                  ? Icons.person_remove_outlined
+                                  : Icons.logout_rounded,
+                              label: chat.conversationActionLabel,
+                              tooltip: chat.conversationActionLabel,
+                              textColor: const Color(0xFFFF6B6B),
+                              bgColor: const Color(0x28E54D42),
+                              compact: true,
+                              onTap: () {
+                                setState(
+                                  () => _isHeaderDangerActionExpanded = false,
+                                );
+                                _confirmAndPerformConversationAction(tg, chat);
+                              },
+                            ),
+                            const SizedBox(width: 4),
+                            _buildTvFocusableActionChip(
+                              icon: Icons.chevron_right_rounded,
+                              label: null,
+                              tooltip: '折叠${chat.conversationActionLabel}',
+                              textColor: tg.textSecondary,
+                              bgColor: tg.searchFill,
+                              compact: true,
+                              onTap: () => setState(
+                                () => _isHeaderDangerActionExpanded = false,
+                              ),
+                            ),
+                          ],
                         ],
                       ],
                     ),
@@ -11845,20 +11856,6 @@ class _TelegramScreenState extends State<TelegramScreen> {
                   () => _showRightInfoPanel = !_showRightInfoPanel,
                 ),
               ),
-              if (chat.conversationActionLabel.isNotEmpty) ...[
-                const SizedBox(width: 8),
-                _buildTvFocusableActionChip(
-                  focusNode: _bottomConversationActionFocusNode,
-                  icon: chat.conversationActionType == 'delete_contact'
-                      ? Icons.person_remove_outlined
-                      : Icons.logout_rounded,
-                  label: chat.conversationActionLabel,
-                  textColor: const Color(0xFFFF6B6B),
-                  bgColor: const Color(0x28E54D42),
-                  compact: true,
-                  onTap: () => _confirmAndPerformConversationAction(tg, chat),
-                ),
-              ],
             ],
           ),
         ),
@@ -12541,20 +12538,6 @@ class _TelegramScreenState extends State<TelegramScreen> {
                           ),
                   ),
                 ),
-                if (chat.conversationActionLabel.isNotEmpty) ...[
-                  const SizedBox(width: 6),
-                  _buildTvFocusableActionChip(
-                    focusNode: _bottomConversationActionFocusNode,
-                    icon: chat.conversationActionType == 'delete_contact'
-                        ? Icons.person_remove_outlined
-                        : Icons.logout_rounded,
-                    label: chat.conversationActionLabel,
-                    textColor: const Color(0xFFFF6B6B),
-                    bgColor: const Color(0x28E54D42),
-                    compact: true,
-                    onTap: () => _confirmAndPerformConversationAction(tg, chat),
-                  ),
-                ],
               ],
             ),
           ),
