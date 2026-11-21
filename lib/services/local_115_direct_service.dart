@@ -198,14 +198,28 @@ class Resolved115Stream {
   final String directCdnUrl;
   final Map<String, String> headers;
   final String fileName;
+  final bool isTranscoded;
 
   const Resolved115Stream({
     required this.proxyStreamUrl,
     required this.directCdnUrl,
     required this.headers,
     required this.fileName,
+    this.isTranscoded = false,
   });
+
+  Map<String, String> get playbackHeaders =>
+      proxyStreamUrl == directCdnUrl ? headers : const {};
 }
+
+typedef _ProxyMediaInfo = ({
+  int totalSize,
+  String contentType,
+  Uint8List rawHeaderChunk,
+  Uint8List normalizedHeaderChunk,
+  int stripPrefixBytes,
+  bool supportsRanges,
+});
 
 /// Manages local 115 Cloud Drive QR/Cookie authentication, direct domestic CDN URL resolution,
 /// local loopback HTTP header injection proxy, and the 3-stage "Server Download -> 115 Upload -> Local 115 Direct Play" pipeline.
@@ -225,7 +239,7 @@ class Local115DirectService extends ChangeNotifier {
   String _userName = '';
   String _targetFolderName = defaultTargetFolderName;
   String _targetFolderCid = '';
-  bool _initialized = false;
+  Future<void>? _initialization;
 
   // Acceleration pipeline state
   bool _isAccelerating = false;
@@ -236,6 +250,7 @@ class Local115DirectService extends ChangeNotifier {
 
   // Local loopback proxy for injecting 115Browser User-Agent + Cookie on all Range requests
   HttpServer? _proxyServer;
+  Future<void>? _proxyStarting;
   int _proxyPort = 0;
   final Map<String, Map<String, String>> _headersByUrl = {};
   late final HttpClient _httpClient;
@@ -272,9 +287,10 @@ class Local115DirectService extends ChangeNotifier {
         if (_cookie.isNotEmpty) 'Cookie': _cookie,
       };
 
-  Future<void> ensureInitialized() async {
-    if (_initialized) return;
-    _initialized = true;
+  Future<void> ensureInitialized() =>
+      _initialization ??= _loadSavedState();
+
+  Future<void> _loadSavedState() async {
     try {
       final prefs = await SharedPreferences.getInstance();
       _cookie = normalizeCookieString(prefs.getString(_prefCookieKey) ?? '');
@@ -955,6 +971,19 @@ class Local115DirectService extends ChangeNotifier {
     final rawExt = ico.isNotEmpty
         ? '.$ico'
         : (dotIdx > 0 ? nameLower.substring(dotIdx) : '.mp4');
+    return resolve115VideoPlayback(
+      pickcode: pickcode,
+      fileName: fileName,
+      extension: rawExt,
+    );
+  }
+
+  Future<Resolved115Stream?> resolve115VideoPlayback({
+    required String pickcode,
+    required String fileName,
+    required String extension,
+    bool? useCloudTranscode,
+  }) async {
     final needsHlsTranscode = const {
       '.f4v',
       '.flv',
@@ -965,53 +994,75 @@ class Local115DirectService extends ChangeNotifier {
       '.ts',
       '.webm',
       '.iso',
-    }.contains(rawExt);
+    }.contains(extension.toLowerCase());
 
-    String? hlsUrl;
-    if (needsHlsTranscode) {
-      hlsUrl = await resolvePickcodeHlsM3u8Url(pickcode);
-    }
-
-    var directUrl = await resolvePickcodeStreamUrl(pickcode);
-    if ((directUrl == null || directUrl.isEmpty) && hlsUrl == null) {
-      hlsUrl = await resolvePickcodeHlsM3u8Url(pickcode);
-    }
-    directUrl ??= hlsUrl;
-    if (directUrl == null || directUrl.isEmpty) return null;
-
-    final headers = requestHeadersForUrl(directUrl);
-    final String proxyUrl;
-    if (needsHlsTranscode && hlsUrl != null && hlsUrl.isNotEmpty) {
-      proxyUrl = await wrapWithLocal115HeaderProxy(
-        hlsUrl,
+    final routes = useCloudTranscode == null
+        ? [needsHlsTranscode, !needsHlsTranscode]
+        : [useCloudTranscode];
+    for (final useTranscode in routes) {
+      final url = useTranscode
+          ? await resolvePickcodeHlsM3u8Url(pickcode)
+          : await resolvePickcodeStreamUrl(pickcode, allowVideoFallback: false);
+      if (url == null) continue;
+      final uri = Uri.parse(url);
+      final isHls = useTranscode || _isHlsUrl(uri);
+      final headers = requestHeadersForUrl(url);
+      if (!await _canOpenVideoSource(uri, headers, isHls: isHls)) continue;
+      final relay = await wrapWithLocal115HeaderProxy(
+        url,
         headers,
-        extHint: '.m3u8',
+        extHint: isHls ? '.m3u8' : extension,
       );
-    } else if (directUrl.toLowerCase().contains('.m3u8')) {
-      proxyUrl = await wrapWithLocal115HeaderProxy(
-        directUrl,
-        headers,
-        extHint: '.m3u8',
-      );
-    } else {
-      proxyUrl = await wrapWithLocal115HeaderProxy(
-        directUrl,
-        headers,
-        extHint: rawExt.isNotEmpty ? rawExt : '.mp4',
+      return Resolved115Stream(
+        proxyStreamUrl: relay,
+        directCdnUrl: url,
+        headers: headers,
+        fileName: fileName,
+        isTranscoded: isHls,
       );
     }
+    return null;
+  }
 
-    return Resolved115Stream(
-      proxyStreamUrl: proxyUrl,
-      directCdnUrl: directUrl,
-      headers: headers,
-      fileName: fileName,
-    );
+  Future<bool> _canOpenVideoSource(
+    Uri uri,
+    Map<String, String> headers, {
+    required bool isHls,
+  }) async {
+    try {
+      final response = await _openProxyUpstream(
+        uri,
+        headers,
+        range: isHls ? null : 'bytes=0-4095',
+      );
+      if (response.statusCode != HttpStatus.ok &&
+          response.statusCode != HttpStatus.partialContent) {
+        await response.listen((_) {}).cancel();
+        return false;
+      }
+      final type = response.headers.contentType?.mimeType ?? '';
+      final prefix = BytesBuilder(copy: false);
+      await for (final chunk in response.timeout(const Duration(seconds: 10))) {
+        final count = min(chunk.length, 64 - prefix.length);
+        prefix.add(chunk.sublist(0, count));
+        if (prefix.length >= 64) break;
+      }
+      if (prefix.isEmpty) return false;
+      final text = utf8.decode(prefix.takeBytes(), allowMalformed: true).trimLeft();
+      if (isHls) return text.startsWith('#EXTM3U');
+      return !type.contains('html') &&
+          !type.contains('json') &&
+          !text.startsWith('<') &&
+          !text.startsWith('#EXTM3U');
+    } catch (_) {
+      return false;
+    }
   }
 
   /// Resolves 115's official cloud transcode HLS `.m3u8` stream URL (`webapi.115.com/files/video?pickcode=...`),
   /// essential for playing `.f4v`, `.flv`, `.mkv`, `.avi`, `.rmvb`, `.wmv`, `.ts` containers smoothly across all platforms.
   Future<String?> resolvePickcodeHlsM3u8Url(String pickcode) async {
+    await ensureInitialized();
     final cleanPc = pickcode.trim();
     if (cleanPc.isEmpty) return null;
     try {
@@ -1019,39 +1070,53 @@ class Local115DirectService extends ChangeNotifier {
           Uri.parse('https://webapi.115.com/files/video?pickcode=$cleanPc');
       final root = await _getJson(vidUri, timeout: const Duration(seconds: 10));
       if (root is Map<String, dynamic>) {
-        final listCandidate = root['video_urls'] ?? root['video_url'];
-        if (listCandidate is List && listCandidate.isNotEmpty) {
-          final last = listCandidate.last;
-          if (last is Map<String, dynamic>) {
-            final u = (last['url'] ?? '').toString().trim();
-            if (u.startsWith('http')) {
-              return u;
-            }
-          }
-        }
-        final directVideoUrl = (root['video_url'] ?? '').toString().trim();
-        if (directVideoUrl.startsWith('http')) {
-          return directVideoUrl;
-        }
-        final dataObj = root['data'];
-        if (dataObj is Map<String, dynamic>) {
-          final nested =
-              (dataObj['video_url'] ?? dataObj['url'] ?? '').toString().trim();
-          if (nested.startsWith('http')) {
-            return nested;
-          }
-        }
+        final data = root['data'];
+        return _readMediaUrl(root['video_urls']) ??
+            _readMediaUrl(root['video_url']) ??
+            _readMediaUrl(data);
       }
     } catch (_) {}
     return null;
   }
 
+  static String? _readMediaUrl(Object? value) {
+    if (value is String) {
+      final text = value.trim();
+      final absolute = text.startsWith('//') ? 'https:$text' : text;
+      final uri = Uri.tryParse(absolute);
+      if (uri != null &&
+          (uri.scheme == 'http' || uri.scheme == 'https') &&
+          uri.host.isNotEmpty) {
+        return absolute;
+      }
+    } else if (value is List) {
+      for (final item in value.reversed) {
+        final url = _readMediaUrl(item);
+        if (url != null) return url;
+      }
+    } else if (value is Map) {
+      for (final key in const ['video_urls', 'video_url', 'm3u8_url', 'url']) {
+        final url = _readMediaUrl(value[key]);
+        if (url != null) return url;
+      }
+    }
+    return null;
+  }
+
+  static bool _isHlsUrl(Uri uri) => uri.path.toLowerCase().endsWith('.m3u8');
+
+  static bool _is115MediaHost(String host) =>
+      const ['115.com', '115cdn.net', '115vod.com'].any(
+        (domain) => host == domain || host.endsWith('.$domain'),
+      );
+
   /// Resolves a 115 `pickcode` to an official 115 domestic CDN direct URL using:
   /// 1) `proapi.115.com/app/chrome/downurl` (m115 encrypted original MP4 direct CDN link)
   /// 2) `webapi.115.com/files/download?pickcode=...`
   /// 3) `webapi.115.com/files/video?pickcode=...`
-  final Map<String, ({String url, int timestampMs})> _pickcodeUrlCache = {};
-  final Map<String, Future<String?>> _pickcodeInFlight = {};
+  final Map<(String, bool), ({String url, int timestampMs})> _pickcodeUrlCache =
+      {};
+  final Map<(String, bool), Future<String?>> _pickcodeInFlight = {};
   final Map<String, String> _cdnAuthCookiesByUrl = {};
   String _latestCdnAuthCookie = '';
 
@@ -1070,40 +1135,45 @@ class Local115DirectService extends ChangeNotifier {
   Future<String?> resolvePickcodeStreamUrl(
     String pickcode, {
     bool forceRefresh = false,
+    bool allowVideoFallback = true,
   }) async {
+    await ensureInitialized();
     final cleanPc = pickcode.trim();
     if (cleanPc.isEmpty) return null;
+    final cacheKey = (cleanPc, allowVideoFallback);
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     if (!forceRefresh) {
-      final cached = _pickcodeUrlCache[cleanPc];
+      final cached = _pickcodeUrlCache[cacheKey];
       if (cached != null && (nowMs - cached.timestampMs) < 12000) {
         return cached.url;
       }
-      final inflight = _pickcodeInFlight[cleanPc];
-      if (inflight != null) {
-        return await inflight;
-      }
     }
-    final fut = _resolvePickcodeStreamUrlInternal(cleanPc);
-    _pickcodeInFlight[cleanPc] = fut;
+    final inflight = _pickcodeInFlight[cacheKey];
+    if (inflight != null) return await inflight;
+    if (forceRefresh) _pickcodeUrlCache.remove(cacheKey);
+    final fut = _resolvePickcodeStreamUrlInternal(cleanPc, allowVideoFallback);
+    _pickcodeInFlight[cacheKey] = fut;
     try {
       final res = await fut;
       if (res != null && res.isNotEmpty) {
         if (_pickcodeUrlCache.length > 64) {
           _pickcodeUrlCache.clear();
         }
-        _pickcodeUrlCache[cleanPc] = (
+        _pickcodeUrlCache[cacheKey] = (
           url: res,
           timestampMs: DateTime.now().millisecondsSinceEpoch,
         );
       }
       return res;
     } finally {
-      _pickcodeInFlight.remove(cleanPc);
+      _pickcodeInFlight.remove(cacheKey);
     }
   }
 
-  Future<String?> _resolvePickcodeStreamUrlInternal(String pickcode) async {
+  Future<String?> _resolvePickcodeStreamUrlInternal(
+    String pickcode,
+    bool allowVideoFallback,
+  ) async {
     // 1. Primary: `proapi.115.com/app/chrome/downurl`
     try {
       final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
@@ -1173,30 +1243,7 @@ class Local115DirectService extends ChangeNotifier {
       }
     } catch (_) {}
 
-    // 3. Fallback 2: `webapi.115.com/files/video?pickcode=...`
-    try {
-      final vidUri =
-          Uri.parse('https://webapi.115.com/files/video?pickcode=$pickcode');
-      final root = await _getJson(vidUri, timeout: const Duration(seconds: 10));
-      if (root is Map<String, dynamic>) {
-        final listCandidate = root['video_urls'] ?? root['video_url'];
-        if (listCandidate is List && listCandidate.isNotEmpty) {
-          final last = listCandidate.last;
-          if (last is Map<String, dynamic>) {
-            final u = (last['url'] ?? '').toString().trim();
-            if (u.startsWith('http')) {
-              return u;
-            }
-          }
-        }
-        final directVideoUrl = (root['video_url'] ?? '').toString().trim();
-        if (directVideoUrl.startsWith('http')) {
-          return directVideoUrl;
-        }
-      }
-    } catch (_) {}
-
-    return null;
+    return allowVideoFallback ? resolvePickcodeHlsM3u8Url(pickcode) : null;
   }
 
   /// Wraps a 115 CDN URL in a local loopback HTTP proxy (`http://127.0.0.1:<port>/115_stream.<ext>?u=...`)
@@ -1209,12 +1256,12 @@ class Local115DirectService extends ChangeNotifier {
   }) async {
     await _ensureLocalProxyStarted();
     if (_proxyPort <= 0) return remoteUrl;
-    if (_headersByUrl.length > 64) {
-      _headersByUrl.clear();
+    if (_headersByUrl.length >= 8192 && !_headersByUrl.containsKey(remoteUrl)) {
+      _headersByUrl.remove(_headersByUrl.keys.first);
     }
     final mergedHeaders = Map<String, String>.from(headers);
     final authCookie = _cdnAuthCookiesByUrl[remoteUrl] ??
-        ((remoteUrl.contains('115cdn') || remoteUrl.contains('115.com'))
+        (_is115MediaHost(Uri.tryParse(remoteUrl)?.host ?? '')
             ? _latestCdnAuthCookie
             : '');
     if (authCookie.isNotEmpty) {
@@ -1278,15 +1325,8 @@ class Local115DirectService extends ChangeNotifier {
     return null;
   }
 
-  final Map<
-      String,
-      ({
-        int totalSize,
-        String contentType,
-        Uint8List rawHeaderChunk,
-        Uint8List normalizedHeaderChunk,
-        int stripPrefixBytes,
-      })> _proxyMetaCache = {};
+  final _proxyMetaCache = <String, _ProxyMediaInfo>{};
+  final _proxyMetaInFlight = <String, Future<_ProxyMediaInfo?>>{};
 
   Uint8List? getCachedRawHeaderBytes(String remoteUrl) {
     return _proxyMetaCache[remoteUrl]?.rawHeaderChunk;
@@ -1476,6 +1516,9 @@ class Local115DirectService extends ChangeNotifier {
     );
   }
 
+  static final _upstreamContentRange =
+      RegExp(r'^bytes (\d+)-(\d+)/(\d+)$', caseSensitive: false);
+
   Future<({Uint8List bytes, int statusCode, int totalSize, String contentType})?>
       _fetchUpstreamRangeChunk({
     required Uri uri,
@@ -1498,7 +1541,8 @@ class Local115DirectService extends ChangeNotifier {
             upstreamReq.headers.set(k, v);
           }
         });
-        upstreamReq.headers.set('Range', 'bytes=$start-$end');
+        upstreamReq.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
+        upstreamReq.headers.set(HttpHeaders.rangeHeader, 'bytes=$start-$end');
         final upstreamResp = await upstreamReq
             .close()
             .timeout(Duration(seconds: attempt == 0 ? 18 : 25));
@@ -1512,27 +1556,38 @@ class Local115DirectService extends ChangeNotifier {
         final code = upstreamResp.statusCode;
         if (code != HttpStatus.partialContent &&
             !(start == 0 && code == HttpStatus.ok)) {
-          await upstreamResp.drain<void>().catchError((_) {});
+          await upstreamResp.listen((_) {}).cancel();
           await Future<void>.delayed(
             Duration(milliseconds: (attempt + 1) * 200),
           );
           continue;
         }
 
-        int totalSize = 0;
-        final cr = upstreamResp.headers.value('content-range') ??
-            upstreamResp.headers.value('Content-Range') ??
-            '';
-        final slash = cr.lastIndexOf('/');
-        if (slash > 0) {
-          totalSize = int.tryParse(cr.substring(slash + 1).trim()) ?? 0;
-        }
-        if (totalSize <= 0 && upstreamResp.contentLength > 0 && code == 200) {
-          totalSize = upstreamResp.contentLength;
+        var totalSize = upstreamResp.contentLength;
+        var bytesToRead = expected;
+        if (code == HttpStatus.partialContent) {
+          final match = _upstreamContentRange.firstMatch(
+            upstreamResp.headers.value(HttpHeaders.contentRangeHeader) ?? '',
+          );
+          final last = int.tryParse(match?[2] ?? '');
+          totalSize = int.tryParse(match?[3] ?? '') ?? 0;
+          if (int.tryParse(match?[1] ?? '') != start ||
+              last == null ||
+              last < start ||
+              last > end ||
+              totalSize <= last) {
+            await upstreamResp.listen((_) {}).cancel();
+            continue;
+          }
+          bytesToRead = last - start + 1;
+        } else if (totalSize > 0) {
+          bytesToRead = min(expected, totalSize);
         }
 
         final builder = BytesBuilder(copy: false);
-        await for (final chunk in upstreamResp) {
+        await for (final chunk in upstreamResp.timeout(
+          const Duration(seconds: 18),
+        )) {
           if (isCancelled != null && isCancelled()) {
             try {
               final sock = await upstreamResp.detachSocket();
@@ -1540,19 +1595,20 @@ class Local115DirectService extends ChangeNotifier {
             } catch (_) {}
             return null;
           }
-          builder.add(chunk);
-          if (builder.length >= expected) break;
+          final remaining = bytesToRead - builder.length;
+          builder.add(chunk.length <= remaining ? chunk : chunk.sublist(0, remaining));
+          if (builder.length == bytesToRead) break;
         }
         final rawBytes = builder.takeBytes();
-        if (rawBytes.isEmpty) continue;
-        final sliced = rawBytes.length > expected
-            ? Uint8List.sublistView(rawBytes, 0, expected)
-            : rawBytes;
+        if (rawBytes.isEmpty ||
+            (code == HttpStatus.partialContent && rawBytes.length != bytesToRead)) {
+          continue;
+        }
         final ct = (upstreamResp.headers.value('content-type') ?? '').trim();
         return (
-          bytes: sliced,
+          bytes: rawBytes,
           statusCode: code,
-          totalSize: totalSize > 0 ? totalSize : sliced.length,
+          totalSize: totalSize,
           contentType: ct,
         );
       } catch (_) {
@@ -1565,10 +1621,14 @@ class Local115DirectService extends ChangeNotifier {
     return null;
   }
 
-  final Map<String, int> _activeStreamGenByUrl = {};
+  Future<void> _ensureLocalProxyStarted() {
+    if (_proxyServer != null) return Future.value();
+    return _proxyStarting ??= _startLocalProxy().whenComplete(() {
+      _proxyStarting = null;
+    });
+  }
 
-  Future<void> _ensureLocalProxyStarted() async {
-    if (_proxyServer != null && _proxyPort > 0) return;
+  Future<void> _startLocalProxy() async {
     try {
       final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       _proxyServer = server;
@@ -1577,293 +1637,365 @@ class Local115DirectService extends ChangeNotifier {
     } catch (_) {}
   }
 
-  Future<void> _handleProxyRequest(HttpRequest req) async {
-    final targetUrl = req.uri.queryParameters['u'] ?? '';
+  Future<_ProxyMediaInfo?> _loadProxyMediaInfo(
+    Uri uri,
+    Map<String, String> headers,
+    String requestPath,
+  ) async {
+    final probe = await _fetchUpstreamRangeChunk(
+      uri: uri,
+      customHeaders: headers,
+      start: 0,
+      end: 262143,
+    );
+    if (probe == null || probe.totalSize <= 0) return null;
+    final normalized = normalizeWavOrAudioHeaderChunk(
+      probe.bytes,
+      probe.totalSize,
+      requestPath,
+    );
+    final contentType = probe.contentType.toLowerCase();
+    final genericType = contentType.isEmpty ||
+        contentType.contains('octet-stream') ||
+        contentType.contains('force-download');
+    return (
+      totalSize: probe.totalSize - normalized.stripPrefixBytes,
+      contentType: normalized.detectedMimeType ??
+          (genericType
+              ? _inferMimeTypeFromPath(requestPath) ??
+                  _inferMimeTypeFromPath(uri.path.toLowerCase()) ??
+                  'application/octet-stream'
+              : probe.contentType),
+      rawHeaderChunk: probe.bytes,
+      normalizedHeaderChunk: normalized.normalizedChunk,
+      stripPrefixBytes: normalized.stripPrefixBytes,
+      supportsRanges: probe.statusCode == HttpStatus.partialContent,
+    );
+  }
+
+  static final _mediaByteRange =
+      RegExp(r'^bytes=(\d*)-(\d*)$', caseSensitive: false);
+
+  static ({int start, int end})? _resolveMediaRange(String? header, int size) {
+    if (header == null) return (start: 0, end: size - 1);
+    final match = _mediaByteRange.firstMatch(header.trim());
+    if (match == null) return null;
+    final startText = match[1]!;
+    final endText = match[2]!;
+    if (startText.isEmpty) {
+      final suffix = int.tryParse(endText);
+      if (suffix == null || suffix <= 0) return null;
+      return (start: max(0, size - suffix), end: size - 1);
+    }
+    final start = int.tryParse(startText);
+    final end = endText.isEmpty ? size - 1 : int.tryParse(endText);
+    if (start == null || end == null || start >= size || end < start) {
+      return null;
+    }
+    return (start: start, end: min(end, size - 1));
+  }
+
+  Future<HttpClientResponse> _openProxyUpstream(
+    Uri uri,
+    Map<String, String> headers, {
+    String method = 'GET',
+    String? range,
+  }) async {
+    const timeout = Duration(seconds: 15);
+    final request = await _httpClient.openUrl(method, uri).timeout(timeout);
+    headers.forEach(request.headers.set);
+    request.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
+    if (range != null) request.headers.set(HttpHeaders.rangeHeader, range);
+    return request.close().timeout(
+      timeout,
+      onTimeout: () {
+        request.abort();
+        throw TimeoutException('115 upstream response timed out', timeout);
+      },
+    );
+  }
+
+  Future<void> _pipeProxyResource(
+    HttpRequest request,
+    Uri uri,
+    Map<String, String> headers,
+  ) async {
+    final upstream = await _openProxyUpstream(
+      uri,
+      headers,
+      method: request.method,
+      range: request.headers.value(HttpHeaders.rangeHeader),
+    );
+    final downstream = request.response;
+    downstream.statusCode = upstream.statusCode;
+    downstream.bufferOutput = false;
+    if (upstream.contentLength >= 0) {
+      downstream.contentLength = upstream.contentLength;
+    }
+    for (final name in [
+      HttpHeaders.contentTypeHeader,
+      HttpHeaders.contentRangeHeader,
+      HttpHeaders.acceptRangesHeader,
+    ]) {
+      final value = upstream.headers.value(name);
+      if (value != null) downstream.headers.set(name, value);
+    }
+    downstream.headers.set('Access-Control-Allow-Origin', '*');
+    if (request.method == 'HEAD') {
+      await upstream.drain<void>();
+      await downstream.close();
+    } else {
+      await upstream.pipe(downstream);
+    }
+  }
+
+  Future<void> _streamWithoutUpstreamRanges(
+    HttpResponse downstream,
+    Uri uri,
+    Map<String, String> headers, {
+    required int skip,
+    required int length,
+    required bool Function() isCancelled,
+  }) async {
+    final source = await _openProxyUpstream(uri, headers);
+    if (source.statusCode != HttpStatus.ok) {
+      await source.listen((_) {}).cancel();
+      return;
+    }
+    await for (final chunk in source.timeout(const Duration(seconds: 18))) {
+      if (isCancelled()) return;
+      if (skip >= chunk.length) {
+        skip -= chunk.length;
+        continue;
+      }
+      final count = min(length, chunk.length - skip);
+      downstream.add(chunk.sublist(skip, skip + count));
+      await downstream.flush();
+      length -= count;
+      if (length == 0) return;
+      skip = 0;
+    }
+  }
+
+  Future<void> _serveProxyPlaylist(
+    HttpRequest request,
+    Uri upstreamUri,
+    Map<String, String> headers,
+  ) async {
+    final upstream = await _openProxyUpstream(upstreamUri, headers);
+    if (upstream.statusCode != HttpStatus.ok) {
+      await upstream.listen((_) {}).cancel();
+      request.response.statusCode = upstream.statusCode;
+      await request.response.close();
+      return;
+    }
+    final bytes = BytesBuilder(copy: false);
+    await for (final chunk in upstream.timeout(const Duration(seconds: 15))) {
+      bytes.add(chunk);
+    }
+    final playlist = utf8.decode(bytes.takeBytes(), allowMalformed: true).trim();
+    if (!playlist.startsWith('#EXTM3U')) {
+      request.response.statusCode = HttpStatus.badGateway;
+      await request.response.close();
+      return;
+    }
+    final base = upstream.redirects.fold(
+      upstreamUri,
+      (current, redirect) => current.resolveUri(redirect.location),
+    );
+
+    String wrapResource(String reference, {required bool playlist}) {
+      final target = base.resolve(reference);
+      if (target.scheme != 'http' && target.scheme != 'https') return reference;
+      final targetUrl = target.toString();
+      final childHeaders = Map<String, String>.from(headers);
+      if (target.host != upstreamUri.host &&
+          !target.host.endsWith('.${upstreamUri.host}') &&
+          !(_is115MediaHost(upstreamUri.host) && _is115MediaHost(target.host))) {
+        childHeaders.removeWhere((key, _) {
+          final lower = key.toLowerCase();
+          return lower == 'authorization' ||
+              lower == 'proxy-authorization' ||
+              lower == 'cookie';
+        });
+      }
+      _headersByUrl[targetUrl] = childHeaders;
+      final ext = playlist || _isHlsUrl(target) ? '.m3u8' : '.resource';
+      return 'http://127.0.0.1:$_proxyPort/115_stream$ext?u=${Uri.encodeQueryComponent(targetUrl)}';
+    }
+
+    final uriAttr = RegExp(r'URI="([^"]+)"');
+    final output = StringBuffer();
+    var nextIsPlaylist = false;
+    for (final rawLine in const LineSplitter().convert(playlist)) {
+      final line = rawLine.trim();
+      if (line.startsWith('#')) {
+        if (line.startsWith('#EXT-X-STREAM-INF:')) nextIsPlaylist = true;
+        final playlistTag = line.startsWith('#EXT-X-MEDIA:') ||
+            line.startsWith('#EXT-X-I-FRAME-STREAM-INF:') ||
+            line.startsWith('#EXT-X-IMAGE-STREAM-INF:') ||
+            line.startsWith('#EXT-X-RENDITION-REPORT:');
+        output.writeln(line.replaceAllMapped(uriAttr, (match) {
+          return 'URI="${wrapResource(match[1]!, playlist: playlistTag)}"';
+        }));
+      } else if (line.isNotEmpty) {
+        output.writeln(wrapResource(line, playlist: nextIsPlaylist));
+        nextIsPlaylist = false;
+      }
+    }
+
+    final data = utf8.encode(output.toString());
+    final response = request.response;
+    response.contentLength = data.length;
+    response.headers
+        .set(HttpHeaders.contentTypeHeader, 'application/vnd.apple.mpegurl');
+    response.headers.set('Access-Control-Allow-Origin', '*');
+    if (request.method != 'HEAD') response.add(data);
+    await response.close();
+  }
+
+  Future<void> _handleProxyRequest(HttpRequest request) async {
+    final response = request.response;
+    final targetUrl = request.uri.queryParameters['u'] ?? '';
     final uri = Uri.tryParse(targetUrl);
-    if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
-      req.response.statusCode = HttpStatus.badRequest;
-      await req.response.close();
+    final headers = _headersByUrl[targetUrl];
+    if (uri == null ||
+        (uri.scheme != 'http' && uri.scheme != 'https') ||
+        headers == null) {
+      response.statusCode = HttpStatus.badRequest;
+      await response.close();
+      return;
+    }
+    if (request.method != 'GET' && request.method != 'HEAD') {
+      response.statusCode = HttpStatus.methodNotAllowed;
+      await response.close();
       return;
     }
 
-    final customHeaders = _headersByUrl[targetUrl] ?? requestHeaders;
-    final rangeHeader =
-        req.headers.value('range') ?? req.headers.value('Range');
-    final reqPathLower = req.uri.path.toLowerCase();
-
+    final rangeHeader = request.headers.value(HttpHeaders.rangeHeader);
+    final path = request.uri.path.toLowerCase();
     try {
-      // 0. If this is an HLS `.m3u8` playlist (e.g. 115's official cloud transcode `https://115.com/api/video/m3u8/<pickcode>.m3u8`),
-      // fetch the playlist with 115 Cookie & User-Agent, follow any master `#EXT-X-STREAM-INF` variant, and rewrite all `.ts` segment URLs
-      // through this local 127.0.0.1 proxy so `libmpv` / `AVPlayer` can fetch every segment with the required 115 Cookie & User-Agent!
-      if (reqPathLower.endsWith('.m3u8') ||
-          uri.path.toLowerCase().endsWith('.m3u8')) {
-        var currentM3u8Uri = uri;
-        String? m3u8Text;
-        for (var depth = 0; depth < 3; depth++) {
-          final upReq = await _httpClient
-              .getUrl(currentM3u8Uri)
-              .timeout(const Duration(seconds: 12));
-          customHeaders.forEach(upReq.headers.set);
-          final upResp =
-              await upReq.close().timeout(const Duration(seconds: 12));
-          for (final c in upResp.cookies) {
-            if (c.name.isNotEmpty && c.value.isNotEmpty) {
-              _latestCdnAuthCookie = '${c.name}=${c.value}';
-            }
-          }
-          if (upResp.statusCode < 200 || upResp.statusCode >= 400) break;
-          final rawBytes = await upResp.fold<List<int>>(
-            <int>[],
-            (acc, b) => acc..addAll(b),
-          );
-          final text = utf8.decode(rawBytes, allowMalformed: true).trim();
-          if (!text.contains('#EXTM3U')) break;
-          m3u8Text = text;
-          if (!text.contains('#EXT-X-STREAM-INF')) break;
-          final lines = text
-              .split(RegExp(r'\r?\n'))
-              .map((l) => l.trim())
-              .where((l) => l.isNotEmpty && !l.startsWith('#'))
-              .toList();
-          if (lines.isEmpty) break;
-          currentM3u8Uri = currentM3u8Uri.resolve(lines.last);
-        }
-
-        if (m3u8Text == null || m3u8Text.isEmpty) {
-          req.response.statusCode = HttpStatus.badGateway;
-          await req.response.close();
-          return;
-        }
-
-        final uriAttrRegex = RegExp(r'URI="([^"]+)"');
-        final outLines = <String>[];
-        for (final rawLine in m3u8Text.split(RegExp(r'\r?\n'))) {
-          final line = rawLine.trim();
-          if (line.isEmpty) continue;
-          if (line.startsWith('#')) {
-            if (line.contains('URI="')) {
-              final rewrittenTag = line.replaceAllMapped(uriAttrRegex, (m) {
-                final rawAttr = m.group(1) ?? '';
-                if (rawAttr.isEmpty) return m.group(0)!;
-                final abs = currentM3u8Uri.resolve(rawAttr).toString();
-                _headersByUrl[abs] = customHeaders;
-                final enc = Uri.encodeQueryComponent(abs);
-                return 'URI="http://127.0.0.1:$_proxyPort/115_stream.key?u=$enc"';
-              });
-              outLines.add(rewrittenTag);
-            } else {
-              outLines.add(line);
-            }
-          } else {
-            final abs = currentM3u8Uri.resolve(line).toString();
-            _headersByUrl[abs] = customHeaders;
-            final enc = Uri.encodeQueryComponent(abs);
-            final ext = abs.toLowerCase().contains('.m3u8') ? '.m3u8' : '.ts';
-            outLines.add('http://127.0.0.1:$_proxyPort/115_stream$ext?u=$enc');
-          }
-        }
-        final outBytes = utf8.encode('${outLines.join('\n')}\n');
-        req.response.statusCode = HttpStatus.ok;
-        req.response.contentLength = outBytes.length;
-        req.response.headers
-            .set('content-type', 'application/vnd.apple.mpegurl; charset=utf-8');
-        req.response.headers.set('Access-Control-Allow-Origin', '*');
-        req.response.add(outBytes);
-        await req.response.close();
+      if (path.endsWith('.m3u8') || _isHlsUrl(uri)) {
+        await _serveProxyPlaylist(request, uri, headers);
+        return;
+      }
+      if (path.endsWith('.resource') || path.endsWith('.key') ||
+          path.endsWith('.ts')) {
+        await _pipeProxyResource(request, uri, headers);
         return;
       }
 
-      if (reqPathLower.endsWith('.ts') || reqPathLower.endsWith('.key')) {
-        final upReq =
-            await _httpClient.getUrl(uri).timeout(const Duration(seconds: 15));
-        customHeaders.forEach(upReq.headers.set);
-        if (rangeHeader != null && rangeHeader.isNotEmpty) {
-          upReq.headers.set('Range', rangeHeader);
-        }
-        final upResp = await upReq.close().timeout(const Duration(seconds: 15));
-        req.response.statusCode = upResp.statusCode;
-        if (upResp.contentLength > 0) {
-          req.response.contentLength = upResp.contentLength;
-        }
-        req.response.headers.set(
-          'content-type',
-          reqPathLower.endsWith('.ts')
-              ? 'video/mp2t'
-              : 'application/octet-stream',
-        );
-        req.response.headers.set('Access-Control-Allow-Origin', '*');
-        await upResp.pipe(req.response);
-        return;
-      }
-
-      // 1. Probe and cache first 256 KB (`bytes=0-262143`) + total file size so rapid WAV/FLAC/APE header probes
-      // and trailing metadata seeks never open concurrent conflicting full-file connections to 115 CDN.
       var meta = _proxyMetaCache[targetUrl];
       if (meta == null) {
-        final probe = await _fetchUpstreamRangeChunk(
-          uri: uri,
-          customHeaders: customHeaders,
-          start: 0,
-          end: 262143,
+        final loading = _proxyMetaInFlight.putIfAbsent(
+          targetUrl,
+          () => _loadProxyMediaInfo(uri, headers, path),
         );
-        if (probe != null && probe.bytes.isNotEmpty) {
-          final norm = normalizeWavOrAudioHeaderChunk(
-            probe.bytes,
-            probe.totalSize,
-            reqPathLower,
-          );
-          final rawCt = probe.contentType.toLowerCase();
-          String ct;
-          if (norm.detectedMimeType != null) {
-            ct = norm.detectedMimeType!;
-          } else if (rawCt.isEmpty ||
-              rawCt.contains('octet-stream') ||
-              rawCt.contains('force-download')) {
-            ct = _inferMimeTypeFromPath(reqPathLower) ??
-                _inferMimeTypeFromPath(uri.path.toLowerCase()) ??
-                'application/octet-stream';
-          } else {
-            ct = probe.contentType;
+        try {
+          meta = await loading;
+        } finally {
+          if (identical(_proxyMetaInFlight[targetUrl], loading)) {
+            _proxyMetaInFlight.remove(targetUrl);
           }
-          final effectiveTotal = max(
-            norm.normalizedChunk.length,
-            probe.totalSize - norm.stripPrefixBytes,
-          );
-          meta = (
-            totalSize: effectiveTotal,
-            contentType: ct,
-            rawHeaderChunk: probe.bytes,
-            normalizedHeaderChunk: norm.normalizedChunk,
-            stripPrefixBytes: norm.stripPrefixBytes,
-          );
-          if (_proxyMetaCache.length > 32) {
-            _proxyMetaCache.clear();
+        }
+        if (meta != null) {
+          if (!_proxyMetaCache.containsKey(targetUrl) &&
+              _proxyMetaCache.length >= 32) {
+            _proxyMetaCache.remove(_proxyMetaCache.keys.first);
           }
           _proxyMetaCache[targetUrl] = meta;
         }
       }
-
-      if (meta == null || meta.totalSize <= 0) {
-        req.response.statusCode = HttpStatus.badGateway;
-        await req.response.close();
+      if (meta == null) {
+        await _pipeProxyResource(request, uri, headers);
         return;
       }
 
-      int reqStart = 0;
-      int reqEnd = meta.totalSize - 1;
-      bool isPartial = false;
-      if (rangeHeader != null &&
-          rangeHeader.toLowerCase().startsWith('bytes=')) {
-        isPartial = true;
-        final spec = rangeHeader.substring(6).trim();
-        final parts = spec.split('-');
-        if (parts.length == 2) {
-          final s = int.tryParse(parts[0].trim());
-          if (s != null && s >= 0 && s < meta.totalSize) {
-            reqStart = s;
+      final range = _resolveMediaRange(rangeHeader, meta.totalSize);
+      if (range == null) {
+        response.statusCode = HttpStatus.requestedRangeNotSatisfiable;
+        response.headers.set(
+          HttpHeaders.contentRangeHeader,
+          'bytes */${meta.totalSize}',
+        );
+        await response.close();
+        return;
+      }
+
+      response.statusCode = rangeHeader == null
+          ? HttpStatus.ok
+          : HttpStatus.partialContent;
+      response.bufferOutput = false;
+      response.contentLength = range.end - range.start + 1;
+      response.headers.set(HttpHeaders.contentTypeHeader, meta.contentType);
+      response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
+      response.headers.set('Access-Control-Allow-Origin', '*');
+      if (rangeHeader != null) {
+        response.headers.set(
+          HttpHeaders.contentRangeHeader,
+          'bytes ${range.start}-${range.end}/${meta.totalSize}',
+        );
+      }
+      if (request.method == 'HEAD') {
+        await response.close();
+        return;
+      }
+
+      var disconnected = false;
+      unawaited(response.done.then<void>(
+        (_) => disconnected = true,
+        onError: (Object _) => disconnected = true,
+      ));
+
+      var cursor = range.start;
+      final cached = meta.normalizedHeaderChunk;
+      if (cursor < cached.length) {
+        final end = min(range.end + 1, cached.length);
+        response.add(Uint8List.sublistView(cached, cursor, end));
+        await response.flush();
+        cursor = end;
+      }
+
+      if (cursor <= range.end && !meta.supportsRanges && !disconnected) {
+        await _streamWithoutUpstreamRanges(
+          response,
+          uri,
+          headers,
+          skip: cursor + meta.stripPrefixBytes,
+          length: range.end - cursor + 1,
+          isCancelled: () => disconnected,
+        );
+      } else {
+        const chunkSize = 2 * 1024 * 1024;
+        while (cursor <= range.end && !disconnected) {
+          final rawStart = cursor + meta.stripPrefixBytes;
+          final rawEnd =
+              min(range.end, cursor + chunkSize - 1) + meta.stripPrefixBytes;
+          final chunk = await _fetchUpstreamRangeChunk(
+            uri: uri,
+            customHeaders: headers,
+            start: rawStart,
+            end: rawEnd,
+            isCancelled: () => disconnected,
+          );
+          if (chunk == null ||
+              chunk.totalSize != meta.totalSize + meta.stripPrefixBytes ||
+              disconnected) {
+            break;
           }
-          if (parts[1].trim().isNotEmpty) {
-            final e = int.tryParse(parts[1].trim());
-            if (e != null) {
-              reqEnd = min(meta.totalSize - 1, e);
-            }
-          }
+          response.add(chunk.bytes);
+          await response.flush();
+          cursor += chunk.bytes.length;
         }
       }
 
-      if (reqStart > reqEnd) {
-        req.response.statusCode = HttpStatus.requestedRangeNotSatisfiable;
-        await req.response.close();
-        return;
-      }
-
-      final contentLen = reqEnd - reqStart + 1;
-      req.response.statusCode =
-          isPartial ? HttpStatus.partialContent : HttpStatus.ok;
-      req.response.bufferOutput = false;
-      req.response.contentLength = contentLen;
-      req.response.headers.set('content-type', meta.contentType);
-      req.response.headers.set('accept-ranges', 'bytes');
-      if (isPartial) {
-        req.response.headers.set(
-          'content-range',
-          'bytes $reqStart-$reqEnd/${meta.totalSize}',
-        );
-      }
-      req.response.headers.set('Access-Control-Allow-Origin', '*');
-
-      if (req.method.toUpperCase() == 'HEAD') {
-        await req.response.close();
-        return;
-      }
-
-      // 2. Fast-path: serve small header probes directly from cached 256 KB normalizedHeaderChunk in 0ms
-      if (reqEnd < meta.normalizedHeaderChunk.length) {
-        req.response.add(
-          Uint8List.sublistView(
-            meta.normalizedHeaderChunk,
-            reqStart,
-            reqEnd + 1,
-          ),
-        );
-        await req.response.close();
-        return;
-      }
-
-      var cursor = reqStart;
-      if (cursor < meta.normalizedHeaderChunk.length) {
-        final cachedEnd = min(reqEnd, meta.normalizedHeaderChunk.length - 1);
-        req.response.add(
-          Uint8List.sublistView(
-            meta.normalizedHeaderChunk,
-            cursor,
-            cachedEnd + 1,
-          ),
-        );
-        await req.response.flush();
-        cursor = cachedEnd + 1;
-      }
-
-      // 3. Supersede any previous active streaming loop on the same targetUrl (e.g. when libmpv aborts initial bytes=0-
-      // to seek to the tail `moov` atom of a tail-moov MP4 or WAV file), and stream sequentially in 2 MB chunks
-      final myStreamGen = (_activeStreamGenByUrl[targetUrl] ?? 0) + 1;
-      _activeStreamGenByUrl[targetUrl] = myStreamGen;
-      bool clientDisconnected = false;
-      unawaited(
-        req.response.done.then(
-          (_) => clientDisconnected = true,
-          onError: (_) => clientDisconnected = true,
-        ),
-      );
-      bool isStreamCancelled() =>
-          clientDisconnected || _activeStreamGenByUrl[targetUrl] != myStreamGen;
-
-      const int chunkSize = 2097152;
-      while (cursor <= reqEnd && !isStreamCancelled()) {
-        final cStart = cursor;
-        final cEnd = min(reqEnd, cStart + chunkSize - 1);
-        final rawStart = cStart + meta.stripPrefixBytes;
-        final rawEnd = cEnd + meta.stripPrefixBytes;
-
-        final chunkRes = await _fetchUpstreamRangeChunk(
-          uri: uri,
-          customHeaders: customHeaders,
-          start: rawStart,
-          end: rawEnd,
-          isCancelled: isStreamCancelled,
-        );
-        if (chunkRes == null || chunkRes.bytes.isEmpty || isStreamCancelled()) {
-          break;
-        }
-        req.response.add(chunkRes.bytes);
-        await req.response.flush();
-        cursor += chunkRes.bytes.length;
-      }
-
-      await req.response.close();
+      await response.close();
     } catch (_) {
       try {
-        await req.response.close();
+        response.statusCode = HttpStatus.badGateway;
+      } catch (_) {}
+      try {
+        await response.close();
       } catch (_) {}
     }
   }

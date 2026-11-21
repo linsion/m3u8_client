@@ -1250,8 +1250,9 @@ class CloudMusicController extends ChangeNotifier {
   }
 
   Future<({String url, Map<String, String> headers, String subtitle})>
-      resolveEntryEndpoint(FileEntry entry) async {
-    if (_customEndpointResolver != null) {
+      resolveEntryEndpoint(FileEntry entry, {bool forceRefreshUrl = false}) async {
+    if (_customEndpointResolver != null &&
+        !(forceRefreshUrl && entry.sourceKind == StorageSourceKind.cloud115)) {
       try {
         return await _customEndpointResolver!(entry);
       } catch (_) {}
@@ -1295,7 +1296,11 @@ class CloudMusicController extends ChangeNotifier {
           throw Exception('该 115 文件缺少 pickcode');
         }
         final directUrl = await Local115DirectService.instance
-            .resolvePickcodeStreamUrl(entry.pickcode115);
+            .resolvePickcodeStreamUrl(
+              entry.pickcode115,
+              forceRefresh: forceRefreshUrl,
+              allowVideoFallback: false,
+            );
         if (directUrl == null || directUrl.isEmpty) {
           throw Exception('无法获取 115 直链，请检查 115 登录状态');
         }
@@ -2141,7 +2146,10 @@ class CloudMusicController extends ChangeNotifier {
         playUrl = extractedLocalPath;
         subtitle = '📦 ${track.archiveContainerName} · ${track.formattedSize}';
       } else {
-        final resolved = await resolveEntryEndpoint(track);
+        final resolved = await resolveEntryEndpoint(
+          track,
+          forceRefreshUrl: forceRefreshUrl,
+        );
         if (seq != _openSeq) return;
         playUrl = resolved.url;
         playHeaders = resolved.headers;
@@ -2174,13 +2182,16 @@ class CloudMusicController extends ChangeNotifier {
                 isLosslessNeedsExtensionProxy ||
                 urlLacksAudioExtension ||
                 playHeaders.isNotEmpty)) {
-          playUrl =
+          final relayed =
               await Local115DirectService.instance.wrapWithLocal115HeaderProxy(
             playUrl,
             playHeaders,
             extHint: ext,
           );
-          playHeaders = const {};
+          if (relayed != playUrl) {
+            playUrl = relayed;
+            playHeaders = const {};
+          }
         }
       }
       if (seq != _openSeq) return;

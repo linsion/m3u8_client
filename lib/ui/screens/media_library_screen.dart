@@ -448,25 +448,11 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
         if (entry.pickcode115.isEmpty) {
           throw const ApiException('缺少 115 pickcode');
         }
-        final ext = entry.normalizedExt;
-        final needsHlsTranscode = const {
-          '.f4v',
-          '.flv',
-          '.mkv',
-          '.avi',
-          '.rmvb',
-          '.wmv',
-          '.ts',
-          '.webm',
-          '.iso',
-        }.contains(ext);
-        String? directUrl;
-        if (needsHlsTranscode) {
-          directUrl = await Local115DirectService.instance
-              .resolvePickcodeHlsM3u8Url(entry.pickcode115);
-        }
-        directUrl ??= await Local115DirectService.instance
-            .resolvePickcodeStreamUrl(entry.pickcode115);
+        final directUrl = await Local115DirectService.instance
+            .resolvePickcodeStreamUrl(
+              entry.pickcode115,
+              allowVideoFallback: false,
+            );
         if (directUrl == null || directUrl.isEmpty) {
           throw const ApiException('无法解析 115 直链，请确认 115 登录状态');
         }
@@ -552,27 +538,33 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
         unawaited(_musicController.togglePlayPause());
       }
       try {
-        final resolved = await _resolveEntryEndpoint(entry);
-        String playUrl = resolved.url;
-        Map<String, String> playHeaders = resolved.headers;
-        if (entry.sourceKind == StorageSourceKind.cloud115) {
-          final isHls = playUrl.toLowerCase().contains('.m3u8');
-          playUrl = await Local115DirectService.instance
-              .wrapWithLocal115HeaderProxy(
-                playUrl,
-                playHeaders,
-                extHint: isHls ? '.m3u8' : entry.normalizedExt,
-              );
-          playHeaders = const {};
+        final is115 = entry.sourceKind == StorageSourceKind.cloud115;
+        Future<Resolved115Stream?> resolve115({bool? useCloudTranscode}) =>
+            Local115DirectService.instance.resolve115VideoPlayback(
+              pickcode: entry.pickcode115,
+              fileName: entry.name,
+              extension: entry.normalizedExt,
+              useCloudTranscode: useCloudTranscode,
+            );
+        final initial115 = is115 ? await resolve115() : null;
+        if (is115 && initial115 == null) {
+          throw const ApiException('115 原画和云转码均暂不可用');
         }
+        final resolved = initial115 == null
+            ? await _resolveEntryEndpoint(entry)
+            : (
+              url: initial115.proxyStreamUrl,
+              headers: initial115.playbackHeaders,
+              subtitle: '115 网盘 · ${entry.formattedSize}',
+            );
         if (!mounted) return;
         if (inMiniPlayer) {
           widget.appState.startMiniPlayer(
             MiniPlayerSession(
               title: entry.name,
               subtitle: resolved.subtitle,
-              streamUrl: playUrl,
-              headers: playHeaders,
+              streamUrl: resolved.url,
+              headers: resolved.headers,
             ),
           );
           ScaffoldMessenger.of(context).showSnackBar(
@@ -588,15 +580,18 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
           builder: (_) => _MediaFilePlayerDialog(
             api: widget.appState.api,
             title: entry.name,
-            streamUrl: playUrl,
-            headers: playHeaders,
-            onEnterMiniPlayer: (posSec) {
+            streamUrl: resolved.url,
+            headers: resolved.headers,
+            fallback115: initial115 == null
+                ? null
+                : () => resolve115(useCloudTranscode: !initial115.isTranscoded),
+            onEnterMiniPlayer: (posSec, url, headers) {
               widget.appState.startMiniPlayer(
                 MiniPlayerSession(
                   title: entry.name,
                   subtitle: resolved.subtitle,
-                  streamUrl: playUrl,
-                  headers: playHeaders,
+                  streamUrl: url,
+                  headers: headers,
                   initialPositionSeconds: posSec,
                 ),
               );
@@ -4493,13 +4488,16 @@ class _MediaFilePlayerDialog extends StatefulWidget {
   final String title;
   final String streamUrl;
   final Map<String, String> headers;
-  final ValueChanged<int>? onEnterMiniPlayer;
+  final Future<Resolved115Stream?> Function()? fallback115;
+  final void Function(int position, String url, Map<String, String> headers)?
+      onEnterMiniPlayer;
 
   const _MediaFilePlayerDialog({
     required this.api,
     required this.title,
     required this.streamUrl,
     required this.headers,
+    this.fallback115,
     this.onEnterMiniPlayer,
   });
 
@@ -4510,6 +4508,12 @@ class _MediaFilePlayerDialog extends StatefulWidget {
 class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
   late final Player _player;
   late final VideoController _controller;
+  StreamSubscription<String>? _playbackErrors;
+  late String _activeUrl;
+  late Map<String, String> _activeHeaders;
+  bool _tryingFallback = false;
+  bool _triedFallback = false;
+  bool _reportedPlaybackError = false;
   double _rate = 1.0;
   String _fitMode = 'fit'; // 'fit', 'cover'
   bool? _landscapeOverride;
@@ -4519,6 +4523,9 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
   @override
   void initState() {
     super.initState();
+    _activeUrl = widget.streamUrl;
+    _activeHeaders = widget.headers;
+    _using115Direct = widget.fallback115 != null;
     _player = Player(
       configuration: PlayerConfiguration(
         bufferSize: (Platform.isAndroid || Platform.isIOS)
@@ -4533,10 +4540,59 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
         enableHardwareAcceleration: !Platform.isAndroid,
       ),
     );
-    _configureMediaPlayer();
-    _player.open(
-      Media(widget.streamUrl, httpHeaders: widget.headers),
+    _playbackErrors = _player.stream.error.listen((message) {
+      if (message.trim().isNotEmpty) unawaited(_handlePlaybackError());
+    });
+    unawaited(_openInitialStream());
+  }
+
+  Future<void> _openInitialStream() async {
+    await _configureMediaPlayer();
+    if (!mounted) return;
+    try {
+      await _openActiveStream();
+    } catch (_) {
+      await _handlePlaybackError();
+    }
+  }
+
+  Future<void> _openActiveStream({Duration? position}) async {
+    await _player.open(
+      Media(_activeUrl, httpHeaders: _activeHeaders, start: position),
       play: true,
+    );
+    if (mounted && _rate != 1.0) await _player.setRate(_rate);
+  }
+
+  Future<void> _handlePlaybackError() async {
+    if (!mounted || _tryingFallback) return;
+    final fallback = widget.fallback115;
+    if (fallback != null && !_triedFallback) {
+      _triedFallback = true;
+      _tryingFallback = true;
+      final position = _player.state.position;
+      try {
+        final alternate = await fallback();
+        if (!mounted) return;
+        if (alternate != null && alternate.proxyStreamUrl != _activeUrl) {
+          _activeUrl = alternate.proxyStreamUrl;
+          _activeHeaders = alternate.playbackHeaders;
+          _tryingFallback = false;
+          await _openActiveStream(position: position);
+          return;
+        }
+      } catch (_) {
+        // Report the failure after both 115 playback routes have been tried.
+      } finally {
+        _tryingFallback = false;
+      }
+    }
+    if (!mounted || _reportedPlaybackError) return;
+    _reportedPlaybackError = true;
+    ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+      SnackBar(content: Text(fallback == null
+          ? '视频播放失败，请确认文件格式和网络连接'
+          : '115 原画和云转码均无法播放，请检查文件状态')),
     );
   }
 
@@ -4589,6 +4645,7 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
 
   @override
   void dispose() {
+    _playbackErrors?.cancel();
     if (_didChangeOrientation && (Platform.isAndroid || Platform.isIOS)) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
       SystemChrome.setPreferredOrientations(const []);
@@ -4649,22 +4706,11 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
                         if (!mounted) return;
                         final curSec = _player.state.position.inSeconds;
                         setState(() => _using115Direct = true);
-                        await _player.open(
-                          Media(
-                            resolved.proxyStreamUrl,
-                            httpHeaders:
-                                resolved.proxyStreamUrl.contains('127.0.0.1')
-                                    ? const {}
-                                    : resolved.headers,
-                            start: curSec > 2
-                                ? Duration(seconds: curSec)
-                                : null,
-                          ),
-                          play: true,
+                        _activeUrl = resolved.proxyStreamUrl;
+                        _activeHeaders = resolved.playbackHeaders;
+                        await _openActiveStream(
+                          position: curSec > 2 ? Duration(seconds: curSec) : null,
                         );
-                        if (_rate != 1.0) {
-                          await _player.setRate(_rate);
-                        }
                       },
                     ),
                     const SizedBox(width: 4),
@@ -4769,7 +4815,7 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
                         onPressed: () {
                           final posSec = _player.state.position.inSeconds;
                           Navigator.of(context).pop();
-                          widget.onEnterMiniPlayer!(posSec);
+                          widget.onEnterMiniPlayer!(posSec, _activeUrl, _activeHeaders);
                         },
                       ),
                     IconButton(

@@ -294,6 +294,84 @@ void main() {
   );
 
   test(
+    'Telegram relay reuses partially received blocks when tracks alternate far apart',
+    () async {
+      final origin = await HttpServer.bind(loopback, 0);
+      final finish = Completer<void>();
+      final requestedOffsets = <int>[];
+      const size = blockSize * 40;
+      const audioStart = blockSize * 2 + 501;
+      const videoStart = blockSize * 25 + 901;
+
+      addTearDown(() async {
+        if (!finish.isCompleted) finish.complete();
+        await origin.close(force: true);
+      });
+      origin.listen((req) async {
+        final range = req.headers.value(HttpHeaders.rangeHeader)!;
+        final bounds = range.substring('bytes='.length).split('-');
+        final start = int.parse(bounds.first);
+        final end = int.parse(bounds.last);
+        final length = end - start + 1;
+        requestedOffsets.add(start);
+        final response = req.response;
+        response.done.then<void>((_) {}, onError: (Object _) {});
+        response.statusCode = HttpStatus.partialContent;
+        response.headers.set(
+          HttpHeaders.contentRangeHeader,
+          'bytes $start-$end/$size',
+        );
+        response.contentLength = length;
+        response.bufferOutput = false;
+        try {
+          if (start == 0) {
+            response.add(List<int>.filled(length, 0));
+          } else {
+            const prefix = 16 * 1024;
+            response.add(List<int>.generate(prefix, (i) => (start + i) % 251));
+            await response.flush();
+            await finish.future;
+            response.add(List<int>.filled(length - prefix, 0));
+          }
+          await response.close();
+        } catch (_) {
+          // A client can abandon its open-ended response after its first read.
+        }
+      });
+
+      final bridge = LocalProxyTunnelBridge(resolveDefaultNode: () => null);
+      addTearDown(bridge.stop);
+      await bridge.ensureStarted();
+      final url = Uri.parse(
+        bridge.buildStreamRelayUrl(
+          targetUrl: 'http://127.0.0.1:${origin.port}/api/telegram/video',
+          forceDirect: true,
+        ),
+      );
+
+      for (final position in [
+        audioStart,
+        videoStart,
+        audioStart + 600,
+        videoStart + 1500,
+        audioStart + 1900,
+        videoStart + 2300,
+      ]) {
+        final client = HttpClient();
+        try {
+          final response = await request(client, url, range: 'bytes=$position-');
+          expect(response.statusCode, HttpStatus.partialContent);
+          final first = await response.first.timeout(const Duration(seconds: 3));
+          expect(first.first, position % 251);
+        } finally {
+          client.close(force: true);
+        }
+      }
+      expect(requestedOffsets, [0, audioStart, videoStart]);
+    },
+  );
+
+  test(
     'Telegram relay streams sources without byte-range support and isolates headers',
     () async {
       final origin = await HttpServer.bind(loopback, 0);

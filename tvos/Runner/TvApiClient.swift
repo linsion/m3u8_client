@@ -4648,28 +4648,8 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     let playhead = tgPlayheadBlockByUrl[targetUrl] ?? 0
     let hdrs = tgHeadersByUrl[targetUrl] ?? [:]
 
-    // 1. Evict stale blocks behind `playhead - 2` first (keeping Block 0 and tail `moov` block pinned)
-    if tgBlockOrder.count > Self.tgMaxCachedBlocks - 4 {
-      let minKeep = max(1, playhead - 2)
-      let maxKeep = min(maxBlockIndex, playhead + Int64(Self.tgLookaheadBlocks) + 2)
-      var idxToRemove: [String] = []
-      for k in tgBlockOrder where k.hasPrefix("\(targetUrl)#") {
-        if let hashIdx = k.lastIndex(of: "#"),
-           let bIdx = Int64(k[k.index(after: hashIdx)...]) {
-          if bIdx != 0 && bIdx != maxBlockIndex && (bIdx < minKeep || bIdx > maxKeep) {
-            idxToRemove.append(k)
-          }
-        }
-      }
-      for k in idxToRemove {
-        tgBlockCache.removeValue(forKey: k)
-        if let p = tgBlockOrder.firstIndex(of: k) {
-          tgBlockOrder.remove(at: p)
-        }
-      }
-    }
-
-    // 2. Always ensure `playhead` block itself (including Block 0 remainder `524288..2097151`!) is cached or in flight first!
+    // Completed blocks remain in the bounded LRU across playhead changes.
+    // MP4 audio and video may be read from distant offsets in the same file.
     let playheadKey = "\(targetUrl)#\(playhead)"
     let isPlayheadReady = tgBlockCache[playheadKey] != nil
 

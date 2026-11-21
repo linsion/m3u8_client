@@ -2244,6 +2244,7 @@ class _TelegramLiveStitchBlock {
   int expectedLength;
   int availableEnd;
   bool failed = false;
+  bool requestedByPlayer = false;
   int readers = 0;
   void Function()? cancelTransfer;
   Completer<void> _changed = Completer<void>();
@@ -2302,13 +2303,16 @@ class _TelegramParallelStitchSession {
   int playhead = 0;
   int playheadOffset = 0;
   int playheadEnd = 0;
+  int? alternatePlayhead;
   Socket? playheadReader;
+  Timer? lookaheadDelay;
   Timer? idleTimer;
 
   _TelegramParallelStitchSession(this.uri, this.headers, this.routes);
 
   void close() {
     closed = true;
+    lookaheadDelay?.cancel();
     idleTimer?.cancel();
     for (final block in transfers) {
       block.cancel();
@@ -2342,6 +2346,11 @@ class LocalProxyTunnelBridge {
   static const int _tgMaxWorkersPerSession = 3;
   static const int _tgLookaheadBlocks = 8;
   static const int _tgMaxBehindBlocks = 2;
+  // Bound reusable data per playback session, including blocks from both tracks.
+  static const int _tgRetainedBlocks = 16;
+  static const int _tgDetachedReadLimit = 2;
+  static const int _tgForwardReadSlack = 64 * 1024;
+  static const Duration _tgLookaheadSettle = Duration(milliseconds: 200);
   static final _contentRangePattern = RegExp(r'^bytes (\d+)-(\d+)/(\d+)$');
   final _tgStitchSessions = <_TelegramSessionKey, _TelegramParallelStitchSession>{};
   final _clientCleanups = <Socket, void Function()>{};
@@ -3688,13 +3697,18 @@ class LocalProxyTunnelBridge {
       if (!session.readers.remove(client)) return;
       if (session.playheadReader == client) {
         session.playheadReader = null;
+        session.lookaheadDelay?.cancel();
+        session.lookaheadDelay = null;
         for (final block in session.transfers) {
-          if (!block.complete && block.readers == 0) block.cancel();
+          if (block.readers == 0 &&
+              _shouldCancelTelegramLookahead(session, block)) {
+            block.cancel();
+          }
         }
       }
       if (session.readers.isNotEmpty || session.closed) return;
       for (final block in session.transfers) {
-        if (!block.complete) block.cancel();
+        if (_shouldCancelTelegramLookahead(session, block)) block.cancel();
       }
       session.idleTimer = Timer(const Duration(seconds: 5), () {
         if (identical(_tgStitchSessions[key], session)) {
@@ -3765,6 +3779,13 @@ class LocalProxyTunnelBridge {
         if (followsPlayback) {
           session.playheadReader = client;
           session.playheadEnd = range.end ~/ _tgBlockSize;
+          // A demuxer can issue several short-lived, open-ended ranges for a
+          // single frame. Only start speculative transfers once a read settles.
+          session.lookaheadDelay?.cancel();
+          session.lookaheadDelay = Timer(_tgLookaheadSettle, () {
+            session.lookaheadDelay = null;
+            _pumpTelegramStitchSession(session);
+          });
         }
         var cursor = range.start;
         while (cursor <= range.end &&
@@ -3774,6 +3795,18 @@ class LocalProxyTunnelBridge {
           final blockStart = index * _tgBlockSize;
           final startOffset = cursor - blockStart;
           if (session.playheadReader == client) {
+            if (cursor == range.start &&
+                (index - session.playhead).abs() > _tgLookaheadBlocks) {
+              // Returning to an already used region often means the demuxer is
+              // alternating between tracks, rather than seeking to a new time.
+              final cached = session.blocks[index];
+              session.alternatePlayhead =
+                  cached != null && cached.requestedByPlayer && !cached.failed
+                      ? session.playhead
+                      : null;
+            } else if (index - range.start ~/ _tgBlockSize >= 2) {
+              session.alternatePlayhead = null;
+            }
             session.playhead = index;
             session.playheadOffset = startOffset;
             if (cursor == range.start) _trimTelegramStitchBlocks(session);
@@ -3787,8 +3820,11 @@ class LocalProxyTunnelBridge {
             preserveLaterBlock: !followsPlayback,
           );
           block.readers++;
+          if (followsPlayback) block.requestedByPlayer = true;
           if (session.playheadReader == client) {
             _pumpTelegramStitchSession(session);
+          } else {
+            _evictTelegramBlocks(session);
           }
           try {
             final sliceEnd = min(
@@ -3826,6 +3862,9 @@ class LocalProxyTunnelBridge {
                 session.blocks[index] != block &&
                 !block.complete) {
               block.cancel();
+            }
+            if (block.requestedByPlayer && !block.complete) {
+              _limitTelegramDetachedReads(session);
             }
             if (session.playheadReader == client) {
               _pumpTelegramStitchSession(session);
@@ -3892,7 +3931,11 @@ class LocalProxyTunnelBridge {
         startOffset >= existing.startOffset &&
         (!prioritizeOffset ||
             existing.startOffset == startOffset ||
-            existing.availableEnd > startOffset)) {
+            existing.availableEnd > startOffset ||
+            (existing.requestedByPlayer &&
+                startOffset - existing.availableEnd <= _tgForwardReadSlack))) {
+      session.blocks.remove(index);
+      session.blocks[index] = existing;
       return existing;
     }
     final length = min(_tgBlockSize, session.totalSize - index * _tgBlockSize);
@@ -3918,14 +3961,17 @@ class LocalProxyTunnelBridge {
 
   int _trimTelegramStitchBlocks(_TelegramParallelStitchSession session) {
     final last = (session.totalSize - 1) ~/ _tgBlockSize;
+    final alternate = session.alternatePlayhead;
     final maxAhead = min(
       session.playheadEnd,
-      session.playhead + _tgLookaheadBlocks,
+      session.playhead + (alternate == null ? _tgLookaheadBlocks : 1),
     );
     session.blocks.removeWhere((index, block) {
       if (block.readers > 0 ||
           index == session.playhead ||
           (index > session.playhead && index <= maxAhead) ||
+          (alternate != null && index == alternate + 1) ||
+          (block.requestedByPlayer && !block.failed) ||
           (block.complete &&
               (index == 0 ||
                   index == last ||
@@ -3936,7 +3982,54 @@ class LocalProxyTunnelBridge {
       block.cancel();
       return true;
     });
+    _evictTelegramBlocks(session);
     return maxAhead;
+  }
+
+  bool _shouldCancelTelegramLookahead(
+    _TelegramParallelStitchSession session,
+    _TelegramLiveStitchBlock block,
+  ) {
+    if (block.complete || block.requestedByPlayer) return false;
+    final alternate = session.alternatePlayhead;
+    return alternate == null ||
+        (block.index != alternate + 1 && block.index != session.playhead + 1);
+  }
+
+  void _evictTelegramBlocks(_TelegramParallelStitchSession session) {
+    var excess = session.blocks.length - _tgRetainedBlocks;
+    if (excess <= 0) return;
+    final last = (session.totalSize - 1) ~/ _tgBlockSize;
+    session.blocks.removeWhere((index, block) {
+      if (excess == 0 ||
+          block.readers > 0 ||
+          index == session.playhead ||
+          (block.complete && (index == 0 || index == last))) {
+        return false;
+      }
+      excess--;
+      block.cancel();
+      return true;
+    });
+  }
+
+  void _limitTelegramDetachedReads(_TelegramParallelStitchSession session) {
+    // Demuxers close and reopen HTTP ranges when alternating between tracks.
+    // Keep the two most recent demanded blocks filling across these switches.
+    var remaining = _tgDetachedReadLimit;
+    for (final block in session.blocks.values.toList().reversed) {
+      if (block.readers > 0 ||
+          !block.requestedByPlayer ||
+          block.complete ||
+          block.failed) {
+        continue;
+      }
+      if (remaining == 0) {
+        block.cancel();
+      } else {
+        remaining--;
+      }
+    }
   }
 
   void _pumpTelegramStitchSession(_TelegramParallelStitchSession session) {
@@ -3946,6 +4039,7 @@ class LocalProxyTunnelBridge {
       return;
     }
     final maxAhead = _trimTelegramStitchBlocks(session);
+    if (session.lookaheadDelay != null) return;
     final current = session.blocks[session.playhead];
     if (current == null ||
         current.startOffset > session.playheadOffset ||
@@ -3956,10 +4050,12 @@ class LocalProxyTunnelBridge {
     for (var index = session.playhead + 1; index <= maxAhead; index++) {
       if (session.transfers.length >= _tgMaxWorkersPerSession) return;
       final block = session.blocks[index];
-      if (block == null || (block.complete && block.startOffset > 0)) {
+      if (block == null ||
+          (block.complete && !block.requestedByPlayer && block.startOffset > 0)) {
         _ensureTelegramStitchBlock(session, index);
       }
     }
+    _evictTelegramBlocks(session);
   }
 
   Future<void> _downloadTelegramBlock(
