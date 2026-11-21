@@ -122,6 +122,64 @@ void main() {
     expect(controller.activePlaylistId, created.id);
     expect(controller.queue, isEmpty);
     expect(controller.savedPlaylists.first.tracks.single.name, 'Blue Sky.mp3');
+
+    // Verify saved playlist playback after long background inactivity
+    var resolveCount = 0;
+    CloudMusicController(
+      endpointResolver: (entry) async {
+        resolveCount++;
+        return (
+          url: 'file:///tmp/test_${resolveCount}_${entry.name}',
+          headers: const <String, String>{},
+          subtitle: '测试音源 #$resolveCount',
+        );
+      },
+    );
+
+    await controller.switchAndPlayPlaylist(
+      'default_playlist',
+      autoPlay: false,
+    );
+    await tester.pumpAndSettle();
+    expect(controller.queue.single.name, 'Blue Sky.mp3');
+
+    controller.didChangeAppLifecycleState(AppLifecycleState.paused);
+    controller.markResumedFromBackground(
+      backgroundDuration: const Duration(minutes: 30),
+    );
+    expect(controller.needsFreshOpenAfterBackground, isTrue);
+
+    // 1. Tapping the already-active saved playlist in 列表管理 after background resume must trigger playback
+    final beforeTapCount = resolveCount;
+    await tester.tap(find.text('列表管理'));
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.descendant(
+        of: find.byType(BottomSheet),
+        matching: find.text('默认播放列表'),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(resolveCount, greaterThan(beforeTapCount));
+    expect(controller.activeStreamUrl, contains('Blue Sky.mp3'));
+
+    // 2. Simulate another long background period, then tap the current track in the saved playlist queue
+    final beforeQueueTapCount = resolveCount;
+    final previousStreamUrl = controller.activeStreamUrl;
+    controller.markResumedFromBackground(
+      backgroundDuration: const Duration(minutes: 45),
+    );
+    expect(controller.needsFreshOpenAfterBackground, isTrue);
+
+    await controller.playQueueIndex(0);
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(resolveCount, greaterThan(beforeQueueTapCount));
+    expect(controller.needsFreshOpenAfterBackground, isFalse);
+    expect(controller.activeStreamUrl, isNotEmpty);
+    expect(controller.activeStreamUrl, isNot(previousStreamUrl));
+
+    await controller.stopAndClose();
+    await tester.pumpAndSettle();
     expect(tester.takeException(), isNull);
   });
 }

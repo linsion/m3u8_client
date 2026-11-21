@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -13,6 +14,7 @@ import 'package:m3u8_client/services/proxy_routing_service.dart';
 import 'package:m3u8_client/services/telegram_notification_service.dart';
 import 'package:m3u8_client/state/app_state.dart';
 import 'package:m3u8_client/ui/screens/proxy_server_screen.dart';
+import 'package:m3u8_client/ui/screens/telegram_screen.dart';
 import 'package:m3u8_client/ui/theme.dart';
 import 'package:m3u8_client/ui/widgets/mobile_edge_swipe_back.dart';
 import 'package:m3u8_client/ui/widgets/video_115_accelerate_button.dart';
@@ -20,6 +22,148 @@ import 'package:m3u8_client/ui/widgets/video_download_speed_badge.dart';
 import 'package:m3u8_client/ui/widgets/video_proxy_node_selector.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:xterm/xterm.dart';
+
+class _FakeTelegramApiClient extends ApiClient {
+  _FakeTelegramApiClient({Completer<void>? sendCompleter})
+      : sendCompleter = sendCompleter ?? (Completer<void>()..complete()),
+        super(const ServerConfig());
+
+  final Completer<void> sendCompleter;
+  bool sendCompleted = false;
+
+  List<TelegramChat> serverChats = [
+    const TelegramChat(
+      peer: 'user:1001',
+      title: '测试好友',
+      kind: '私聊',
+      preview: '你好',
+      date: 1700000000,
+      unread: 0,
+      readOnly: false,
+      topMessageId: 101,
+    ),
+    const TelegramChat(
+      peer: 'user:1002',
+      title: '群组伙伴',
+      kind: '私聊',
+      preview: '早安',
+      date: 1699999000,
+      unread: 0,
+      readOnly: false,
+      topMessageId: 201,
+    ),
+  ];
+
+  final Map<String, List<TelegramMessage>> serverMessagesByPeer = {
+    'user:1001': [
+      const TelegramMessage(
+        id: 101,
+        date: 1700000000,
+        sender: '测试好友',
+        text: '附带测试文件',
+        outgoing: false,
+        attachment: TelegramAttachment(
+          kind: 'file',
+          fileName: 'report_2026.pdf',
+          size: 2048,
+          mimeType: 'application/pdf',
+          url: 'https://example.test/api/telegram/file?id=101',
+        ),
+      ),
+    ],
+    'user:1002': [
+      const TelegramMessage(
+        id: 201,
+        date: 1699999000,
+        sender: '群组伙伴',
+        text: '早安',
+        outgoing: false,
+      ),
+    ],
+  };
+
+  @override
+  Future<({String activeId, List<TelegramAccount> accounts})>
+      fetchTelegramAccounts() async {
+    return (
+      activeId: 'default',
+      accounts: const [
+        TelegramAccount(id: 'default', name: '测试账号', username: 'tester'),
+      ],
+    );
+  }
+
+  @override
+  Future<TelegramAuthStatus> fetchTelegramStatus([String? accountId]) async {
+    return const TelegramAuthStatus(configured: true, authorized: true);
+  }
+
+  @override
+  Future<List<TelegramFolder>> fetchTelegramFolders([String? accountId]) async {
+    return const [TelegramFolder(key: '0', title: '全部会话')];
+  }
+
+  @override
+  Future<({List<TelegramChat> chats, String nextCursor})> fetchTelegramChats({
+    required String accountId,
+    String folder = '0',
+    String cursor = '',
+    int limit = 50,
+  }) async {
+    return (
+      chats: List<TelegramChat>.from(serverChats),
+      nextCursor: '',
+    );
+  }
+
+  @override
+  Future<({List<TelegramMessage> messages, int nextOffset})>
+      fetchTelegramMessages({
+    required String accountId,
+    required String peer,
+    int offsetId = 0,
+    int limit = 50,
+  }) async {
+    return (
+      messages: List<TelegramMessage>.from(
+        serverMessagesByPeer[peer] ?? const <TelegramMessage>[],
+      ),
+      nextOffset: 0,
+    );
+  }
+
+  @override
+  Future<TelegramMessage?> sendTelegramTextMessage({
+    required String accountId,
+    required String peer,
+    required String text,
+    int replyTo = 0,
+  }) async {
+    await sendCompleter.future;
+    sendCompleted = true;
+    return TelegramMessage(
+      id: 102,
+      date: 1700000050,
+      sender: '我',
+      text: text,
+      outgoing: true,
+    );
+  }
+
+  @override
+  Future<void> markTelegramChatRead({
+    required String accountId,
+    required String peer,
+    int maxId = 0,
+  }) async {}
+
+  @override
+  Future<void> sendTelegramTyping({
+    required String accountId,
+    required String peer,
+    required bool active,
+  }) async {}
+}
 
 class _PlaybackIndicatorPlayer extends PlatformPlayer {
   _PlaybackIndicatorPlayer() : super(configuration: const PlayerConfiguration());
@@ -942,37 +1086,44 @@ proxies:
       final rx = <int>[];
       var stage = 0;
       Socket? upstream;
-      client.listen((chunk) async {
-        if (stage == 2 && upstream != null) {
-          upstream!.add(chunk);
-          return;
-        }
-        rx.addAll(chunk);
-        if (stage == 0 && rx.length >= 3) {
-          rx.clear();
-          stage = 1;
-          client.add(const [0x05, 0x00]);
-        } else if (stage == 1 && rx.length >= 7) {
-          final hostLen = rx[4];
-          if (rx.length >= 5 + hostLen + 2) {
-            final host = utf8.decode(rx.sublist(5, 5 + hostLen));
-            final port = (rx[5 + hostLen] << 8) | rx[5 + hostLen + 1];
-            rx.removeRange(0, 5 + hostLen + 2);
-            upstream = await Socket.connect(host, port);
-            stage = 2;
-            client.add(const [0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0]);
-            if (rx.isNotEmpty) {
-              upstream!.add(List<int>.from(rx));
-              rx.clear();
+      client.listen(
+        (chunk) async {
+          try {
+            if (stage == 2 && upstream != null) {
+              upstream!.add(chunk);
+              return;
             }
-            upstream!.listen(
-              (d) => client.add(d),
-              onDone: () => client.destroy(),
-              onError: (_) => client.destroy(),
-            );
+            rx.addAll(chunk);
+            if (stage == 0 && rx.length >= 3) {
+              rx.clear();
+              stage = 1;
+              client.add(const [0x05, 0x00]);
+            } else if (stage == 1 && rx.length >= 7) {
+              final hostLen = rx[4];
+              if (rx.length >= 5 + hostLen + 2) {
+                final host = utf8.decode(rx.sublist(5, 5 + hostLen));
+                final port = (rx[5 + hostLen] << 8) | rx[5 + hostLen + 1];
+                rx.removeRange(0, 5 + hostLen + 2);
+                upstream = await Socket.connect(host, port);
+                stage = 2;
+                client.add(const [0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0]);
+                if (rx.isNotEmpty) {
+                  upstream!.add(List<int>.from(rx));
+                  rx.clear();
+                }
+                upstream!.listen(
+                  (d) => client.add(d),
+                  onDone: () => client.destroy(),
+                  onError: (_) => client.destroy(),
+                );
+              }
+            }
+          } catch (_) {
+            client.destroy();
           }
-        }
-      });
+        },
+        onError: (_) => client.destroy(),
+      );
     });
 
     SharedPreferences.setMockInitialValues({});
@@ -1589,5 +1740,467 @@ proxies:
     });
     expect(selfChat.conversationActionType, '');
     expect(selfChat.conversationActionLabel, '');
+  });
+
+  test('ProxyRoutingService switches nodes immediately for existing relay URLs and forces direct when proxy is disabled',
+      () async {
+    HttpOverrides.global = null;
+    final originServer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final originPort = originServer.port;
+    originServer.listen((HttpRequest req) async {
+      if (req.uri.path == '/live/index.m3u8') {
+        req.response.headers.contentType =
+            ContentType('application', 'vnd.apple.mpegurl', charset: 'utf-8');
+        req.response.write(
+          '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXTINF:4.0,\nseg01.ts\n#EXT-X-ENDLIST\n',
+        );
+        await req.response.close();
+      } else if (req.uri.path == '/live/seg01.ts') {
+        req.response.headers.contentType = ContentType('video', 'mp2t');
+        req.response.add(List<int>.filled(512, 0x47));
+        await req.response.close();
+      } else {
+        req.response.statusCode = 404;
+        await req.response.close();
+      }
+    });
+
+    var socks1Hits = 0;
+    var socks2Hits = 0;
+
+    Future<ServerSocket> startMockSocks(void Function() onHit) async {
+      final srv = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      srv.listen((Socket client) async {
+        final rx = <int>[];
+        var stage = 0;
+        Socket? upstream;
+        client.listen(
+          (chunk) async {
+            try {
+              if (stage == 2 && upstream != null) {
+                upstream!.add(chunk);
+                return;
+              }
+              rx.addAll(chunk);
+              if (stage == 0 && rx.length >= 3) {
+                rx.clear();
+                stage = 1;
+                client.add(const [0x05, 0x00]);
+              } else if (stage == 1 && rx.length >= 7) {
+                final hostLen = rx[4];
+                if (rx.length >= 5 + hostLen + 2) {
+                  final host = utf8.decode(rx.sublist(5, 5 + hostLen));
+                  final port = (rx[5 + hostLen] << 8) | rx[5 + hostLen + 1];
+                  rx.removeRange(0, 5 + hostLen + 2);
+                  onHit();
+                  upstream = await Socket.connect(host, port);
+                  stage = 2;
+                  client.add(const [0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0]);
+                  if (rx.isNotEmpty) {
+                    upstream!.add(List<int>.from(rx));
+                    rx.clear();
+                  }
+                  upstream!.listen(
+                    (d) => client.add(d),
+                    onDone: () => client.destroy(),
+                    onError: (_) => client.destroy(),
+                  );
+                }
+              }
+            } catch (_) {
+              client.destroy();
+            }
+          },
+          onError: (_) => client.destroy(),
+        );
+      });
+      return srv;
+    }
+
+    final socks1 = await startMockSocks(() => socks1Hits++);
+    final socks2 = await startMockSocks(() => socks2Hits++);
+
+    SharedPreferences.setMockInitialValues({});
+    final svc = ProxyRoutingService();
+    await svc.initialize();
+    await svc.upsertManualNode(
+      ProxyNode(
+        id: 'node_socks_1',
+        name: '节点1',
+        protocol: 'socks5',
+        server: '127.0.0.1',
+        port: socks1.port,
+        latencyMs: 60,
+        speedKbps: 1200,
+      ),
+      testLatency: false,
+    );
+    await svc.upsertManualNode(
+      ProxyNode(
+        id: 'node_socks_2',
+        name: '节点2',
+        protocol: 'socks5',
+        server: '127.0.0.1',
+        port: socks2.port,
+        latencyMs: 45,
+        speedKbps: 2000,
+      ),
+      testLatency: false,
+    );
+
+    // 1. Lock node_socks_1 via scenario rule + manual selection (simulating VideoProxyNodeSelector)
+    await svc.setProxyEnabled(true);
+    await svc.updateScenarioRule(
+      RequestScenario.vodStream,
+      mode: ScenarioRouteMode.proxyNode,
+      specificNodeId: 'node_socks_1',
+    );
+    await svc.selectNode('node_socks_1', switchToManual: true);
+
+    final playlistUrl = 'http://127.0.0.1:$originPort/live/index.m3u8';
+    final relayedPlaylistUrl = await svc.resolveProxiedStreamUrl(
+      RequestScenario.vodStream,
+      playlistUrl,
+    );
+    expect(relayedPlaylistUrl, contains('nid=node_socks_1'));
+
+    final hc = HttpClient();
+    final m3u8Req = await hc.getUrl(Uri.parse(relayedPlaylistUrl));
+    final m3u8Resp = await m3u8Req.close();
+    final m3u8Text = await utf8.decoder.bind(m3u8Resp).join();
+    expect(socks1Hits, greaterThanOrEqualTo(1));
+    expect(socks2Hits, 0);
+
+    final segUrlWithOldNid = m3u8Text
+        .split('\n')
+        .map((l) => l.trim())
+        .firstWhere((l) => l.startsWith('http://127.0.0.1:'));
+    expect(segUrlWithOldNid, contains('nid=node_socks_1'));
+
+    // 2. Switch to node_socks_2 -> even existing segment URLs with `nid=node_socks_1`
+    // MUST immediately route through node_socks_2 instead of staying on node_socks_1!
+    final socks1BeforeSwitch = socks1Hits;
+    await svc.selectNode('node_socks_2', switchToManual: true);
+    expect(
+      svc.resolveNodeForScenario(RequestScenario.vodStream)?.id,
+      'node_socks_2',
+    );
+
+    final segReq2 = await hc.getUrl(Uri.parse(segUrlWithOldNid));
+    final segResp2 = await segReq2.close();
+    expect(segResp2.statusCode, 200);
+    await segResp2.drain<void>();
+    expect(socks2Hits, greaterThanOrEqualTo(1));
+    expect(socks1Hits, socks1BeforeSwitch);
+
+    // 3. Switch to autoFastest mode -> clears specificNodeId locks so fastestNode takes effect
+    await svc.setSelectionMode(ProxySelectionMode.autoFastest);
+    expect(
+      svc.scenarioRules[RequestScenario.vodStream]?.specificNodeId,
+      isNull,
+    );
+    expect(
+      svc.resolveNodeForScenario(RequestScenario.vodStream)?.id,
+      'node_socks_2',
+    );
+
+    // 4. Turn OFF global proxy -> existing `/__m3u8_proxy__/` URLs MUST immediately
+    // connect DIRECT without hitting either proxy node!
+    await svc.setProxyEnabled(false);
+    final socks1BeforeOff = socks1Hits;
+    final socks2BeforeOff = socks2Hits;
+
+    final segReqDirect = await hc.getUrl(Uri.parse(segUrlWithOldNid));
+    final segRespDirect = await segReqDirect.close();
+    expect(segRespDirect.statusCode, 200);
+    final directBytes =
+        await segRespDirect.fold<List<int>>(<int>[], (a, b) => a..addAll(b));
+    expect(directBytes.length, 512);
+    expect(socks1Hits, socks1BeforeOff);
+    expect(socks2Hits, socks2BeforeOff);
+
+    hc.close(force: true);
+    svc.dispose();
+    await socks1.close();
+    await socks2.close();
+    await originServer.close(force: true);
+  });
+
+  test('Direct VOD M3U8 routes through local multi-thread prefetch relay and awaits in-flight segments cleanly',
+      () async {
+    HttpOverrides.global = null;
+    var seg0FetchCount = 0;
+    final originServer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final originPort = originServer.port;
+    originServer.listen((HttpRequest req) async {
+      if (req.uri.path == '/vod/direct.m3u8') {
+        req.response.headers.contentType =
+            ContentType('application', 'vnd.apple.mpegurl', charset: 'utf-8');
+        req.response.write(
+          '#EXTM3U\n'
+          '#EXT-X-VERSION:3\n'
+          '#EXT-X-TARGETDURATION:4\n'
+          '#EXTINF:4.0,\n'
+          'seg_0.ts\n'
+          '#EXTINF:4.0,\n'
+          'seg_1.ts\n'
+          '#EXT-X-ENDLIST\n',
+        );
+        await req.response.close();
+        return;
+      }
+      if (req.uri.path == '/vod/seg_0.ts') {
+        seg0FetchCount++;
+        // Simulate a 320ms network transfer (previously timed out at 180ms and caused duplicate fetch!)
+        await Future<void>.delayed(const Duration(milliseconds: 320));
+        final payload = List<int>.filled(4096, 0x47);
+        req.response.headers.contentType = ContentType('video', 'mp2t');
+        req.response.contentLength = payload.length;
+        req.response.add(payload);
+        await req.response.close();
+        return;
+      }
+      if (req.uri.path == '/vod/seg_1.ts') {
+        final payload = List<int>.filled(4096, 0x47);
+        req.response.headers.contentType = ContentType('video', 'mp2t');
+        req.response.contentLength = payload.length;
+        req.response.add(payload);
+        await req.response.close();
+        return;
+      }
+      req.response.statusCode = 404;
+      await req.response.close();
+    });
+
+    SharedPreferences.setMockInitialValues({});
+    final svc = ProxyRoutingService();
+    await svc.initialize();
+    expect(svc.proxyEnabled, isFalse);
+
+    final rawM3u8Url = 'http://127.0.0.1:$originPort/vod/direct.m3u8';
+    // Even with proxy disabled (direct mode), VOD M3U8 with remote host routes through local relay
+    // Test with localhost replacement via buildStreamRelayUrl + resolveProxiedStreamUrl on external domain
+    final externalM3u8 = 'https://cdn.qq.com/vod/index.m3u8';
+    final relayedExternal = await svc.resolveProxiedStreamUrl(
+      RequestScenario.vodStream,
+      externalM3u8,
+      cleanM3u8Ads: true,
+    );
+    expect(relayedExternal, contains('/__m3u8_proxy__/playlist.m3u8'));
+    expect(relayedExternal, contains('direct=1'));
+
+    final bridge = LocalProxyTunnelBridge(resolveDefaultNode: () => null);
+    addTearDown(bridge.stop);
+    await bridge.ensureStarted();
+    final localRelayed = bridge.buildStreamRelayUrl(
+      targetUrl: rawM3u8Url,
+      forceDirect: true,
+    );
+
+    final hc = HttpClient();
+    final m3u8Req = await hc.getUrl(Uri.parse(localRelayed));
+    final m3u8Resp = await m3u8Req.close();
+    final m3u8Text = await utf8.decoder.bind(m3u8Resp).join();
+    final segUrls = m3u8Text
+        .split('\n')
+        .map((l) => l.trim())
+        .where((l) => l.startsWith('http://127.0.0.1:'))
+        .toList();
+    expect(segUrls.length, 2);
+
+    // Wait 70ms so the initial prefetch timer starts fetching seg_0 in-flight
+    await Future<void>.delayed(const Duration(milliseconds: 70));
+
+    // Request seg_0 while it is in-flight (320ms duration) -> should await the in-flight fetch
+    // and return `INFLIGHT-HIT` without opening a duplicate download!
+    final seg0Req = await hc.getUrl(Uri.parse(segUrls[0]));
+    final seg0Resp = await seg0Req.close();
+    expect(seg0Resp.statusCode, 200);
+    expect(seg0Resp.headers.value('x-multithread-cache'), anyOf('INFLIGHT-HIT', 'HIT'));
+    final seg0Bytes =
+        await seg0Resp.fold<List<int>>(<int>[], (a, b) => a..addAll(b));
+    expect(seg0Bytes.length, 4096);
+    expect(seg0FetchCount, 1);
+
+    hc.close(force: true);
+    svc.dispose();
+    await originServer.close(force: true);
+  });
+
+  testWidgets(
+      'TelegramScreen optimistic send shows message immediately before background send completes and saved local files show clickable directory path',
+      (WidgetTester tester) async {
+    final sendCompleter = Completer<void>();
+    final fakeApi = _FakeTelegramApiClient(sendCompleter: sendCompleter);
+
+    SharedPreferences.setMockInitialValues({
+      'm3u8_tg_saved_local_paths_v1': jsonEncode({
+        'default|user:1001|101': '/Users/tester/Downloads/report_2026.pdf',
+      }),
+    });
+
+    final appState = AppState(customApi: fakeApi);
+    appState.updateTelegramReadingContext(
+      isTelegramViewActive: true,
+      isAppForeground: true,
+    );
+
+    await tester.binding.setSurfaceSize(const Size(1280, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: MediaQuery(
+          data: const MediaQueryData(size: Size(1280, 800)),
+          child: Scaffold(
+            body: TelegramScreen(appState: appState),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+    await tester.pump(const Duration(milliseconds: 50));
+    await tester.pump(const Duration(milliseconds: 50));
+
+    expect(find.text('测试好友'), findsWidgets);
+    if (find.text('report_2026.pdf').evaluate().isEmpty) {
+      await tester.tap(find.text('测试好友').first);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+    }
+    expect(find.text('report_2026.pdf'), findsOneWidget);
+
+    // 1. Verify the downloaded local file path and "打开目录" button are displayed on the message bubble!
+    expect(
+      find.text('/Users/tester/Downloads/report_2026.pdf'),
+      findsOneWidget,
+    );
+    expect(find.text('打开目录'), findsOneWidget);
+
+    // 2. Enter text in the compose input and click Send -> should IMMEDIATELY clear input
+    // and display the optimistic message bubble with '发送中...' before the network call finishes!
+    final composeFinder = find.byWidgetPredicate(
+      (w) =>
+          w is TextField &&
+          (w.decoration?.hintText?.contains('撰写消息') ?? false),
+    );
+    expect(composeFinder, findsOneWidget);
+
+    await tester.enterText(composeFinder, '这是一条乐观发送的测试消息');
+    await tester.pump();
+
+    await tester.tap(find.byIcon(Icons.send_rounded));
+    await tester.pump();
+
+    // Immediately after tapping Send (0ms elapsed, background request still in flight):
+    expect(fakeApi.sendCompleted, isFalse);
+    final composeWidget = tester.widget<TextField>(composeFinder);
+    expect(composeWidget.controller?.text, isEmpty);
+    expect(find.text('这是一条乐观发送的测试消息'), findsWidgets);
+    expect(find.text('发送中...'), findsOneWidget);
+
+    // Complete the background network send -> optimistic status transitions to '已发送'
+    sendCompleter.complete();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+
+    expect(fakeApi.sendCompleted, isTrue);
+    expect(find.text('这是一条乐观发送的测试消息'), findsWidgets);
+    expect(find.text('发送中...'), findsNothing);
+    expect(find.text('已发送'), findsOneWidget);
+
+    appState.dispose();
+  });
+
+  testWidgets(
+      'TelegramScreen receives incoming messages in real time via SSE even when account userId is empty and via fast live polling',
+      (WidgetTester tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final fakeApi = _FakeTelegramApiClient();
+
+    final appState = AppState(customApi: fakeApi);
+    appState.updateTelegramReadingContext(
+      isTelegramViewActive: true,
+      isAppForeground: true,
+    );
+
+    await tester.binding.setSurfaceSize(const Size(1280, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: MediaQuery(
+          data: const MediaQueryData(size: Size(1280, 800)),
+          child: Scaffold(
+            body: TelegramScreen(appState: appState),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+    await tester.pump(const Duration(milliseconds: 50));
+    await tester.pump(const Duration(milliseconds: 50));
+
+    // 1. Even though TelegramAccount.userId is empty (''), 'default' account MUST be registered
+    // in TelegramNotificationService so the SSE notification stream connects immediately.
+    await appState.telegramNotifications.refreshAccountsAndConnect();
+    expect(
+      appState.telegramNotifications.registeredAccountIdsForTesting,
+      contains('default'),
+    );
+
+    // 2. Inject a real-time SSE message frame for the active chat ('user:1001')
+    final ssePayload = jsonEncode({
+      'type': 'new_message',
+      'account_id': 'default',
+      'peer': 'user:1001',
+      'chat_title': '测试好友',
+      'new_message': true,
+      'message_id': 105,
+      'message': {
+        'id': 105,
+        'date': 1700000100,
+        'sender': '测试好友',
+        'text': 'SSE实时推送的新消息立即到达',
+        'outgoing': false,
+      },
+      'chat': {
+        'peer': 'user:1001',
+        'title': '测试好友',
+        'kind': '私聊',
+        'preview': 'SSE实时推送的新消息立即到达',
+        'date': 1700000100,
+        'unread': 0,
+        'top_message_id': 105,
+      },
+    });
+    appState.telegramNotifications.injectSseEventForTesting(
+      'update',
+      ssePayload,
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 20));
+
+    expect(find.text('SSE实时推送的新消息立即到达'), findsWidgets);
+
+    // 3. Simulate a message arriving on the server without an embedded SSE message payload
+    // and verify the 2.2s fast polling timer picks it up automatically.
+    fakeApi.serverMessagesByPeer['user:1001']!.add(
+      const TelegramMessage(
+        id: 106,
+        date: 1700000200,
+        sender: '测试好友',
+        text: '高频轮询兜底同步的新消息',
+        outgoing: false,
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 2300));
+    await tester.pump(const Duration(milliseconds: 50));
+
+    expect(find.text('高频轮询兜底同步的新消息'), findsWidgets);
+
+    appState.dispose();
   });
 }

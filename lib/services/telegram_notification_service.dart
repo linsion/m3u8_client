@@ -85,6 +85,14 @@ class TelegramNotificationService extends ChangeNotifier {
 
   Stream<TelegramNotificationEvent> get eventStream => _eventController.stream;
 
+  @visibleForTesting
+  List<String> get registeredAccountIdsForTesting =>
+      _accountsById.keys.toList(growable: false);
+
+  @visibleForTesting
+  void injectSseEventForTesting(String eventType, String rawData) =>
+      _handleSseFrame(eventType, rawData);
+
   bool get systemNotificationsEnabled => _systemNotificationsEnabled;
   bool get inAppNotificationsEnabled => _inAppNotificationsEnabled;
   bool get soundEnabled => _soundEnabled;
@@ -249,11 +257,28 @@ class TelegramNotificationService extends ChangeNotifier {
     _bornMs = DateTime.now().millisecondsSinceEpoch;
     _watchdogTimer?.cancel();
     _watchdogTimer = Timer.periodic(
-      const Duration(seconds: 15),
+      const Duration(seconds: 10),
       (_) => _checkConnectionsWatchdog(),
     );
     _updateStatusLabel();
     unawaited(refreshAccountsAndConnect());
+  }
+
+  /// Ensure the specified [accountId] is registered and its SSE stream is actively connected.
+  void registerActiveAccountId(String accountId) {
+    final clean = accountId.trim();
+    if (clean.isEmpty) return;
+    if (!_accountsById.containsKey(clean)) {
+      _accountsById[clean] = TelegramAccount(id: clean, name: 'Telegram');
+    }
+    if (!_running) {
+      return;
+    }
+    final validIds = _accountsById.keys.toList()..sort();
+    final sortedIdsKey = validIds.join(',');
+    if (sortedIdsKey != _connectedIdsKey || _sseLineSub == null) {
+      _connectSseStream(sortedIdsKey);
+    }
   }
 
   void stop() {
@@ -271,22 +296,38 @@ class TelegramNotificationService extends ChangeNotifier {
   }
 
   Future<void> refreshAccountsAndConnect() async {
-    if (!_running) return;
     final currentGen = ++_generation;
     _accountsRefreshTimer?.cancel();
 
     try {
       final accData = await _apiProvider().fetchTelegramAccounts();
-      if (!_running || currentGen != _generation) return;
+      if (_disposed || currentGen != _generation) return;
 
-      final validAccounts = accData.accounts
+      var validAccounts = accData.accounts
           .where((a) => a.userId.isNotEmpty && a.userId != '0')
           .toList();
+      if (validAccounts.isEmpty && accData.accounts.isNotEmpty) {
+        validAccounts = accData.accounts
+            .where((a) => a.id.trim().isNotEmpty)
+            .toList();
+      }
       final validIds = validAccounts.map((a) => a.id).toSet();
+      if (accData.activeId.trim().isNotEmpty) {
+        validIds.add(accData.activeId.trim());
+      }
+      if (validIds.isEmpty) {
+        validIds.add('default');
+      }
 
       _accountsById.removeWhere((id, _) => !validIds.contains(id));
       for (final acc in validAccounts) {
         _accountsById[acc.id] = acc;
+      }
+      for (final id in validIds) {
+        _accountsById.putIfAbsent(
+          id,
+          () => TelegramAccount(id: id, name: 'Telegram'),
+        );
       }
 
       final removedKeys = _pendingByKey.entries
@@ -297,6 +338,7 @@ class TelegramNotificationService extends ChangeNotifier {
         dismiss(k);
       }
 
+      if (!_running) return;
       final sortedIdsKey = (validIds.toList()..sort()).join(',');
       if (sortedIdsKey != _connectedIdsKey || _sseLineSub == null) {
         _connectSseStream(sortedIdsKey);
@@ -304,13 +346,18 @@ class TelegramNotificationService extends ChangeNotifier {
       _updateStatusLabel();
     } catch (_) {
       if (_running && currentGen == _generation) {
+        if (_sseLineSub == null) {
+          final fallbackKey =
+              _connectedIdsKey.isNotEmpty ? _connectedIdsKey : 'default';
+          _connectSseStream(fallbackKey);
+        }
         _statusText = '消息提醒连接重试中...';
         notifyListeners();
       }
     } finally {
       if (_running && currentGen == _generation) {
         _accountsRefreshTimer = Timer(
-          const Duration(seconds: 60),
+          const Duration(seconds: 30),
           refreshAccountsAndConnect,
         );
       }
@@ -323,8 +370,8 @@ class TelegramNotificationService extends ChangeNotifier {
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     if (_connectedIdsKey.isNotEmpty &&
         _reconnectTimer == null &&
-        _lastStreamEventMs > 0 &&
-        nowMs - _lastStreamEventMs > 45000) {
+        (_sseLineSub == null ||
+            (_lastStreamEventMs > 0 && nowMs - _lastStreamEventMs > 28000))) {
       _connectSseStream(_connectedIdsKey, previousDelayMs: _reconnectDelayMs);
     }
   }
@@ -355,8 +402,8 @@ class TelegramNotificationService extends ChangeNotifier {
       _closeActiveSseStream();
       _reconnectTimer?.cancel();
       final nextDelay = _reconnectDelayMs <= 0
-          ? 3000
-          : (_reconnectDelayMs * 2).clamp(3000, 30000);
+          ? 1200
+          : (_reconnectDelayMs * 2).clamp(1200, 12000);
       _reconnectDelayMs = nextDelay;
       _reconnectTimer = Timer(Duration(milliseconds: nextDelay), () {
         _reconnectTimer = null;
@@ -371,7 +418,8 @@ class TelegramNotificationService extends ChangeNotifier {
         final api = _apiProvider();
         final uri = api.buildTelegramNotificationStreamUri(idsKey.split(','));
         final client = HttpClient()
-          ..connectionTimeout = const Duration(seconds: 15)
+          ..connectionTimeout = const Duration(seconds: 12)
+          ..findProxy = ((Uri u) => api.buildProxyDirectiveForUri(u))
           ..badCertificateCallback = (_, __, ___) => true;
         _sseHttpClient = client;
 
@@ -444,7 +492,9 @@ class TelegramNotificationService extends ChangeNotifier {
       notifyListeners();
       return;
     }
-    if (eventType != 'update' || rawData.isEmpty) return;
+    if ((eventType != 'update' && eventType != 'message') || rawData.isEmpty) {
+      return;
+    }
 
     try {
       final decoded = jsonDecode(rawData);

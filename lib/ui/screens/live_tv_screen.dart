@@ -40,6 +40,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
   StreamSubscription<int?>? _heightSub;
   StreamSubscription<VideoParams>? _videoParamsSub;
   StreamSubscription<Duration>? _posSub;
+  StreamSubscription<bool>? _bufferingSub;
   final GlobalKey _liveVideoWidgetKey =
       GlobalKey(debugLabel: 'LiveMainVideoWidget');
   int _liveVideoWidth = 0;
@@ -48,6 +49,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
   bool? _liveLandscapeOverride;
   Timer? _startupTimer;
   Timer? _reconnectTimer;
+  Timer? _liveBufferingLagTimer;
 
   String _selectedGroup = '全部';
   String _channelSearch = '';
@@ -257,6 +259,34 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
   final Map<int, Player> _subPlayers = {};
   final Map<int, VideoController> _subControllers = {};
   final Map<int, LiveChannel> _subChannels = {};
+  String _lastLiveRouteSignature = '';
+
+  String _computeLiveRouteSignature() {
+    final svc = widget.appState.proxyService;
+    final effective = svc.resolveEffectiveRoute(RequestScenario.liveStream);
+    final nodeId = effective == ScenarioRouteMode.proxyNode
+        ? (svc.resolveNodeForScenario(RequestScenario.liveStream)?.id ?? '')
+        : '';
+    return '${svc.proxyEnabled}|${effective.name}|$nodeId';
+  }
+
+  void _onExternalProxyServiceChanged() {
+    if (!mounted) return;
+    final nextSig = _computeLiveRouteSignature();
+    if (nextSig == _lastLiveRouteSignature) return;
+    _lastLiveRouteSignature = nextSig;
+    final ch = _currentChannel;
+    if (ch == null || widget.appState.miniPlayerSession != null) return;
+    _useServerProxy = widget.appState.proxyService
+            .resolveEffectiveRoute(RequestScenario.liveStream) ==
+        ScenarioRouteMode.serverRelay;
+    _playChannel(
+      ch,
+      urlIndex: _currentUrlIndex,
+      resetTried: false,
+      isAutoReconnect: true,
+    );
+  }
 
   @override
   void initState() {
@@ -311,6 +341,51 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
           setState(() {});
         }
       }
+    });
+
+    _bufferingSub = _player.stream.buffering.listen((isBuffering) {
+      _liveBufferingLagTimer?.cancel();
+      if (!isBuffering ||
+          !mounted ||
+          _isResolving ||
+          !_hasActivePlayback ||
+          widget.appState.miniPlayerSession != null) {
+        return;
+      }
+      final ch = _currentChannel;
+      if (ch == null) return;
+      _liveBufferingLagTimer = Timer(const Duration(seconds: 8), () async {
+        if (!mounted ||
+            !_player.state.buffering ||
+            _currentChannel != ch ||
+            widget.appState.miniPlayerSession != null) {
+          return;
+        }
+        if (LocalProxyTunnelBridge.recentDownstreamBytesPerSecond >
+            192 * 1024) {
+          return;
+        }
+        if (_activeRouteLabel == '客户端代理') {
+          final prevNodeId = widget.appState.proxyService.activeNode?.id;
+          final nextNode = await widget.appState.proxyService
+              .reportActiveNodeLag(reason: '直播缓冲卡顿');
+          if (!mounted || _currentChannel != ch) return;
+          if (nextNode != null && nextNode.id != prevNodeId) {
+            return; // _onExternalProxyServiceChanged will automatically reconnect on the new node
+          }
+        }
+        // Reconnect or switch to backup signal line if live stream stalled for 8s
+        if (ch.urls.length > 1) {
+          _tryNextSignalOrReportError(ch, '直播信号源缓冲过慢');
+        } else {
+          _playChannel(
+            ch,
+            urlIndex: _currentUrlIndex,
+            resetTried: false,
+            isAutoReconnect: true,
+          );
+        }
+      });
     });
 
     _completedSub = _player.stream.completed.listen((completed) {
@@ -379,6 +454,8 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
         widget.appState.loadLiveSources();
       });
     }
+    _lastLiveRouteSignature = _computeLiveRouteSignature();
+    widget.appState.proxyService.addListener(_onExternalProxyServiceChanged);
     _loadLivePrefs();
   }
 
@@ -599,15 +676,16 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
         'vd-lavc-software-fallback': 'yes',
         'cache': 'yes',
         'cache-on-disk': 'no',
-        'cache-secs': isMobileOrTv ? '30' : '45',
+        'cache-secs': isMobileOrTv ? '45' : '60',
         'cache-pause': 'yes',
         'cache-pause-initial': 'no',
-        'cache-pause-wait': '1.5',
+        'cache-pause-wait': '2.0',
         'demuxer-thread': 'yes',
-        'demuxer-max-bytes': isMobileOrTv ? '50331648' : '83886080',
+        'demuxer-max-bytes': isMobileOrTv ? '67108864' : '134217728',
         'demuxer-max-back-bytes': '8388608',
-        'demuxer-readahead-secs': isMobileOrTv ? '18' : '25',
-        'stream-buffer-size': '1048576',
+        'demuxer-readahead-secs': isMobileOrTv ? '25' : '40',
+        'stream-buffer-size': isMobileOrTv ? '1048576' : '2097152',
+        'framedrop': 'vo',
         'vd-lavc-threads': Platform.isAndroid ? '4' : '0',
         'ad-lavc-threads': '0',
         'demuxer-lavf-probesize': '524288',
@@ -621,7 +699,9 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
         'loop-playlist': 'inf',
         // Enable FFmpeg/libavformat HTTP stream auto-reconnect
         'stream-lavf-o':
-            'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=4xx,5xx,reconnect_delay_max=5',
+            'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=4xx,5xx,reconnect_delay_max=3',
+        'demuxer-lavf-o':
+            'seg_max_retry=10,http_persistent=1,http_multiple=1,allowed_extensions=ALL,protocol_whitelist=file,http,https,httpproxy,tcp,tls,crypto,data,rtp,udp,subfile',
       };
       for (final entry in props.entries) {
         await platform.setProperty(entry.key.trim(), entry.value);
@@ -715,6 +795,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     _liveOsdTimer?.cancel();
     _startupTimer?.cancel();
     _reconnectTimer?.cancel();
+    _liveBufferingLagTimer?.cancel();
     _channelOsdTimer?.cancel();
     _digitInputTimer?.cancel();
     _errorSub?.cancel();
@@ -723,9 +804,11 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     _heightSub?.cancel();
     _videoParamsSub?.cancel();
     _posSub?.cancel();
+    _bufferingSub?.cancel();
     _groupScrollController.dispose();
     _playerFocusNode.dispose();
     _liveBottomBarFocusNode.dispose();
+    widget.appState.proxyService.removeListener(_onExternalProxyServiceChanged);
     for (final p in _subPlayers.values) {
       p.dispose();
     }
@@ -1009,6 +1092,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     bool resetTried = true,
     bool isAutoReconnect = false,
   }) async {
+    _lastLiveRouteSignature = _computeLiveRouteSignature();
     final source = widget.appState.selectedLiveSource;
     if (source == null || channel.urls.isEmpty) return;
 

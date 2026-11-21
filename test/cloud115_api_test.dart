@@ -53,13 +53,20 @@ class _AccelerationApi extends ApiClient {
   final void Function() onUpload;
   final submissions = <bool>[];
   final uploads = <String>[];
+  final convertedFiles = <String>[];
+  Map<String, dynamic> savedSettings = {'eleven_dir_id': '10'};
 
   @override
   Future<Map<String, dynamic>> fetch115Status() async => {'Id': 'test'};
 
   @override
   Future<ServerSettings> fetchServerSettings() async =>
-      ServerSettings({'eleven_dir_id': '10'});
+      ServerSettings(savedSettings);
+
+  @override
+  Future<void> saveServerSettings(Map<String, dynamic> settings) async {
+    savedSettings = Map<String, dynamic>.from(settings);
+  }
 
   @override
   Future<String?> createDownloadTask({
@@ -95,6 +102,115 @@ class _AccelerationApi extends ApiClient {
   @override
   Future<void> uploadTaskTo115(String id) async {
     uploads.add(id);
+    onUpload();
+  }
+}
+
+class _Mp4ConversionAccelerationApi extends ApiClient {
+  _Mp4ConversionAccelerationApi(this.onUpload) : super(const ServerConfig());
+
+  final void Function() onUpload;
+  final events = <String>[];
+  Map<String, dynamic> savedSettings = {
+    'eleven_dir_id': '10',
+    'convert_to_mp4': false,
+  };
+  bool mp4ExistsOnServer = false;
+
+  @override
+  Future<Map<String, dynamic>> fetch115Status() async => {'Id': 'test'};
+
+  @override
+  Future<ServerSettings> fetchServerSettings() async =>
+      ServerSettings(savedSettings);
+
+  @override
+  Future<void> saveServerSettings(Map<String, dynamic> settings) async {
+    savedSettings = Map<String, dynamic>.from(settings);
+    events.add('saveSettings:convert_to_mp4=${settings['convert_to_mp4']}');
+  }
+
+  @override
+  Future<void> deleteDownloadTask(String id, {bool deleteFiles = false}) async {
+    events.add('deleteTask:$id');
+  }
+
+  @override
+  Future<String?> createDownloadTask({
+    required String url,
+    required String name,
+    Map<String, String>? headers,
+    Map<String, dynamic>? videoContext,
+    String? telegramAccountId,
+    bool forceDuplicate = false,
+  }) async {
+    events.add('createTask:$url:force=$forceDuplicate');
+    if (url.contains('dead-line')) {
+      return 'failed-task';
+    }
+    return 'ts-task';
+  }
+
+  @override
+  Future<void> retryDownloadTask(String id) async {
+    events.add('retryTask:$id');
+    throw const ApiException('Not Found', statusCode: HttpStatus.notFound);
+  }
+
+  @override
+  Future<List<DownloadTask>> fetchDownloadTasks() async => [
+    const DownloadTask(
+      id: 'failed-task',
+      url: 'https://example.test/dead-line.m3u8',
+      name: 'Acceleration episode 1',
+      status: 'Failed',
+      error: 'HTTP 403 Forbidden',
+    ),
+    DownloadTask(
+      id: 'ts-task',
+      url: 'https://example.test/backup-line.m3u8',
+      name: 'Acceleration episode 1',
+      status: 'Completed',
+      urlType: 'm3u8',
+      outputFile: mp4ExistsOnServer
+          ? 'downloads/Acceleration episode 1.mp4'
+          : 'downloads/Acceleration episode 1.ts',
+    ),
+  ];
+
+  @override
+  Future<FileDirectoryListing> fetchFiles({String path = ''}) async {
+    return FileDirectoryListing(
+      path: path,
+      parent: '',
+      root: '/',
+      entries: [
+        if (mp4ExistsOnServer)
+          const FileEntry(
+            name: 'Acceleration episode 1.mp4',
+            path: 'downloads/Acceleration episode 1.mp4',
+            size: 102400,
+            modTime: '2026-11-21 23:00:00',
+            isDir: false,
+            isMp4: true,
+            ext: '.mp4',
+          ),
+      ],
+    );
+  }
+
+  @override
+  Future<void> convertFileToMp4(String filePath) async {
+    events.add('convertToMp4:$filePath');
+    mp4ExistsOnServer = true;
+  }
+
+  @override
+  Future<List<Map<String, dynamic>>> fetchServerFileOps() async => const [];
+
+  @override
+  Future<void> uploadTaskTo115(String id) async {
+    events.add('uploadTaskTo115:$id:mp4Ready=$mp4ExistsOnServer');
     onUpload();
   }
 }
@@ -382,6 +498,40 @@ void main() {
       );
       expect(api.submissions, [false, true]);
       expect(api.uploads, ['new-task']);
+      expect(api.savedSettings['convert_to_mp4'], isTrue);
+      expect(stream?.fileName, 'Acceleration episode 1.mp4');
+      expect(errors, isEmpty);
+      expect(service.isAccelerating, isFalse);
+    },
+  );
+
+  test(
+    '115 acceleration fails over on server download error, converts TS to MP4 before uploading, and resolves MP4 playback',
+    () async {
+      showAccelerationFiles = true;
+      acceleratedCopyExists = false;
+      final api = _Mp4ConversionAccelerationApi(
+        () => acceleratedCopyExists = true,
+      );
+      final errors = <String>[];
+      final stream = await service.run115CloudAccelerationPipeline(
+        api: api,
+        downloadUrl: 'https://example.test/dead-line.m3u8',
+        fallbackDownloadUrls: const ['https://example.test/backup-line.m3u8'],
+        videoName: 'Acceleration episode 1',
+        onError: errors.add,
+      );
+      expect(api.savedSettings['convert_to_mp4'], isTrue);
+      expect(
+        api.events,
+        containsAllInOrder([
+          'saveSettings:convert_to_mp4=true',
+          'createTask:https://example.test/dead-line.m3u8:force=false',
+          'createTask:https://example.test/backup-line.m3u8:force=true',
+          'convertToMp4:downloads/Acceleration episode 1.ts',
+          'uploadTaskTo115:ts-task:mp4Ready=true',
+        ]),
+      );
       expect(stream?.fileName, 'Acceleration episode 1.mp4');
       expect(errors, isEmpty);
       expect(service.isAccelerating, isFalse);

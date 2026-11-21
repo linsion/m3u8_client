@@ -67,7 +67,6 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
 
   final TextEditingController _searchController = TextEditingController();
   late final CloudMusicController _musicController = CloudMusicController(
-    endpointResolver: _resolveEntryEndpoint,
     appState: widget.appState,
   );
 
@@ -161,6 +160,7 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
       final custom =
           _mounts.where((m) => !m.isBuiltIn).map((m) => m.toJson()).toList();
       await prefs.setString(_prefMountsKey, jsonEncode(custom));
+      await _musicController.refreshAvailableMounts();
     } catch (_) {}
   }
 

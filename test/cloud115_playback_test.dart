@@ -215,4 +215,55 @@ void main() {
       ]);
     },
   );
+
+  test(
+    'resetAfterBackground clears stale header cache and verifies loopback proxy health',
+    () async {
+      var probeCount = 0;
+      final payload = Uint8List.fromList(
+        List.generate(4096, (index) => (index + 7) % 251),
+      );
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      server.listen((request) async {
+        probeCount++;
+        request.response.statusCode = HttpStatus.partialContent;
+        request.response.headers.set(
+          HttpHeaders.contentRangeHeader,
+          'bytes 0-${payload.length - 1}/${payload.length}',
+        );
+        request.response.contentLength = payload.length;
+        request.response.add(payload);
+        await request.response.close();
+      });
+
+      final remoteUrl = 'http://127.0.0.1:${server.port}/track.flac';
+      final proxyUrl1 = await service.wrapWithLocal115HeaderProxy(
+        remoteUrl,
+        const {},
+        extHint: '.flac',
+      );
+      final client = HttpClient();
+      addTearDown(() => client.close(force: true));
+
+      final resp1 = await fetch(client, proxyUrl1, range: 'bytes=0-31');
+      expect(resp1.statusCode, HttpStatus.partialContent);
+      expect(await collect(resp1), payload.sublist(0, 32));
+      expect(probeCount, 1);
+
+      // Simulate returning from long background inactivity
+      service.resetAfterBackground();
+      expect(service.getCachedRawHeaderBytes(remoteUrl), isNull);
+
+      final proxyUrl2 = await service.wrapWithLocal115HeaderProxy(
+        remoteUrl,
+        const {},
+        extHint: '.flac',
+      );
+      final resp2 = await fetch(client, proxyUrl2, range: 'bytes=0-31');
+      expect(resp2.statusCode, HttpStatus.partialContent);
+      expect(await collect(resp2), payload.sublist(0, 32));
+      expect(probeCount, 2);
+    },
+  );
 }

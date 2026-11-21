@@ -24,8 +24,10 @@ class ApiException implements Exception {
 class ApiClient {
   ServerConfig _config;
   ProxyRoutingService? _proxyService;
-  late final http.Client _client;
-  late final HttpClient _rawHttpClient;
+  late http.Client _client;
+  late HttpClient _rawHttpClient;
+  HttpClient? _ioHttpClient;
+  String _lastProxyConfigSignature = '';
 
   static final Map<String, List<LiveChannel>> _liveChannelCache = {};
   static final Map<String, ({VodListResponse data, DateTime expiresAt})>
@@ -39,6 +41,14 @@ class ApiClient {
 
   ApiClient(this._config, {ProxyRoutingService? proxyService})
       : _proxyService = proxyService {
+    _initHttpClients();
+    if (_proxyService != null) {
+      _lastProxyConfigSignature = _computeProxySignature(_proxyService!);
+      _proxyService!.addListener(_onProxyServiceChanged);
+    }
+  }
+
+  void _initHttpClients() {
     final ioHttpClient = HttpClient()
       ..connectionTimeout = const Duration(seconds: 8)
       ..idleTimeout = const Duration(seconds: 30)
@@ -46,6 +56,7 @@ class ApiClient {
       ..findProxy = ((Uri uri) => _findProxyForUri(uri))
       ..badCertificateCallback =
           (X509Certificate cert, String host, int port) => true;
+    _ioHttpClient = ioHttpClient;
     _client = IOClient(ioHttpClient);
 
     _rawHttpClient = HttpClient()
@@ -57,9 +68,46 @@ class ApiClient {
           (X509Certificate cert, String host, int port) => true;
   }
 
-  void attachProxyService(ProxyRoutingService service) {
-    _proxyService = service;
+  String _computeProxySignature(ProxyRoutingService svc) {
+    final rulesSig = svc.scenarioRules.entries
+        .map((e) => '${e.key.name}:${e.value.mode.name}:${e.value.specificNodeId ?? ""}')
+        .join('|');
+    return '${svc.proxyEnabled}|${svc.selectionMode.name}|${svc.activeNode?.id ?? ""}|$rulesSig';
   }
+
+  void _onProxyServiceChanged() {
+    final svc = _proxyService;
+    if (svc == null) return;
+    final nextSig = _computeProxySignature(svc);
+    if (nextSig == _lastProxyConfigSignature) return;
+    _lastProxyConfigSignature = nextSig;
+    resetHttpClientPool();
+  }
+
+  /// Closes pooled keep-alive sockets (so no requests linger on an old proxy node
+  /// or stay proxied after turning off the proxy) and creates fresh [HttpClient]s.
+  void resetHttpClientPool() {
+    final oldIo = _ioHttpClient;
+    final oldRaw = _rawHttpClient;
+    _initHttpClients();
+    try {
+      oldIo?.close(force: false);
+    } catch (_) {}
+    try {
+      oldRaw.close(force: false);
+    } catch (_) {}
+  }
+
+  void attachProxyService(ProxyRoutingService service) {
+    if (identical(_proxyService, service)) return;
+    _proxyService?.removeListener(_onProxyServiceChanged);
+    _proxyService = service;
+    _lastProxyConfigSignature = _computeProxySignature(service);
+    service.addListener(_onProxyServiceChanged);
+  }
+
+  String buildProxyDirectiveForUri(Uri uri, {RequestScenario? scenarioHint}) =>
+      _findProxyForUri(uri, scenarioHint: scenarioHint);
 
   String _findProxyForUri(Uri uri, {RequestScenario? scenarioHint}) {
     final svc = _proxyService;
@@ -2201,6 +2249,32 @@ class ApiClient {
     if (data is Map<String, dynamic>) {
       return FileDirectoryListing.fromJson(data);
     }
+    if (data is List) {
+      final entries = <FileEntry>[];
+      for (final item in data) {
+        if (item is Map<String, dynamic>) {
+          final name = (item['name'] ?? '').toString().trim();
+          final rawPath = (item['path'] ?? '').toString().trim();
+          final dot = name.lastIndexOf('.');
+          final ext = (item['ext'] ??
+                  (dot > 0 && dot < name.length - 1 ? name.substring(dot) : ''))
+              .toString();
+          entries.add(
+            FileEntry.fromJson({
+              ...item,
+              'path': rawPath.isNotEmpty ? rawPath : name,
+              'ext': ext,
+            }),
+          );
+        }
+      }
+      return FileDirectoryListing(
+        path: path,
+        parent: '',
+        root: '/',
+        entries: entries,
+      );
+    }
     throw const ApiException('读取媒体库目录失败');
   }
 
@@ -2216,12 +2290,51 @@ class ApiClient {
 
   /// Convert a TS video file to MP4 on the server
   Future<void> convertFileToMp4(String filePath) async {
-    await _postJson('/api/files/convert', body: {'path': filePath});
+    final cleanPath = filePath.trim();
+    try {
+      await _postJson('/api/files/convert', body: {'path': cleanPath});
+    } on ApiException catch (e) {
+      if (e.statusCode != HttpStatus.notFound &&
+          e.statusCode != HttpStatus.methodNotAllowed) {
+        rethrow;
+      }
+      final baseName = cleanPath.replaceAll('\\', '/').split('/').last;
+      if (baseName.isEmpty) rethrow;
+      await _postJson(
+        '/api/files/${Uri.encodeComponent(baseName)}/convert',
+        body: const {},
+      );
+    }
   }
 
   /// Upload a server file to 115 Cloud Drive
   Future<void> uploadFileTo115(String filePath) async {
-    await _postJson('/api/files/upload-115', body: {'path': filePath});
+    final cleanPath = filePath.trim();
+    try {
+      await _postJson('/api/files/upload-115', body: {'path': cleanPath});
+    } on ApiException catch (e) {
+      if (e.statusCode != HttpStatus.notFound &&
+          e.statusCode != HttpStatus.methodNotAllowed) {
+        rethrow;
+      }
+      final baseName = cleanPath.replaceAll('\\', '/').split('/').last;
+      if (baseName.isEmpty) rethrow;
+      await _postJson(
+        '/api/files/${Uri.encodeComponent(baseName)}/upload',
+        body: const {},
+      );
+    }
+  }
+
+  /// Fetch active file conversion/upload operations (`/api/file-ops`) on the server
+  Future<List<Map<String, dynamic>>> fetchServerFileOps() async {
+    try {
+      final data = await _getJson('/api/file-ops');
+      if (data is List) {
+        return data.whereType<Map<String, dynamic>>().toList();
+      }
+    } catch (_) {}
+    return const [];
   }
 
   /// Rename a file or directory on the server

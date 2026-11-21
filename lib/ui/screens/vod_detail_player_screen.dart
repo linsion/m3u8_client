@@ -164,6 +164,27 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
   DateTime? _lastBackHandledAt;
   bool _isVerticalVolumeDragging = false;
   double _volumePercent = 100.0;
+  String _lastVodRouteSignature = '';
+
+  String _computeVodRouteSignature() {
+    final svc = widget.appState.proxyService;
+    final effective = svc.resolveEffectiveRoute(RequestScenario.vodStream);
+    final nodeId = effective == ScenarioRouteMode.proxyNode
+        ? (svc.resolveNodeForScenario(RequestScenario.vodStream)?.id ?? '')
+        : '';
+    return '${svc.proxyEnabled}|${effective.name}|$nodeId';
+  }
+
+  void _onExternalProxyServiceChanged() {
+    if (!mounted) return;
+    final nextSig = _computeVodRouteSignature();
+    if (nextSig == _lastVodRouteSignature) return;
+    _lastVodRouteSignature = nextSig;
+    if (_using115Direct || _isResolvingPlay || _resolvedPlayback == null) {
+      return;
+    }
+    _onProxyNodeSwitched(widget.appState.proxyService.lastStatusMessage);
+  }
 
   bool get _isPortraitVideo =>
       _videoWidth > 0 && _videoHeight > 0 && _videoHeight > _videoWidth;
@@ -382,19 +403,40 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         setState(() {});
       }
       _bufferingLagTimer?.cancel();
-      if (isBuffering && _usingClientProxy) {
+      if (isBuffering && !_using115Direct) {
         final hasStarted = _player.state.duration > Duration.zero ||
             _player.state.position > Duration.zero;
         if (hasStarted) {
-          _bufferingLagTimer = Timer(const Duration(seconds: 10), () async {
-            if (!mounted || !_player.state.buffering || !_usingClientProxy) {
+          _bufferingLagTimer = Timer(const Duration(seconds: 7), () async {
+            if (!mounted || !_player.state.buffering || _using115Direct) {
               return;
             }
-            final prevNodeId = widget.appState.proxyService.activeNode?.id;
-            final nextNode = await widget.appState.proxyService
-                .reportActiveNodeLag(reason: '视频播放缓冲卡顿');
-            if (mounted && nextNode != null && nextNode.id != prevNodeId) {
-              _showAdToast('当前代理卡顿，已自动切换至：${nextNode.displayTitle}');
+            // If bytes are actively flowing at > 256 KB/s, let the buffer fill naturally
+            if (LocalProxyTunnelBridge.recentDownstreamBytesPerSecond >
+                256 * 1024) {
+              return;
+            }
+            if (_usingClientProxy) {
+              final prevNodeId = widget.appState.proxyService.activeNode?.id;
+              final nextNode = await widget.appState.proxyService
+                  .reportActiveNodeLag(reason: '视频播放缓冲卡顿');
+              if (mounted && nextNode != null && nextNode.id != prevNodeId) {
+                _showAdToast('⚡ 当前代理缓冲卡顿，已自动切换至：${nextNode.displayTitle}');
+                return;
+              }
+            }
+            // If direct playback (or single proxy node) is stalled mid-stream and a faster backup line exists, switch seamlessly preserving progress!
+            final backupLine = _verifiedFastestBackupLine;
+            if (backupLine != null &&
+                !_triedGroupIndicesForEpisode.contains(backupLine.groupIndex)) {
+              final curPosSec = _player.state.position.inSeconds > 0
+                  ? _player.state.position.inSeconds.toDouble()
+                  : _lastValidPosition.inSeconds.toDouble();
+              if (curPosSec > 2) {
+                _pendingSeekSeconds = curPosSec;
+                _hasAppliedInitialSeek = false;
+              }
+              _triggerFastStartupFallback(reason: '当前播放线路缓冲过慢');
             }
           });
         }
@@ -423,6 +465,8 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       }
     });
 
+    _lastVodRouteSignature = _computeVodRouteSignature();
+    widget.appState.proxyService.addListener(_onExternalProxyServiceChanged);
     _loadDetail();
   }
 
@@ -437,15 +481,16 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         'vd-lavc-software-fallback': 'yes',
         'cache': 'yes',
         'cache-on-disk': 'no',
-        'cache-secs': isMobileOrTv ? '45' : '120',
+        'cache-secs': isMobileOrTv ? '60' : '180',
         'cache-pause': 'yes',
         'cache-pause-initial': 'no',
-        'cache-pause-wait': '0.8',
+        'cache-pause-wait': '2.0',
         'demuxer-thread': 'yes',
-        'demuxer-max-bytes': isMobileOrTv ? '50331648' : '134217728',
+        'demuxer-max-bytes': isMobileOrTv ? '67108864' : '201326592',
         'demuxer-max-back-bytes': isMobileOrTv ? '16777216' : '33554432',
-        'demuxer-readahead-secs': isMobileOrTv ? '30' : '60',
-        'stream-buffer-size': '524288',
+        'demuxer-readahead-secs': isMobileOrTv ? '45' : '90',
+        'stream-buffer-size': isMobileOrTv ? '1048576' : '2097152',
+        'framedrop': 'vo',
         'vd-lavc-threads': Platform.isAndroid ? '4' : '0',
         'ad-lavc-threads': '0',
         'demuxer-lavf-probesize': '131072',
@@ -453,7 +498,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         'network-timeout': '15',
         'tls-verify': 'no',
         'stream-lavf-o':
-            'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=4xx,5xx,reconnect_delay_max=5',
+            'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=4xx,5xx,reconnect_delay_max=3',
         'demuxer-lavf-o':
             'seg_max_retry=10,http_persistent=1,http_multiple=1,allowed_extensions=ALL,protocol_whitelist=file,http,https,httpproxy,tcp,tls,crypto,data,rtp,udp,subfile',
       };
@@ -625,6 +670,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     _bufferingLagTimer?.cancel();
     _episodeSearchCtrl.dispose();
     _syncHistoryNow();
+    widget.appState.proxyService.removeListener(_onExternalProxyServiceChanged);
     _positionSub?.cancel();
     _completedSub?.cancel();
     _errorSub?.cancel();
@@ -912,9 +958,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     // bandwidth is dedicated to the primary stream's initial handshake & first frame!
     if (resetTriedLines) {
       Future<void>.delayed(const Duration(milliseconds: 1800), () {
-        if (!mounted ||
-            attemptId != _playAttemptSessionId ||
-            _hasRenderedFirstFrame) {
+        if (!mounted || attemptId != _playAttemptSessionId) {
           return;
         }
         unawaited(
@@ -1198,13 +1242,22 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     final attempt = ++_playAttemptSessionId;
     _startupWatchdogTimer?.cancel();
     _bufferingLagTimer?.cancel();
-    final curSec = _player.state.position.inSeconds;
+    final playerPosSec = _player.state.position.inSeconds;
+    final curSec = playerPosSec > 2
+        ? playerPosSec
+        : (_lastValidPosition.inSeconds > 2
+              ? _lastValidPosition.inSeconds
+              : _pendingSeekSeconds.round());
     setState(() {
       _using115Direct = true;
       _activeStreamUrl = resolved.proxyStreamUrl;
       _activeStreamHeaders = resolved.playbackHeaders;
       _playError = null;
       _isResolvingPlay = false;
+      if (curSec > 2) {
+        _pendingSeekSeconds = curSec.toDouble();
+        _hasAppliedInitialSeek = false;
+      }
     });
     await _applyVodStreamHeaders(
       resolved.playbackHeaders,
@@ -1492,9 +1545,12 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
 
   void _onProxyNodeSwitched(String statusMessage) {
     if (!mounted) return;
+    _lastVodRouteSignature = _computeVodRouteSignature();
     final attemptId = ++_playAttemptSessionId;
     final wasPlaying = _player.state.playing || !_hasRenderedFirstFrame;
-    _showAdToast(statusMessage);
+    if (statusMessage.isNotEmpty) {
+      _showAdToast(statusMessage);
+    }
     final curPosSec = _player.state.position.inSeconds > 0
         ? _player.state.position.inSeconds.toDouble()
         : _lastValidPosition.inSeconds.toDouble();

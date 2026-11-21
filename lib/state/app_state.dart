@@ -247,10 +247,10 @@ class AppState extends ChangeNotifier {
     onNavigateToTab?.call(index);
   }
 
-  AppState() {
+  AppState({ApiClient? customApi}) {
     proxyService = ProxyRoutingService();
     proxyService.addListener(notifyListeners);
-    api = ApiClient(_serverConfig, proxyService: proxyService);
+    api = customApi ?? ApiClient(_serverConfig, proxyService: proxyService);
     telegramNotifications = TelegramNotificationService(
       apiProvider: () => api,
       isReadingPeer: (accountId, peer) =>
@@ -295,6 +295,8 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  bool get isTelegramViewActive => _isTelegramViewActive;
+
   void updateTelegramReadingContext({
     bool? isTelegramViewActive,
     bool? isAppForeground,
@@ -302,6 +304,9 @@ class AppState extends ChangeNotifier {
     String? peer,
     bool? atBottom,
   }) {
+    final becameForeground = isAppForeground == true && !_isAppForeground;
+    final becameViewActive =
+        isTelegramViewActive == true && !_isTelegramViewActive;
     if (isTelegramViewActive != null) {
       _isTelegramViewActive = isTelegramViewActive;
     }
@@ -310,6 +315,7 @@ class AppState extends ChangeNotifier {
     }
     if (accountId != null) {
       _activeReadingTelegramAccountId = accountId;
+      telegramNotifications.registerActiveAccountId(accountId);
     }
     if (peer != null) {
       _activeReadingTelegramPeer = peer;
@@ -318,6 +324,9 @@ class AppState extends ChangeNotifier {
       _activeReadingAtBottom = atBottom;
     }
     telegramNotifications.reconcileReadingState();
+    if (becameForeground || becameViewActive) {
+      unawaited(telegramNotifications.refreshAccountsAndConnect());
+    }
   }
 
   // Getters

@@ -623,15 +623,40 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                                       ),
                                     ),
                                   Expanded(
-                                    child: FocusTraversalGroup(
-                                      child: KeyedSubtree(
-                                        key: ValueKey(
-                                          _selectedIndex == 8
-                                              ? 'settings'
-                                              : '${_selectedIndex}_${state.themeId}',
+                                    child: Stack(
+                                      fit: StackFit.expand,
+                                      children: [
+                                        Offstage(
+                                          offstage: _selectedIndex != 5,
+                                          child: TickerMode(
+                                            enabled: _selectedIndex == 5,
+                                            child: ExcludeFocus(
+                                              excluding: _selectedIndex != 5,
+                                              child: FocusTraversalGroup(
+                                                child: KeyedSubtree(
+                                                  key: const ValueKey(
+                                                    'persistent_telegram_screen',
+                                                  ),
+                                                  child: TelegramScreen(
+                                                    appState: state,
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
                                         ),
-                                        child: _buildActiveScreen(state),
-                                      ),
+                                        if (_selectedIndex != 5)
+                                          FocusTraversalGroup(
+                                            child: KeyedSubtree(
+                                              key: ValueKey(
+                                                _selectedIndex == 8
+                                                    ? 'settings'
+                                                    : '${_selectedIndex}_${state.themeId}',
+                                              ),
+                                              child: _buildActiveScreen(state),
+                                            ),
+                                          ),
+                                      ],
                                     ),
                                   ),
                                 ],
@@ -3494,6 +3519,33 @@ class _FloatingMiniPlayerOverlayState
   Duration _lastKnownDuration = Duration.zero;
   DateTime _lastPositionAdvanceAt = DateTime.now();
   DateTime _lastProgressSave = DateTime.fromMillisecondsSinceEpoch(0);
+  String _lastMiniRouteSignature = '';
+
+  String _computeMiniRouteSignature() {
+    final svc = widget.appState.proxyService;
+    final scenario = _playbackScenario;
+    final effective = svc.resolveEffectiveRoute(scenario);
+    final nodeId = effective == ScenarioRouteMode.proxyNode
+        ? (svc.resolveNodeForScenario(scenario)?.id ?? '')
+        : '';
+    return '${svc.proxyEnabled}|${effective.name}|$nodeId';
+  }
+
+  void _onExternalProxyServiceChanged() {
+    if (!mounted) return;
+    final nextSig = _computeMiniRouteSignature();
+    if (nextSig == _lastMiniRouteSignature) return;
+    _lastMiniRouteSignature = nextSig;
+    if (_is115Playback) return;
+    _recoveryTimer?.cancel();
+    _isRecovering = false;
+    final resume = widget.session.isLive
+        ? null
+        : (_player.state.position.inSeconds > 2
+            ? _player.state.position.inSeconds
+            : _lastKnownPosition.inSeconds);
+    unawaited(_startPlayback(overrideResumeSeconds: resume));
+  }
 
   @override
   void initState() {
@@ -3525,6 +3577,8 @@ class _FloatingMiniPlayerOverlayState
       const Duration(seconds: 4),
       (_) => _checkPlaybackHealth(),
     );
+    _lastMiniRouteSignature = _computeMiniRouteSignature();
+    widget.appState.proxyService.addListener(_onExternalProxyServiceChanged);
     _startPlayback();
   }
 
@@ -3579,15 +3633,16 @@ class _FloatingMiniPlayerOverlayState
         'vd-lavc-software-fallback': 'yes',
         'cache': 'yes',
         'cache-on-disk': 'no',
-        'cache-secs': widget.session.isLive ? '30' : '90',
+        'cache-secs': widget.session.isLive ? '45' : '120',
         'cache-pause': 'yes',
-        'cache-pause-initial': widget.session.isLive ? 'no' : 'yes',
-        'cache-pause-wait': widget.session.isLive ? '1.5' : '3.5',
+        'cache-pause-initial': 'no',
+        'cache-pause-wait': widget.session.isLive ? '1.8' : '2.2',
         'demuxer-thread': 'yes',
-        'demuxer-max-bytes': isMobileOrTv ? '50331648' : '134217728',
+        'demuxer-max-bytes': isMobileOrTv ? '67108864' : '167772160',
         'demuxer-max-back-bytes': isMobileOrTv ? '16777216' : '33554432',
-        'demuxer-readahead-secs': widget.session.isLive ? '20' : '45',
-        'stream-buffer-size': isMobileOrTv ? '524288' : '4194304',
+        'demuxer-readahead-secs': widget.session.isLive ? '30' : '60',
+        'stream-buffer-size': isMobileOrTv ? '1048576' : '4194304',
+        'framedrop': 'vo',
         'vd-lavc-threads': Platform.isAndroid ? '4' : '0',
         'ad-lavc-threads': '0',
         'demuxer-lavf-probesize': '524288',
@@ -3597,7 +3652,7 @@ class _FloatingMiniPlayerOverlayState
         'keep-open': 'no',
         if (!widget.session.isLive) 'hr-seek-framedrop': 'yes',
         'stream-lavf-o':
-            'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=4xx,5xx,reconnect_delay_max=5',
+            'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=4xx,5xx,reconnect_delay_max=3',
         'demuxer-lavf-o':
             'seg_max_retry=10,http_persistent=1,http_multiple=1,allowed_extensions=ALL,protocol_whitelist=file,http,https,httpproxy,tcp,tls,crypto,data,rtp,udp,subfile',
         if (widget.session.isLive) ...{
@@ -3638,6 +3693,7 @@ class _FloatingMiniPlayerOverlayState
   }
 
   Future<void> _startPlayback({int? overrideResumeSeconds}) async {
+    _lastMiniRouteSignature = _computeMiniRouteSignature();
     final openSequence = ++_playbackOpenSequence;
     bool isCurrent() => mounted && openSequence == _playbackOpenSequence;
     if (overrideResumeSeconds != null && overrideResumeSeconds > 2) {
@@ -3703,10 +3759,16 @@ class _FloatingMiniPlayerOverlayState
     _lastPositionAdvanceAt = DateTime.now();
     await _player.setVolume(_isMuted ? 0.0 : _volume);
     if (!isCurrent()) return;
+    final startSec = overrideResumeSeconds != null && overrideResumeSeconds > 2
+        ? overrideResumeSeconds
+        : (!_hasAppliedInitialSeek && _pendingSeekSeconds > 2
+              ? _pendingSeekSeconds
+              : 0);
     await _player.open(
       Media(
         streamUrl,
         httpHeaders: usingLocalStreamRelay ? const {} : headers,
+        start: startSec > 2 ? Duration(seconds: startSec) : null,
       ),
       play: !_userPaused,
     );
@@ -3927,6 +3989,7 @@ class _FloatingMiniPlayerOverlayState
 
   @override
   void dispose() {
+    widget.appState.proxyService.removeListener(_onExternalProxyServiceChanged);
     _autoPlayGuardTimer?.cancel();
     _recoveryTimer?.cancel();
     _watchdogTimer?.cancel();
@@ -4056,7 +4119,12 @@ class _FloatingMiniPlayerOverlayState
                             overlayStyle: true,
                             onResolved: (resolved) async {
                               if (!mounted) return;
-                              final curSec = _player.state.position.inSeconds;
+                              final playerSec = _player.state.position.inSeconds;
+                              final curSec = playerSec > 2
+                                  ? playerSec
+                                  : (_lastKnownPosition.inSeconds > 2
+                                        ? _lastKnownPosition.inSeconds
+                                        : _pendingSeekSeconds);
                               _recoveryTimer?.cancel();
                               _isRecovering = false;
                               _userPaused = false;

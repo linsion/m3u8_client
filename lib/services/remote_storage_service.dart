@@ -13,6 +13,10 @@ class RemoteStorageService {
 
   final Map<String, String> _cachedAlistTokens = {};
 
+  void resetAfterBackground() {
+    _cachedAlistTokens.clear();
+  }
+
   HttpClient _createHttpClient({Duration timeout = const Duration(seconds: 25)}) {
     final client = HttpClient()
       ..connectionTimeout = timeout
@@ -81,17 +85,19 @@ class RemoteStorageService {
     final base = cleanBaseUrl(mount.baseUrl);
     final uri = Uri.parse('$base/api/auth/login');
     final client = _createHttpClient();
+    const timeout = Duration(seconds: 15);
     try {
-      final req = await client.postUrl(uri);
+      final req = await client.postUrl(uri).timeout(timeout);
       req.headers.set('Content-Type', 'application/json; charset=utf-8');
       final bodyBytes = utf8.encode(
         jsonEncode({'username': user, 'password': pass}),
       );
       req.contentLength = bodyBytes.length;
       req.add(bodyBytes);
-      final resp = await req.close();
-      final bytes =
-          await resp.fold<List<int>>(<int>[], (acc, b) => acc..addAll(b));
+      final resp = await req.close().timeout(timeout);
+      final bytes = await resp
+          .fold<List<int>>(<int>[], (acc, b) => acc..addAll(b))
+          .timeout(timeout);
       final root = jsonDecode(utf8.decode(bytes, allowMalformed: true));
       if (root is! Map<String, dynamic>) {
         throw const ApiException('AList 登录响应解析失败');
@@ -122,8 +128,9 @@ class RemoteStorageService {
     final uri = Uri.parse('$base$endpointPath');
     final token = await resolveAlistToken(mount, forceRefresh: isRetry);
     final client = _createHttpClient();
+    const timeout = Duration(seconds: 15);
     try {
-      final req = await client.postUrl(uri);
+      final req = await client.postUrl(uri).timeout(timeout);
       req.headers.set('Content-Type', 'application/json; charset=utf-8');
       if (token.isNotEmpty) {
         req.headers.set('Authorization', token);
@@ -131,17 +138,22 @@ class RemoteStorageService {
       final bodyBytes = utf8.encode(jsonEncode(body));
       req.contentLength = bodyBytes.length;
       req.add(bodyBytes);
-      final resp = await req.close();
-      final bytes =
-          await resp.fold<List<int>>(<int>[], (acc, b) => acc..addAll(b));
+      final resp = await req.close().timeout(timeout);
+      final bytes = await resp
+          .fold<List<int>>(<int>[], (acc, b) => acc..addAll(b))
+          .timeout(timeout);
       final root = jsonDecode(utf8.decode(bytes, allowMalformed: true));
       if (root is! Map<String, dynamic>) {
         throw const ApiException('无法解析 AList JSON 响应');
       }
       final code = int.tryParse((root['code'] ?? 200).toString()) ?? 200;
-      if (code == 401 &&
+      if ((code == 401 ||
+              code == 403 ||
+              resp.statusCode == 401 ||
+              resp.statusCode == 403) &&
           !isRetry &&
           (mount.username.isNotEmpty || mount.password.isNotEmpty)) {
+        _cachedAlistTokens.remove(mount.id);
         return await _alistJsonRequest(
           mount,
           endpointPath,
@@ -154,6 +166,16 @@ class RemoteStorageService {
         throw ApiException(msg, statusCode: code);
       }
       return root;
+    } catch (e) {
+      if (!isRetry && e is! ApiException) {
+        return await _alistJsonRequest(
+          mount,
+          endpointPath,
+          body,
+          isRetry: true,
+        );
+      }
+      rethrow;
     } finally {
       client.close(force: true);
     }
@@ -274,12 +296,35 @@ class RemoteStorageService {
     StorageMount mount,
     String path, {
     String fallbackUrl = '',
+    bool forceRefresh = false,
   }) async {
     final norm = normalizePath(path);
+    if (forceRefresh) {
+      final parentDir = parentPathOf(norm);
+      try {
+        await _alistJsonRequest(
+          mount,
+          '/api/fs/list',
+          {
+            'path': parentDir.isEmpty ? '/' : parentDir,
+            'password': '',
+            'page': 1,
+            'per_page': 50,
+            'refresh': true,
+          },
+          isRetry: true,
+        );
+      } catch (_) {}
+    }
     final root = await _alistJsonRequest(
       mount,
       '/api/fs/get',
-      {'path': norm, 'password': ''},
+      {
+        'path': norm,
+        'password': '',
+        if (forceRefresh) 'refresh': true,
+      },
+      isRetry: forceRefresh,
     );
     final data = root['data'];
     final base = cleanBaseUrl(mount.baseUrl);
@@ -314,7 +359,8 @@ class RemoteStorageService {
     final String alistProxyUrl;
     if (sign.isNotEmpty) {
       alistProxyUrl = '$base/d$encodedPath?sign=${Uri.encodeQueryComponent(sign)}';
-    } else if (fallbackUrl.isNotEmpty) {
+    } else if (fallbackUrl.isNotEmpty &&
+        !(forceRefresh && fallbackUrl.contains('sign='))) {
       alistProxyUrl = fallbackUrl;
     } else {
       alistProxyUrl = '$base/d$encodedPath';

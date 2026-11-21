@@ -1674,6 +1674,31 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
     );
   }
 
+  Future<void> _activateNodeFromCard(String nodeId) async {
+    if (!_proxySvc.proxyEnabled) {
+      await _proxySvc.setProxyEnabled(true);
+    }
+    for (final s in const [
+      RequestScenario.vodApi,
+      RequestScenario.vodStream,
+      RequestScenario.liveStream,
+      RequestScenario.telegram,
+    ]) {
+      final cur = _proxySvc.scenarioRules[s];
+      if (cur != null && cur.mode == ScenarioRouteMode.direct) {
+        await _proxySvc.updateScenarioRule(
+          s,
+          mode: ScenarioRouteMode.followGlobal,
+          clearSpecificNode: true,
+        );
+      }
+    }
+    await _proxySvc.selectNode(
+      nodeId,
+      switchToManual: true,
+    );
+  }
+
   Widget _buildProxyNodeCard(
     ProxyNode node, {
     required bool isActive,
@@ -1683,10 +1708,7 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
 
     return InkWell(
       borderRadius: BorderRadius.circular(8),
-      onTap: () => _proxySvc.selectNode(
-        node.id,
-        switchToManual: true,
-      ),
+      onTap: () => _activateNodeFromCard(node.id),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 160),
         padding: const EdgeInsets.all(12),

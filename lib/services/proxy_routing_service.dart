@@ -2337,14 +2337,14 @@ class LocalProxyTunnelBridge {
   HttpClient? _directRelayHttpClient;
 
   /// Multi-connection concurrent HLS segment prefetching & parallel chunk state.
-  static const int maxConcurrentPrefetchWorkers = 4;
-  static const int prefetchLookaheadCount = 6;
-  static const int _maxPrefetchCacheSegments = 24;
-  static const int _maxPrefetchCacheBytes = 48 * 1024 * 1024;
+  static const int maxConcurrentPrefetchWorkers = 6;
+  static const int prefetchLookaheadCount = 8;
+  static const int _maxPrefetchCacheSegments = 36;
+  static const int _maxPrefetchCacheBytes = 64 * 1024 * 1024;
 
   static const int _tgBlockSize = 2 * 1024 * 1024;
-  static const int _tgMaxWorkersPerSession = 3;
-  static const int _tgLookaheadBlocks = 8;
+  static const int _tgMaxWorkersPerSession = 4;
+  static const int _tgLookaheadBlocks = 10;
   static const int _tgMaxBehindBlocks = 2;
   // Bound reusable data per playback session, including blocks from both tracks.
   static const int _tgRetainedBlocks = 16;
@@ -2484,6 +2484,12 @@ class LocalProxyTunnelBridge {
       if (force || session.readers.isEmpty) session.close();
     }
     _tgStitchSessions.removeWhere((_, session) => session.closed);
+    if (force) {
+      for (final cleanup in _clientCleanups.values.toList()) {
+        cleanup();
+      }
+      lastActiveTunnelNode = null;
+    }
     for (final hc in _streamRelayClients.values) {
       hc.close(force: force);
     }
@@ -2869,24 +2875,30 @@ class LocalProxyTunnelBridge {
       }
 
       final cleanAds = reqUri?.queryParameters['clean'] == '1';
-      final forceDirect = reqUri?.queryParameters['direct'] == '1';
+      final rawForceDirect = reqUri?.queryParameters['direct'] == '1';
       final explicitNodeId = reqUri?.queryParameters['nid']?.trim() ?? '';
       final isHead = rawHttpHeaderLines.first.toUpperCase().startsWith('HEAD ');
       final candidateNodes = <ProxyNode>[];
-      if (!forceDirect) {
+      if (!rawForceDirect) {
         final primary = _resolveDefaultNode();
-        final fallbacks = _resolveFallbackNodes?.call() ?? const <ProxyNode>[];
-        final available = {
-          if (primary != null) primary.id: primary,
-          for (final node in fallbacks) node.id: node,
-        };
-        final explicit = available[explicitNodeId];
-        if (explicit != null) candidateNodes.add(explicit);
-        for (final node in available.values) {
-          if (candidateNodes.length >= 3) break;
-          if (node.id != explicit?.id) candidateNodes.add(node);
+        if (primary != null) {
+          final fallbacks = _resolveFallbackNodes?.call() ?? const <ProxyNode>[];
+          final available = {
+            primary.id: primary,
+            for (final node in fallbacks) node.id: node,
+          };
+          final explicit =
+              (explicitNodeId.isNotEmpty && explicitNodeId == primary.id)
+                  ? available[explicitNodeId]
+                  : null;
+          if (explicit != null) candidateNodes.add(explicit);
+          for (final node in available.values) {
+            if (candidateNodes.length >= 3) break;
+            if (node.id != explicit?.id) candidateNodes.add(node);
+          }
         }
       }
+      final forceDirect = rawForceDirect || candidateNodes.isEmpty;
       final primary = candidateNodes.firstOrNull;
       final route = primary == null ? 'direct' : _relayNodeKey(primary);
       final playlistScope = jsonEncode([route, customHeaders]);
@@ -2939,7 +2951,7 @@ class LocalProxyTunnelBridge {
         if (cached != null) {
           _scheduleLookaheadPrefetch(
             fromIndex: segIndex + 1,
-            count: forceDirect ? prefetchLookaheadCount : 4,
+            count: forceDirect ? prefetchLookaheadCount : 6,
             customHeaders: customHeaders,
             forceDirect: forceDirect,
             candidateNodes: candidateNodes,
@@ -2959,14 +2971,15 @@ class LocalProxyTunnelBridge {
 
         final inFlight = _inFlightSegmentFetches[targetUrl];
         if (inFlight != null) {
+          final waitMs = forceDirect ? 750 : 1200;
           final awaited = await inFlight.timeout(
-            const Duration(milliseconds: 180),
+            Duration(milliseconds: waitMs),
             onTimeout: () => null,
           );
           if (awaited != null && prefetchGeneration == _prefetchGeneration) {
             _scheduleLookaheadPrefetch(
               fromIndex: segIndex + 1,
-              count: forceDirect ? 4 : 2,
+              count: forceDirect ? 6 : 4,
               customHeaders: customHeaders,
               forceDirect: forceDirect,
               candidateNodes: candidateNodes,
@@ -3162,15 +3175,16 @@ class LocalProxyTunnelBridge {
 
         final nodesToTry = candidateNodes;
 
-        // Happy-Eyeballs fast race when opening a stream for the first time:
-        // if primary node takes > 1100ms, race the second candidate node in parallel!
-        if (nodesToTry.length >= 2 && segIndex == null) {
+        // Happy-Eyeballs fast race when opening a stream or segment:
+        // if primary node takes > 900ms (or > 1100ms for initial playlist), race the second candidate node in parallel!
+        if (nodesToTry.length >= 2) {
           final winnerCompleter =
               Completer<
                 ({HttpClientResponse resp, Uri finalUri, HttpClient hc})?
               >();
           var pendingCount = 2;
           Timer? staggerTimer;
+          final staggerMs = segIndex == null ? 1050 : 900;
 
           void handleCandidateResult(
             ({HttpClientResponse resp, Uri finalUri, HttpClient hc})? res,
@@ -3197,7 +3211,7 @@ class LocalProxyTunnelBridge {
               activeRange: activeRange,
             ).then(handleCandidateResult),
           );
-          staggerTimer = Timer(const Duration(milliseconds: 1100), () {
+          staggerTimer = Timer(Duration(milliseconds: staggerMs), () {
             if (!winnerCompleter.isCompleted) {
               unawaited(
                 tryOpenWithNode(
@@ -3611,13 +3625,13 @@ class LocalProxyTunnelBridge {
         }
         if (prefetchGeneration == _prefetchGeneration && segIndex != null &&
             !lookaheadTriggeredForProxySeg &&
-            (streamedBytes >= 256 * 1024 ||
+            (streamedBytes >= 128 * 1024 ||
                 (resp.contentLength > 0 &&
-                    streamedBytes * 2 >= resp.contentLength))) {
+                    streamedBytes * 3 >= resp.contentLength))) {
           lookaheadTriggeredForProxySeg = true;
           _scheduleLookaheadPrefetch(
             fromIndex: segIndex + 1,
-            count: forceDirect ? 3 : 2,
+            count: forceDirect ? 5 : 4,
             customHeaders: customHeaders,
             forceDirect: forceDirect,
             candidateNodes: candidateNodes,
@@ -3641,7 +3655,7 @@ class LocalProxyTunnelBridge {
           !lookaheadTriggeredForProxySeg) {
         _scheduleLookaheadPrefetch(
           fromIndex: segIndex + 1,
-          count: forceDirect ? 4 : 2,
+          count: forceDirect ? 6 : 4,
           customHeaders: customHeaders,
           forceDirect: forceDirect,
           candidateNodes: candidateNodes,
@@ -4439,25 +4453,26 @@ class LocalProxyTunnelBridge {
       _playlistScope = playlistScope;
       _registerPlaylistSegments(discoveredSegments);
       _initialPrefetchTimer?.cancel();
-      if (forceDirect) {
-        // Defer initial segment prefetch by 50ms:
-        // - In real playback, `libmpv` requests `seg[0]` (or `seg[seek]`) within 2-5ms,
-        //   which cancels this timer so `seg[0]` streams chunk-by-chunk directly to `libmpv`
-        //   with 100% exclusive bandwidth (rendering the first keyframe after ~128KB instead
-        //   of waiting for the entire `.ts` file to buffer in `_inFlightSegmentFetches`).
-        // - When pre-warming a playlist without an immediate segment request, this timer
-        //   fires after 50ms and prefetches `seg[0..N]` in parallel.
-        _initialPrefetchTimer = Timer(const Duration(milliseconds: 50), () {
+      // Defer initial segment prefetch by 50ms (direct) or 80ms (proxy):
+      // - In real playback, `libmpv` requests `seg[0]` (or `seg[seek]`) within 2-5ms,
+      //   which cancels this timer so `seg[0]` streams chunk-by-chunk directly to `libmpv`
+      //   with 100% exclusive bandwidth (rendering the first keyframe after ~128KB instead
+      //   of waiting for the entire `.ts` file to buffer in `_inFlightSegmentFetches`).
+      // - When pre-warming a playlist without an immediate segment request, this timer
+      //   fires and prefetches `seg[0..N]` in parallel.
+      _initialPrefetchTimer = Timer(
+        Duration(milliseconds: forceDirect ? 50 : 80),
+        () {
           _initialPrefetchTimer = null;
           _scheduleLookaheadPrefetch(
             fromIndex: 0,
-            count: prefetchLookaheadCount,
+            count: forceDirect ? prefetchLookaheadCount : 4,
             customHeaders: headers,
             forceDirect: forceDirect,
             candidateNodes: candidateNodes,
           );
-        });
-      }
+        },
+      );
     }
 
     return sb.toString();
@@ -6119,8 +6134,9 @@ class ProxyRoutingService extends ChangeNotifier {
 
   ProxyRoutingService() {
     _localBridge = LocalProxyTunnelBridge(
-      resolveDefaultNode: () => activeNode,
-      resolveFallbackNodes: _resolveCandidateFallbackNodes,
+      resolveDefaultNode: () => _proxyEnabled ? activeNode : null,
+      resolveFallbackNodes: () =>
+          _proxyEnabled ? _resolveCandidateFallbackNodes() : const <ProxyNode>[],
       onNodeFeedback: _handleNodeRuntimeFeedback,
     );
   }
@@ -6319,11 +6335,24 @@ class ProxyRoutingService extends ChangeNotifier {
     var bridge = _nodeBridges[node.id];
     if (bridge == null) {
       bridge = LocalProxyTunnelBridge(
-        resolveDefaultNode: () => _nodes.firstWhere(
-          (n) => n.id == node.id,
-          orElse: () => node,
-        ),
-        resolveFallbackNodes: _resolveCandidateFallbackNodes,
+        resolveDefaultNode: () {
+          if (!_proxyEnabled) return null;
+          final pinned = _scenarioRules.values.any(
+            (r) =>
+                r.specificNodeId == node.id &&
+                r.mode != ScenarioRouteMode.direct &&
+                r.mode != ScenarioRouteMode.serverRelay,
+          );
+          if (!pinned) {
+            return activeNode;
+          }
+          return _nodes.firstWhere(
+            (n) => n.id == node.id,
+            orElse: () => node,
+          );
+        },
+        resolveFallbackNodes: () =>
+            _proxyEnabled ? _resolveCandidateFallbackNodes() : const <ProxyNode>[],
         onNodeFeedback: _handleNodeRuntimeFeedback,
       );
       _nodeBridges[node.id] = bridge;
@@ -6375,10 +6404,11 @@ class ProxyRoutingService extends ChangeNotifier {
     notifyListeners();
   }
 
-  void _resetAllBridgeSessionCaches() {
-    _localBridge.resetSessionState();
+  void _resetAllBridgeSessionCaches({bool force = true}) {
+    _ipProbeCache.clear();
+    _localBridge.resetSessionState(force: force);
     for (final b in _nodeBridges.values) {
-      b.resetSessionState();
+      b.resetSessionState(force: force);
     }
   }
 
@@ -6863,6 +6893,23 @@ class ProxyRoutingService extends ChangeNotifier {
           );
         }
       }
+      final isDirectVodM3u8 = scenario == RequestScenario.vodStream &&
+          effective == ScenarioRouteMode.direct &&
+          !uri.path.toLowerCase().startsWith('/api/vod/proxy') &&
+          uri.host != '127.0.0.1' &&
+          uri.host != 'localhost' &&
+          (lowerTrimmed.contains('.m3u8') || cleanM3u8Ads);
+      if (isDirectVodM3u8) {
+        final directPort = await _localBridge.ensureStarted();
+        if (directPort > 0) {
+          return _localBridge.buildStreamRelayUrl(
+            targetUrl: trimmed,
+            headers: headers,
+            cleanM3u8Ads: cleanM3u8Ads,
+            forceDirect: true,
+          );
+        }
+      }
       return trimmed;
     }
     final node = resolveNodeForScenario(scenario);
@@ -6877,6 +6924,23 @@ class ProxyRoutingService extends ChangeNotifier {
             targetUrl: trimmed,
             headers: headers,
             cleanM3u8Ads: false,
+            forceDirect: true,
+          );
+        }
+      }
+      final isDirectVodM3u8 = scenario == RequestScenario.vodStream &&
+          effective == ScenarioRouteMode.direct &&
+          !uri.path.toLowerCase().startsWith('/api/vod/proxy') &&
+          uri.host != '127.0.0.1' &&
+          uri.host != 'localhost' &&
+          (lowerTrimmed.contains('.m3u8') || cleanM3u8Ads);
+      if (isDirectVodM3u8) {
+        final directPort = await _localBridge.ensureStarted();
+        if (directPort > 0) {
+          return _localBridge.buildStreamRelayUrl(
+            targetUrl: trimmed,
+            headers: headers,
+            cleanM3u8Ads: cleanM3u8Ads,
             forceDirect: true,
           );
         }
@@ -7115,16 +7179,20 @@ class ProxyRoutingService extends ChangeNotifier {
       // Clear any sticky per-scenario `proxyNode` overrides so turning off global proxy truly disables all proxy routing
       for (final s in RequestScenario.values) {
         final cur = _scenarioRules[s];
-        if (cur != null && cur.mode == ScenarioRouteMode.proxyNode) {
+        if (cur != null &&
+            (cur.mode == ScenarioRouteMode.proxyNode ||
+                (cur.specificNodeId != null && cur.specificNodeId!.isNotEmpty))) {
           _scenarioRules[s] = ScenarioRuleConfig(
             scenario: s,
-            mode: ScenarioRouteMode.followGlobal,
+            mode: cur.mode == ScenarioRouteMode.proxyNode
+                ? ScenarioRouteMode.followGlobal
+                : cur.mode,
           );
           rulesReset = true;
         }
       }
     }
-    _resetAllBridgeSessionCaches();
+    _resetAllBridgeSessionCaches(force: true);
     if (enabled) {
       await _localBridge.ensureStarted();
       _configureAutoFastestTimer();
@@ -7155,7 +7223,19 @@ class ProxyRoutingService extends ChangeNotifier {
   /// Switch between `manual` and `autoFastest` proxy selection modes.
   Future<void> setSelectionMode(ProxySelectionMode mode) async {
     _selectionMode = mode;
-    _resetAllBridgeSessionCaches();
+    var rulesUpdated = false;
+    if (mode == ProxySelectionMode.autoFastest) {
+      for (final s in RequestScenario.values) {
+        final cur = _scenarioRules[s];
+        if (cur != null &&
+            cur.specificNodeId != null &&
+            cur.specificNodeId!.isNotEmpty) {
+          _scenarioRules[s] = cur.copyWith(clearSpecificNode: true);
+          rulesUpdated = true;
+        }
+      }
+    }
+    _resetAllBridgeSessionCaches(force: true);
     _configureAutoFastestTimer();
     if (mode == ProxySelectionMode.autoFastest) {
       final fastest = fastestNode;
@@ -7176,6 +7256,9 @@ class ProxyRoutingService extends ChangeNotifier {
     _lastStatusIsError = false;
     notifyListeners();
     try {
+      if (rulesUpdated) {
+        await _persistScenarioRules();
+      }
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString(_prefSelectionModeKey, mode.name);
       if (_selectedNodeId != null) {
@@ -7372,6 +7455,7 @@ class ProxyRoutingService extends ChangeNotifier {
         _lastStatusMessage = '已应用「服务端中转优先预设」：点播与直播均通过主服务器中转';
         break;
     }
+    _resetAllBridgeSessionCaches(force: true);
     _lastStatusIsError = false;
     await _localBridge.ensureStarted();
     notifyListeners();

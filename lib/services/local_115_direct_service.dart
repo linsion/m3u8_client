@@ -221,6 +221,7 @@ typedef _ProxyMediaInfo = ({
   Uint8List normalizedHeaderChunk,
   int stripPrefixBytes,
   bool supportsRanges,
+  int cachedAtMs,
 });
 
 /// Manages local 115 Cloud Drive QR/Cookie authentication, direct domestic CDN URL resolution,
@@ -254,16 +255,51 @@ class Local115DirectService extends ChangeNotifier {
   HttpServer? _proxyServer;
   Future<void>? _proxyStarting;
   int _proxyPort = 0;
+  bool _needsProxyHealthCheck = false;
   final Map<String, Map<String, String>> _headersByUrl = {};
-  late final HttpClient _httpClient;
+  late HttpClient _httpClient;
 
   Local115DirectService._() {
-    _httpClient = HttpClient()
+    _httpClient = _createHttpClient();
+    unawaited(ensureInitialized());
+  }
+
+  static HttpClient _createHttpClient() {
+    final hc = HttpClient()
       ..connectionTimeout = const Duration(seconds: 15)
       ..idleTimeout = const Duration(seconds: 30)
       ..findProxy = ((_) => 'DIRECT')
       ..badCertificateCallback = (_, __, ___) => true;
-    unawaited(ensureInitialized());
+    try {
+      hc.maxConnectionsPerHost = 12;
+    } catch (_) {}
+    return hc;
+  }
+
+  void _recreateHttpClient() {
+    final old = _httpClient;
+    _httpClient = _createHttpClient();
+    try {
+      old.close(force: false);
+    } catch (_) {}
+  }
+
+  /// Resets pooled HTTP sockets, clears expired stream/header caches, and schedules
+  /// a loopback proxy health check when the app resumes from background inactivity.
+  void resetAfterBackground({bool clearCaches = true}) {
+    if (!Platform.environment.containsKey('FLUTTER_TEST')) {
+      _recreateHttpClient();
+    }
+    _needsProxyHealthCheck = true;
+    if (clearCaches) {
+      _pickcodeUrlCache.clear();
+      _pickcodeInFlight.clear();
+      _proxyMetaCache.clear();
+      _proxyMetaInFlight.clear();
+      _cdnAuthCookiesByUrl.clear();
+      _latestCdnAuthCookie = '';
+      _latestCdnAuthCookieAtMs = 0;
+    }
   }
 
   String get savedCookie => _cookie;
@@ -417,14 +453,23 @@ class Local115DirectService extends ChangeNotifier {
     ApiClient api,
     String targetCid, {
     bool throwOnFailure = false,
+    bool ensureConvertToMp4 = false,
   }) async {
     if (targetCid.isEmpty || targetCid == '0') return;
     try {
       final settings = await api.fetchServerSettings();
       final map = Map<String, dynamic>.from(settings.raw);
       final cur = (map['eleven_dir_id'] ?? '').toString().trim();
+      var changed = false;
       if (cur != targetCid) {
         map['eleven_dir_id'] = targetCid;
+        changed = true;
+      }
+      if (ensureConvertToMp4 && map['convert_to_mp4'] != true) {
+        map['convert_to_mp4'] = true;
+        changed = true;
+      }
+      if (changed) {
         await api.saveServerSettings(map);
       }
     } catch (_) {
@@ -765,6 +810,7 @@ class Local115DirectService extends ChangeNotifier {
   Future<Resolved115Stream?> findAndResolveDirectPlayUrl({
     required List<String> keywords,
     bool searchAccount = true,
+    bool preferMp4Only = false,
   }) async {
     await ensureInitialized();
     if (!hasLocalCookie) return null;
@@ -778,14 +824,28 @@ class Local115DirectService extends ChangeNotifier {
     Future<Resolved115Stream?> resolveMatches(
       Iterable<FileEntry> entries,
     ) async {
+      final list = entries.toList();
       for (final name in names) {
-        for (final entry in entries) {
+        final matched = <FileEntry>[];
+        for (final entry in list) {
           if (!entry.isVideo ||
               entry.pickcode115.isEmpty ||
-              _cleanMatchToken(entry.name) != name ||
-              !seenPickcodes.add(entry.pickcode115)) {
+              _cleanMatchToken(entry.name) != name) {
             continue;
           }
+          if (preferMp4Only && !entry.isMp4 && entry.normalizedExt != '.mp4') {
+            continue;
+          }
+          matched.add(entry);
+        }
+        // Always prioritize MP4 over TS/other containers when both exist
+        matched.sort((a, b) {
+          final aMp4 = (a.isMp4 || a.normalizedExt == '.mp4') ? 0 : 1;
+          final bMp4 = (b.isMp4 || b.normalizedExt == '.mp4') ? 0 : 1;
+          return aMp4.compareTo(bMp4);
+        });
+        for (final entry in matched) {
+          if (!seenPickcodes.add(entry.pickcode115)) continue;
           final stream = await resolve115VideoPlayback(
             pickcode: entry.pickcode115,
             fileName: entry.name,
@@ -1000,10 +1060,23 @@ class Local115DirectService extends ChangeNotifier {
   final Map<(String, bool), Future<String?>> _pickcodeInFlight = {};
   final Map<String, String> _cdnAuthCookiesByUrl = {};
   String _latestCdnAuthCookie = '';
+  int _latestCdnAuthCookieAtMs = 0;
+
+  String get _activeLatestCdnAuthCookie {
+    if (_latestCdnAuthCookie.isEmpty) return '';
+    final ageMs =
+        DateTime.now().millisecondsSinceEpoch - _latestCdnAuthCookieAtMs;
+    if (ageMs > 120000) {
+      _latestCdnAuthCookie = '';
+      _latestCdnAuthCookieAtMs = 0;
+      return '';
+    }
+    return _latestCdnAuthCookie;
+  }
 
   Map<String, String> requestHeadersForUrl(String url) {
     final base = Map<String, String>.from(requestHeaders);
-    final extra = _cdnAuthCookiesByUrl[url] ?? _latestCdnAuthCookie;
+    final extra = _cdnAuthCookiesByUrl[url] ?? _activeLatestCdnAuthCookie;
     if (extra.isNotEmpty) {
       final cur = (base['Cookie'] ?? '').trim();
       if (!cur.contains(extra)) {
@@ -1011,6 +1084,17 @@ class Local115DirectService extends ChangeNotifier {
       }
     }
     return base;
+  }
+
+  Future<String?> resolvePickcodeFromFid(String fid) async {
+    await ensureInitialized();
+    final cleanFid = fid.trim();
+    if (!hasLocalCookie || cleanFid.isEmpty || cleanFid == '0') return null;
+    try {
+      final info = await _read115FileInfo(cleanFid);
+      if (info.pickcode.isNotEmpty) return info.pickcode;
+    } catch (_) {}
+    return null;
   }
 
   Future<String?> resolvePickcodeStreamUrl(
@@ -1028,10 +1112,12 @@ class Local115DirectService extends ChangeNotifier {
       if (cached != null && (nowMs - cached.timestampMs) < 12000) {
         return cached.url;
       }
+    } else {
+      _pickcodeUrlCache.remove(cacheKey);
+      _pickcodeInFlight.remove(cacheKey);
     }
     final inflight = _pickcodeInFlight[cacheKey];
     if (inflight != null) return await inflight;
-    if (forceRefresh) _pickcodeUrlCache.remove(cacheKey);
     final fut = _resolvePickcodeStreamUrlInternal(cleanPc, allowVideoFallback);
     _pickcodeInFlight[cacheKey] = fut;
     try {
@@ -1085,7 +1171,10 @@ class Local115DirectService extends ChangeNotifier {
       }
       Object? root;
       if (response.statusCode == HttpStatus.ok) {
-        root = await _readJsonResponse(response).timeout(timeout);
+        root = await _readJsonResponse(
+          response,
+          captureAuthCookie: true,
+        ).timeout(timeout);
       } else {
         await response.drain<void>().timeout(timeout);
       }
@@ -1110,9 +1199,14 @@ class Local115DirectService extends ChangeNotifier {
                       }
                       _cdnAuthCookiesByUrl[cdnUrl] = pair;
                       _latestCdnAuthCookie = pair;
+                      _latestCdnAuthCookieAtMs =
+                          DateTime.now().millisecondsSinceEpoch;
                     }
-                  } else if (_latestCdnAuthCookie.isNotEmpty) {
-                    _cdnAuthCookiesByUrl[cdnUrl] = _latestCdnAuthCookie;
+                  } else {
+                    final freshCookie = _activeLatestCdnAuthCookie;
+                    if (freshCookie.isNotEmpty) {
+                      _cdnAuthCookiesByUrl[cdnUrl] = freshCookie;
+                    }
                   }
                   return cdnUrl;
                 }
@@ -1154,7 +1248,12 @@ class Local115DirectService extends ChangeNotifier {
     String remoteUrl,
     Map<String, String> headers, {
     String extHint = '',
+    bool forceRefresh = false,
   }) async {
+    if (forceRefresh) {
+      _proxyMetaCache.remove(remoteUrl);
+      _proxyMetaInFlight.remove(remoteUrl);
+    }
     await _ensureLocalProxyStarted();
     if (_proxyPort <= 0) return remoteUrl;
     if (_headersByUrl.length >= 8192 && !_headersByUrl.containsKey(remoteUrl)) {
@@ -1163,7 +1262,7 @@ class Local115DirectService extends ChangeNotifier {
     final mergedHeaders = Map<String, String>.from(headers);
     final authCookie = _cdnAuthCookiesByUrl[remoteUrl] ??
         (_is115MediaHost(Uri.tryParse(remoteUrl)?.host ?? '')
-            ? _latestCdnAuthCookie
+            ? _activeLatestCdnAuthCookie
             : '');
     if (authCookie.isNotEmpty) {
       final curCookie =
@@ -1514,6 +1613,9 @@ class Local115DirectService extends ChangeNotifier {
         );
       } catch (_) {
         if (isCancelled != null && isCancelled()) return null;
+        if (attempt == 0) {
+          _recreateHttpClient();
+        }
         await Future<void>.delayed(
           Duration(milliseconds: (attempt + 1) * 200),
         );
@@ -1522,11 +1624,48 @@ class Local115DirectService extends ChangeNotifier {
     return null;
   }
 
-  Future<void> _ensureLocalProxyStarted() {
-    if (_proxyServer != null) return Future.value();
-    return _proxyStarting ??= _startLocalProxy().whenComplete(() {
+  Future<void> _ensureLocalProxyStarted() async {
+    if (_proxyServer != null && _proxyPort > 0) {
+      if (!_needsProxyHealthCheck) return;
+      _needsProxyHealthCheck = false;
+      if (await _isLocalProxyHealthy(_proxyPort)) {
+        return;
+      }
+      final stale = _proxyServer;
+      _proxyServer = null;
+      _proxyPort = 0;
+      try {
+        await stale?.close(force: true);
+      } catch (_) {}
+    }
+    return await (_proxyStarting ??= _startLocalProxy().whenComplete(() {
       _proxyStarting = null;
-    });
+    }));
+  }
+
+  Future<bool> _isLocalProxyHealthy(int port) async {
+    if (port <= 0) return false;
+    Socket? socket;
+    try {
+      socket = await Socket.connect(
+        InternetAddress.loopbackIPv4,
+        port,
+        timeout: const Duration(milliseconds: 250),
+      );
+      socket.add(
+        ascii.encode(
+          'HEAD /__ping__ HTTP/1.1\r\nHost: 127.0.0.1:$port\r\nConnection: close\r\n\r\n',
+        ),
+      );
+      await socket.flush();
+      return true;
+    } catch (_) {
+      return false;
+    } finally {
+      try {
+        socket?.destroy();
+      } catch (_) {}
+    }
   }
 
   Future<void> _startLocalProxy() async {
@@ -1534,7 +1673,18 @@ class Local115DirectService extends ChangeNotifier {
       final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       _proxyServer = server;
       _proxyPort = server.port;
-      server.listen(_handleProxyRequest, cancelOnError: false);
+      _needsProxyHealthCheck = false;
+      server.listen(
+        _handleProxyRequest,
+        cancelOnError: false,
+        onDone: () {
+          if (identical(_proxyServer, server)) {
+            _proxyServer = null;
+            _proxyPort = 0;
+          }
+        },
+        onError: (_) {},
+      );
     } catch (_) {}
   }
 
@@ -1571,6 +1721,7 @@ class Local115DirectService extends ChangeNotifier {
       normalizedHeaderChunk: normalized.normalizedChunk,
       stripPrefixBytes: normalized.stripPrefixBytes,
       supportsRanges: probe.statusCode == HttpStatus.partialContent,
+      cachedAtMs: DateTime.now().millisecondsSinceEpoch,
     );
   }
 
@@ -1757,6 +1908,11 @@ class Local115DirectService extends ChangeNotifier {
 
   Future<void> _handleProxyRequest(HttpRequest request) async {
     final response = request.response;
+    if (request.uri.path == '/__ping__') {
+      response.statusCode = HttpStatus.noContent;
+      await response.close();
+      return;
+    }
     final targetUrl = request.uri.queryParameters['u'] ?? '';
     final uri = Uri.tryParse(targetUrl);
     final headers = _headersByUrl[targetUrl];
@@ -1787,6 +1943,11 @@ class Local115DirectService extends ChangeNotifier {
       }
 
       var meta = _proxyMetaCache[targetUrl];
+      if (meta != null &&
+          (DateTime.now().millisecondsSinceEpoch - meta.cachedAtMs) > 90000) {
+        _proxyMetaCache.remove(targetUrl);
+        meta = null;
+      }
       if (meta == null) {
         final loading = _proxyMetaInFlight.putIfAbsent(
           targetUrl,
@@ -2288,6 +2449,7 @@ class Local115DirectService extends ChangeNotifier {
       final lookupNames = <String>{taskTitle, videoName};
       final existing = await findAndResolveDirectPlayUrl(
         keywords: lookupNames.toList(),
+        preferMp4Only: true,
       );
       if (cancelled()) return null;
       if (existing != null) return existing;
@@ -2338,7 +2500,12 @@ class Local115DirectService extends ChangeNotifier {
           await api.login115WithCookie(_cookie);
           if (cancelled()) return null;
         }
-        await _syncFolderCidToServer(api, folder, throwOnFailure: true);
+        await _syncFolderCidToServer(
+          api,
+          folder,
+          throwOnFailure: true,
+          ensureConvertToMp4: true,
+        );
         serverReady = true;
       } catch (error) {
         failure = '服务端 115 上传准备失败：$error';
@@ -2346,15 +2513,44 @@ class Local115DirectService extends ChangeNotifier {
 
       var serverHasVideo = false;
       if (serverReady) {
-        for (final candidate in candidates.entries) {
+        final candidateList = candidates.entries.toList();
+        for (var cIdx = 0; cIdx < candidateList.length; cIdx++) {
+          final candidate = candidateList[cIdx];
           if (cancelled()) return null;
-          update('阶段 1/3 · 正在提交下载任务', taskTitle, 0.10);
+          final lineSuffix = candidateList.length > 1
+              ? ' (线路 ${cIdx + 1}/${candidateList.length})'
+              : '';
+          update(
+            cIdx == 0
+                ? '阶段 1/3 · 正在提交下载任务'
+                : '阶段 1/3 · 当前线路下载出错，正在切换备用线路 (${cIdx + 1}/${candidateList.length})',
+            '$taskTitle$lineSuffix',
+            0.10,
+          );
           var forced = false;
           var retried = false;
           var duplicateRetryPolls = 0;
+          var convertRequested = false;
+          var convertReady = false;
+          var convertPolls = 0;
           var uploadRequested = false;
           var missingPolls = 0;
           var uploadedPolls = 0;
+          var candidateCompletedUpload = false;
+
+          // Pre-clean any stale Failed tasks with the same name or URL so the server creates a clean download task
+          try {
+            final existingTasks = await api.fetchDownloadTasks();
+            for (final stale in existingTasks) {
+              if (stale.status == 'Failed' &&
+                  (stale.url == candidate.key || stale.name == taskTitle)) {
+                try {
+                  await api.deleteDownloadTask(stale.id, deleteFiles: true);
+                } catch (_) {}
+              }
+            }
+          } catch (_) {}
+          if (cancelled()) return null;
 
           Future<String?> submit({required bool force}) {
             return api.createDownloadTask(
@@ -2368,7 +2564,8 @@ class Local115DirectService extends ChangeNotifier {
 
           String? taskId;
           try {
-            taskId = await submit(force: false);
+            taskId = await submit(force: cIdx > 0);
+            if (cIdx > 0) forced = true;
           } catch (error) {
             failure = '提交下载任务失败：$error';
             continue;
@@ -2386,6 +2583,25 @@ class Local115DirectService extends ChangeNotifier {
               final tasks = await api.fetchDownloadTasks();
               listedTasks = true;
               task = tasks.where((item) => item.id == taskId).firstOrNull;
+              if (task == null) {
+                task = tasks
+                    .where(
+                      (item) =>
+                          (item.url == candidate.key ||
+                              item.name == taskTitle) &&
+                          item.status != 'Failed',
+                    )
+                    .firstOrNull;
+                task ??= tasks
+                    .where(
+                      (item) =>
+                          item.url == candidate.key || item.name == taskTitle,
+                    )
+                    .firstOrNull;
+                if (task != null) {
+                  taskId = task.id;
+                }
+              }
             } catch (error) {
               failure = '获取下载任务失败：$error';
             }
@@ -2418,17 +2634,28 @@ class Local115DirectService extends ChangeNotifier {
                   .replaceAll('\\', '/')
                   .split('/')
                   .last;
+              final mp4OutputPath = _ensureMp4OutputPath(
+                task.outputFile,
+                fallbackTaskName: task.name.isNotEmpty ? task.name : taskTitle,
+              );
+              final mp4OutputName = mp4OutputPath
+                  .replaceAll('\\', '/')
+                  .split('/')
+                  .last;
               final taskNames = <String>{
+                if (mp4OutputName.isNotEmpty) mp4OutputName,
                 if (outputName.isNotEmpty) outputName,
                 if (task.name.isNotEmpty) task.name,
                 ...lookupNames,
               };
               final progress = task.progress.clamp(0.0, 100.0) / 100;
 
-              if (task.status == 'Duplicate' || task.status == 'Completed') {
+              if ((task.status == 'Duplicate' || task.status == 'Completed') &&
+                  (!convertRequested || convertReady || uploadRequested)) {
                 final stream = await findAndResolveDirectPlayUrl(
                   keywords: taskNames.toList(),
                   searchAccount: !uploadRequested || uploadedPolls % 5 == 4,
+                  preferMp4Only: true,
                 );
                 if (cancelled()) return null;
                 if (stream != null) return stream;
@@ -2449,31 +2676,117 @@ class Local115DirectService extends ChangeNotifier {
                     }
                     if (!retried) {
                       retried = true;
-                      await api.retryDownloadTask(task.id);
+                      try {
+                        await api.retryDownloadTask(task.id);
+                      } on ApiException catch (e) {
+                        if (e.statusCode == HttpStatus.notFound ||
+                            e.statusCode == HttpStatus.methodNotAllowed) {
+                          try {
+                            await api.deleteDownloadTask(
+                              task.id,
+                              deleteFiles: true,
+                            );
+                          } catch (_) {}
+                          final freshId = await submit(force: true);
+                          if (cancelled()) return null;
+                          if (freshId != null) {
+                            taskId = freshId;
+                            continue;
+                          }
+                        } else {
+                          rethrow;
+                        }
+                      }
                     } else if (++duplicateRetryPolls >= 4) {
                       failure = '重复任务的文件已不可用，服务器未能重新下载';
                       break pollTask;
                     }
                     break;
                   case 'Completed':
-                    serverHasVideo = true;
+                    final errLower = task.error.toLowerCase();
+                    final needsServerMp4Convert = !convertReady &&
+                        !uploadRequested &&
+                        (_isNonMp4OutputFile(outputName) ||
+                            errLower.contains('mp4 conversion failed') ||
+                            (outputName.isEmpty && task.urlType == 'm3u8'));
+
+                    if (needsServerMp4Convert) {
+                      final tsSourcePath = task.outputFile.trim().isNotEmpty
+                          ? task.outputFile.trim()
+                          : 'downloads/${task.name.isNotEmpty ? task.name : taskTitle}.ts';
+                      if (!convertRequested) {
+                        convertRequested = true;
+                        update('阶段 1/3 · 下载完成，正在服务端转成 MP4...', task.name, 0.70);
+                        final ready = await _ensureServerConvertedToMp4(
+                          api: api,
+                          task: task,
+                          tsSourcePath: tsSourcePath,
+                          mp4OutputPath: mp4OutputPath,
+                          onUpdate: update,
+                          isCancelled: cancelled,
+                        );
+                        if (cancelled()) return null;
+                        if (ready) {
+                          convertReady = true;
+                        } else {
+                          convertPolls = 1;
+                          break;
+                        }
+                      } else {
+                        convertPolls++;
+                        final ready = await _pollServerMp4ConversionStatus(
+                          api: api,
+                          task: task,
+                          tsSourcePath: tsSourcePath,
+                          mp4OutputPath: mp4OutputPath,
+                          pollTick: convertPolls,
+                          onUpdate: update,
+                        );
+                        if (cancelled()) return null;
+                        if (ready) {
+                          convertReady = true;
+                        } else if (convertPolls < 90) {
+                          break;
+                        } else {
+                          convertReady = true;
+                        }
+                      }
+                    }
+
                     update('阶段 3/3 · 正在核对 115 中的当前视频', task.name, 0.92);
                     if (!uploadRequested) {
                       uploadRequested = true;
-                      update('阶段 2/3 · 正在请求服务器上传至 115', task.name, 0.76);
+                      update(
+                        '阶段 2/3 · 正在将转码后的 MP4 上传至 115',
+                        mp4OutputName.isNotEmpty ? mp4OutputName : task.name,
+                        0.76,
+                      );
                       try {
                         await api.uploadTaskTo115(task.id);
                       } on ApiException catch (error) {
-                        if (task.outputFile.isEmpty ||
-                            !const {
-                              HttpStatus.notFound,
-                              HttpStatus.methodNotAllowed,
-                            }.contains(error.statusCode)) {
+                        if (!const {
+                          HttpStatus.notFound,
+                          HttpStatus.methodNotAllowed,
+                          HttpStatus.badRequest,
+                        }.contains(error.statusCode)) {
                           rethrow;
                         }
-                        await api.uploadFileTo115(task.outputFile);
+                        final uploadPath = mp4OutputPath.isNotEmpty
+                            ? mp4OutputPath
+                            : task.outputFile;
+                        if (uploadPath.isEmpty) rethrow;
+                        await api.uploadFileTo115(uploadPath);
                       }
-                    } else if (++uploadedPolls >= 20) {
+                      candidateCompletedUpload = true;
+                    } else if (++uploadedPolls >= 25) {
+                      // Final fallback check allowing non-MP4 in case the source was non-remuxable
+                      final anyStream = await findAndResolveDirectPlayUrl(
+                        keywords: taskNames.toList(),
+                        searchAccount: true,
+                      );
+                      if (cancelled()) return null;
+                      if (anyStream != null) return anyStream;
+
                       final reason = task.error.trim();
                       failure = reason.isEmpty
                           ? '上传后未在 115 网盘找到当前视频'
@@ -2482,33 +2795,98 @@ class Local115DirectService extends ChangeNotifier {
                     }
                     break;
                   case 'Uploading':
+                    candidateCompletedUpload = true;
                     final pct = task.progress.toStringAsFixed(1);
                     update(
-                      '阶段 2/3 · 正在上传至 115',
+                      '阶段 2/3 · 正在上传 MP4 至 115',
                       '上传进度 $pct% · ${task.name}',
                       0.72 + progress * 0.18,
                     );
                     break;
                   case 'Downloading':
                   case 'Pending':
+                    final segDetail = task.totalSegments > 0
+                        ? ' · 分片 ${task.downloadedSegments}/${task.totalSegments}'
+                        : '';
                     update(
-                      '阶段 1/3 · 正在下载视频',
-                      '下载进度 ${task.progress.toStringAsFixed(1)}% · ${task.formattedSpeed}',
+                      '阶段 1/3 · 正在下载视频$lineSuffix',
+                      '下载进度 ${task.progress.toStringAsFixed(1)}% · ${task.formattedSpeed}$segDetail',
                       0.10 + progress * 0.58,
                     );
                     break;
                   case 'Converting':
-                    update('阶段 1/3 · 正在封装 MP4', task.name, 0.70);
+                    convertReady = true;
+                    update('阶段 1/3 · 服务器正在转成 MP4', task.name, 0.70);
                     break;
                   case 'Failed':
                     final reason = task.error.trim();
                     failure = reason.isEmpty
                         ? (uploadRequested ? '115 上传失败' : '服务器下载失败')
                         : reason;
+                    // If the task actually finished downloading (or only failed during 115 auto-upload),
+                    // convert to MP4 and trigger 115 upload instead of discarding the downloaded file!
+                    final hasDownloadedOutput = outputName.isNotEmpty ||
+                        reason.toLowerCase().contains('download success') ||
+                        reason.toLowerCase().contains('115');
+                    if (hasDownloadedOutput && !uploadRequested) {
+                      final tsSourcePath = task.outputFile.trim().isNotEmpty
+                          ? task.outputFile.trim()
+                          : 'downloads/${task.name.isNotEmpty ? task.name : taskTitle}.ts';
+                      if (!convertReady && _isNonMp4OutputFile(tsSourcePath)) {
+                        update('阶段 1/3 · 下载完成，正在服务端转成 MP4...', task.name, 0.70);
+                        await _ensureServerConvertedToMp4(
+                          api: api,
+                          task: task,
+                          tsSourcePath: tsSourcePath,
+                          mp4OutputPath: mp4OutputPath,
+                          onUpdate: update,
+                          isCancelled: cancelled,
+                        );
+                        if (cancelled()) return null;
+                        convertReady = true;
+                      }
+                      uploadRequested = true;
+                      update(
+                        '阶段 2/3 · 正在将转码后的 MP4 上传至 115',
+                        mp4OutputName.isNotEmpty ? mp4OutputName : task.name,
+                        0.76,
+                      );
+                      try {
+                        await api.uploadTaskTo115(task.id);
+                      } catch (_) {
+                        final uploadPath = mp4OutputPath.isNotEmpty
+                            ? mp4OutputPath
+                            : task.outputFile;
+                        if (uploadPath.isNotEmpty) {
+                          await api.uploadFileTo115(uploadPath);
+                        }
+                      }
+                      candidateCompletedUpload = true;
+                      break;
+                    }
                     if (!uploadRequested && !retried && outputName.isEmpty) {
                       retried = true;
-                      await api.retryDownloadTask(task.id);
-                      break;
+                      update('阶段 1/3 · 服务器下载出错，正在自动重试...', reason, 0.12);
+                      try {
+                        await api.retryDownloadTask(task.id);
+                        break;
+                      } on ApiException catch (e) {
+                        if (e.statusCode == HttpStatus.notFound ||
+                            e.statusCode == HttpStatus.methodNotAllowed) {
+                          try {
+                            await api.deleteDownloadTask(
+                              task.id,
+                              deleteFiles: true,
+                            );
+                          } catch (_) {}
+                          final freshId = await submit(force: true);
+                          if (cancelled()) return null;
+                          if (freshId != null && freshId != taskId) {
+                            taskId = freshId;
+                            continue;
+                          }
+                        }
+                      } catch (_) {}
                     }
                     break pollTask;
                   default:
@@ -2525,7 +2903,10 @@ class Local115DirectService extends ChangeNotifier {
 
             await Future<void>.delayed(const Duration(milliseconds: 1200));
           }
-          if (serverHasVideo) break;
+          if (candidateCompletedUpload) {
+            serverHasVideo = true;
+            break;
+          }
         }
       }
 
@@ -2551,14 +2932,190 @@ class Local115DirectService extends ChangeNotifier {
     }
   }
 
+  static bool _isNonMp4OutputFile(String pathOrName) {
+    final clean = pathOrName.trim().toLowerCase();
+    if (clean.isEmpty) return false;
+    if (clean.endsWith('.mp4')) return false;
+    final dot = clean.lastIndexOf('.');
+    return dot > 0 && dot < clean.length - 1;
+  }
+
+  static String _ensureMp4OutputPath(
+    String rawOutputFile, {
+    required String fallbackTaskName,
+  }) {
+    final clean = rawOutputFile.trim();
+    if (clean.isEmpty) {
+      return 'downloads/$fallbackTaskName.mp4';
+    }
+    if (clean.toLowerCase().endsWith('.mp4')) return clean;
+    final normalized = clean.replaceAll('\\', '/');
+    final slashIdx = normalized.lastIndexOf('/');
+    final dirPrefix = slashIdx >= 0 ? normalized.substring(0, slashIdx + 1) : '';
+    final fileName = slashIdx >= 0
+        ? normalized.substring(slashIdx + 1)
+        : normalized;
+    final dotIdx = fileName.lastIndexOf('.');
+    final baseName = dotIdx > 0 ? fileName.substring(0, dotIdx) : fileName;
+    return '$dirPrefix$baseName.mp4';
+  }
+
+  /// Ensures a downloaded non-MP4 file (e.g. `.ts`) on the server is converted to `.mp4`
+  /// before uploading to 115 Cloud Drive.
+  Future<bool> _ensureServerConvertedToMp4({
+    required ApiClient api,
+    required DownloadTask task,
+    required String tsSourcePath,
+    required String mp4OutputPath,
+    required void Function(String title, String detail, double progress)
+    onUpdate,
+    required bool Function() isCancelled,
+  }) async {
+    final mp4Name = mp4OutputPath.replaceAll('\\', '/').split('/').last;
+    try {
+      final dirPath = mp4OutputPath.contains('/')
+          ? mp4OutputPath
+                .replaceAll('\\', '/')
+                .substring(0, mp4OutputPath.replaceAll('\\', '/').lastIndexOf('/'))
+          : '';
+      for (final checkDir in <String>{if (dirPath.isNotEmpty) dirPath, ''}) {
+        try {
+          final listing = await api.fetchFiles(path: checkDir);
+          final hasMp4 = listing.entries.any(
+            (e) =>
+                !e.isDir &&
+                (e.name.toLowerCase() == mp4Name.toLowerCase() ||
+                    e.path.toLowerCase().endsWith(mp4Name.toLowerCase())) &&
+                e.size > 0,
+          );
+          if (hasMp4) return true;
+        } catch (_) {}
+      }
+    } catch (_) {}
+
+    if (isCancelled()) return false;
+    try {
+      await api.convertFileToMp4(tsSourcePath);
+    } on ApiException catch (e) {
+      // 409 Conflict means conversion is already running; 400/404 means either already converted or endpoint unavailable
+      if (e.statusCode != HttpStatus.conflict) {
+        return true;
+      }
+    } catch (_) {
+      return true;
+    }
+
+    return _pollServerMp4ConversionStatus(
+      api: api,
+      task: task,
+      tsSourcePath: tsSourcePath,
+      mp4OutputPath: mp4OutputPath,
+      pollTick: 0,
+      onUpdate: onUpdate,
+    );
+  }
+
+  Future<bool> _pollServerMp4ConversionStatus({
+    required ApiClient api,
+    required DownloadTask task,
+    required String tsSourcePath,
+    required String mp4OutputPath,
+    required int pollTick,
+    required void Function(String title, String detail, double progress)
+    onUpdate,
+  }) async {
+    final tsName = tsSourcePath.replaceAll('\\', '/').split('/').last;
+    final mp4Name = mp4OutputPath.replaceAll('\\', '/').split('/').last;
+
+    try {
+      final ops = await api.fetchServerFileOps();
+      final convertOp = ops.where((op) {
+        final type = (op['type'] ?? '').toString().toLowerCase();
+        final fn = (op['file_name'] ?? '')
+            .toString()
+            .replaceAll('\\', '/')
+            .split('/')
+            .last;
+        return type == 'convert' &&
+            (fn.toLowerCase() == tsName.toLowerCase() ||
+                fn.toLowerCase() == mp4Name.toLowerCase());
+      }).firstOrNull;
+
+      if (convertOp != null) {
+        final status = (convertOp['status'] ?? '').toString().toLowerCase();
+        final pct =
+            double.tryParse((convertOp['progress'] ?? 0).toString()) ?? 0.0;
+        if (status == 'processing') {
+          onUpdate(
+            '阶段 1/3 · 服务器正在转成 MP4',
+            '转码进度 ${pct.toStringAsFixed(1)}% · ${task.name}',
+            0.69 + (pct.clamp(0.0, 100.0) / 100.0) * 0.05,
+          );
+          return false;
+        }
+        if (status == 'completed') {
+          return true;
+        }
+        if (status == 'failed') {
+          return true;
+        }
+      }
+    } catch (_) {}
+
+    final dirPath = mp4OutputPath.contains('/')
+        ? mp4OutputPath
+              .replaceAll('\\', '/')
+              .substring(0, mp4OutputPath.replaceAll('\\', '/').lastIndexOf('/'))
+        : '';
+    for (final checkDir in <String>{if (dirPath.isNotEmpty) dirPath, ''}) {
+      try {
+        final listing = await api.fetchFiles(path: checkDir);
+        final hasMp4 = listing.entries.any(
+          (e) =>
+              !e.isDir &&
+              (e.name.toLowerCase() == mp4Name.toLowerCase() ||
+                  e.path.toLowerCase().endsWith(mp4Name.toLowerCase())) &&
+              e.size > 0,
+        );
+        if (hasMp4) return true;
+      } catch (_) {}
+    }
+
+    // Check if the task status itself transitioned to Converting -> Completed
+    try {
+      final tasks = await api.fetchDownloadTasks();
+      final cur = tasks.where((t) => t.id == task.id).firstOrNull;
+      if (cur != null) {
+        if (cur.status == 'Converting') {
+          onUpdate('阶段 1/3 · 服务器正在转成 MP4', task.name, 0.70);
+          return false;
+        }
+        if (cur.outputFile.toLowerCase().endsWith('.mp4')) {
+          return true;
+        }
+      }
+    } catch (_) {}
+
+    return pollTick >= 2;
+  }
+
   Future<dynamic> _getJson(
     Uri uri, {
     Duration timeout = const Duration(seconds: 12),
   }) async {
-    final req = await _httpClient.getUrl(uri).timeout(timeout);
-    requestHeaders.forEach(req.headers.set);
-    final resp = await req.close().timeout(timeout);
-    return _readJsonResponse(resp);
+    Future<dynamic> fetchOnce() async {
+      final req = await _httpClient.getUrl(uri).timeout(timeout);
+      requestHeaders.forEach(req.headers.set);
+      final resp = await req.close().timeout(timeout);
+      return await _readJsonResponse(resp).timeout(timeout);
+    }
+
+    try {
+      return await fetchOnce();
+    } catch (_) {
+      _recreateHttpClient();
+      return await fetchOnce();
+    }
   }
 
   Future<dynamic> _postFormJson(
@@ -2567,7 +3124,7 @@ class Local115DirectService extends ChangeNotifier {
     Duration timeout = const Duration(seconds: 12),
   }) async {
     final resp = await _postForm(uri, body: body, timeout: timeout);
-    return _readJsonResponse(resp);
+    return _readJsonResponse(resp).timeout(timeout);
   }
 
   Future<HttpClientResponse> _postForm(
@@ -2575,19 +3132,34 @@ class Local115DirectService extends ChangeNotifier {
     required String body,
     required Duration timeout,
   }) async {
-    final req = await _httpClient.postUrl(uri).timeout(timeout);
-    requestHeaders.forEach(req.headers.set);
-    req.headers.set('Content-Type', 'application/x-www-form-urlencoded');
-    final bodyBytes = utf8.encode(body);
-    req.contentLength = bodyBytes.length;
-    req.add(bodyBytes);
-    return req.close().timeout(timeout);
+    Future<HttpClientResponse> sendOnce() async {
+      final req = await _httpClient.postUrl(uri).timeout(timeout);
+      requestHeaders.forEach(req.headers.set);
+      req.headers.set('Content-Type', 'application/x-www-form-urlencoded');
+      final bodyBytes = utf8.encode(body);
+      req.contentLength = bodyBytes.length;
+      req.add(bodyBytes);
+      return req.close().timeout(timeout);
+    }
+
+    try {
+      return await sendOnce();
+    } catch (_) {
+      _recreateHttpClient();
+      return await sendOnce();
+    }
   }
 
-  Future<dynamic> _readJsonResponse(HttpClientResponse resp) async {
-    for (final c in resp.cookies) {
-      if (c.name.isNotEmpty && c.value.isNotEmpty) {
-        _latestCdnAuthCookie = '${c.name}=${c.value}';
+  Future<dynamic> _readJsonResponse(
+    HttpClientResponse resp, {
+    bool captureAuthCookie = false,
+  }) async {
+    if (captureAuthCookie) {
+      for (final c in resp.cookies) {
+        if (c.name.isNotEmpty && c.value.isNotEmpty) {
+          _latestCdnAuthCookie = '${c.name}=${c.value}';
+          _latestCdnAuthCookieAtMs = DateTime.now().millisecondsSinceEpoch;
+        }
       }
     }
     final bytes = await resp.fold<List<int>>(<int>[], (acc, b) => acc..addAll(b));

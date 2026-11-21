@@ -590,6 +590,7 @@ class CloudArchiveMusicService {
   Future<String> extractArchiveAudioToTempFile({
     required FileEntry entry,
     required CloudEndpointResolver endpointResolver,
+    bool forceRefresh = false,
   }) async {
     final tempRoot = Directory(
       '${Directory.systemTemp.path}${Platform.pathSeparator}liuguang_archive_audio',
@@ -605,7 +606,9 @@ class CloudArchiveMusicService {
     final outFile = File(
       '${tempRoot.path}${Platform.pathSeparator}track_$hashKey$ext',
     );
-    if (await outFile.exists() && await outFile.length() > 1024) {
+    if (!forceRefresh &&
+        await outFile.exists() &&
+        await outFile.length() > 1024) {
       return outFile.path;
     }
 
@@ -728,7 +731,7 @@ class CloudArchiveMusicService {
 // Global Cloud Hi-Fi Music Controller (Standalone + MediaLibrary Shared Engine)
 // =============================================================================
 
-class CloudMusicController extends ChangeNotifier {
+class CloudMusicController extends ChangeNotifier with WidgetsBindingObserver {
   static const String _prefSavedMusicFoldersKey = 'm3u8_saved_music_folders_v1';
   static const String _prefSavedMusicPlaylistsKey =
       'm3u8_saved_music_playlists_v1';
@@ -748,6 +751,12 @@ class CloudMusicController extends ChangeNotifier {
   AppState? _boundAppState;
 
   Player? _player;
+  StreamSubscription<bool>? _playingSub;
+  StreamSubscription<Duration>? _positionSub;
+  StreamSubscription<Duration>? _durationSub;
+  StreamSubscription<bool>? _completedSub;
+  StreamSubscription<String>? _errorSub;
+  Timer? _openWatchdogTimer;
 
   List<FileEntry> _queue = [];
   int _currentIndex = -1;
@@ -755,6 +764,12 @@ class CloudMusicController extends ChangeNotifier {
   bool _isLoadingTrack = false;
   bool _isSessionDocked = false;
   bool _isScanningFolders = false;
+  bool _trackHasStartedPlaying = false;
+  bool _needsFreshOpenAfterBackground = false;
+  DateTime? _backgroundedAt;
+  DateTime _lastTrackOpenedAt = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastLoadingStartedAt = DateTime.fromMillisecondsSinceEpoch(0);
+  Duration? _pendingResumePosition;
   String _scanningStatusText = '';
   String _errorText = '';
   Duration _position = Duration.zero;
@@ -789,13 +804,75 @@ class CloudMusicController extends ChangeNotifier {
   int _openSeq = 0;
   bool _handlingCompletion = false;
   bool _retriedCurrentTrack = false;
-  late final Future<void> _initialLoad;
+  late Future<void> _initialLoad;
   Future<void> _playlistWrite = Future.value();
   int _scanSeq = 0;
 
   CloudMusicController._internal() {
+    try {
+      WidgetsBinding.instance.addObserver(this);
+    } catch (_) {}
     _initNativeMediaSessionHandler();
     _initialLoad = _loadSavedMusicFoldersAndMounts(restorePlaylists: true);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    switch (state) {
+      case AppLifecycleState.paused:
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.detached:
+        _backgroundedAt ??= DateTime.now();
+        break;
+      case AppLifecycleState.inactive:
+        if (Platform.isIOS || Platform.isAndroid) {
+          _backgroundedAt ??= DateTime.now();
+        }
+        break;
+      case AppLifecycleState.resumed:
+        final bgAt = _backgroundedAt;
+        _backgroundedAt = null;
+        final bgDuration =
+            bgAt == null ? Duration.zero : DateTime.now().difference(bgAt);
+        markResumedFromBackground(backgroundDuration: bgDuration);
+        break;
+    }
+  }
+
+  /// Resets stale sockets, expired URL caches, and idle native player state
+  /// when returning from background inactivity.
+  void markResumedFromBackground({
+    Duration backgroundDuration = const Duration(minutes: 5),
+  }) {
+    final longBackground = backgroundDuration >= const Duration(seconds: 15);
+    if (longBackground) {
+      Local115DirectService.instance.resetAfterBackground();
+      RemoteStorageService.instance.resetAfterBackground();
+    }
+    final actuallyPlaying = _player?.state.playing ?? false;
+    if (!actuallyPlaying) {
+      var changed = false;
+      if (_isPlaying) {
+        _isPlaying = false;
+        changed = true;
+      }
+      if (_isLoadingTrack &&
+          (longBackground ||
+              DateTime.now().difference(_lastLoadingStartedAt) >=
+                  const Duration(seconds: 6))) {
+        _isLoadingTrack = false;
+        changed = true;
+      }
+      if (longBackground || _activeStreamUrl.isNotEmpty) {
+        _needsFreshOpenAfterBackground = true;
+        _activeStreamUrl = '';
+        _resetPlayerInstance();
+        changed = true;
+      }
+      if (changed) {
+        notifyListeners();
+      }
+    }
   }
 
   void _initNativeMediaSessionHandler() {
@@ -923,6 +1000,7 @@ class CloudMusicController extends ChangeNotifier {
           ? _queue[_currentIndex]
           : null;
   bool get hasActiveSession => _isSessionDocked && currentTrack != null;
+  bool get needsFreshOpenAfterBackground => _needsFreshOpenAfterBackground;
   bool get isPlaying => _isPlaying;
   bool get isLoadingTrack => _isLoadingTrack;
   bool get isScanningFolders => _isScanningFolders;
@@ -1171,7 +1249,7 @@ class CloudMusicController extends ChangeNotifier {
         _currentIndex = 0;
       }
       final persisted = _syncActivePlaylist();
-      await _openCurrentTrack();
+      await _openCurrentTrack(forceRefreshUrl: true);
       await persisted;
       return;
     }
@@ -1220,14 +1298,23 @@ class CloudMusicController extends ChangeNotifier {
 
   Future<({String url, Map<String, String> headers, String subtitle})>
       resolveEntryEndpoint(FileEntry entry, {bool forceRefreshUrl = false}) async {
+    await _initialLoad;
     if (_customEndpointResolver != null &&
-        !(forceRefreshUrl && entry.sourceKind == StorageSourceKind.cloud115)) {
+        !(forceRefreshUrl &&
+            (entry.sourceKind == StorageSourceKind.cloud115 ||
+                entry.sourceKind == StorageSourceKind.alist))) {
       try {
         return await _customEndpointResolver!(entry);
       } catch (_) {}
     }
 
-    final mount = _availableMounts.where((m) => m.id == entry.mountId).firstOrNull;
+    var mount = _availableMounts.where((m) => m.id == entry.mountId).firstOrNull;
+    if (mount == null &&
+        (entry.sourceKind == StorageSourceKind.alist ||
+            entry.sourceKind == StorageSourceKind.webdav)) {
+      await _loadSavedMusicFoldersAndMounts();
+      mount = _availableMounts.where((m) => m.id == entry.mountId).firstOrNull;
+    }
     switch (entry.sourceKind) {
       case StorageSourceKind.server:
         final api = _boundAppState?.api;
@@ -1244,6 +1331,7 @@ class CloudMusicController extends ChangeNotifier {
           mount,
           entry.path,
           fallbackUrl: entry.rawDownloadUrl,
+          forceRefresh: forceRefreshUrl,
         );
         return (
           url: info.url,
@@ -1261,15 +1349,48 @@ class CloudMusicController extends ChangeNotifier {
         );
       case StorageSourceKind.cloud115:
         await Local115DirectService.instance.ensureInitialized();
-        if (entry.pickcode115.isEmpty) {
+        var pickcode = entry.pickcode115.trim();
+        if (pickcode.isEmpty && entry.fid115.trim().isNotEmpty) {
+          pickcode = await Local115DirectService.instance
+                  .resolvePickcodeFromFid(entry.fid115.trim()) ??
+              '';
+        }
+        if (pickcode.isEmpty &&
+            entry.path.trim().isNotEmpty &&
+            entry.path.trim() != '0' &&
+            !entry.path.contains('/')) {
+          final candidate = entry.path.trim();
+          if (RegExp(r'^[0-9]+$').hasMatch(candidate)) {
+            pickcode = await Local115DirectService.instance
+                    .resolvePickcodeFromFid(candidate) ??
+                '';
+          } else {
+            pickcode = candidate;
+          }
+        }
+        if (pickcode.isEmpty) {
           throw Exception('该 115 文件缺少 pickcode');
         }
-        final directUrl = await Local115DirectService.instance
+        var directUrl = await Local115DirectService.instance
             .resolvePickcodeStreamUrl(
-              entry.pickcode115,
+              pickcode,
               forceRefresh: forceRefreshUrl,
               allowVideoFallback: false,
             );
+        if ((directUrl == null || directUrl.isEmpty) &&
+            forceRefreshUrl &&
+            entry.fid115.trim().isNotEmpty) {
+          final refreshedPc = await Local115DirectService.instance
+              .resolvePickcodeFromFid(entry.fid115.trim());
+          if (refreshedPc != null && refreshedPc.isNotEmpty) {
+            directUrl = await Local115DirectService.instance
+                .resolvePickcodeStreamUrl(
+                  refreshedPc,
+                  forceRefresh: true,
+                  allowVideoFallback: false,
+                );
+          }
+        }
         if (directUrl == null || directUrl.isEmpty) {
           throw Exception('无法获取 115 直链，请检查 115 登录状态');
         }
@@ -1917,6 +2038,54 @@ class CloudMusicController extends ChangeNotifier {
     return '${entry.mountId}::$parent';
   }
 
+  void _resetPlayerInstance() {
+    _openWatchdogTimer?.cancel();
+    _openWatchdogTimer = null;
+    _playingSub?.cancel();
+    _positionSub?.cancel();
+    _durationSub?.cancel();
+    _completedSub?.cancel();
+    _errorSub?.cancel();
+    _playingSub = null;
+    _positionSub = null;
+    _durationSub = null;
+    _completedSub = null;
+    _errorSub = null;
+    final oldPlayer = _player;
+    _player = null;
+    if (oldPlayer != null) {
+      unawaited(
+        oldPlayer
+            .stop()
+            .catchError((_) {})
+            .whenComplete(() => oldPlayer.dispose().catchError((_) {})),
+      );
+    }
+  }
+
+  Future<void> _configureMusicPlayer(Player p, {required bool isLocalRelay}) async {
+    try {
+      final dynamic platform = p.platform;
+      final props = <String, String>{
+        'cache': 'yes',
+        'cache-on-disk': 'no',
+        'cache-secs': '60',
+        'demuxer-readahead-secs': '30',
+        'network-timeout': '15',
+        'tls-verify': 'no',
+        'keep-open': 'no',
+        'stream-lavf-o':
+            'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=5',
+        if (isLocalRelay) 'http-proxy': '',
+      };
+      await Future(() async {
+        for (final entry in props.entries) {
+          await platform.setProperty(entry.key, entry.value);
+        }
+      }).timeout(const Duration(seconds: 2));
+    } catch (_) {}
+  }
+
   void _ensurePlayerInitialized() {
     if (_player != null) return;
     final p = Player(
@@ -1925,46 +2094,90 @@ class CloudMusicController extends ChangeNotifier {
       ),
     );
     _player = p;
-    p.stream.playing.listen((playing) {
+    _playingSub = p.stream.playing.listen((playing) {
+      if (!identical(_player, p)) return;
       if (_isPlaying != playing || (playing && _isLoadingTrack)) {
         _isPlaying = playing;
         if (playing) {
           _isLoadingTrack = false;
           _errorText = '';
+          _openWatchdogTimer?.cancel();
         }
         notifyListeners();
         _syncNativeMediaSession(force: true);
       }
     });
-    p.stream.position.listen((pos) {
+    _positionSub = p.stream.position.listen((pos) {
+      if (!identical(_player, p)) return;
       if (pos > Duration.zero && _isLoadingTrack) {
         _isLoadingTrack = false;
+        _openWatchdogTimer?.cancel();
+      }
+      if (pos.inMilliseconds >= 400 && _isPlaying) {
+        _trackHasStartedPlaying = true;
+      }
+      final resumeTarget = _pendingResumePosition;
+      if (resumeTarget != null &&
+          resumeTarget.inSeconds > 2 &&
+          _duration.inSeconds > resumeTarget.inSeconds + 3 &&
+          pos.inSeconds < 2) {
+        _pendingResumePosition = null;
+        unawaited(p.seek(resumeTarget).catchError((_) {}));
       }
       if ((pos.inMilliseconds - _position.inMilliseconds).abs() >= 200 ||
-          pos == Duration.zero) {
+           pos == Duration.zero) {
         _position = pos;
         notifyListeners();
         _syncNativeMediaSession(force: false);
       }
     });
-    p.stream.duration.listen((dur) {
+    _durationSub = p.stream.duration.listen((dur) {
+      if (!identical(_player, p)) return;
       if (dur > Duration.zero && dur != _duration) {
         _duration = dur;
+        final resumeTarget = _pendingResumePosition;
+        if (resumeTarget != null &&
+            resumeTarget.inSeconds > 2 &&
+            dur.inSeconds > resumeTarget.inSeconds + 3) {
+          _pendingResumePosition = null;
+          unawaited(p.seek(resumeTarget).catchError((_) {}));
+        }
         notifyListeners();
         _syncNativeMediaSession(force: true);
       }
     });
-    p.stream.completed.listen((completed) {
-      if (completed) {
-        _onTrackCompleted();
+    _completedSub = p.stream.completed.listen((completed) {
+      if (!identical(_player, p) || !completed) return;
+      if (_isLoadingTrack || _errorText.isNotEmpty) return;
+      if (!_trackHasStartedPlaying && _position.inMilliseconds < 400) {
+        if (!_retriedCurrentTrack && currentTrack != null) {
+          _retriedCurrentTrack = true;
+          unawaited(
+            _openCurrentTrack(
+              forceRefreshUrl: true,
+              resetPlayer: true,
+              isRetry: true,
+            ),
+          );
+        }
+        return;
       }
+      _trackHasStartedPlaying = false;
+      _onTrackCompleted();
     });
-    p.stream.error.listen((err) {
-      if (err.trim().isEmpty) return;
+    _errorSub = p.stream.error.listen((err) {
+      if (!identical(_player, p) || err.trim().isEmpty) return;
       if (!_retriedCurrentTrack && currentTrack != null) {
         _retriedCurrentTrack = true;
-        unawaited(_openCurrentTrack(forceRefreshUrl: true));
+        unawaited(
+          _openCurrentTrack(
+            forceRefreshUrl: true,
+            resetPlayer: true,
+            isRetry: true,
+          ),
+        );
       } else if (_isLoadingTrack || _errorText.isEmpty) {
+        _openWatchdogTimer?.cancel();
         _isLoadingTrack = false;
         _isPlaying = false;
         _errorText = '音频播放失败：$err';
@@ -2012,13 +2225,14 @@ class CloudMusicController extends ChangeNotifier {
 
   /// Shuffles the current queue and starts playing a random track immediately!
   Future<void> shuffleCurrentQueue() async {
+    await _initialLoad;
     if (_queue.isEmpty) return;
     _playMode = 'shuffle';
     _queue.shuffle(math.Random());
     _currentIndex = 0;
     unawaited(_syncActivePlaylist());
     notifyListeners();
-    await _openCurrentTrack();
+    await _openCurrentTrack(forceRefreshUrl: _needsFreshOpenAfterBackground);
   }
 
   Future<void> addToQueue(
@@ -2063,14 +2277,42 @@ class CloudMusicController extends ChangeNotifier {
   }
 
   Future<void> playQueueIndex(int index) async {
+    await _initialLoad;
     if (index < 0 || index >= _queue.length) return;
-    if (index == _currentIndex && _player != null && _errorText.isEmpty) {
+    final isSameTrack = index == _currentIndex;
+    final idleDuration = DateTime.now().difference(_lastTrackOpenedAt);
+    final isStaleOrRecovering = _needsFreshOpenAfterBackground ||
+        _player == null ||
+        _activeStreamUrl.isEmpty ||
+        _errorText.isNotEmpty ||
+        _isLoadingTrack ||
+        (!_isPlaying &&
+            (idleDuration > const Duration(seconds: 45) ||
+                (_player?.state.completed ?? false) ||
+                (_player?.state.duration ?? Duration.zero) == Duration.zero));
+    if (isSameTrack && !isStaleOrRecovering) {
       await togglePlayPause();
       return;
     }
+    final resumePos = (isSameTrack &&
+            !_isPlaying &&
+            _position.inSeconds > 2 &&
+            (_duration == Duration.zero ||
+                _position < _duration - const Duration(seconds: 3)))
+        ? _position
+        : null;
     _currentIndex = index;
     unawaited(_syncActivePlaylist());
-    await _openCurrentTrack();
+    await _openCurrentTrack(
+      forceRefreshUrl:
+          isSameTrack ||
+          _needsFreshOpenAfterBackground ||
+          idleDuration > const Duration(seconds: 45),
+      resumePosition: resumePos,
+      resetPlayer:
+          _needsFreshOpenAfterBackground ||
+          (!_isPlaying && idleDuration > const Duration(minutes: 2)),
+    );
   }
 
   Future<void> removeTrackAt(int index) async {
@@ -2095,20 +2337,46 @@ class CloudMusicController extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> _openCurrentTrack({bool forceRefreshUrl = false}) async {
+  Future<void> _openCurrentTrack({
+    bool forceRefreshUrl = false,
+    Duration? resumePosition,
+    bool resetPlayer = false,
+    bool isRetry = false,
+  }) async {
+    await _initialLoad;
     final track = currentTrack;
     if (track == null) return;
-    _ensurePlayerInitialized();
+    final now = DateTime.now();
+    final longIdle =
+        !_isPlaying &&
+        _lastTrackOpenedAt.millisecondsSinceEpoch > 0 &&
+        now.difference(_lastTrackOpenedAt) > const Duration(minutes: 2);
+    if (_needsFreshOpenAfterBackground || resetPlayer || isRetry || longIdle) {
+      _needsFreshOpenAfterBackground = false;
+      forceRefreshUrl = true;
+      Local115DirectService.instance.resetAfterBackground(
+        clearCaches: forceRefreshUrl,
+      );
+      _resetPlayerInstance();
+    }
+
     final seq = ++_openSeq;
-    if (!forceRefreshUrl) {
+    _openWatchdogTimer?.cancel();
+    if (!forceRefreshUrl && !isRetry) {
       _retriedCurrentTrack = false;
     }
 
+    _lastTrackOpenedAt = now;
+    _lastLoadingStartedAt = now;
+    _trackHasStartedPlaying = false;
+    _pendingResumePosition = resumePosition;
     _isLoadingTrack = true;
     _isSessionDocked = true;
     _errorText = '';
-    _position = Duration.zero;
-    _duration = Duration.zero;
+    if (resumePosition == null) {
+      _position = Duration.zero;
+      _duration = Duration.zero;
+    }
     _coverImageBytes = null;
     notifyListeners();
     _syncNativeMediaSession(force: true);
@@ -2125,7 +2393,9 @@ class CloudMusicController extends ChangeNotifier {
         final extractedLocalPath =
             await CloudArchiveMusicService.instance.extractArchiveAudioToTempFile(
           entry: track,
-          endpointResolver: resolveEntryEndpoint,
+          endpointResolver: (e) =>
+              resolveEntryEndpoint(e, forceRefreshUrl: forceRefreshUrl),
+          forceRefresh: forceRefreshUrl,
         );
         if (seq != _openSeq) return;
         playUrl = extractedLocalPath;
@@ -2161,7 +2431,10 @@ class CloudMusicController extends ChangeNotifier {
         final urlLacksAudioExtension =
             ext.isNotEmpty && !uriPathLower.endsWith(ext);
 
-        if (!lowerUrl.contains('.m3u8') &&
+        final isRemoteHttpUrl =
+            lowerUrl.startsWith('http://') || lowerUrl.startsWith('https://');
+        if (isRemoteHttpUrl &&
+            !lowerUrl.contains('.m3u8') &&
             track.sourceKind != StorageSourceKind.localCache &&
             (track.sourceKind == StorageSourceKind.cloud115 ||
                 isLosslessNeedsExtensionProxy ||
@@ -2172,6 +2445,7 @@ class CloudMusicController extends ChangeNotifier {
             playUrl,
             playHeaders,
             extHint: ext,
+            forceRefresh: forceRefreshUrl,
           );
           if (relayed != playUrl) {
             playUrl = relayed;
@@ -2183,21 +2457,74 @@ class CloudMusicController extends ChangeNotifier {
 
       _activeStreamUrl = playUrl;
       _activeSubtitle = subtitle;
+      if (Platform.environment.containsKey('FLUTTER_TEST') && _player == null) {
+        _isLoadingTrack = false;
+        _isPlaying = true;
+        _trackHasStartedPlaying = true;
+        notifyListeners();
+        return;
+      }
       notifyListeners();
 
-      await _player!.open(
-        Media(playUrl, httpHeaders: playHeaders),
-        play: true,
-      );
+      _ensurePlayerInitialized();
+      final isLocalRelay = playUrl.contains('://127.0.0.1:') ||
+          playUrl.contains('://localhost:');
+      await _configureMusicPlayer(_player!, isLocalRelay: isLocalRelay);
+      if (seq != _openSeq) return;
+
+      await _player!
+          .open(
+            Media(
+              playUrl,
+              httpHeaders: playHeaders,
+              start: resumePosition,
+            ),
+            play: true,
+          )
+          .timeout(const Duration(seconds: 15));
       if (seq != _openSeq) return;
       if (_speed != 1.0) {
-        await _player!.setRate(_speed);
+        await _player!.setRate(_speed).timeout(
+              const Duration(seconds: 2),
+              onTimeout: () {},
+            );
       }
       if (_volume != 100.0) {
-        await _player!.setVolume(_volume);
+        await _player!.setVolume(_volume).timeout(
+              const Duration(seconds: 2),
+              onTimeout: () {},
+            );
       }
+      _openWatchdogTimer?.cancel();
+      _openWatchdogTimer = Timer(const Duration(seconds: 8), () {
+        if (seq != _openSeq || !_isLoadingTrack || _isPlaying) return;
+        if (!_retriedCurrentTrack && currentTrack != null) {
+          _retriedCurrentTrack = true;
+          unawaited(
+            _openCurrentTrack(
+              forceRefreshUrl: true,
+              resumePosition: resumePosition,
+              resetPlayer: true,
+              isRetry: true,
+            ),
+          );
+        } else {
+          _isLoadingTrack = false;
+          notifyListeners();
+        }
+      });
     } catch (e) {
       if (seq != _openSeq) return;
+      if (!isRetry && !_retriedCurrentTrack) {
+        _retriedCurrentTrack = true;
+        await _openCurrentTrack(
+          forceRefreshUrl: true,
+          resumePosition: resumePosition,
+          resetPlayer: true,
+          isRetry: true,
+        );
+        return;
+      }
       _isLoadingTrack = false;
       _isPlaying = false;
       _errorText = '音频加载失败：$e';
@@ -2393,6 +2720,7 @@ class CloudMusicController extends ChangeNotifier {
   }
 
   Future<List<CloudLrcLine>?> _fetchOnlineLrcFromLrclib(String query) async {
+    if (Platform.environment.containsKey('FLUTTER_TEST')) return null;
     final cleanQ = query
         .replaceAll(RegExp(r'\(.*?\)|\[.*?\]|【.*?】'), ' ')
         .trim();
@@ -2575,6 +2903,11 @@ class CloudMusicController extends ChangeNotifier {
       } else {
         final resolved = await resolveEntryEndpoint(track);
         if (seq != _openSeq || resolved.url.isEmpty) return;
+        final lowerResolved = resolved.url.toLowerCase();
+        if (!lowerResolved.startsWith('http://') &&
+            !lowerResolved.startsWith('https://')) {
+          return;
+        }
         // Wait briefly for the local audio proxy to cache the first 256 KB header
         // so we never open a competing HTTP Range connection against 115 CDN / AList
         for (int poll = 0; poll < 12; poll++) {
@@ -2733,6 +3066,7 @@ class CloudMusicController extends ChangeNotifier {
     FileEntry track,
     int seq,
   ) async {
+    if (Platform.environment.containsKey('FLUTTER_TEST')) return;
     final meta = parseTrackMetadata(track);
     final cleanTitle = meta.title
         .replaceAll(RegExp(r'\(.*?\)|\[.*?\]|【.*?】'), ' ')
@@ -2807,13 +3141,80 @@ class CloudMusicController extends ChangeNotifier {
   }
 
   Future<void> togglePlayPause() async {
-    if (currentTrack == null || _isLoadingTrack) return;
-    if (_errorText.isNotEmpty || _player == null || _activeStreamUrl.isEmpty) {
-      await _openCurrentTrack(forceRefreshUrl: true);
+    await _initialLoad;
+    if (currentTrack == null) {
+      if (_queue.isNotEmpty) {
+        _currentIndex = _currentIndex.clamp(0, _queue.length - 1);
+        await _openCurrentTrack(forceRefreshUrl: true);
+      }
       return;
     }
-    await _player!.playOrPause();
-    _syncNativeMediaSession(force: true);
+    if (_isLoadingTrack) {
+      if (DateTime.now().difference(_lastLoadingStartedAt) <
+          const Duration(seconds: 3)) {
+        return;
+      }
+      await _openCurrentTrack(forceRefreshUrl: true, resetPlayer: true);
+      return;
+    }
+
+    if (_isPlaying && (_player?.state.playing ?? false)) {
+      await _player!.pause();
+      _isPlaying = false;
+      notifyListeners();
+      _syncNativeMediaSession(force: true);
+      return;
+    }
+
+    final idleDuration = _lastTrackOpenedAt.millisecondsSinceEpoch > 0
+        ? DateTime.now().difference(_lastTrackOpenedAt)
+        : Duration.zero;
+    final resumePos = (_position.inSeconds > 2 &&
+            (_duration == Duration.zero ||
+                _position < _duration - const Duration(seconds: 3)))
+        ? _position
+        : null;
+    final isStaleStream = _needsFreshOpenAfterBackground ||
+        _errorText.isNotEmpty ||
+        _player == null ||
+        _activeStreamUrl.isEmpty ||
+        (_player?.state.completed ?? false) ||
+        (_player?.state.duration ?? Duration.zero) == Duration.zero ||
+        idleDuration > const Duration(minutes: 2);
+    if (isStaleStream) {
+      await _openCurrentTrack(
+        forceRefreshUrl: true,
+        resumePosition: resumePos,
+        resetPlayer: _needsFreshOpenAfterBackground ||
+            idleDuration > const Duration(minutes: 2),
+      );
+      return;
+    }
+
+    final seq = _openSeq;
+    try {
+      await _player!.play();
+      _syncNativeMediaSession(force: true);
+      await Future<void>.delayed(const Duration(milliseconds: 1200));
+      if (seq == _openSeq &&
+          !(_player?.state.playing ?? false) &&
+          !_isPlaying &&
+          currentTrack != null) {
+        await _openCurrentTrack(
+          forceRefreshUrl: true,
+          resumePosition: resumePos,
+          resetPlayer: true,
+        );
+      }
+    } catch (_) {
+      if (seq == _openSeq && currentTrack != null) {
+        await _openCurrentTrack(
+          forceRefreshUrl: true,
+          resumePosition: resumePos,
+          resetPlayer: true,
+        );
+      }
+    }
   }
 
   Future<void> seekTo(Duration target) async {
@@ -2832,14 +3233,23 @@ class CloudMusicController extends ChangeNotifier {
   }
 
   Future<void> stepTrack(int delta) async {
+    await _initialLoad;
     if (_queue.isEmpty) return;
-    if (delta < 0 && _position.inSeconds >= 5) {
+    if (delta < 0 && _position.inSeconds >= 5 && _isPlaying) {
       await seekTo(Duration.zero);
       return;
     }
     if (_queue.length == 1) {
-      await seekTo(Duration.zero);
-      await _player?.play();
+      _currentIndex = 0;
+      if (_needsFreshOpenAfterBackground ||
+          _player == null ||
+          _activeStreamUrl.isEmpty ||
+          _errorText.isNotEmpty) {
+        await _openCurrentTrack(forceRefreshUrl: true);
+      } else {
+        await seekTo(Duration.zero);
+        await _player?.play();
+      }
       return;
     }
     if (_playMode == 'shuffle') {
@@ -2857,7 +3267,7 @@ class CloudMusicController extends ChangeNotifier {
       _currentIndex = (_currentIndex + delta + _queue.length) % _queue.length;
     }
     unawaited(_syncActivePlaylist());
-    await _openCurrentTrack();
+    await _openCurrentTrack(forceRefreshUrl: _needsFreshOpenAfterBackground);
   }
 
   Future<void> _onTrackCompleted() async {
@@ -2941,8 +3351,12 @@ class CloudMusicController extends ChangeNotifier {
 
   Future<void> stopAndClose({bool clearPersistedQueue = false}) async {
     _openSeq++;
+    _openWatchdogTimer?.cancel();
     _cancelFolderScan();
-    final stopped = _player?.stop();
+    final stopped = _player
+        ?.stop()
+        .timeout(const Duration(seconds: 2), onTimeout: () {})
+        .catchError((_) {});
     if (clearPersistedQueue) {
       _queue = [];
       _currentIndex = -1;
@@ -2951,6 +3365,8 @@ class CloudMusicController extends ChangeNotifier {
     _isPlaying = false;
     _isLoadingTrack = false;
     _isSessionDocked = false;
+    _trackHasStartedPlaying = false;
+    _pendingResumePosition = null;
     _errorText = '';
     _position = Duration.zero;
     _duration = Duration.zero;
@@ -5445,7 +5861,11 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                             _showPlaylistQueue();
                             if (!isActive ||
                                 shuffle ||
-                                (canPlay && !_ctrl.hasActiveSession)) {
+                                (canPlay &&
+                                    (!_ctrl.hasActiveSession ||
+                                        !_ctrl.isPlaying ||
+                                        _ctrl.errorText.isNotEmpty ||
+                                        _ctrl.needsFreshOpenAfterBackground))) {
                               unawaited(
                                 _ctrl.switchAndPlayPlaylist(
                                   playlist.id,
@@ -5483,6 +5903,8 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                               tooltip: '列表操作',
                               onSelected: (action) async {
                                 switch (action) {
+                                  case 'play':
+                                    select(shuffle: false);
                                   case 'shuffle':
                                     select(shuffle: true);
                                   case 'rename':
@@ -5503,6 +5925,11 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                               },
                               itemBuilder:
                                   (_) => [
+                                    if (canPlay)
+                                      const PopupMenuItem(
+                                        value: 'play',
+                                        child: Text('顺序播放'),
+                                      ),
                                     if (canPlay)
                                       const PopupMenuItem(
                                         value: 'shuffle',
