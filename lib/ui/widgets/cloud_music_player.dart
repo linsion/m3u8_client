@@ -7154,7 +7154,6 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
   Widget _buildMobilePlaylistQueue() {
     final items = _matchingQueueTracks();
     final count = _ctrl.queue.length;
-    final accent = VideoPlatformTheme.accent;
     final theme = Theme.of(context);
     return Material(
       type: MaterialType.transparency,
@@ -7248,53 +7247,13 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
             )
           else
             SliverPadding(
-              padding: const EdgeInsets.fromLTRB(8, 0, 8, 12),
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
               sliver: SliverList.builder(
                 itemCount: items.length,
-                itemBuilder: (context, index) {
-                  final item = items[index];
-                  final isCurrent = item.index == _ctrl.currentIndex;
-                  final metadata = CloudMusicController.parseTrackMetadata(
-                    item.entry,
-                    fallbackArtist: _ctrl.mountNameFor(item.entry),
-                  );
-                  return ListTile(
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                    selected: isCurrent,
-                    selectedColor: accent,
-                    selectedTileColor: accent.withValues(alpha: 0.12),
-                    leading: Icon(
-                      isCurrent
-                          ? Icons.equalizer_rounded
-                          : Icons.music_note_rounded,
-                      size: 20,
-                    ),
-                    title: Text(
-                      metadata.title,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    subtitle: Text(
-                      metadata.artist,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    onTap: () => _ctrl.playQueueIndex(item.index),
-                    trailing: PopupMenuButton<String>(
-                      tooltip: '曲目操作',
-                      itemBuilder:
-                          (_) => const [
-                            PopupMenuItem(
-                              value: 'remove',
-                              child: Text('从列表移除'),
-                            ),
-                          ],
-                      onSelected: (_) => _ctrl.removeTrackAt(item.index),
-                    ),
-                  );
-                },
+                itemBuilder: (_, index) => Padding(
+                  padding: const EdgeInsets.only(bottom: 4),
+                  child: _buildQueueTrackCard(items[index], compact: true),
+                ),
               ),
             ),
         ],
@@ -7467,160 +7426,163 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
             itemCount: pageItems.length,
             separatorBuilder: (_, __) => const SizedBox(height: 4),
-            itemBuilder: (context, i) {
-              final item = pageItems[i];
-              final isCurrent = item.index == _ctrl.currentIndex;
-              final mountTitle = _ctrl.mountNameFor(item.entry);
-              final meta = CloudMusicController.parseTrackMetadata(
-                item.entry,
-                fallbackArtist: mountTitle,
-              );
-              final subtitleParts = <String>[
-                if (meta.artist.isNotEmpty) meta.artist,
-                if (mountTitle.isNotEmpty && mountTitle != meta.artist)
-                  mountTitle,
-                item.entry.formattedSize,
-              ];
-              return StatefulBuilder(
-                builder: (qRowCtx, setQRowState) {
-                  return InkWell(
-                    onFocusChange: (_) {
-                      if (qRowCtx.mounted) setQRowState(() {});
-                    },
-                    onTap: () => _ctrl.playQueueIndex(item.index),
-                    borderRadius: BorderRadius.circular(10),
-                    child: Builder(
-                      builder: (ctx) {
-                        final isFocused = Focus.of(ctx).hasPrimaryFocus;
-                        return Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 12,
-                            vertical: 9,
-                          ),
-                          decoration: BoxDecoration(
-                            color: isFocused
-                                ? VideoPlatformTheme.accent
-                                    .withValues(alpha: 0.30)
-                                : (isCurrent
-                                    ? VideoPlatformTheme.accent
-                                        .withValues(alpha: 0.16)
-                                    : VideoPlatformTheme.bgCard),
-                            borderRadius: BorderRadius.circular(10),
-                            border: Border.all(
-                              color: isFocused
-                                  ? const Color(0xFFFFE066)
-                                  : (isCurrent
-                                      ? VideoPlatformTheme.accent
-                                          .withValues(alpha: 0.65)
-                                      : VideoPlatformTheme.borderSubtle),
-                              width: isFocused ? 2.2 : 1.0,
-                            ),
-                          ),
-                          child: Row(
-                            children: [
-                              SizedBox(
-                                width: 28,
-                                child: isCurrent
-                                    ? Icon(
-                                        Icons.equalizer_rounded,
-                                        color: isFocused
-                                            ? Colors.white
-                                            : VideoPlatformTheme.accent,
-                                        size: 20,
-                                      )
-                                    : Text(
-                                        '${item.index + 1}'.padLeft(2, '0'),
-                                        style: TextStyle(
-                                          fontSize: 12,
-                                          color: isFocused
-                                              ? Colors.white70
-                                              : VideoPlatformTheme.textMuted,
-                                        ),
-                                      ),
-                              ),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      meta.title,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: TextStyle(
-                                        fontSize: 13.5,
-                                        fontWeight: (isCurrent || isFocused)
-                                            ? FontWeight.w700
-                                            : FontWeight.w500,
-                                        color: isFocused
-                                            ? Colors.white
-                                            : (isCurrent
-                                                ? VideoPlatformTheme.accent
-                                                : VideoPlatformTheme
-                                                    .textPrimary),
-                                      ),
-                                    ),
-                                    const SizedBox(height: 2),
-                                    Text(
-                                      subtitleParts.join(' · '),
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: TextStyle(
-                                        fontSize: 11,
-                                        color: isFocused
-                                            ? Colors.white70
-                                            : VideoPlatformTheme.textMuted,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 6,
-                                  vertical: 2,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: VideoPlatformTheme.bgHover,
-                                  borderRadius: BorderRadius.circular(4),
-                                ),
-                                child: Text(
-                                  item.entry.isInsideArchive
-                                      ? '📦 ${item.entry.normalizedExt.replaceAll('.', '').toUpperCase()}'
-                                      : item.entry.normalizedExt
-                                          .replaceAll('.', '')
-                                          .toUpperCase(),
-                                  style: TextStyle(
-                                    fontSize: 10,
-                                    fontWeight: FontWeight.w700,
-                                    color: VideoPlatformTheme.accent,
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 4),
-                              IconButton(
-                                tooltip: '从队列移除',
-                                visualDensity: VisualDensity.compact,
-                                onPressed: () =>
-                                    _ctrl.removeTrackAt(item.index),
-                                icon: Icon(
-                                  Icons.close_rounded,
-                                  size: 16,
-                                  color: VideoPlatformTheme.textMuted,
-                                ),
-                              ),
-                            ],
-                          ),
-                        );
-                      },
-                    ),
-                  );
-                },
-              );
-            },
+            itemBuilder: (_, index) => _buildQueueTrackCard(pageItems[index]),
           ),
         ),
       ],
+    );
+  }
+
+  Widget _buildQueueTrackCard(
+    ({int index, FileEntry entry}) item, {
+    bool compact = false,
+  }) {
+    final isCurrent = item.index == _ctrl.currentIndex;
+    final mountTitle = _ctrl.mountNameFor(item.entry);
+    final meta = CloudMusicController.parseTrackMetadata(
+      item.entry,
+      fallbackArtist: mountTitle,
+    );
+    final subtitleParts = <String>[
+      if (meta.artist.isNotEmpty) meta.artist,
+      if (mountTitle.isNotEmpty && mountTitle != meta.artist) mountTitle,
+      item.entry.formattedSize,
+    ];
+    final extension = item.entry.normalizedExt.replaceAll('.', '').toUpperCase();
+    final format = item.entry.isInsideArchive ? '📦 $extension' : extension;
+
+    return StatefulBuilder(
+      builder: (qRowCtx, setQRowState) {
+        return InkWell(
+          onFocusChange: (_) {
+            if (qRowCtx.mounted) setQRowState(() {});
+          },
+          onTap: () => _ctrl.playQueueIndex(item.index),
+          borderRadius: BorderRadius.circular(10),
+          child: Builder(
+            builder: (ctx) {
+              final isFocused = Focus.of(ctx).hasPrimaryFocus;
+              return Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 9,
+                ),
+                decoration: BoxDecoration(
+                  color: isFocused
+                      ? VideoPlatformTheme.accent
+                          .withValues(alpha: 0.30)
+                      : (isCurrent
+                          ? VideoPlatformTheme.accent
+                              .withValues(alpha: 0.16)
+                          : VideoPlatformTheme.bgCard),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(
+                    color: isFocused
+                        ? const Color(0xFFFFE066)
+                        : (isCurrent
+                            ? VideoPlatformTheme.accent
+                                .withValues(alpha: 0.65)
+                            : VideoPlatformTheme.borderSubtle),
+                    width: isFocused ? 2.2 : 1.0,
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    SizedBox(
+                      width: 28,
+                      child: isCurrent
+                          ? Icon(
+                              Icons.equalizer_rounded,
+                              color: isFocused
+                                  ? Colors.white
+                                  : VideoPlatformTheme.accent,
+                              size: 20,
+                            )
+                          : Text(
+                              '${item.index + 1}'.padLeft(2, '0'),
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: isFocused
+                                    ? Colors.white70
+                                    : VideoPlatformTheme.textMuted,
+                              ),
+                            ),
+                    ),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            meta.title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 13.5,
+                              fontWeight: (isCurrent || isFocused)
+                                  ? FontWeight.w700
+                                  : FontWeight.w500,
+                              color: isFocused
+                                  ? Colors.white
+                                  : (isCurrent
+                                      ? VideoPlatformTheme.accent
+                                      : VideoPlatformTheme
+                                          .textPrimary),
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            subtitleParts.join(' · '),
+                            maxLines: compact ? 2 : 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: isFocused
+                                  ? Colors.white70
+                                  : VideoPlatformTheme.textMuted,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 2,
+                      ),
+                      decoration: BoxDecoration(
+                        color: VideoPlatformTheme.bgHover,
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Text(
+                        format,
+                        style: TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w700,
+                          color: VideoPlatformTheme.accent,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    IconButton(
+                      tooltip: '从队列移除',
+                      visualDensity: compact
+                          ? VisualDensity.standard
+                          : VisualDensity.compact,
+                      onPressed: () => _ctrl.removeTrackAt(item.index),
+                      icon: Icon(
+                        Icons.close_rounded,
+                        size: 16,
+                        color: VideoPlatformTheme.textMuted,
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        );
+      },
     );
   }
 

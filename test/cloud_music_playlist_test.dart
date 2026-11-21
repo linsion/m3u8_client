@@ -20,7 +20,7 @@ void main() {
   testWidgets('mobile playlists support search and independent empty lists', (
     tester,
   ) async {
-    final tracks = [_track('Blue Sky'), _track('Evening Walk')];
+    final tracks = [_track('Blue Sky'), _track('Artist - Evening Walk')];
     SharedPreferences.setMockInitialValues({
       'm3u8_default_music_queue_v1': jsonEncode(
         tracks.map((track) => track.toJson()).toList(),
@@ -55,13 +55,19 @@ void main() {
     await tester.pumpAndSettle();
     expect(controller.queue.map((track) => track.name), [
       'Blue Sky.mp3',
-      'Evening Walk.mp3',
+      'Artist - Evening Walk.mp3',
     ]);
 
     await tester.tap(find.text('播放列表'));
     await tester.pumpAndSettle();
     expect(find.text('Blue Sky'), findsWidgets);
     expect(find.text('Evening Walk'), findsOneWidget);
+    expect(find.text('02'), findsOneWidget);
+    expect(find.text('MP3'), findsNWidgets(2));
+    expect(
+      find.text('Artist · 流光服务端 · ${tracks.last.formattedSize}'),
+      findsOneWidget,
+    );
 
     tester.view.viewInsets = const FakeViewPadding(bottom: 285);
     await tester.pumpAndSettle();
@@ -93,7 +99,7 @@ void main() {
     expect(find.text('添加音乐'), findsOneWidget);
     expect(controller.savedPlaylists.first.tracks.map((track) => track.name), [
       'Blue Sky.mp3',
-      'Evening Walk.mp3',
+      'Artist - Evening Walk.mp3',
     ]);
 
     final prefs = await SharedPreferences.getInstance();
@@ -106,9 +112,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(controller.queue, hasLength(2));
 
-    await tester.tap(find.byTooltip('曲目操作').last);
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('从列表移除'));
+    await tester.tap(find.byTooltip('从队列移除').last);
     await tester.pumpAndSettle();
     expect(controller.queue.single.name, 'Blue Sky.mp3');
 
