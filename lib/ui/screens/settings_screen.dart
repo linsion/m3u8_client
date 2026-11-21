@@ -497,7 +497,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                         ),
                                       ),
                                       child: Text(
-                                        AppState.appFullVersion,
+                                        widget.appState.appFullVersion,
                                         style: TextStyle(
                                           fontSize: 11.5,
                                           fontWeight: FontWeight.w700,

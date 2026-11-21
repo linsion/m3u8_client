@@ -134,7 +134,7 @@ class _LoginScreenState extends State<LoginScreen> {
                                   ),
                                 ),
                                 child: Text(
-                                  AppState.appShortVersion,
+                                  widget.appState.appShortVersion,
                                   style: TextStyle(
                                     fontSize: 11,
                                     fontWeight: FontWeight.w700,

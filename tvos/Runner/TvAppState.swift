@@ -102,20 +102,24 @@ final class TvAppState: ObservableObject {
     TvThemePalette.palette(for: themeId)
   }
 
-  var appVersion: String {
-    let raw = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String)?
-      .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    return (raw.isEmpty || raw.contains("$(")) ? "1.2.6" : raw
-  }
-
-  var appBuildNumber: String {
-    let raw = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String)?
-      .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    return (raw.isEmpty || raw.contains("$(")) ? "41" : raw
+  var appShortVersion: String {
+    guard let version = bundleValue(forKey: "CFBundleShortVersionString") else {
+      return "版本未知"
+    }
+    return "v\(version)"
   }
 
   var appFullVersion: String {
-    "v\(appVersion) (Build \(appBuildNumber))"
+    guard let buildNumber = bundleValue(forKey: "CFBundleVersion") else {
+      return appShortVersion
+    }
+    return "\(appShortVersion) (Build \(buildNumber))"
+  }
+
+  private func bundleValue(forKey key: String) -> String? {
+    let value = (Bundle.main.object(forInfoDictionaryKey: key) as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return (value.isEmpty || value.contains("$(")) ? nil : value
   }
 
   func setTheme(_ id: String) {

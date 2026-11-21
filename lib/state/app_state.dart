@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/models.dart';
@@ -107,17 +108,19 @@ class VodPlaybackProgress {
 }
 
 class AppState extends ChangeNotifier {
-  static const String appVersionName = String.fromEnvironment(
-    'FLUTTER_BUILD_NAME',
-    defaultValue: '1.2.6',
-  );
-  static const String appBuildNumber = String.fromEnvironment(
-    'FLUTTER_BUILD_NUMBER',
-    defaultValue: '41',
-  );
-  static String get appShortVersion => 'v$appVersionName';
-  static String get appFullVersion =>
-      'v$appVersionName (Build $appBuildNumber)';
+  PackageInfo? _packageInfo;
+
+  String get appShortVersion {
+    final version = _packageInfo?.version.trim() ?? '';
+    return version.isEmpty ? '版本未知' : 'v$version';
+  }
+
+  String get appFullVersion {
+    final buildNumber = _packageInfo?.buildNumber.trim() ?? '';
+    return buildNumber.isEmpty
+        ? appShortVersion
+        : '$appShortVersion (Build $buildNumber)';
+  }
 
   static const _prefServerConfigKey = 'm3u8_server_config_v1';
   static const _prefSelectedSourceIdKey = 'm3u8_selected_vod_source_id_v1';
@@ -414,6 +417,11 @@ class AppState extends ChangeNotifier {
 
   Future<void> initialize() async {
     if (_initialized) return;
+    try {
+      _packageInfo = await PackageInfo.fromPlatform();
+    } catch (error) {
+      debugPrint('Unable to read app version: $error');
+    }
     String? savedSourceId;
     bool hasSavedConfig = false;
     try {

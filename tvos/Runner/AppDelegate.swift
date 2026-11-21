@@ -602,7 +602,7 @@ struct TvAppleTopNavigationBar: View {
         Text("流光视频")
           .font(.system(size: 22, weight: .bold, design: .rounded))
           .foregroundColor(.white)
-        Text("v\(appState.appVersion)")
+        Text(appState.appShortVersion)
           .font(.system(size: 13, weight: .bold, design: .monospaced))
           .foregroundColor(theme.accentHover)
           .padding(.horizontal, 9)

@@ -984,7 +984,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                       ),
                     ),
                     child: Text(
-                      AppState.appShortVersion,
+                      state.appShortVersion,
                       style: TextStyle(
                         fontSize: 10,
                         fontWeight: FontWeight.w700,
@@ -1234,7 +1234,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                   ],
                 ),
                 Text(
-                  AppState.appShortVersion,
+                  state.appShortVersion,
                   style: TextStyle(
                     fontSize: 10,
                     color: VideoPlatformTheme.textMuted,
@@ -2389,7 +2389,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
             child: Text(
-              '流光视频 ${AppState.appFullVersion}',
+              '流光视频 ${state.appFullVersion}',
               style: TextStyle(
                 fontSize: 10.5,
                 color: VideoPlatformTheme.textMuted,
