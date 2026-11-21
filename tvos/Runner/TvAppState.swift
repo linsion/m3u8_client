@@ -105,13 +105,13 @@ final class TvAppState: ObservableObject {
   var appVersion: String {
     let raw = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String)?
       .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    return (raw.isEmpty || raw.contains("$(")) ? "1.2.5" : raw
+    return (raw.isEmpty || raw.contains("$(")) ? "1.2.6" : raw
   }
 
   var appBuildNumber: String {
     let raw = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String)?
       .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    return (raw.isEmpty || raw.contains("$(")) ? "40" : raw
+    return (raw.isEmpty || raw.contains("$(")) ? "41" : raw
   }
 
   var appFullVersion: String {

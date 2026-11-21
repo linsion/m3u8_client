@@ -4,11 +4,13 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/models.dart';
 import 'api_client.dart';
+import 'cloud115_upload_protocol.dart';
 
 /// 1:1 port of `github.com/deadblue/elevengo/internal/crypto/m115`
 /// Used to encrypt/decrypt `https://proapi.115.com/app/chrome/downurl` payloads.
@@ -1111,7 +1113,7 @@ class Local115DirectService extends ChangeNotifier {
       );
 
   /// Resolves a 115 `pickcode` to an official 115 domestic CDN direct URL using:
-  /// 1) `proapi.115.com/app/chrome/downurl` (m115 encrypted original MP4 direct CDN link)
+  /// 1) `proapi.115.com/app/chrome/downurl` (encrypted original file URL)
   /// 2) `webapi.115.com/files/download?pickcode=...`
   /// 3) `webapi.115.com/files/video?pickcode=...`
   final Map<(String, bool), ({String url, int timestampMs})> _pickcodeUrlCache =
@@ -1183,11 +1185,31 @@ class Local115DirectService extends ChangeNotifier {
       final paramBytes = utf8.encode(jsonEncode({'pickcode': pickcode}));
       final encodedData = M115Crypto.encode(Uint8List.fromList(paramBytes), key);
       final body = 'data=${Uri.encodeQueryComponent(encodedData)}';
-      final root = await _postFormJson(
+      const timeout = Duration(seconds: 12);
+      var response = await _postForm(
         endpoint,
         body: body,
-        timeout: const Duration(seconds: 12),
+        timeout: timeout,
       );
+      if (response.statusCode == HttpStatus.found) {
+        final location = response.headers.value(HttpHeaders.locationHeader);
+        final uri = location == null ? null : endpoint.resolve(location);
+        if (uri != null && uri.scheme == 'https' && _is115MediaHost(uri.host)) {
+          // Large files can return the encrypted result via a second GET.
+          // It uses the same key as the original POST.
+          await response.drain<void>().timeout(timeout);
+          final request = await _httpClient.getUrl(uri).timeout(timeout);
+          request.followRedirects = false;
+          requestHeaders.forEach(request.headers.set);
+          response = await request.close().timeout(timeout);
+        }
+      }
+      Object? root;
+      if (response.statusCode == HttpStatus.ok) {
+        root = await _readJsonResponse(response).timeout(timeout);
+      } else {
+        await response.drain<void>().timeout(timeout);
+      }
       if (root is Map<String, dynamic> && root['data'] is String) {
         final decrypted = M115Crypto.decode(root['data'] as String, key);
         if (decrypted != null) {
@@ -2769,15 +2791,7 @@ class Local115DirectService extends ChangeNotifier {
     final req = await _httpClient.getUrl(uri).timeout(timeout);
     requestHeaders.forEach(req.headers.set);
     final resp = await req.close().timeout(timeout);
-    for (final c in resp.cookies) {
-      if (c.name.isNotEmpty && c.value.isNotEmpty) {
-        _latestCdnAuthCookie = '${c.name}=${c.value}';
-      }
-    }
-    final bytes = await resp.fold<List<int>>(<int>[], (acc, b) => acc..addAll(b));
-    final text = utf8.decode(bytes, allowMalformed: true).trim();
-    if (text.isEmpty) return null;
-    return jsonDecode(text);
+    return _readJsonResponse(resp);
   }
 
   Future<dynamic> _postFormJson(
@@ -2785,13 +2799,25 @@ class Local115DirectService extends ChangeNotifier {
     required String body,
     Duration timeout = const Duration(seconds: 12),
   }) async {
+    final resp = await _postForm(uri, body: body, timeout: timeout);
+    return _readJsonResponse(resp);
+  }
+
+  Future<HttpClientResponse> _postForm(
+    Uri uri, {
+    required String body,
+    required Duration timeout,
+  }) async {
     final req = await _httpClient.postUrl(uri).timeout(timeout);
     requestHeaders.forEach(req.headers.set);
     req.headers.set('Content-Type', 'application/x-www-form-urlencoded');
     final bodyBytes = utf8.encode(body);
     req.contentLength = bodyBytes.length;
     req.add(bodyBytes);
-    final resp = await req.close().timeout(timeout);
+    return req.close().timeout(timeout);
+  }
+
+  Future<dynamic> _readJsonResponse(HttpClientResponse resp) async {
     for (final c in resp.cookies) {
       if (c.name.isNotEmpty && c.value.isNotEmpty) {
         _latestCdnAuthCookie = '${c.name}=${c.value}';
@@ -3008,7 +3034,18 @@ class Local115DirectService extends ChangeNotifier {
         final fid = (item['fid'] ?? '').toString().trim();
         final itemCid = (item['cid'] ?? '').toString().trim();
         final hasValidFid = fid.isNotEmpty && fid != '0';
-        final isDir = !hasValidFid && itemCid.isNotEmpty && itemCid != '0';
+        // Android uses fid for both files and folders, with fc marking the type.
+        // The web listings identify folders by cid and omit fid.
+        final isDir = switch (item['fc']?.toString()) {
+          '0' => true,
+          '1' => false,
+          _ => !hasValidFid && itemCid.isNotEmpty && itemCid != '0',
+        };
+        final folderCid = hasValidFid ? fid : itemCid;
+        if (isDir &&
+            (folderCid.isEmpty || folderCid == '0' || folderCid == cleanCid)) {
+          continue;
+        }
         final name = (item['n'] ?? item['ns'] ?? item['fn'] ?? '未命名').toString();
         final size = int.tryParse((item['s'] ?? item['fs'] ?? 0).toString()) ?? 0;
         final pickcode =
@@ -3040,13 +3077,13 @@ class Local115DirectService extends ChangeNotifier {
               '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
         }
         final thumb = (item['u'] ?? '').toString();
-        final entryPath = isDir ? itemCid : (hasValidFid ? fid : pickcode);
+        final entryPath = isDir ? folderCid : (hasValidFid ? fid : pickcode);
         if (!seenEntryKeys.add('${isDir ? "D" : "F"}::$entryPath::$name')) {
           continue;
         }
         if (isDir) {
-          _cidParentMap[itemCid] = cleanCid;
-          _cidNameMap[itemCid] = name;
+          _cidParentMap[folderCid] = cleanCid;
+          _cidNameMap[folderCid] = name;
         }
         entries.add(
           FileEntry(
@@ -3055,14 +3092,14 @@ class Local115DirectService extends ChangeNotifier {
             size: size,
             modTime: modStr,
             isDir: isDir,
-            isMp4: ext == '.mp4' || (is115Video && ext.isEmpty),
+            isMp4: !isDir && (ext == '.mp4' || (is115Video && ext.isEmpty)),
             ext: ext,
             mountId: mountId,
             sourceKind: StorageSourceKind.cloud115,
             thumbUrl: thumb,
             pickcode115: pickcode,
-            fid115: isDir ? itemCid : fid,
-            cid115: isDir ? itemCid : cleanCid,
+            fid115: isDir ? folderCid : fid,
+            cid115: isDir ? folderCid : cleanCid,
           ),
         );
       }
@@ -3091,32 +3128,375 @@ class Local115DirectService extends ChangeNotifier {
     );
   }
 
-  Future<void> rename115File({
+  Future<String> rename115File({
     required String fid,
+    required String currentName,
     required String newName,
+    required bool isDir,
   }) async {
-    await ensureInitialized();
-    if (!hasLocalCookie) return;
-    final body =
-        'files_new_name[$fid]=${Uri.encodeQueryComponent(newName)}';
-    await _postFormJson(
-      Uri.parse('https://webapi.115.com/files/batch_rename'),
-      body: body,
-    );
+    final id = _validate115FileId(fid);
+    if (!isDir && changes115FileSuffix(currentName, newName)) {
+      throw const ApiException('115 重命名会保留原文件后缀，请保留原后缀后再保存');
+    }
+    final result = await _post115FileOperation('/files/batch_rename', {
+      'files_new_name[$id]': newName,
+    });
+    final names = result['data'];
+    final savedName = names is Map ? names[id] : null;
+    if (savedName is! String || savedName.isEmpty) {
+      throw const ApiException('115 未确认保存后的文件名');
+    }
+    return savedName;
   }
 
-  Future<void> delete115File({
-    required String fid,
+  static bool changes115FileSuffix(String currentName, String newName) =>
+      _fileNameSuffix(currentName) != _fileNameSuffix(newName);
+
+  final _replacing115Files = <String>{};
+
+  Future<void> replace115FileSuffix(FileEntry entry, String newName) async {
+    await ensureInitialized();
+    if (!hasLocalCookie) {
+      throw const ApiException('请先登录 115 网盘账号');
+    }
+    if (entry.sourceKind != StorageSourceKind.cloud115 ||
+        entry.isDir ||
+        !changes115FileSuffix(entry.name, newName)) {
+      throw const ApiException('请选择需要更换后缀的 115 文件');
+    }
+    if (newName.trim().isEmpty ||
+        newName == '.' ||
+        newName == '..' ||
+        newName.contains(RegExp(r'[/\\\x00-\x1f]'))) {
+      throw const ApiException('请输入有效的文件名');
+    }
+    final id = _validate115FileId(entry.fid115);
+    final parentCid = entry.cid115 == '0'
+        ? '0'
+        : _validate115FileId(entry.cid115);
+    if (!_replacing115Files.add(id)) {
+      throw const ApiException('该文件正在更换后缀');
+    }
+    final accountCookie = _cookie;
+    try {
+      final original = await _read115FileInfo(id);
+      if (original.name != entry.name ||
+          original.pickcode != entry.pickcode115 ||
+          !await _is115FileInDirectory(id, parentCid)) {
+        throw const ApiException('115 原件信息已变化，请刷新目录后重试');
+      }
+      final directory = await list115Directory(cid: parentCid);
+      if (directory.entries.any(
+        (item) =>
+            item.fid115 != id &&
+            item.name.toLowerCase() == newName.toLowerCase(),
+      )) {
+        throw const ApiException('115 目录里已有同名项目');
+      }
+      if (_cookie != accountCookie) {
+        throw const ApiException('115 登录状态已变化，请重试');
+      }
+
+      final pickcode = await _copy115FileByHash(
+        name: newName,
+        parentCid: parentCid,
+        fileHash: original.fileHash,
+        size: original.size,
+        sourcePickcode: original.pickcode,
+      );
+      FileEntry? newEntry;
+      for (var attempt = 0; attempt < 5; attempt++) {
+        final refreshed = await list115Directory(cid: parentCid);
+        newEntry = refreshed.entries
+            .where((item) => !item.isDir && item.pickcode115 == pickcode)
+            .firstOrNull;
+        if (newEntry != null) break;
+        await Future<void>.delayed(const Duration(milliseconds: 350));
+      }
+      if (newEntry == null ||
+          newEntry.fid115.isEmpty ||
+          newEntry.fid115 == id) {
+        throw const ApiException('115 未能确认新文件已创建，原件已保留');
+      }
+      final copy = await _read115FileInfo(newEntry.fid115);
+      if (copy.name != newName ||
+          copy.pickcode != pickcode ||
+          copy.size != original.size ||
+          copy.fileHash != original.fileHash) {
+        throw const ApiException('新文件的名称或内容校验失败，原件已保留');
+      }
+      if (await _read115FileInfo(id) != original ||
+          !await _is115FileInDirectory(id, parentCid) ||
+          _cookie != accountCookie) {
+        throw const ApiException('原件或登录状态已变化，新文件已创建，原件已保留');
+      }
+      try {
+        await delete115Files(fids: [id], parentCid: parentCid);
+      } catch (e) {
+        throw ApiException('新文件已校验，原件移入回收站失败：$e');
+      }
+    } finally {
+      _replacing115Files.remove(id);
+    }
+  }
+
+  Future<({String name, String pickcode, int size, String fileHash})>
+  _read115FileInfo(String id) async {
+    final root = await _getJson(
+      Uri.https('webapi.115.com', '/files/file', {'file_id': id}),
+    );
+    if (root is Map<String, dynamic> &&
+        root['state'] == true &&
+        root['data'] is List) {
+      for (final item in root['data'] as List) {
+        if (item is! Map || item['file_id']?.toString() != id) continue;
+        final size = int.tryParse(item['file_size']?.toString() ?? '');
+        final name = item['file_name'];
+        final pickcode = item['pick_code'];
+        final hash = item['sha1']?.toString().toUpperCase() ?? '';
+        if (size != null &&
+            size >= 0 &&
+            name is String &&
+            pickcode is String &&
+            pickcode.isNotEmpty &&
+            RegExp(r'^[0-9A-F]{40}$').hasMatch(hash)) {
+          return (name: name, pickcode: pickcode, size: size, fileHash: hash);
+        }
+      }
+    }
+    throw const ApiException('无法核对 115 文件的元数据');
+  }
+
+  Future<bool> _is115FileInDirectory(String id, String parentCid) async {
+    final root = await _getJson(
+      Uri.https('proapi.115.com', '/android/2.0/category/get', {
+        'aid': '1',
+        'cid': id,
+      }),
+    );
+    if (root is! Map || root['file_id']?.toString() != id) return false;
+    final paths = root['paths'];
+    if (paths is! List || paths.isEmpty) return false;
+    final parent = paths.last;
+    return parent is Map && parent['file_id']?.toString() == parentCid;
+  }
+
+  Future<String> _copy115FileByHash({
+    required String name,
+    required String parentCid,
+    required String fileHash,
+    required int size,
+    required String sourcePickcode,
+  }) async {
+    final info = await _getJson(Uri.https('proapi.115.com', '/app/uploadinfo'));
+    final userId = info is Map ? info['user_id']?.toString() ?? '' : '';
+    final userKey = info is Map ? info['userkey']?.toString() ?? '' : '';
+    if (userId.isEmpty || userKey.isEmpty) {
+      throw const ApiException('115 未返回上传凭证，原件已保留');
+    }
+
+    final protocol = Cloud115UploadProtocol();
+    final target = 'U_1_$parentCid';
+    final inner = sha1.convert(utf8.encode('$userId$fileHash${target}0'));
+    final signature = sha1
+        .convert(utf8.encode('$userKey${inner}000000'))
+        .toString()
+        .toUpperCase();
+    final userHash = md5.convert(utf8.encode(userId));
+    const appVersion = '27.0.5.7';
+
+    Future<Map<String, dynamic>> initialize({
+      String signKey = '',
+      String signValue = '',
+    }) async {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final token = md5.convert(
+        utf8.encode(
+          'Qclm8MGWUv59TnrR0XPg$fileHash$size$signKey$signValue'
+          '$userId$now$userHash$appVersion',
+        ),
+      );
+      final form = Uri(
+        queryParameters: {
+          'appid': '0',
+          'appversion': appVersion,
+          'userid': userId,
+          'filename': name,
+          'filesize': size.toString(),
+          'fileid': fileHash,
+          'target': target,
+          'sig': signature,
+          't': now.toString(),
+          'token': token.toString(),
+          if (signKey.isNotEmpty) 'sign_key': signKey,
+          if (signValue.isNotEmpty) 'sign_val': signValue,
+        },
+      ).query;
+      final uri = Uri.https('uplb.115.com', '/4.0/initupload.php', {
+        'k_ec': protocol.encodeToken(now),
+      });
+      const timeout = Duration(seconds: 15);
+      final request = await _httpClient.postUrl(uri).timeout(timeout);
+      request.followRedirects = false;
+      requestHeaders.forEach(request.headers.set);
+      request.headers.contentType = ContentType(
+        'application',
+        'x-www-form-urlencoded',
+      );
+      final payload = protocol.encrypt(form);
+      request.contentLength = payload.length;
+      request.add(payload);
+      final response = await request.close().timeout(timeout);
+      if (response.statusCode != HttpStatus.ok) {
+        await response.drain<void>().timeout(timeout);
+        throw ApiException('115 创建新文件失败（HTTP ${response.statusCode}），原件已保留');
+      }
+      final bytes = BytesBuilder(copy: false);
+      await for (final chunk in response.timeout(timeout)) {
+        bytes.add(chunk);
+        if (bytes.length > 1024 * 1024) {
+          throw const ApiException('115 返回了异常的上传响应，原件已保留');
+        }
+      }
+      try {
+        return protocol.decodeResponse(bytes.takeBytes());
+      } on FormatException {
+        throw const ApiException('无法读取 115 上传结果，原件已保留');
+      } on RangeError {
+        throw const ApiException('115 上传响应不完整，原件已保留');
+      }
+    }
+
+    var result = await initialize();
+    if (result['status']?.toString() == '7') {
+      final signKey = result['sign_key']?.toString() ?? '';
+      final range = RegExp(r'^(\d+)-(\d+)$')
+          .firstMatch(result['sign_check']?.toString() ?? '');
+      final start = int.tryParse(range?[1] ?? '');
+      final end = int.tryParse(range?[2] ?? '');
+      if (signKey.isEmpty ||
+          start == null ||
+          end == null ||
+          end < start ||
+          end >= size) {
+        throw const ApiException('115 返回了无效的秒传校验范围，原件已保留');
+      }
+      final hash = await _hash115FileRange(sourcePickcode, start, end, size);
+      result = await initialize(signKey: signKey, signValue: hash);
+    }
+    final pickcode = result['pickcode']?.toString() ?? '';
+    if (result['status']?.toString() != '2' ||
+        pickcode.isEmpty ||
+        pickcode == sourcePickcode) {
+      throw const ApiException('115 未能秒传新文件，原件已保留');
+    }
+    return pickcode;
+  }
+
+  Future<String> _hash115FileRange(
+    String pickcode,
+    int start,
+    int end,
+    int fileSize,
+  ) async {
+    final url = await resolvePickcodeStreamUrl(
+      pickcode,
+      forceRefresh: true,
+      allowVideoFallback: false,
+    );
+    if (url == null) {
+      throw const ApiException('无法获取 115 原件的下载地址，原件已保留');
+    }
+    final response = await _openProxyUpstream(
+      Uri.parse(url),
+      requestHeadersForUrl(url),
+      range: 'bytes=$start-$end',
+    );
+    if (response.statusCode != HttpStatus.partialContent ||
+        response.headers.value(HttpHeaders.contentRangeHeader) !=
+            'bytes $start-$end/$fileSize') {
+      await response.listen((_) {}).cancel();
+      throw const ApiException('115 原件的分段校验请求失败，原件已保留');
+    }
+    var length = 0;
+    final hash = await sha1
+        .bind(
+          response.timeout(const Duration(seconds: 15)).map((chunk) {
+            length += chunk.length;
+            return chunk;
+          }),
+        )
+        .first;
+    if (length != end - start + 1) {
+      throw const ApiException('115 原件的分段校验数据不完整，原件已保留');
+    }
+    return hash.toString().toUpperCase();
+  }
+
+  Future<void> delete115Files({
+    required Iterable<String> fids,
     required String parentCid,
   }) async {
-    await ensureInitialized();
-    if (!hasLocalCookie) return;
+    final ids = fids.map(_validate115FileId).toSet().toList();
+    if (ids.isEmpty) return;
     final pid = (parentCid.isEmpty || parentCid == '/') ? '0' : parentCid;
-    final body =
-        'pid=${Uri.encodeQueryComponent(pid)}&fid[0]=${Uri.encodeQueryComponent(fid)}&ignore_warn=1';
-    await _postFormJson(
-      Uri.parse('https://rb.115.com/2.0/rb/delete'),
-      body: body,
+    await _post115FileOperation('/rb/delete', {
+      'pid': pid,
+      for (var i = 0; i < ids.length; i++) 'fid[$i]': ids[i],
+    });
+  }
+
+  static final _valid115FileId = RegExp(r'^[1-9][0-9]*$');
+
+  static String _validate115FileId(String fid) {
+    final id = fid.trim();
+    if (!_valid115FileId.hasMatch(id)) {
+      throw const ApiException('缺少有效的 115 文件 ID，请刷新目录后重试');
+    }
+    return id;
+  }
+
+  static String _fileNameSuffix(String name) {
+    final dot = name.lastIndexOf('.');
+    return dot > 0 && dot < name.length - 1 ? name.substring(dot) : '';
+  }
+
+  Future<Map<String, dynamic>> _post115FileOperation(
+    String path,
+    Map<String, String> parameters,
+  ) async {
+    await ensureInitialized();
+    if (!hasLocalCookie) {
+      throw const ApiException('请先登录 115 网盘账号');
+    }
+    const timeout = Duration(seconds: 12);
+    final response = await _postForm(
+      Uri.https('webapi.115.com', path),
+      body: Uri(queryParameters: parameters).query,
+      timeout: timeout,
     );
+    if (response.statusCode != HttpStatus.ok) {
+      await response.drain<void>().timeout(timeout);
+      throw ApiException(
+        '115 接口请求失败（HTTP ${response.statusCode}）',
+        statusCode: response.statusCode,
+      );
+    }
+    final Object? result;
+    try {
+      result = await _readJsonResponse(response).timeout(timeout);
+    } on FormatException {
+      throw const ApiException('115 返回了无法识别的操作结果');
+    }
+    if (result is! Map<String, dynamic>) {
+      throw const ApiException('115 返回了无法识别的操作结果');
+    }
+    final state = result['state'];
+    if (state == true || state.toString() == '1') return result;
+    for (final key in const ['error', 'message', 'msg']) {
+      final message = result[key]?.toString().trim() ?? '';
+      if (message.isNotEmpty) throw ApiException(message);
+    }
+    throw const ApiException('115 未确认操作成功，请刷新目录检查结果');
   }
 }

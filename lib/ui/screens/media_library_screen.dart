@@ -1286,6 +1286,37 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
     if (trimmed.isEmpty || trimmed == entry.name) return;
     final mount =
         _mounts.where((m) => m.id == entry.mountId).firstOrNull ?? _activeMount;
+    final replaceSuffix =
+        mount.kind == StorageSourceKind.cloud115 &&
+        !entry.isDir &&
+        Local115DirectService.changes115FileSuffix(entry.name, trimmed);
+    if (replaceSuffix) {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('更换 115 文件后缀'),
+          content: Text(
+            '${entry.name}\n→ $trimmed\n\n'
+            '新文件校验通过后，原件会移入 115 回收站。'
+            '新文件的 ID 会变化，原分享链接和歌单引用可能失效。',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('确认更换'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('正在创建并校验新文件…')));
+    }
+    var savedName = trimmed;
     try {
       switch (mount.kind) {
         case StorageSourceKind.server:
@@ -1309,10 +1340,17 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
           );
           break;
         case StorageSourceKind.cloud115:
-          await Local115DirectService.instance.rename115File(
-            fid: entry.fid115.isEmpty ? entry.path : entry.fid115,
-            newName: trimmed,
-          );
+          final provider = Local115DirectService.instance;
+          if (replaceSuffix) {
+            await provider.replace115FileSuffix(entry, trimmed);
+          } else {
+            savedName = await provider.rename115File(
+              fid: entry.fid115,
+              currentName: entry.name,
+              newName: trimmed,
+              isDir: entry.isDir,
+            );
+          }
           break;
         case StorageSourceKind.localCache:
           final parentDir = File(entry.path).parent.path;
@@ -1325,16 +1363,17 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
           break;
       }
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('✓ 已重命名为：$trimmed')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('✓ 已重命名为：$savedName')));
       }
       await _loadDirectory(_listing?.path ?? '');
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('重命名失败：$e')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('重命名失败：$e')));
+        if (replaceSuffix && _activeMount.id == mount.id) {
+          await _loadDirectory(_listing?.path ?? '');
+        }
       }
     }
   }
@@ -1364,12 +1403,10 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
           }
           break;
         case StorageSourceKind.cloud115:
-          for (final e in entries) {
-            await Local115DirectService.instance.delete115File(
-              fid: e.fid115.isEmpty ? e.path : e.fid115,
-              parentCid: curDir,
-            );
-          }
+          await Local115DirectService.instance.delete115Files(
+            fids: entries.map((entry) => entry.fid115),
+            parentCid: curDir,
+          );
           break;
         case StorageSourceKind.localCache:
           for (final e in entries) {
@@ -2110,20 +2147,18 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
   }
 
   Future<void> _showRenameDialog(FileEntry entry) async {
-    final ctrl = TextEditingController(text: entry.name);
-    await showDialog<void>(
+    var input = entry.name;
+    final newName = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: VideoPlatformTheme.bgElevated,
         title: const Text('重命名', style: TextStyle(fontSize: 15.5)),
-        content: TextField(
-          controller: ctrl,
+        content: TextFormField(
+          initialValue: entry.name,
           autofocus: true,
           decoration: const InputDecoration(hintText: '请输入新名称'),
-          onSubmitted: (v) {
-            Navigator.of(ctx).pop();
-            _renameEntryInActiveMount(entry, v);
-          },
+          onChanged: (value) => input = value,
+          onFieldSubmitted: (value) => Navigator.of(ctx).pop(value),
         ),
         actions: [
           TextButton(
@@ -2131,15 +2166,15 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
             child: const Text('取消'),
           ),
           FilledButton(
-            onPressed: () {
-              Navigator.of(ctx).pop();
-              _renameEntryInActiveMount(entry, ctrl.text);
-            },
+            onPressed: () => Navigator.of(ctx).pop(input),
             child: const Text('保存'),
           ),
         ],
       ),
     );
+    if (mounted && newName != null) {
+      await _renameEntryInActiveMount(entry, newName);
+    }
   }
 
   Future<void> _showFileActionSheet(FileEntry entry) async {
