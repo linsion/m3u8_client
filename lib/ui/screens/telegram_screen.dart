@@ -16981,6 +16981,12 @@ class _TelegramPhotoGalleryDialogState
     return widget.photoMessages;
   }
 
+  void _onGalleryFocusManagerChanged() {
+    if (!mounted || _controlsHidden) return;
+    _galleryAutoHideTimer?.cancel();
+    _scheduleGalleryAutoHide();
+  }
+
   @override
   void initState() {
     super.initState();
@@ -16991,6 +16997,7 @@ class _TelegramPhotoGalleryDialogState
     _currentIndex = idx >= 0 ? idx : 0;
     _lastGalleryRouteSignature = _computeGalleryRouteSignature();
     widget.appState.proxyService.addListener(_onGalleryExternalProxyChanged);
+    FocusManager.instance.addListener(_onGalleryFocusManagerChanged);
     _syncVideoPlayerForCurrentItem();
     _scrollActiveThumbnailIntoView(animated: false);
     _scheduleGalleryAutoHide();
@@ -17005,6 +17012,7 @@ class _TelegramPhotoGalleryDialogState
         SystemChrome.setPreferredOrientations(const []);
       }
     }
+    FocusManager.instance.removeListener(_onGalleryFocusManagerChanged);
     widget.appState.proxyService.removeListener(_onGalleryExternalProxyChanged);
     _galleryAutoHideTimer?.cancel();
     _dialogHudTimer?.cancel();
@@ -17611,6 +17619,7 @@ class _TelegramPhotoGalleryDialogState
           onFocusChange: (hasFocus) {
             setBtnState(() {});
             if (hasFocus) {
+              _pokeGalleryControls();
               WidgetsBinding.instance.addPostFrameCallback((_) {
                 if (btnCtx.mounted) {
                   Scrollable.ensureVisible(
@@ -17626,6 +17635,7 @@ class _TelegramPhotoGalleryDialogState
             if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
               return KeyEventResult.ignored;
             }
+            _pokeGalleryControls();
             if (event is KeyDownEvent &&
                 (event.logicalKey == LogicalKeyboardKey.select ||
                     event.logicalKey == LogicalKeyboardKey.enter ||
@@ -17734,6 +17744,7 @@ class _TelegramPhotoGalleryDialogState
           onFocusChange: (hasFocus) {
             setBtnState(() {});
             if (hasFocus) {
+              _pokeGalleryControls();
               WidgetsBinding.instance.addPostFrameCallback((_) {
                 if (btnCtx.mounted) {
                   Scrollable.ensureVisible(
@@ -17749,6 +17760,7 @@ class _TelegramPhotoGalleryDialogState
             if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
               return KeyEventResult.ignored;
             }
+            _pokeGalleryControls();
             if (event is KeyDownEvent &&
                 (event.logicalKey == LogicalKeyboardKey.select ||
                     event.logicalKey == LogicalKeyboardKey.enter ||
@@ -17957,7 +17969,8 @@ class _TelegramPhotoGalleryDialogState
                 focusNode: _focusNode,
                 autofocus: !isVideo,
                 canRequestFocus: !isVideo,
-                onFocusChange: (_) {
+                onFocusChange: (hasFocus) {
+                  if (hasFocus) _pokeGalleryControls();
                   if (mounted) setState(() {});
                 },
                 onKeyEvent: (node, event) {
@@ -17965,6 +17978,7 @@ class _TelegramPhotoGalleryDialogState
                     return KeyEventResult.ignored;
                   }
                   if (event is KeyDownEvent || event is KeyRepeatEvent) {
+                    _pokeGalleryControls();
                     if (event.logicalKey == LogicalKeyboardKey.arrowLeft) {
                       if (isVideo) {
                         _seekRelative(-5);
@@ -18976,12 +18990,16 @@ class _TelegramPhotoGalleryDialogState
                             builder: (scrubCtx, setScrubState) {
                               return Focus(
                                 focusNode: _scrubberFocusNode,
-                                onFocusChange: (_) => setScrubState(() {}),
+                                onFocusChange: (hasFocus) {
+                                  if (hasFocus) _pokeGalleryControls();
+                                  setScrubState(() {});
+                                },
                                 onKeyEvent: (node, event) {
                                   if (event is! KeyDownEvent &&
                                       event is! KeyRepeatEvent) {
                                     return KeyEventResult.ignored;
                                   }
+                                  _pokeGalleryControls();
                                   if (event.logicalKey ==
                                       LogicalKeyboardKey.arrowLeft) {
                                     _seekRelative(-5);
@@ -19654,6 +19672,7 @@ class _TelegramPhotoGalleryDialogState
                                 onFocusChange: (hasFocus) {
                                   if (thumbCtx.mounted) setThumbState(() {});
                                   if (hasFocus) {
+                                    _pokeGalleryControls();
                                     WidgetsBinding.instance
                                         .addPostFrameCallback((_) {
                                       if (thumbCtx.mounted) {
@@ -19672,6 +19691,7 @@ class _TelegramPhotoGalleryDialogState
                                       event is! KeyRepeatEvent) {
                                     return KeyEventResult.ignored;
                                   }
+                                  _pokeGalleryControls();
                                   if (event is KeyDownEvent &&
                                       (event.logicalKey ==
                                               LogicalKeyboardKey.select ||

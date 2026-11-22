@@ -335,9 +335,15 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     }
   }
 
+  void _onVodFocusManagerChanged() {
+    if (!mounted || !_isFullscreenMode || !_fullscreenControlsVisible) return;
+    _pokeFullscreenControls();
+  }
+
   @override
   void initState() {
     super.initState();
+    FocusManager.instance.addListener(_onVodFocusManagerChanged);
     _activeSource = widget.source;
     _activeVodId = widget.vodId;
     if (widget.appState.miniPlayerSession != null) {
@@ -692,6 +698,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
 
   @override
   void dispose() {
+    FocusManager.instance.removeListener(_onVodFocusManagerChanged);
     if (_isFullscreenMode && (Platform.isAndroid || Platform.isIOS)) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
       if (!widget.appState.tvMode) {

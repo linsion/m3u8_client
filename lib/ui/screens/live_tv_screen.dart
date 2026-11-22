@@ -319,9 +319,15 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     );
   }
 
+  void _onLiveFocusManagerChanged() {
+    if (!mounted || !_isLiveFullscreen || !_liveOsdVisible) return;
+    _pokeLiveOsd();
+  }
+
   @override
   void initState() {
     super.initState();
+    FocusManager.instance.addListener(_onLiveFocusManagerChanged);
     _player = Player(
       configuration: PlayerConfiguration(
         bufferSize: (Platform.isAndroid || Platform.isIOS)
@@ -830,6 +836,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
 
   @override
   void dispose() {
+    FocusManager.instance.removeListener(_onLiveFocusManagerChanged);
     if (widget.appState.activeChildBackHandler == _handleBackPress) {
       widget.appState.activeChildBackHandler = null;
     }

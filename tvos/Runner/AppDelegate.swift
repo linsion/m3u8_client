@@ -71,6 +71,8 @@ final class TvInteractiveWindow: UIWindow {
 
   override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
     super.didUpdateFocus(in: context, with: coordinator)
+    lastTouchActivityTime = CACurrentMediaTime()
+    onRemoteActivity?()
     let prevView = context.previouslyFocusedView
     let nextView = context.nextFocusedView
     applyDarkFocusStyleNearFocusedViews(prevView: prevView, nextView: nextView)

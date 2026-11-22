@@ -2097,6 +2097,9 @@ struct TvPlayerModalView: View {
       }
       wakeUpControls()
     }
+    .onChange(of: focusedField) { _ in
+      lastInteractionAt = Date()
+    }
     .onChange(of: appState.remoteActivityTick) { _ in
       wakeUpControls()
     }
@@ -3432,6 +3435,9 @@ struct TvTelegramGalleryModalView: View {
     .onMoveCommand { _ in
       appState.isPlayerScrubberFocused = (galleryFocus == .scrubber || galleryFocus == .restoreControls || galleryFocus == nil)
       wakeUpGalleryControls()
+    }
+    .onChange(of: galleryFocus) { _ in
+      lastInteractionAt = Date()
     }
     .onChange(of: appState.remoteActivityTick) { _ in
       wakeUpGalleryControls()
