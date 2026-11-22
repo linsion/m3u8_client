@@ -463,6 +463,7 @@ enum TvStorageSourceKind: String, Codable, CaseIterable, Hashable, Identifiable 
   case server = "server"
   case alist = "alist"
   case webdav = "webdav"
+  case smb = "smb"
   case cloud115 = "cloud115"
   case localCache = "localCache"
 
@@ -473,6 +474,7 @@ enum TvStorageSourceKind: String, Codable, CaseIterable, Hashable, Identifiable 
     case .server: return "流光服务端"
     case .alist: return "AList / OpenList"
     case .webdav: return "WebDAV 远程盘"
+    case .smb: return "SMB 局域网共享"
     case .cloud115: return "115 网盘直连"
     case .localCache: return "本机离线缓存"
     }
@@ -483,6 +485,7 @@ enum TvStorageSourceKind: String, Codable, CaseIterable, Hashable, Identifiable 
     case .server: return "externaldrive.fill.badge.wifi"
     case .alist: return "server.rack"
     case .webdav: return "network.badge.shield.half.filled"
+    case .smb: return "externaldrive.connected.to.line.below.fill"
     case .cloud115: return "icloud.fill"
     case .localCache: return "appletv.fill"
     }
@@ -531,6 +534,7 @@ struct TvStorageMount: Identifiable, Codable, Hashable {
     case .server: return "服务端"
     case .alist: return "AList"
     case .webdav: return "WebDAV"
+    case .smb: return "SMB"
     case .cloud115: return "115网盘"
     case .localCache: return "本机缓存"
     }

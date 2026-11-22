@@ -3253,6 +3253,9 @@ final class TvAppState: ObservableObject {
       case .webdav:
         listing = try await TvRemoteStorageClient.shared.listWebdavDirectory(mount: mount, path: path)
 
+      case .smb:
+        listing = try await TvSmbClient.shared.listSmbDirectory(mount: mount, path: path)
+
       case .cloud115:
         if !TvLocal115DirectClient.shared.hasLocalCookie {
           let srvSettings = await api.fetchServerSettings()
@@ -3367,6 +3370,14 @@ final class TvAppState: ObservableObject {
       let url = TvRemoteStorageClient.shared.buildWebdavUrl(mount: mount, path: entry.path)?.absoluteString ?? entry.rawDownloadUrl
       let headers = TvRemoteStorageClient.shared.webdavAuthHeaders(for: mount)
       return (url, headers, "\(mount.name) · \(entry.formattedSize)")
+
+    case .smb:
+      let url = await TvSmbClient.shared.buildLocalStreamUrl(
+        mount: mount,
+        virtualPath: entry.path,
+        fileNameHint: entry.name
+      )
+      return (url, [:], "\(mount.name) (SMB) · \(entry.formattedSize)")
 
     case .cloud115:
       if !TvLocal115DirectClient.shared.hasLocalCookie {
@@ -4010,6 +4021,12 @@ final class TvAppState: ObservableObject {
       return allEntries
     case .webdav:
       let res = try await TvRemoteStorageClient.shared.listWebdavDirectory(
+        mount: mount,
+        path: path.isEmpty ? mount.rootPath : path
+      )
+      return res.entries
+    case .smb:
+      let res = try await TvSmbClient.shared.listSmbDirectory(
         mount: mount,
         path: path.isEmpty ? mount.rootPath : path
       )
@@ -5947,6 +5964,8 @@ final class TvAppState: ObservableObject {
         try await TvRemoteStorageClient.shared.createAlistFolder(mount: mount, parentPath: currentDir, name: trimmed)
       case .webdav:
         try await TvRemoteStorageClient.shared.createWebdavFolder(mount: mount, parentPath: currentDir, name: trimmed)
+      case .smb:
+        try await TvSmbClient.shared.createSmbFolder(mount: mount, parentPath: currentDir, name: trimmed)
       case .cloud115:
         try await TvLocal115DirectClient.shared.create115Folder(parentCid: currentDir, name: trimmed)
       case .localCache:
@@ -5974,6 +5993,10 @@ final class TvAppState: ObservableObject {
         let parent = TvRemoteStorageClient.parentPath(of: entry.path)
         let dst = TvRemoteStorageClient.joinPath(parent.isEmpty ? "/" : parent, trimmed)
         try await TvRemoteStorageClient.shared.moveOrCopyWebdavEntry(mount: mount, srcPath: entry.path, dstPath: dst, isMove: true)
+      case .smb:
+        let parent = TvRemoteStorageClient.parentPath(of: entry.path)
+        let dst = TvRemoteStorageClient.joinPath(parent.isEmpty ? "/" : parent, trimmed)
+        try await TvSmbClient.shared.moveOrCopySmbEntry(mount: mount, srcVirtualPath: entry.path, dstVirtualPath: dst, isMove: true)
       case .cloud115:
         try await TvLocal115DirectClient.shared.rename115File(fid: entry.fid115.isEmpty ? entry.path : entry.fid115, newName: trimmed)
       case .localCache:
@@ -6004,6 +6027,10 @@ final class TvAppState: ObservableObject {
       case .webdav:
         for e in entries {
           try await TvRemoteStorageClient.shared.deleteWebdavEntry(mount: mount, path: e.path, isDir: e.isDir)
+        }
+      case .smb:
+        for e in entries {
+          try await TvSmbClient.shared.deleteSmbEntry(mount: mount, virtualPath: e.path, isDir: e.isDir)
         }
       case .cloud115:
         for e in entries {
@@ -6071,6 +6098,21 @@ final class TvAppState: ObservableObject {
               mount: dstMount,
               srcPath: entry.path,
               dstPath: dstPath,
+              isMove: clip.operation == .move
+            )
+          }
+          fileClipboard = nil
+          showToast("✓ 已\(clip.operation == .move ? "移动" : "复制") \(clip.entries.count) 个项目")
+          await loadFiles(path: fileListing.path)
+          return
+
+        case .smb:
+          for entry in clip.entries {
+            let dstPath = TvRemoteStorageClient.joinPath(dstDir, entry.name)
+            try await TvSmbClient.shared.moveOrCopySmbEntry(
+              mount: dstMount,
+              srcVirtualPath: entry.path,
+              dstVirtualPath: dstPath,
               isMove: clip.operation == .move
             )
           }
@@ -6480,6 +6522,34 @@ final class TvAppState: ObservableObject {
           speedBytesPerSec: Double(totalBytes) / max(0.2, Date().timeIntervalSince1970 - startTime),
           status: .completed,
           detail: "✓ 已通过 WebDAV 上传至 \(mount.name)"
+        )
+
+      case .smb:
+        try await TvSmbClient.shared.uploadToSmb(
+          mount: mount,
+          targetDir: dir,
+          fileName: fileName,
+          fileData: fileData
+        ) { sent, total in
+          let elapsed = max(0.15, Date().timeIntervalSince1970 - startTime)
+          Task { @MainActor [weak self] in
+            self?.updateTransferTaskProgress(
+              id: transferId,
+              transferredBytes: sent,
+              totalBytes: total,
+              speedBytesPerSec: Double(sent) / elapsed,
+              status: .running,
+              detail: "正在通过 SMB 上传至 \(mount.name)..."
+            )
+          }
+        }
+        updateTransferTaskProgress(
+          id: transferId,
+          transferredBytes: totalBytes,
+          totalBytes: totalBytes,
+          speedBytesPerSec: Double(totalBytes) / max(0.2, Date().timeIntervalSince1970 - startTime),
+          status: .completed,
+          detail: "✓ 已通过 SMB 上传至 \(mount.name)"
         )
 
       case .server, .cloud115:
@@ -7778,7 +7848,14 @@ final class TvAppState: ObservableObject {
       let rootPath = form["root_path"] ?? "/"
       Task { @MainActor in
         if !baseUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-          let kind: TvStorageSourceKind = kindStr == "webdav" ? .webdav : .alist
+          let kind: TvStorageSourceKind
+          if kindStr == "smb" {
+            kind = .smb
+          } else if kindStr == "webdav" {
+            kind = .webdav
+          } else {
+            kind = .alist
+          }
           let created = appState.upsertStorageMount(
             name: name,
             kind: kind,
@@ -8117,18 +8194,19 @@ final class TvAppState: ObservableObject {
       </div>
 
       <div class="card">
-        <h2>☁️ 2. 远程挂载 AList / OpenList / WebDAV 网盘到 Apple TV</h2>
-        <p class="sub">无需用遥控器逐字输入，在此填入 AList 或 WebDAV 地址后点击挂载，Apple TV 文件管理器将立即打开该网盘！</p>
+        <h2>☁️ 2. 远程挂载 AList / OpenList / WebDAV / SMB 共享到 Apple TV</h2>
+        <p class="sub">无需用遥控器逐字输入，在此填入 AList、WebDAV 或 SMB (NAS/Windows) 地址后点击挂载，Apple TV 文件管理器将立即打开该存储！</p>
         <form method="POST" action="/mount-storage">
           <label>存储类型</label>
           <select name="kind">
             <option value="alist">AList / OpenList (v3 API 原生挂载)</option>
             <option value="webdav">WebDAV 标准网盘 (如 AList /dav、群晖、CloudDrive2、Nextcloud)</option>
+            <option value="smb">SMB 局域网共享 (群晖 / 飞牛 fnOS / Unraid / 威联通 / Windows)</option>
           </select>
-          <label>显示名称（例如：家庭 AList / 115 CloudDrive2）</label>
-          <input type="text" name="name" placeholder="例如：家庭 AList 媒体中心" />
-          <label>服务器地址（AList 填 http://IP:5244；WebDAV 填完整 http://IP:5244/dav）</label>
-          <input type="text" name="base_url" placeholder="http://192.168.1.10:5244" required />
+          <label>显示名称（例如：家庭 NAS / 家庭 AList）</label>
+          <input type="text" name="name" placeholder="例如：家庭 NAS 媒体库" />
+          <label>服务器地址（AList 填 http://IP:5244；WebDAV 填 http://IP:5244/dav；SMB 填 smb://192.168.1.10 或 192.168.1.10）</label>
+          <input type="text" name="base_url" placeholder="smb://192.168.1.10 或 http://192.168.1.10:5244" required />
           <div style="display:flex;gap:10px;">
             <div style="flex:1;">
               <label>用户名（选填，游客留空）</label>

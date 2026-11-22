@@ -10758,3 +10758,1471 @@ final class TvRemoteStorageClient: @unchecked Sendable {
     )
   }
 }
+
+// MARK: - 3. Pure Swift SMB2 (SMB 2.0.2 / 2.1 + NTLMv2 + SRVSVC + Local HTTP Range Proxy) Client for Apple TV
+
+final class TvSmbClient: @unchecked Sendable {
+  static let shared = TvSmbClient()
+
+  private let lock = NSLock()
+  private var registeredMounts: [String: TvStorageMount] = [:]
+  private var listener: NWListener?
+  private(set) var proxyPort: UInt16 = 0
+  private let proxyQueue = DispatchQueue(label: "tv.liuguang.smb.proxy", qos: .userInitiated, attributes: .concurrent)
+
+  private init() {
+    startProxyServerIfNeeded()
+  }
+
+  func registerMount(_ mount: TvStorageMount) {
+    guard mount.kind == .smb else { return }
+    lock.lock()
+    registeredMounts[mount.id] = mount
+    lock.unlock()
+    startProxyServerIfNeeded()
+  }
+
+  func getRegisteredMount(_ id: String) -> TvStorageMount? {
+    lock.lock()
+    defer { lock.unlock() }
+    return registeredMounts[id]
+  }
+
+  static func parseSmbTarget(mount: TvStorageMount, requestedPath: String) -> (
+    host: String,
+    port: UInt16,
+    share: String,
+    relPath: String,
+    virtualPath: String
+  ) {
+    var rawBase = mount.baseUrl.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "\\", with: "/")
+    let lower = rawBase.lowercased()
+    if lower.hasPrefix("smb://") {
+      rawBase = String(rawBase.dropFirst(6))
+    } else if lower.hasPrefix("cifs://") {
+      rawBase = String(rawBase.dropFirst(7))
+    } else if lower.hasPrefix("http://") {
+      rawBase = String(rawBase.dropFirst(7))
+    } else if lower.hasPrefix("https://") {
+      rawBase = String(rawBase.dropFirst(8))
+    }
+    while rawBase.hasPrefix("/") {
+      rawBase.removeFirst()
+    }
+
+    if let atRange = rawBase.range(of: "@") {
+      let slashRange = rawBase.range(of: "/")
+      if slashRange == nil || atRange.lowerBound < slashRange!.lowerBound {
+        rawBase = String(rawBase[atRange.upperBound...])
+      }
+    }
+
+    var hostPort = rawBase
+    var baseSubPath = ""
+    if let firstSlash = rawBase.firstIndex(of: "/") {
+      hostPort = String(rawBase[..<firstSlash])
+      baseSubPath = String(rawBase[rawBase.index(after: firstSlash)...])
+    }
+
+    var host = hostPort.trimmingCharacters(in: .whitespacesAndNewlines)
+    var port: UInt16 = 445
+    if host.hasPrefix("["), let closeBracket = host.firstIndex(of: "]") {
+      let ipv6 = String(host[host.index(after: host.startIndex)..<closeBracket])
+      let rest = String(host[host.index(after: closeBracket)...])
+      if rest.hasPrefix(":"), let p = UInt16(rest.dropFirst()) {
+        port = p
+      }
+      host = ipv6
+    } else if let colonIdx = host.lastIndex(of: ":") {
+      let pStr = String(host[host.index(after: colonIdx)...])
+      if let p = UInt16(pStr), p > 0 {
+        port = p
+        host = String(host[..<colonIdx])
+      }
+    }
+
+    let reqTrim = requestedPath.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "\\", with: "/")
+    let rootTrim = mount.rootPath.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "\\", with: "/")
+    var effectiveVirtual = reqTrim.isEmpty ? rootTrim : reqTrim
+    if effectiveVirtual.isEmpty { effectiveVirtual = "/" }
+    if !effectiveVirtual.hasPrefix("/") { effectiveVirtual = "/\(effectiveVirtual)" }
+
+    let baseSegments = baseSubPath.split(separator: "/").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    let reqSegments = effectiveVirtual.split(separator: "/").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+
+    let allSegments: [String]
+    if !baseSegments.isEmpty {
+      if reqSegments.isEmpty {
+        allSegments = baseSegments
+      } else if reqSegments[0].lowercased() == baseSegments[0].lowercased() {
+        allSegments = reqSegments
+      } else {
+        allSegments = baseSegments + reqSegments
+      }
+    } else {
+      allSegments = reqSegments
+    }
+
+    let normVirtual = allSegments.isEmpty ? "/" : "/\(allSegments.joined(separator: "/"))"
+    guard let share = allSegments.first else {
+      return (host, port, "", "", "/")
+    }
+    let relPath = allSegments.count > 1 ? allSegments.dropFirst().joined(separator: "\\") : ""
+    return (host, port, share, relPath, normVirtual)
+  }
+
+  func buildLocalStreamUrl(mount: TvStorageMount, virtualPath: String, fileNameHint: String? = nil) async -> String {
+    registerMount(mount)
+    for _ in 0..<25 {
+      lock.lock()
+      let p = proxyPort
+      lock.unlock()
+      if p > 0 { break }
+      try? await Task.sleep(nanoseconds: 20_000_000)
+    }
+    return buildLocalStreamUrlSync(mount: mount, virtualPath: virtualPath, fileNameHint: fileNameHint)
+  }
+
+  func buildLocalStreamUrlSync(mount: TvStorageMount, virtualPath: String, fileNameHint: String? = nil) -> String {
+    registerMount(mount)
+    lock.lock()
+    let p = proxyPort
+    lock.unlock()
+    let normPath = TvRemoteStorageClient.normalizePath(virtualPath)
+    let rawName = (fileNameHint?.isEmpty == false)
+      ? fileNameHint!
+      : ((normPath as NSString).lastPathComponent.isEmpty ? "stream.mp4" : (normPath as NSString).lastPathComponent)
+    let encName = rawName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? "stream.mp4"
+    var comps = URLComponents()
+    comps.scheme = "http"
+    comps.host = "127.0.0.1"
+    comps.port = Int(p > 0 ? p : 18089)
+    comps.path = "/smb-stream/\(encName)"
+    comps.queryItems = [
+      URLQueryItem(name: "mount", value: mount.id),
+      URLQueryItem(name: "path", value: normPath)
+    ]
+    return comps.url?.absoluteString ?? "http://127.0.0.1:\(p)/smb-stream"
+  }
+
+  private func startProxyServerIfNeeded() {
+    lock.lock()
+    if listener != nil && proxyPort > 0 {
+      lock.unlock()
+      return
+    }
+    lock.unlock()
+
+    do {
+      let params = NWParameters.tcp
+      params.allowLocalEndpointReuse = true
+      let nwListener = try NWListener(using: params, on: .any)
+      nwListener.stateUpdateHandler = { [weak self] state in
+        guard let self else { return }
+        if case .ready = state, let p = nwListener.port?.rawValue, p > 0 {
+          self.lock.lock()
+          self.proxyPort = p
+          self.lock.unlock()
+        }
+      }
+      nwListener.newConnectionHandler = { [weak self] conn in
+        self?.handleProxyClient(conn)
+      }
+      nwListener.start(queue: proxyQueue)
+      lock.lock()
+      self.listener = nwListener
+      lock.unlock()
+    } catch {}
+  }
+
+  private func handleProxyClient(_ client: NWConnection) {
+    client.start(queue: proxyQueue)
+    client.receive(minimumIncompleteLength: 1, maximumLength: 32768) { [weak self] data, _, _, err in
+      guard let self, err == nil, let data, !data.isEmpty,
+            let reqStr = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) else {
+        client.cancel()
+        return
+      }
+      Task {
+        await self.processProxyHttpRequest(client: client, requestString: reqStr)
+      }
+    }
+  }
+
+  private func processProxyHttpRequest(client: NWConnection, requestString: String) async {
+    let lines = requestString.components(separatedBy: "\r\n")
+    guard let firstLine = lines.first else {
+      client.cancel()
+      return
+    }
+    let parts = firstLine.split(separator: " ")
+    guard parts.count >= 2 else {
+      client.cancel()
+      return
+    }
+    let method = parts[0].uppercased()
+    let rawUri = String(parts[1])
+    guard let comps = URLComponents(string: "http://127.0.0.1\(rawUri)"),
+          comps.path.hasPrefix("/smb-stream") else {
+      await Self.sendRawHttp(client: client, header: "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+      client.cancel()
+      return
+    }
+
+    let mountId = comps.queryItems?.first(where: { $0.name == "mount" })?.value ?? ""
+    let filePath = comps.queryItems?.first(where: { $0.name == "path" })?.value ?? ""
+    guard let mount = getRegisteredMount(mountId), !filePath.isEmpty else {
+      await Self.sendRawHttp(client: client, header: "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+      client.cancel()
+      return
+    }
+
+    let target = Self.parseSmbTarget(mount: mount, requestedPath: filePath)
+    guard !target.host.isEmpty, !target.share.isEmpty, !target.relPath.isEmpty else {
+      await Self.sendRawHttp(client: client, header: "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+      client.cancel()
+      return
+    }
+
+    var rangeHeader: String?
+    for line in lines.dropFirst() {
+      if line.lowercased().hasPrefix("range:") {
+        rangeHeader = String(line.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+        break
+      }
+    }
+
+    do {
+      let conn = try await TvSmb2Session.connectAndAuthenticate(
+        host: target.host,
+        port: target.port,
+        username: mount.username,
+        password: mount.password,
+        domainHint: mount.token
+      )
+      var fileId: Data?
+      do {
+        try await conn.treeConnect(shareName: target.share)
+        let opened = try await conn.openFileForRead(relPath: target.relPath)
+        fileId = opened.fileId
+        let totalSize = opened.fileSize
+
+        var start: Int64 = 0
+        var end: Int64 = totalSize > 0 ? (totalSize - 1) : 0
+        var isPartial = false
+        if let rh = rangeHeader, rh.lowercased().hasPrefix("bytes="), totalSize > 0 {
+          let spec = rh.dropFirst(6).split(separator: ",").first.map(String.init)?.trimmingCharacters(in: .whitespaces) ?? ""
+          if let dashIdx = spec.firstIndex(of: "-") {
+            let sStr = String(spec[..<dashIdx]).trimmingCharacters(in: .whitespaces)
+            let eStr = String(spec[spec.index(after: dashIdx)...]).trimmingCharacters(in: .whitespaces)
+            if sStr.isEmpty, let suffix = Int64(eStr) {
+              start = max(0, totalSize - suffix)
+              end = totalSize - 1
+              isPartial = true
+            } else if let sVal = Int64(sStr) {
+              start = sVal
+              if let eVal = Int64(eStr) {
+                end = min(totalSize - 1, eVal)
+              } else {
+                end = totalSize - 1
+              }
+              isPartial = true
+            }
+          }
+        }
+
+        if totalSize > 0 && (start < 0 || start >= totalSize || start > end) {
+          let hdr = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */\(totalSize)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+          await Self.sendRawHttp(client: client, header: hdr)
+          try? await conn.closeFile(fileId: opened.fileId)
+          conn.close()
+          client.cancel()
+          return
+        }
+
+        let contentLength: Int64 = totalSize > 0 ? (end - start + 1) : 0
+        let statusLine = isPartial ? "HTTP/1.1 206 Partial Content" : "HTTP/1.1 200 OK"
+        let mime = Self.guessMimeType(target.relPath)
+        var hdr = "\(statusLine)\r\nContent-Type: \(mime)\r\nAccept-Ranges: bytes\r\nContent-Length: \(contentLength)\r\n"
+        if isPartial && totalSize > 0 {
+          hdr += "Content-Range: bytes \(start)-\(end)/\(totalSize)\r\n"
+        }
+        hdr += "Connection: close\r\n\r\n"
+        let hdrOk = await Self.sendRawHttp(client: client, header: hdr)
+        if !hdrOk || method == "HEAD" || contentLength <= 0 {
+          try? await conn.closeFile(fileId: opened.fileId)
+          conn.close()
+          client.cancel()
+          return
+        }
+
+        var offset = start
+        var remaining = contentLength
+        let chunkSize = Int64(conn.safeReadChunkSize)
+        while remaining > 0 {
+          let toRead = Int(min(remaining, chunkSize))
+          let chunk = try await conn.readFileChunk(fileId: opened.fileId, offset: UInt64(offset), length: UInt32(toRead))
+          if chunk.isEmpty { break }
+          TvNetworkSpeedMonitor.shared.recordDownstreamBytes(chunk.count)
+          let sentOk = await Self.sendRawData(client: client, data: chunk)
+          if !sentOk { break }
+          offset += Int64(chunk.count)
+          remaining -= Int64(chunk.count)
+        }
+      } catch {}
+      if let fid = fileId {
+        try? await conn.closeFile(fileId: fid)
+      }
+      conn.close()
+      client.cancel()
+    } catch {
+      await Self.sendRawHttp(client: client, header: "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+      client.cancel()
+    }
+  }
+
+  private static func sendRawHttp(client: NWConnection, header: String) async -> Bool {
+    await sendRawData(client: client, data: Data(header.utf8))
+  }
+
+  private static func sendRawData(client: NWConnection, data: Data) async -> Bool {
+    await withCheckedContinuation { cont in
+      client.send(content: data, completion: .contentProcessed { err in
+        cont.resume(returning: err == nil)
+      })
+    }
+  }
+
+  private static func guessMimeType(_ path: String) -> String {
+    let lower = path.lowercased()
+    if lower.hasSuffix(".mp4") || lower.hasSuffix(".m4v") { return "video/mp4" }
+    if lower.hasSuffix(".mkv") { return "video/x-matroska" }
+    if lower.hasSuffix(".mov") { return "video/quicktime" }
+    if lower.hasSuffix(".ts") { return "video/mp2t" }
+    if lower.hasSuffix(".flv") { return "video/x-flv" }
+    if lower.hasSuffix(".avi") { return "video/x-msvideo" }
+    if lower.hasSuffix(".mp3") { return "audio/mpeg" }
+    if lower.hasSuffix(".flac") { return "audio/flac" }
+    if lower.hasSuffix(".wav") { return "audio/wav" }
+    if lower.hasSuffix(".m4a") || lower.hasSuffix(".aac") { return "audio/mp4" }
+    if lower.hasSuffix(".jpg") || lower.hasSuffix(".jpeg") { return "image/jpeg" }
+    if lower.hasSuffix(".png") { return "image/png" }
+    return "application/octet-stream"
+  }
+
+  // MARK: - Directory Listing & File Operations
+
+  func listSmbDirectory(mount: TvStorageMount, path: String) async throws -> TvFileListing {
+    registerMount(mount)
+    let target = Self.parseSmbTarget(mount: mount, requestedPath: path)
+    guard !target.host.isEmpty else {
+      throw NSError(domain: "TvSMB", code: -1, userInfo: [NSLocalizedDescriptionKey: "请输入有效的 SMB 服务器 IP 或主机名"])
+    }
+
+    let conn = try await TvSmb2Session.connectAndAuthenticate(
+      host: target.host,
+      port: target.port,
+      username: mount.username,
+      password: mount.password,
+      domainHint: mount.token
+    )
+    defer { conn.close() }
+
+    if target.share.isEmpty {
+      let shares = try await conn.enumerateShares()
+      let entries = shares.map { shareName in
+        TvFileEntry(
+          name: shareName,
+          path: "/\(shareName)",
+          size: 0,
+          modTime: "SMB 共享目录",
+          isDir: true,
+          isMp4: false,
+          ext: "",
+          mountId: mount.id,
+          sourceKind: .smb
+        )
+      }
+      return TvFileListing(path: "/", parent: "", root: "/", entries: entries)
+    }
+
+    try await conn.treeConnect(shareName: target.share)
+    let rawEntries = try await conn.queryDirectory(relPath: target.relPath)
+    var entries: [TvFileEntry] = []
+    for item in rawEntries {
+      if item.name == "." || item.name == ".." { continue }
+      let itemVirtual = TvRemoteStorageClient.joinPath(target.virtualPath, item.name)
+      let ext = item.isDir ? "" : ((item.name as NSString).pathExtension.isEmpty ? "" : ".\((item.name as NSString).pathExtension.lowercased())")
+      let directUrl = item.isDir ? "" : buildLocalStreamUrlSync(mount: mount, virtualPath: itemVirtual, fileNameHint: item.name)
+      entries.append(
+        TvFileEntry(
+          name: item.name,
+          path: itemVirtual,
+          size: item.size,
+          modTime: item.modTime,
+          isDir: item.isDir,
+          isMp4: ext == ".mp4",
+          ext: ext,
+          mountId: mount.id,
+          sourceKind: .smb,
+          rawDownloadUrl: directUrl
+        )
+      )
+    }
+    return TvFileListing(
+      path: target.virtualPath,
+      parent: TvRemoteStorageClient.parentPath(of: target.virtualPath),
+      root: TvRemoteStorageClient.normalizePath(mount.rootPath),
+      entries: entries
+    )
+  }
+
+  func createSmbFolder(mount: TvStorageMount, parentPath: String, name: String) async throws {
+    let fullVirtual = TvRemoteStorageClient.joinPath(parentPath, name)
+    let target = Self.parseSmbTarget(mount: mount, requestedPath: fullVirtual)
+    guard !target.share.isEmpty, !target.relPath.isEmpty else {
+      throw NSError(domain: "TvSMB", code: -1, userInfo: [NSLocalizedDescriptionKey: "请先进入具体的 SMB 共享目录后再新建文件夹"])
+    }
+    let conn = try await TvSmb2Session.connectAndAuthenticate(
+      host: target.host,
+      port: target.port,
+      username: mount.username,
+      password: mount.password,
+      domainHint: mount.token
+    )
+    defer { conn.close() }
+    try await conn.treeConnect(shareName: target.share)
+    try await conn.createDirectory(relPath: target.relPath)
+  }
+
+  func deleteSmbEntry(mount: TvStorageMount, virtualPath: String, isDir: Bool) async throws {
+    let target = Self.parseSmbTarget(mount: mount, requestedPath: virtualPath)
+    guard !target.share.isEmpty, !target.relPath.isEmpty else {
+      throw NSError(domain: "TvSMB", code: -1, userInfo: [NSLocalizedDescriptionKey: "无法删除 SMB 根共享目录"])
+    }
+    let conn = try await TvSmb2Session.connectAndAuthenticate(
+      host: target.host,
+      port: target.port,
+      username: mount.username,
+      password: mount.password,
+      domainHint: mount.token
+    )
+    defer { conn.close() }
+    try await conn.treeConnect(shareName: target.share)
+    try await conn.deleteEntryRecursive(relPath: target.relPath, isDir: isDir)
+  }
+
+  func moveOrCopySmbEntry(
+    mount: TvStorageMount,
+    srcVirtualPath: String,
+    dstVirtualPath: String,
+    isMove: Bool
+  ) async throws {
+    let srcTarget = Self.parseSmbTarget(mount: mount, requestedPath: srcVirtualPath)
+    let dstTarget = Self.parseSmbTarget(mount: mount, requestedPath: dstVirtualPath)
+    guard !srcTarget.share.isEmpty, !srcTarget.relPath.isEmpty,
+          !dstTarget.share.isEmpty, !dstTarget.relPath.isEmpty else {
+      throw NSError(domain: "TvSMB", code: -1, userInfo: [NSLocalizedDescriptionKey: "SMB 路径无效，请确认处于共享目录内"])
+    }
+    let conn = try await TvSmb2Session.connectAndAuthenticate(
+      host: srcTarget.host,
+      port: srcTarget.port,
+      username: mount.username,
+      password: mount.password,
+      domainHint: mount.token
+    )
+    defer { conn.close() }
+    try await conn.treeConnect(shareName: srcTarget.share)
+    if isMove && srcTarget.share.lowercased() == dstTarget.share.lowercased() {
+      try await conn.renameEntry(srcRelPath: srcTarget.relPath, dstRelPath: dstTarget.relPath)
+      return
+    }
+    let openedSrc = try await conn.openFileForRead(relPath: srcTarget.relPath)
+    let dstId = try await conn.openFileForWrite(relPath: dstTarget.relPath)
+    var offset: Int64 = 0
+    let chunkSize = Int64(conn.safeWriteChunkSize)
+    while offset < openedSrc.fileSize {
+      let toRead = Int(min(chunkSize, openedSrc.fileSize - offset))
+      let chunk = try await conn.readFileChunk(fileId: openedSrc.fileId, offset: UInt64(offset), length: UInt32(toRead))
+      if chunk.isEmpty { break }
+      try await conn.writeFileChunk(fileId: dstId, offset: UInt64(offset), data: chunk)
+      offset += Int64(chunk.count)
+    }
+    try? await conn.closeFile(fileId: openedSrc.fileId)
+    try? await conn.closeFile(fileId: dstId)
+    if isMove {
+      try await conn.deleteEntryRecursive(relPath: srcTarget.relPath, isDir: false)
+    }
+  }
+
+  func uploadToSmb(
+    mount: TvStorageMount,
+    targetDir: String,
+    fileName: String,
+    fileData: Data,
+    onProgress: @escaping @Sendable (Int64, Int64) -> Void
+  ) async throws {
+    let fullVirtual = TvRemoteStorageClient.joinPath(targetDir, fileName)
+    let target = Self.parseSmbTarget(mount: mount, requestedPath: fullVirtual)
+    guard !target.share.isEmpty, !target.relPath.isEmpty else {
+      throw NSError(domain: "TvSMB", code: -1, userInfo: [NSLocalizedDescriptionKey: "请先进入具体的 SMB 共享目录后再上传文件"])
+    }
+    let conn = try await TvSmb2Session.connectAndAuthenticate(
+      host: target.host,
+      port: target.port,
+      username: mount.username,
+      password: mount.password,
+      domainHint: mount.token
+    )
+    defer { conn.close() }
+    try await conn.treeConnect(shareName: target.share)
+    let fileId = try await conn.openFileForWrite(relPath: target.relPath)
+    defer {
+      Task { try? await conn.closeFile(fileId: fileId) }
+    }
+    let totalBytes = Int64(fileData.count)
+    let chunkSize = conn.safeWriteChunkSize
+    var offset = 0
+    while offset < fileData.count {
+      let end = min(fileData.count, offset + chunkSize)
+      let chunk = fileData.subdata(in: offset..<end)
+      try await conn.writeFileChunk(fileId: fileId, offset: UInt64(offset), data: chunk)
+      offset = end
+      onProgress(Int64(offset), totalBytes)
+    }
+  }
+}
+
+private final class TvSmb2Session: @unchecked Sendable {
+  let host: String
+  let port: UInt16
+  private let conn: NWConnection
+  private let queue = DispatchQueue(label: "tv.liuguang.smb2.session", qos: .userInitiated)
+  private var rxBuffer = Data()
+
+  private var messageId: UInt64 = 0
+  private var sessionId: UInt64 = 0
+  private var treeId: UInt32 = 0
+  private var serverSecurityMode: UInt16 = 0
+  private var maxReadSize: Int = 65536
+  private var maxWriteSize: Int = 65536
+  private var signingKey: Data?
+
+  var safeReadChunkSize: Int { min(maxReadSize, 65536) }
+  var safeWriteChunkSize: Int { min(maxWriteSize, 65536) }
+
+  private init(host: String, port: UInt16, conn: NWConnection) {
+    self.host = host
+    self.port = port
+    self.conn = conn
+  }
+
+  static func connectAndAuthenticate(
+    host: String,
+    port: UInt16,
+    username: String,
+    password: String,
+    domainHint: String
+  ) async throws -> TvSmb2Session {
+    guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+      throw NSError(domain: "TvSMB", code: -1, userInfo: [NSLocalizedDescriptionKey: "无效的 SMB 端口: \(port)"])
+    }
+    let nwConn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
+    let session = TvSmb2Session(host: host, port: port, conn: nwConn)
+    try await session.startConnection()
+    do {
+      try await session.negotiate()
+      try await session.authenticate(rawUsername: username, password: password, domainHint: domainHint)
+      return session
+    } catch {
+      session.close()
+      throw error
+    }
+  }
+
+  private func startConnection() async throws {
+    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+      let box = NSLock()
+      var resumed = false
+      conn.stateUpdateHandler = { state in
+        switch state {
+        case .ready:
+          box.lock()
+          if !resumed {
+            resumed = true
+            box.unlock()
+            cont.resume()
+          } else {
+            box.unlock()
+          }
+        case .failed(let err):
+          box.lock()
+          if !resumed {
+            resumed = true
+            box.unlock()
+            cont.resume(throwing: err)
+          } else {
+            box.unlock()
+          }
+        case .cancelled:
+          box.lock()
+          if !resumed {
+            resumed = true
+            box.unlock()
+            cont.resume(throwing: NSError(domain: "TvSMB", code: -1, userInfo: [NSLocalizedDescriptionKey: "SMB 连接已取消"]))
+          } else {
+            box.unlock()
+          }
+        default:
+          break
+        }
+      }
+      conn.start(queue: queue)
+    }
+  }
+
+  func close() {
+    conn.cancel()
+  }
+
+  private func sendAndReceive(
+    command: UInt16,
+    body: Data,
+    flags: UInt32 = 0,
+    allowMoreProcessing: Bool = false,
+    allowNoMoreFiles: Bool = false
+  ) async throws -> Data {
+    let msgId = messageId
+    messageId &+= 1
+
+    var packet = Data(count: 64 + body.count)
+    packet[0] = 0xFE
+    packet[1] = 0x53
+    packet[2] = 0x4D
+    packet[3] = 0x42
+    packet.setLE16(at: 4, 64)
+    packet.setLE16(at: 6, command == 0 ? 0 : 1)
+    packet.setLE32(at: 8, 0)
+    packet.setLE16(at: 12, command)
+    packet.setLE16(at: 14, 32)
+    let shouldSign = signingKey != nil && command != 0 && command != 1 && ((serverSecurityMode & 0x03) != 0)
+    let effFlags = shouldSign ? (flags | 0x00000008) : flags
+    packet.setLE32(at: 16, effFlags)
+    packet.setLE32(at: 20, 0)
+    packet.setLE64(at: 24, msgId)
+    packet.setLE32(at: 32, 0xFEFF)
+    packet.setLE32(at: 36, treeId)
+    packet.setLE64(at: 40, sessionId)
+    packet.replaceSubrange(64..<(64 + body.count), with: body)
+
+    if shouldSign, let key = signingKey {
+      let mac = HMAC<SHA256>.authenticationCode(for: packet, using: SymmetricKey(data: key))
+      let sig = Data(mac.prefix(16))
+      packet.replaceSubrange(48..<64, with: sig)
+    }
+
+    var frame = Data(count: 4 + packet.count)
+    let len = packet.count
+    frame[0] = 0x00
+    frame[1] = UInt8((len >> 16) & 0xFF)
+    frame[2] = UInt8((len >> 8) & 0xFF)
+    frame[3] = UInt8(len & 0xFF)
+    frame.replaceSubrange(4..<(4 + len), with: packet)
+
+    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+      conn.send(content: frame, completion: .contentProcessed { err in
+        if let err {
+          cont.resume(throwing: err)
+        } else {
+          cont.resume()
+        }
+      })
+    }
+
+    while true {
+      let resp = try await readOnePacket()
+      guard resp.count >= 64 else {
+        throw NSError(domain: "TvSMB", code: -1, userInfo: [NSLocalizedDescriptionKey: "SMB2 响应包长度不足"])
+      }
+      let status = resp.getLE32(at: 8)
+      let respFlags = resp.getLE32(at: 16)
+      if status == 0x00000103 && (respFlags & 0x00000002) != 0 {
+        continue
+      }
+      let rSess = resp.getLE64(at: 40)
+      if rSess != 0 { sessionId = rSess }
+      let rTree = resp.getLE32(at: 36)
+      if rTree != 0 && command == 0x0003 { treeId = rTree }
+
+      if status == 0x00000000
+          || (allowMoreProcessing && status == 0xC0000016)
+          || (allowNoMoreFiles && (status == 0x80000006 || status == 0x00000107)) {
+        return resp
+      }
+      throw NSError(domain: "TvSMB", code: Int(status), userInfo: [NSLocalizedDescriptionKey: Self.formatNtStatus(status, command: command)])
+    }
+  }
+
+  private func readOnePacket() async throws -> Data {
+    while true {
+      if rxBuffer.count >= 4 {
+        let b1 = Int(rxBuffer[rxBuffer.startIndex + 1])
+        let b2 = Int(rxBuffer[rxBuffer.startIndex + 2])
+        let b3 = Int(rxBuffer[rxBuffer.startIndex + 3])
+        let pktLen = (b1 << 16) | (b2 << 8) | b3
+        if rxBuffer.count >= 4 + pktLen {
+          let start = rxBuffer.startIndex + 4
+          let end = start + pktLen
+          let pkt = Data(rxBuffer[start..<end])
+          rxBuffer.removeSubrange(rxBuffer.startIndex..<end)
+          return pkt
+        }
+      }
+      let chunk = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Data, Error>) in
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 131072) { data, _, _, err in
+          if let err {
+            cont.resume(throwing: err)
+          } else if let data, !data.isEmpty {
+            cont.resume(returning: data)
+          } else {
+            cont.resume(throwing: NSError(domain: "TvSMB", code: -1, userInfo: [NSLocalizedDescriptionKey: "SMB 服务器已断开连接"]))
+          }
+        }
+      }
+      rxBuffer.append(chunk)
+    }
+  }
+
+  private func negotiate() async throws {
+    var body = Data(count: 40)
+    body.setLE16(at: 0, 36)
+    body.setLE16(at: 2, 2)
+    body.setLE16(at: 4, 0x0001)
+    for i in 0..<16 {
+      body[12 + i] = UInt8((i * 19 + 0x37) & 0xFF)
+    }
+    body.setLE16(at: 36, 0x0202)
+    body.setLE16(at: 38, 0x0210)
+
+    let resp = try await sendAndReceive(command: 0x0000, body: body)
+    if resp.count >= 64 + 48 {
+      serverSecurityMode = resp.getLE16(at: 64 + 2)
+      let maxR = Int(resp.getLE32(at: 64 + 40))
+      let maxW = Int(resp.getLE32(at: 64 + 44))
+      if maxR >= 4096 { maxReadSize = min(maxR, 65536) }
+      if maxW >= 4096 { maxWriteSize = min(maxW, 65536) }
+    }
+  }
+
+  private func authenticate(rawUsername: String, password: String, domainHint: String) async throws {
+    var user = rawUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+    var domain = domainHint.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let backIdx = user.firstIndex(of: "\\") {
+      if domain.isEmpty { domain = String(user[..<backIdx]) }
+      user = String(user[user.index(after: backIdx)...])
+    } else if let atIdx = user.firstIndex(of: "@") {
+      if domain.isEmpty { domain = String(user[user.index(after: atIdx)...]) }
+      user = String(user[..<atIdx])
+    }
+
+    do {
+      try await performNtlmSessionSetup(user: user, password: password, domain: domain)
+    } catch {
+      if user.isEmpty && password.isEmpty {
+        sessionId = 0
+        signingKey = nil
+        try await performNtlmSessionSetup(user: "guest", password: "", domain: domain)
+        return
+      }
+      throw error
+    }
+  }
+
+  private func performNtlmSessionSetup(user: String, password: String, domain: String) async throws {
+    let type1 = TvNtlmHelper.buildType1Message()
+    let secOut1 = TvNtlmHelper.wrapSpnegoInit(type1)
+    let resp1 = try await sendAndReceive(command: 0x0001, body: buildSessionSetupBody(secOut1), allowMoreProcessing: true)
+    if resp1.getLE32(at: 8) == 0x00000000 { return }
+
+    let secOff = Int(resp1.getLE16(at: 64 + 4))
+    let secLen = Int(resp1.getLE16(at: 64 + 6))
+    guard secLen >= 8, secOff + secLen <= resp1.count else {
+      throw NSError(domain: "TvSMB", code: -1, userInfo: [NSLocalizedDescriptionKey: "SMB2 NTLM 质询包无效"])
+    }
+    let serverSec = resp1.subdata(in: secOff..<(secOff + secLen))
+    let usedSpnego = !serverSec.isEmpty && serverSec[0] == 0xA1
+    let chall = try TvNtlmHelper.extractType2Challenge(serverSec)
+
+    let auth = TvNtlmHelper.buildType3Message(
+      username: user,
+      password: password,
+      domain: domain,
+      serverChallenge: chall.serverChallenge,
+      targetInfo: chall.targetInfo,
+      negotiateFlags: chall.flags
+    )
+    let secOut3 = usedSpnego ? TvNtlmHelper.wrapSpnegoResp(auth.type3) : auth.type3
+    _ = try await sendAndReceive(command: 0x0001, body: buildSessionSetupBody(secOut3))
+    if !user.isEmpty && !password.isEmpty {
+      signingKey = auth.sessionBaseKey
+    }
+  }
+
+  private func buildSessionSetupBody(_ secBuf: Data) -> Data {
+    var out = Data(count: 24 + secBuf.count)
+    out.setLE16(at: 0, 25)
+    out[2] = 0
+    out[3] = 0x01
+    out.setLE16(at: 12, 64 + 24)
+    out.setLE16(at: 14, UInt16(secBuf.count))
+    out.replaceSubrange(24..<(24 + secBuf.count), with: secBuf)
+    return out
+  }
+
+  func treeConnect(shareName: String) async throws {
+    let unc = "\\\\\(host)\\\(shareName)"
+    let pathBytes = unc.utf16LEData
+    var body = Data(count: 8 + pathBytes.count)
+    body.setLE16(at: 0, 9)
+    body.setLE16(at: 4, 64 + 8)
+    body.setLE16(at: 6, UInt16(pathBytes.count))
+    body.replaceSubrange(8..<(8 + pathBytes.count), with: pathBytes)
+    _ = try await sendAndReceive(command: 0x0003, body: body)
+  }
+
+  func enumerateShares() async throws -> [String] {
+    try await treeConnect(shareName: "IPC$")
+    let pipe = try await createRaw(
+      path: "srvsvc",
+      desiredAccess: 0x0012019F,
+      fileAttributes: 0,
+      shareAccess: 0x07,
+      createDisposition: 1,
+      createOptions: 0
+    )
+    defer {
+      Task { try? await closeFile(fileId: pipe.fileId) }
+    }
+    let bindPkt = Data([
+      0x05, 0x00, 0x0B, 0x03, 0x10, 0x00, 0x00, 0x00,
+      0x48, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+      0xB8, 0x10, 0xB8, 0x10, 0x00, 0x00, 0x00, 0x00,
+      0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+      0xC8, 0x4F, 0x32, 0x4B, 0x70, 0x16, 0xD3, 0x01,
+      0x12, 0x78, 0x5A, 0x47, 0xBF, 0x6E, 0xE1, 0x88,
+      0x03, 0x00, 0x00, 0x00,
+      0x04, 0x5D, 0x88, 0x8A, 0xEB, 0x1C, 0xC9, 0x11,
+      0x9F, 0xE8, 0x08, 0x00, 0x2B, 0x10, 0x48, 0x60,
+      0x02, 0x00, 0x00, 0x00
+    ])
+    try await writeFileChunk(fileId: pipe.fileId, offset: 0, data: bindPkt)
+    let bindAck = try await readFileChunk(fileId: pipe.fileId, offset: 0, length: 4096)
+    guard bindAck.count >= 24, bindAck[2] == 0x0C else {
+      throw NSError(domain: "TvSMB", code: -1, userInfo: [NSLocalizedDescriptionKey: "SMB SRVSVC 共享枚举失败，请直接填写共享目录名（如 /Movies）"])
+    }
+
+    let serverUnc = "\\\\\(host)\0"
+    let uncBytes = serverUnc.utf16LEData
+    let charCount = UInt32(serverUnc.utf16.count)
+    var stub = Data()
+    func addU32(_ v: UInt32) {
+      var le = v.littleEndian
+      stub.append(Data(bytes: &le, count: 4))
+    }
+    addU32(0x00020000)
+    addU32(charCount)
+    addU32(0)
+    addU32(charCount)
+    stub.append(uncBytes)
+    while (stub.count % 4) != 0 { stub.append(0) }
+    addU32(1)
+    addU32(1)
+    addU32(0x00020004)
+    addU32(0)
+    addU32(0)
+    addU32(0xFFFFFFFF)
+    addU32(0x00020008)
+    addU32(0)
+
+    var rpcReq = Data(count: 24 + stub.count)
+    rpcReq[0] = 5
+    rpcReq[1] = 0
+    rpcReq[2] = 0
+    rpcReq[3] = 0x03
+    rpcReq.setLE32(at: 4, 0x10)
+    rpcReq.setLE16(at: 8, UInt16(rpcReq.count))
+    rpcReq.setLE16(at: 10, 0)
+    rpcReq.setLE32(at: 12, 2)
+    rpcReq.setLE32(at: 16, UInt32(stub.count))
+    rpcReq.setLE16(at: 20, 0)
+    rpcReq.setLE16(at: 22, 15)
+    rpcReq.replaceSubrange(24..<(24 + stub.count), with: stub)
+
+    try await writeFileChunk(fileId: pipe.fileId, offset: 0, data: rpcReq)
+    var rpcStubOut = Data()
+    while true {
+      let frag = try await readFileChunk(fileId: pipe.fileId, offset: 0, length: 16384)
+      guard frag.count >= 24, frag[2] == 0x02 else { break }
+      let flags = frag[3]
+      let fragLen = min(frag.count, Int(frag.getLE16(at: 8)))
+      if fragLen > 24 {
+        rpcStubOut.append(frag.subdata(in: 24..<fragLen))
+      }
+      if (flags & 0x02) != 0 { break }
+    }
+    return Self.parseNetrShareEnumLevel1(rpcStubOut)
+  }
+
+  private static func parseNetrShareEnumLevel1(_ stub: Data) -> [String] {
+    guard stub.count >= 24 else { return [] }
+    let entriesRead = Int(stub.getLE32(at: 12))
+    let arrayPtr = stub.getLE32(at: 16)
+    guard entriesRead > 0, arrayPtr != 0, entriesRead <= 2048 else { return [] }
+    var pos = 24
+    guard pos + entriesRead * 12 <= stub.count else { return [] }
+
+    var headers: [(namePtr: UInt32, type: UInt32, remarkPtr: UInt32)] = []
+    for _ in 0..<entriesRead {
+      headers.append((stub.getLE32(at: pos), stub.getLE32(at: pos + 4), stub.getLE32(at: pos + 8)))
+      pos += 12
+    }
+
+    func readNdrString() -> String {
+      while (pos % 4) != 0 && pos < stub.count { pos += 1 }
+      guard pos + 12 <= stub.count else { return "" }
+      let actualCount = Int(stub.getLE32(at: pos + 8))
+      pos += 12
+      let byteLen = actualCount * 2
+      guard byteLen > 0, pos + byteLen <= stub.count else {
+        pos = min(stub.count, pos + max(0, byteLen))
+        return ""
+      }
+      let strData = stub.subdata(in: pos..<(pos + byteLen))
+      pos += byteLen
+      while (pos % 4) != 0 && pos < stub.count { pos += 1 }
+      var s = String(data: strData, encoding: .utf16LittleEndian) ?? ""
+      if s.hasSuffix("\0") { s.removeLast() }
+      return s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var shares: [String] = []
+    for h in headers {
+      let name = h.namePtr != 0 ? readNdrString() : ""
+      if h.remarkPtr != 0 { _ = readNdrString() }
+      if !name.isEmpty && (h.type & 0x03) == 0 && !name.hasSuffix("$") {
+        shares.append(name)
+      }
+    }
+    return shares
+  }
+
+  func queryDirectory(relPath: String) async throws -> [(name: String, size: Int64, modTime: String, isDir: Bool)] {
+    let cleanRel = relPath.replacingOccurrences(of: "/", with: "\\").trimmingCharacters(in: CharacterSet(charactersIn: "\\"))
+    let opened = try await createRaw(
+      path: cleanRel,
+      desiredAccess: 0x00120089,
+      fileAttributes: 0x00000010,
+      shareAccess: 0x00000007,
+      createDisposition: 1,
+      createOptions: 0x00000001
+    )
+    defer {
+      Task { try? await closeFile(fileId: opened.fileId) }
+    }
+    var entries: [(name: String, size: Int64, modTime: String, isDir: Bool)] = []
+    var firstCall = true
+    let patternBytes = "*".utf16LEData
+
+    while true {
+      var body = Data(count: 32 + patternBytes.count)
+      body.setLE16(at: 0, 33)
+      body[2] = 0x25
+      body[3] = firstCall ? 0x01 : 0x00
+      body.replaceSubrange(8..<24, with: opened.fileId)
+      body.setLE16(at: 24, 64 + 32)
+      body.setLE16(at: 26, UInt16(patternBytes.count))
+      body.setLE32(at: 28, 65536)
+      body.replaceSubrange(32..<(32 + patternBytes.count), with: patternBytes)
+      firstCall = false
+
+      let resp = try await sendAndReceive(command: 0x000E, body: body, allowNoMoreFiles: true)
+      if resp.getLE32(at: 8) == 0x80000006 || resp.count < 64 + 8 { break }
+      let outOff = Int(resp.getLE16(at: 64 + 2))
+      let outLen = Int(resp.getLE32(at: 64 + 4))
+      guard outLen > 0, outOff + outLen <= resp.count else { break }
+
+      let dirBuf = resp.subdata(in: outOff..<(outOff + outLen))
+      var offset = 0
+      while offset + 104 <= dirBuf.count {
+        let nextOff = Int(dirBuf.getLE32(at: offset))
+        let lastWrite = dirBuf.getLE64(at: offset + 16)
+        let eof = Int64(bitPattern: dirBuf.getLE64(at: offset + 40))
+        let attr = dirBuf.getLE32(at: offset + 56)
+        let nameLen = Int(dirBuf.getLE32(at: offset + 60))
+        if nameLen > 0 && offset + 104 + nameLen <= dirBuf.count {
+          let nameData = dirBuf.subdata(in: (offset + 104)..<(offset + 104 + nameLen))
+          let name = String(data: nameData, encoding: .utf16LittleEndian) ?? ""
+          let isDir = (attr & 0x00000010) != 0
+          entries.append((name: name, size: max(0, eof), modTime: Self.formatFileTime(lastWrite), isDir: isDir))
+        }
+        if nextOff == 0 { break }
+        offset += nextOff
+      }
+    }
+    return entries
+  }
+
+  private static func formatFileTime(_ ft: UInt64) -> String {
+    guard ft > 116444736000000000 else { return "" }
+    let unixSec = TimeInterval((ft / 10_000_000) - 11644473600)
+    let dt = Date(timeIntervalSince1970: unixSec)
+    let fmt = DateFormatter()
+    fmt.dateFormat = "yyyy-MM-dd HH:mm"
+    return fmt.string(from: dt)
+  }
+
+  func openFileForRead(relPath: String) async throws -> (fileId: Data, fileSize: Int64, isDir: Bool) {
+    let cleanRel = relPath.replacingOccurrences(of: "/", with: "\\").trimmingCharacters(in: CharacterSet(charactersIn: "\\"))
+    return try await createRaw(
+      path: cleanRel,
+      desiredAccess: 0x00120089,
+      fileAttributes: 0x00000080,
+      shareAccess: 0x00000007,
+      createDisposition: 1,
+      createOptions: 0x00000040
+    )
+  }
+
+  func openFileForWrite(relPath: String) async throws -> Data {
+    let cleanRel = relPath.replacingOccurrences(of: "/", with: "\\").trimmingCharacters(in: CharacterSet(charactersIn: "\\"))
+    let res = try await createRaw(
+      path: cleanRel,
+      desiredAccess: 0x00120196,
+      fileAttributes: 0x00000080,
+      shareAccess: 0x00000007,
+      createDisposition: 5,
+      createOptions: 0x00000040
+    )
+    return res.fileId
+  }
+
+  func createDirectory(relPath: String) async throws {
+    let cleanRel = relPath.replacingOccurrences(of: "/", with: "\\").trimmingCharacters(in: CharacterSet(charactersIn: "\\"))
+    let res = try await createRaw(
+      path: cleanRel,
+      desiredAccess: 0x00120089,
+      fileAttributes: 0x00000010,
+      shareAccess: 0x00000007,
+      createDisposition: 2,
+      createOptions: 0x00000001
+    )
+    try await closeFile(fileId: res.fileId)
+  }
+
+  func deleteEntryRecursive(relPath: String, isDir: Bool) async throws {
+    let cleanRel = relPath.replacingOccurrences(of: "/", with: "\\").trimmingCharacters(in: CharacterSet(charactersIn: "\\"))
+    if isDir {
+      let children = try await queryDirectory(relPath: cleanRel)
+      for child in children where child.name != "." && child.name != ".." {
+        try await deleteEntryRecursive(relPath: "\(cleanRel)\\\(child.name)", isDir: child.isDir)
+      }
+    }
+    let opened = try await createRaw(
+      path: cleanRel,
+      desiredAccess: 0x00010080,
+      fileAttributes: isDir ? 0x00000010 : 0x00000080,
+      shareAccess: 0x00000007,
+      createDisposition: 1,
+      createOptions: isDir ? 0x00000001 : 0x00000040
+    )
+    try await setInfo(fileId: opened.fileId, fileInfoClass: 0x0D, infoBuffer: Data([1]))
+    try await closeFile(fileId: opened.fileId)
+  }
+
+  func renameEntry(srcRelPath: String, dstRelPath: String) async throws {
+    let cleanSrc = srcRelPath.replacingOccurrences(of: "/", with: "\\").trimmingCharacters(in: CharacterSet(charactersIn: "\\"))
+    let cleanDst = dstRelPath.replacingOccurrences(of: "/", with: "\\").trimmingCharacters(in: CharacterSet(charactersIn: "\\"))
+    let opened = try await createRaw(
+      path: cleanSrc,
+      desiredAccess: 0x00110080,
+      fileAttributes: 0,
+      shareAccess: 0x00000007,
+      createDisposition: 1,
+      createOptions: 0
+    )
+    let dstBytes = cleanDst.utf16LEData
+    var infoBuf = Data(count: 20 + dstBytes.count)
+    infoBuf[0] = 1
+    infoBuf.setLE32(at: 16, UInt32(dstBytes.count))
+    infoBuf.replaceSubrange(20..<(20 + dstBytes.count), with: dstBytes)
+    try await setInfo(fileId: opened.fileId, fileInfoClass: 0x0A, infoBuffer: infoBuf)
+    try await closeFile(fileId: opened.fileId)
+  }
+
+  private func setInfo(fileId: Data, fileInfoClass: UInt8, infoBuffer: Data) async throws {
+    var body = Data(count: 32 + infoBuffer.count)
+    body.setLE16(at: 0, 33)
+    body[2] = 0x01
+    body[3] = fileInfoClass
+    body.setLE32(at: 4, UInt32(infoBuffer.count))
+    body.setLE16(at: 8, 64 + 32)
+    body.replaceSubrange(16..<32, with: fileId)
+    body.replaceSubrange(32..<(32 + infoBuffer.count), with: infoBuffer)
+    _ = try await sendAndReceive(command: 0x0011, body: body)
+  }
+
+  private func createRaw(
+    path: String,
+    desiredAccess: UInt32,
+    fileAttributes: UInt32,
+    shareAccess: UInt32,
+    createDisposition: UInt32,
+    createOptions: UInt32
+  ) async throws -> (fileId: Data, fileSize: Int64, isDir: Bool) {
+    let nameBytes = path.isEmpty ? Data() : path.utf16LEData
+    let bufBytes = nameBytes.isEmpty ? Data([0]) : nameBytes
+    var body = Data(count: 56 + bufBytes.count)
+    body.setLE16(at: 0, 57)
+    body.setLE32(at: 4, 2)
+    body.setLE32(at: 24, desiredAccess)
+    body.setLE32(at: 28, fileAttributes)
+    body.setLE32(at: 32, shareAccess)
+    body.setLE32(at: 36, createDisposition)
+    body.setLE32(at: 40, createOptions)
+    body.setLE16(at: 44, 64 + 56)
+    body.setLE16(at: 46, UInt16(nameBytes.count))
+    body.replaceSubrange(56..<(56 + bufBytes.count), with: bufBytes)
+
+    let resp = try await sendAndReceive(command: 0x0005, body: body)
+    guard resp.count >= 64 + 80 else {
+      throw NSError(domain: "TvSMB", code: -1, userInfo: [NSLocalizedDescriptionKey: "SMB2_CREATE 响应异常"])
+    }
+    let eof = Int64(bitPattern: resp.getLE64(at: 64 + 48))
+    let attr = resp.getLE32(at: 64 + 56)
+    let fileId = resp.subdata(in: (64 + 64)..<(64 + 80))
+    return (fileId: fileId, fileSize: max(0, eof), isDir: (attr & 0x00000010) != 0)
+  }
+
+  func readFileChunk(fileId: Data, offset: UInt64, length: UInt32) async throws -> Data {
+    var body = Data(count: 49)
+    body.setLE16(at: 0, 49)
+    body[2] = 0x50
+    body.setLE32(at: 4, length)
+    body.setLE64(at: 8, offset)
+    body.replaceSubrange(16..<32, with: fileId)
+
+    let resp = try await sendAndReceive(command: 0x0008, body: body, allowNoMoreFiles: true)
+    if resp.getLE32(at: 8) == 0x00000107 || resp.count < 64 + 16 {
+      return Data()
+    }
+    let dataOff = Int(resp[64 + 2])
+    let dataLen = Int(resp.getLE32(at: 64 + 4))
+    guard dataLen > 0, dataOff + dataLen <= resp.count else { return Data() }
+    return resp.subdata(in: dataOff..<(dataOff + dataLen))
+  }
+
+  func writeFileChunk(fileId: Data, offset: UInt64, data: Data) async throws {
+    var body = Data(count: 48 + data.count)
+    body.setLE16(at: 0, 49)
+    body.setLE16(at: 2, 64 + 48)
+    body.setLE32(at: 4, UInt32(data.count))
+    body.setLE64(at: 8, offset)
+    body.replaceSubrange(16..<32, with: fileId)
+    body.replaceSubrange(48..<(48 + data.count), with: data)
+    _ = try await sendAndReceive(command: 0x0009, body: body)
+  }
+
+  func closeFile(fileId: Data) async throws {
+    var body = Data(count: 24)
+    body.setLE16(at: 0, 24)
+    body.replaceSubrange(8..<24, with: fileId)
+    _ = try await sendAndReceive(command: 0x0006, body: body)
+  }
+
+  private static func formatNtStatus(_ status: UInt32, command: UInt16) -> String {
+    let hex = String(format: "0x%08X", status)
+    switch status {
+    case 0xC000006D, 0xC000006A, 0xC000006E:
+      return "SMB 账号或密码错误 (\(hex))"
+    case 0xC0000022:
+      return "SMB 权限不足：拒绝访问 (\(hex))"
+    case 0xC00000CC:
+      return "SMB 共享目录名不存在，请检查共享路径 (\(hex))"
+    case 0xC0000034, 0xC000003A:
+      return "SMB 指定的文件或目录不存在 (\(hex))"
+    default:
+      return "SMB 请求失败 (命令 \(command), 状态 \(hex))"
+    }
+  }
+}
+
+private enum TvNtlmHelper {
+  static let ntlmSig = Data([0x4E, 0x54, 0x4C, 0x4D, 0x53, 0x53, 0x50, 0x00])
+  static let defaultFlags: UInt32 = 0xA0088215
+
+  static func buildType1Message() -> Data {
+    var out = Data(count: 32)
+    out.replaceSubrange(0..<8, with: ntlmSig)
+    out.setLE32(at: 8, 1)
+    out.setLE32(at: 12, defaultFlags)
+    return out
+  }
+
+  static func extractType2Challenge(_ secBuf: Data) throws -> (serverChallenge: Data, targetInfo: Data, flags: UInt32) {
+    guard let range = secBuf.range(of: ntlmSig),
+          range.lowerBound + 32 <= secBuf.count else {
+      throw NSError(domain: "TvSMB", code: -1, userInfo: [NSLocalizedDescriptionKey: "未找到 NTLMSSP 质询头"])
+    }
+    let msg = secBuf.subdata(in: range.lowerBound..<secBuf.count)
+    let flags = msg.getLE32(at: 20)
+    let serverChallenge = msg.subdata(in: 24..<32)
+    var targetInfo = Data()
+    if msg.count >= 48 {
+      let tiLen = Int(msg.getLE16(at: 40))
+      let tiOff = Int(msg.getLE32(at: 44))
+      if tiLen > 0, tiOff >= 48, tiOff + tiLen <= msg.count {
+        targetInfo = msg.subdata(in: tiOff..<(tiOff + tiLen))
+      }
+    }
+    return (serverChallenge, targetInfo, flags)
+  }
+
+  static func buildType3Message(
+    username: String,
+    password: String,
+    domain: String,
+    serverChallenge: Data,
+    targetInfo: Data,
+    negotiateFlags: UInt32
+  ) -> (type3: Data, sessionBaseKey: Data) {
+    let flags = (negotiateFlags & ~UInt32(0x40000000)) | 0x00088205
+    let isAnonymous = username.isEmpty && password.isEmpty
+
+    let ntChallengeResp: Data
+    let lmChallengeResp: Data
+    let sessionBaseKey: Data
+
+    if isAnonymous {
+      ntChallengeResp = Data()
+      lmChallengeResp = Data([0])
+      sessionBaseKey = Data(count: 16)
+    } else {
+      let ntHash = md4(password.utf16LEData)
+      let userDomData = "\(username.uppercased())\(domain)".utf16LEData
+      let ntlmv2Key = hmacMd5(key: ntHash, data: userDomData)
+
+      var clientChallenge = Data(count: 8)
+      for i in 0..<8 { clientChallenge[i] = UInt8.random(in: 0...255) }
+
+      let unixMs = UInt64(Date().timeIntervalSince1970 * 1000)
+      let filetime = (unixMs + 11644473600000) * 10000
+      let effTi = targetInfo.isEmpty ? Data([0, 0, 0, 0]) : targetInfo
+
+      var blob = Data(count: 28 + effTi.count + 4)
+      blob[0] = 0x01
+      blob[1] = 0x01
+      blob.setLE64(at: 8, filetime)
+      blob.replaceSubrange(16..<24, with: clientChallenge)
+      blob.replaceSubrange(28..<(28 + effTi.count), with: effTi)
+
+      var challAndBlob = Data(serverChallenge)
+      challAndBlob.append(blob)
+      let ntProofStr = hmacMd5(key: ntlmv2Key, data: challAndBlob)
+
+      var ntResp = Data(ntProofStr)
+      ntResp.append(blob)
+      ntChallengeResp = ntResp
+
+      var challAndClient = Data(serverChallenge)
+      challAndClient.append(clientChallenge)
+      var lmResp = hmacMd5(key: ntlmv2Key, data: challAndClient)
+      lmResp.append(clientChallenge)
+      lmChallengeResp = lmResp
+
+      sessionBaseKey = hmacMd5(key: ntlmv2Key, data: ntProofStr)
+    }
+
+    let domainBytes = domain.utf16LEData
+    let userBytes = username.utf16LEData
+    let wsBytes = "APPLETV".utf16LEData
+
+    let headerLen = 64
+    let domOff = headerLen
+    let userOff = domOff + domainBytes.count
+    let wsOff = userOff + userBytes.count
+    let lmOff = wsOff + wsBytes.count
+    let ntOff = lmOff + lmChallengeResp.count
+    let skOff = ntOff + ntChallengeResp.count
+
+    var out = Data(count: skOff)
+    out.replaceSubrange(0..<8, with: ntlmSig)
+    out.setLE32(at: 8, 3)
+
+    func setSec(_ fieldOff: Int, _ len: Int, _ off: Int) {
+      out.setLE16(at: fieldOff, UInt16(len))
+      out.setLE16(at: fieldOff + 2, UInt16(len))
+      out.setLE32(at: fieldOff + 4, UInt32(off))
+    }
+
+    setSec(12, lmChallengeResp.count, lmOff)
+    setSec(20, ntChallengeResp.count, ntOff)
+    setSec(28, domainBytes.count, domOff)
+    setSec(36, userBytes.count, userOff)
+    setSec(44, wsBytes.count, wsOff)
+    setSec(52, 0, skOff)
+    out.setLE32(at: 60, flags)
+
+    out.replaceSubrange(domOff..<userOff, with: domainBytes)
+    out.replaceSubrange(userOff..<wsOff, with: userBytes)
+    out.replaceSubrange(wsOff..<lmOff, with: wsBytes)
+    out.replaceSubrange(lmOff..<ntOff, with: lmChallengeResp)
+    out.replaceSubrange(ntOff..<skOff, with: ntChallengeResp)
+
+    return (out, sessionBaseKey)
+  }
+
+  private static func asn1Wrap(_ tag: UInt8, _ content: Data) -> Data {
+    var out = Data([tag])
+    let len = content.count
+    if len < 0x80 {
+      out.append(UInt8(len))
+    } else if len <= 0xFF {
+      out.append(contentsOf: [0x81, UInt8(len)])
+    } else {
+      out.append(contentsOf: [0x82, UInt8((len >> 8) & 0xFF), UInt8(len & 0xFF)])
+    }
+    out.append(content)
+    return out
+  }
+
+  static func wrapSpnegoInit(_ type1: Data) -> Data {
+    let ntlmOid = Data([0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0A])
+    let spnegoOid = Data([0x06, 0x06, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x02])
+    let mechTypes = asn1Wrap(0xA0, asn1Wrap(0x30, ntlmOid))
+    let mechToken = asn1Wrap(0xA2, asn1Wrap(0x04, type1))
+    var seqContent = Data(mechTypes)
+    seqContent.append(mechToken)
+    let negInit = asn1Wrap(0xA0, asn1Wrap(0x30, seqContent))
+    var appContent = Data(spnegoOid)
+    appContent.append(negInit)
+    return asn1Wrap(0x60, appContent)
+  }
+
+  static func wrapSpnegoResp(_ type3: Data) -> Data {
+    let respTok = asn1Wrap(0xA2, asn1Wrap(0x04, type3))
+    return asn1Wrap(0xA1, asn1Wrap(0x30, respTok))
+  }
+
+  static func hmacMd5(key: Data, data: Data) -> Data {
+    let mac = HMAC<Insecure.MD5>.authenticationCode(for: data, using: SymmetricKey(data: key))
+    return Data(mac)
+  }
+
+  /// Pure Swift RFC 1320 MD4 implementation
+  static func md4(_ input: Data) -> Data {
+    let origBitLen = UInt64(input.count * 8)
+    let padLen = (56 - ((input.count + 1) % 64) + 64) % 64
+    var padded = Data(count: input.count + 1 + padLen + 8)
+    padded.replaceSubrange(0..<input.count, with: input)
+    padded[input.count] = 0x80
+    padded.setLE64(at: padded.count - 8, origBitLen)
+
+    var a: UInt32 = 0x67452301
+    var b: UInt32 = 0xEFCDAB89
+    var c: UInt32 = 0x98BADCFE
+    var d: UInt32 = 0x10325476
+
+    func rotl(_ x: UInt32, _ s: UInt32) -> UInt32 { (x << s) | (x >> (32 - s)) }
+    func f(_ x: UInt32, _ y: UInt32, _ z: UInt32) -> UInt32 { (x & y) | (~x & z) }
+    func g(_ x: UInt32, _ y: UInt32, _ z: UInt32) -> UInt32 { (x & y) | (x & z) | (y & z) }
+    func h(_ x: UInt32, _ y: UInt32, _ z: UInt32) -> UInt32 { x ^ y ^ z }
+
+    var x = [UInt32](repeating: 0, count: 16)
+    for offset in stride(from: 0, to: padded.count, by: 64) {
+      for i in 0..<16 {
+        x[i] = padded.getLE32(at: offset + i * 4)
+      }
+      let aa = a, bb = b, cc = c, dd = d
+
+      let r1s: [UInt32] = [3, 7, 11, 19]
+      for i in 0..<16 {
+        let t = a &+ f(b, c, d) &+ x[i]
+        a = d; d = c; c = b; b = rotl(t, r1s[i % 4])
+      }
+
+      let r2k = [0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15]
+      let r2s: [UInt32] = [3, 5, 9, 13]
+      for i in 0..<16 {
+        let t = a &+ g(b, c, d) &+ x[r2k[i]] &+ 0x5A827999
+        a = d; d = c; c = b; b = rotl(t, r2s[i % 4])
+      }
+
+      let r3k = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15]
+      let r3s: [UInt32] = [3, 9, 11, 15]
+      for i in 0..<16 {
+        let t = a &+ h(b, c, d) &+ x[r3k[i]] &+ 0x6ED9EBA1
+        a = d; d = c; c = b; b = rotl(t, r3s[i % 4])
+      }
+
+      a = a &+ aa
+      b = b &+ bb
+      c = c &+ cc
+      d = d &+ dd
+    }
+
+    var out = Data(count: 16)
+    out.setLE32(at: 0, a)
+    out.setLE32(at: 4, b)
+    out.setLE32(at: 8, c)
+    out.setLE32(at: 12, d)
+    return out
+  }
+}
+
+private extension String {
+  var utf16LEData: Data {
+    self.data(using: .utf16LittleEndian) ?? Data()
+  }
+}
+
+private extension Data {
+  mutating func setLE16(at offset: Int, _ val: UInt16) {
+    self[offset] = UInt8(val & 0xFF)
+    self[offset + 1] = UInt8((val >> 8) & 0xFF)
+  }
+
+  mutating func setLE32(at offset: Int, _ val: UInt32) {
+    self[offset] = UInt8(val & 0xFF)
+    self[offset + 1] = UInt8((val >> 8) & 0xFF)
+    self[offset + 2] = UInt8((val >> 16) & 0xFF)
+    self[offset + 3] = UInt8((val >> 24) & 0xFF)
+  }
+
+  mutating func setLE64(at offset: Int, _ val: UInt64) {
+    for i in 0..<8 {
+      self[offset + i] = UInt8((val >> (i * 8)) & 0xFF)
+    }
+  }
+
+  func getLE16(at offset: Int) -> UInt16 {
+    let i0 = self.startIndex + offset
+    return UInt16(self[i0]) | (UInt16(self[i0 + 1]) << 8)
+  }
+
+  func getLE32(at offset: Int) -> UInt32 {
+    let i0 = self.startIndex + offset
+    return UInt32(self[i0])
+      | (UInt32(self[i0 + 1]) << 8)
+      | (UInt32(self[i0 + 2]) << 16)
+      | (UInt32(self[i0 + 3]) << 24)
+  }
+
+  func getLE64(at offset: Int) -> UInt64 {
+    let i0 = self.startIndex + offset
+    var res: UInt64 = 0
+    for i in 0..<8 {
+      res |= (UInt64(self[i0 + i]) << (i * 8))
+    }
+    return res
+  }
+}

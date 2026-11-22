@@ -12,6 +12,7 @@ import '../../models/models.dart';
 import '../../services/api_client.dart';
 import '../../services/local_115_direct_service.dart';
 import '../../services/remote_storage_service.dart';
+import '../../services/smb_client_service.dart';
 import '../../state/app_state.dart';
 import '../theme.dart';
 import '../widgets/cloud_music_player.dart';
@@ -312,6 +313,10 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
           result = await RemoteStorageService.instance
               .listWebdavDirectory(mount, path);
           break;
+        case StorageSourceKind.smb:
+          result =
+              await SmbClientService.instance.listSmbDirectory(mount, path);
+          break;
         case StorageSourceKind.cloud115:
           final targetCid = (path.isEmpty || path == '/') ? '0' : path;
           result = await Local115DirectService.instance.list115Directory(
@@ -444,6 +449,17 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
           url: url,
           headers: headers,
           subtitle: '${mount.name} · ${entry.formattedSize}',
+        );
+      case StorageSourceKind.smb:
+        final url = await SmbClientService.instance.buildLocalStreamUrl(
+          mount,
+          entry.path,
+          fileNameHint: entry.name,
+        );
+        return (
+          url: url,
+          headers: const <String, String>{},
+          subtitle: '${mount.name} (SMB) · ${entry.formattedSize}',
         );
       case StorageSourceKind.cloud115:
         if (entry.pickcode115.isEmpty) {
@@ -1257,6 +1273,10 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
           await RemoteStorageService.instance
               .createWebdavFolder(mount, curDir, trimmed);
           break;
+        case StorageSourceKind.smb:
+          await SmbClientService.instance
+              .createSmbFolder(mount, curDir, trimmed);
+          break;
         case StorageSourceKind.cloud115:
           await Local115DirectService.instance
               .create115Folder(parentCid: curDir, name: trimmed);
@@ -1342,6 +1362,19 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
             isMove: true,
           );
           break;
+        case StorageSourceKind.smb:
+          final parent = RemoteStorageService.parentPathOf(entry.path);
+          final dst = RemoteStorageService.joinPath(
+            parent.isEmpty ? '/' : parent,
+            trimmed,
+          );
+          await SmbClientService.instance.moveOrCopySmbEntry(
+            mount: mount,
+            srcVirtualPath: entry.path,
+            dstVirtualPath: dst,
+            isMove: true,
+          );
+          break;
         case StorageSourceKind.cloud115:
           final provider = Local115DirectService.instance;
           if (replaceSuffix) {
@@ -1403,6 +1436,12 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
           for (final e in entries) {
             await RemoteStorageService.instance
                 .deleteWebdavEntry(mount, e.path, isDir: e.isDir);
+          }
+          break;
+        case StorageSourceKind.smb:
+          for (final e in entries) {
+            await SmbClientService.instance
+                .deleteSmbEntry(mount, e.path, isDir: e.isDir);
           }
           break;
         case StorageSourceKind.cloud115:
@@ -1489,6 +1528,19 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
                 mount: dstMount,
                 srcPath: e.path,
                 dstPath: dstPath,
+                isMove: clip.isMove,
+              );
+            }
+            setState(() => _clipboard = null);
+            await _loadDirectory(dstDir);
+            return;
+          case StorageSourceKind.smb:
+            for (final e in clip.entries) {
+              final dstPath = RemoteStorageService.joinPath(dstDir, e.name);
+              await SmbClientService.instance.moveOrCopySmbEntry(
+                mount: dstMount,
+                srcVirtualPath: e.path,
+                dstVirtualPath: dstPath,
                 isMove: clip.isMove,
               );
             }
@@ -1644,12 +1696,17 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
 
   Future<void> _showMountStorageDialog({StorageMount? existing}) async {
     var kind = existing?.kind ?? StorageSourceKind.alist;
-    if (kind != StorageSourceKind.alist && kind != StorageSourceKind.webdav) {
+    if (kind != StorageSourceKind.alist &&
+        kind != StorageSourceKind.webdav &&
+        kind != StorageSourceKind.smb) {
       kind = StorageSourceKind.alist;
     }
     final nameCtrl = TextEditingController(text: existing?.name ?? '');
     final urlCtrl = TextEditingController(
-      text: existing?.baseUrl ?? 'http://192.168.1.10:5244',
+      text: existing?.baseUrl ??
+          (kind == StorageSourceKind.smb
+              ? 'smb://192.168.1.10'
+              : 'http://192.168.1.10:5244'),
     );
     final userCtrl = TextEditingController(text: existing?.username ?? '');
     final passCtrl = TextEditingController(text: existing?.password ?? '');
@@ -1672,45 +1729,62 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
                 const SizedBox(width: 8),
                 Text(
                   existing == null
-                      ? '挂载远程存储 (AList / OpenList / WebDAV)'
+                      ? '挂载远程存储 (AList / WebDAV / SMB)'
                       : '编辑挂载：${existing.name}',
                   style: const TextStyle(fontSize: 15.5),
                 ),
               ],
             ),
             content: SizedBox(
-              width: 520,
+              width: 560,
               child: SingleChildScrollView(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Row(
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      crossAxisAlignment: WrapCrossAlignment.center,
                       children: [
                         const Text('协议类型：', style: TextStyle(fontSize: 13)),
-                        const SizedBox(width: 8),
                         ChoiceChip(
-                          label: const Text('AList / OpenList (v3 API)'),
+                          label: const Text('AList / OpenList'),
                           selected: kind == StorageSourceKind.alist,
                           onSelected: (_) {
                             setModalState(() {
                               kind = StorageSourceKind.alist;
                               if (urlCtrl.text ==
-                                  'http://192.168.1.10:5244/dav') {
+                                      'http://192.168.1.10:5244/dav' ||
+                                  urlCtrl.text == 'smb://192.168.1.10') {
                                 urlCtrl.text = 'http://192.168.1.10:5244';
                               }
                             });
                           },
                         ),
-                        const SizedBox(width: 8),
                         ChoiceChip(
-                          label: const Text('WebDAV 标准网盘'),
+                          label: const Text('WebDAV 网盘'),
                           selected: kind == StorageSourceKind.webdav,
                           onSelected: (_) {
                             setModalState(() {
                               kind = StorageSourceKind.webdav;
-                              if (urlCtrl.text == 'http://192.168.1.10:5244') {
+                              if (urlCtrl.text == 'http://192.168.1.10:5244' ||
+                                  urlCtrl.text == 'smb://192.168.1.10') {
                                 urlCtrl.text = 'http://192.168.1.10:5244/dav';
+                              }
+                            });
+                          },
+                        ),
+                        ChoiceChip(
+                          label: const Text('SMB 局域网共享 (NAS/Win)'),
+                          selected: kind == StorageSourceKind.smb,
+                          onSelected: (_) {
+                            setModalState(() {
+                              kind = StorageSourceKind.smb;
+                              if (urlCtrl.text == 'http://192.168.1.10:5244' ||
+                                  urlCtrl.text ==
+                                      'http://192.168.1.10:5244/dav') {
+                                urlCtrl.text = 'smb://192.168.1.10';
                               }
                             });
                           },
@@ -1721,16 +1795,23 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
                     TextField(
                       controller: nameCtrl,
                       decoration: const InputDecoration(
-                        labelText: '显示名称（例如：家庭 AList / 群晖 WebDAV / CloudDrive2）',
+                        labelText:
+                            '显示名称（例如：家庭 NAS SMB / 群晖 WebDAV / 家庭 AList）',
                       ),
                     ),
                     const SizedBox(height: 10),
                     TextField(
                       controller: urlCtrl,
                       decoration: InputDecoration(
-                        labelText: kind == StorageSourceKind.alist
-                            ? 'AList 地址（如 http://192.168.1.10:5244）'
-                            : 'WebDAV 完整地址（如 http://192.168.1.10:5244/dav）',
+                        labelText: switch (kind) {
+                          StorageSourceKind.alist =>
+                            'AList 地址（如 http://192.168.1.10:5244）',
+                          StorageSourceKind.webdav =>
+                            'WebDAV 完整地址（如 http://192.168.1.10:5244/dav）',
+                          StorageSourceKind.smb =>
+                            'SMB 服务器地址（如 smb://192.168.1.10 或 smb://192.168.1.10/Movies）',
+                          _ => '服务器地址',
+                        },
                       ),
                     ),
                     const SizedBox(height: 10),
@@ -1762,8 +1843,10 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
                         Expanded(
                           child: TextField(
                             controller: rootCtrl,
-                            decoration: const InputDecoration(
-                              labelText: '默认初始目录（默认 /）',
+                            decoration: InputDecoration(
+                              labelText: kind == StorageSourceKind.smb
+                                  ? '默认共享路径（填 / 自动列出全部共享，或填 /Movies）'
+                                  : '默认初始目录（默认 /）',
                             ),
                           ),
                         ),
@@ -1774,6 +1857,16 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
                               controller: tokenCtrl,
                               decoration: const InputDecoration(
                                 labelText: 'AList Token（选填）',
+                              ),
+                            ),
+                          ),
+                        ] else if (kind == StorageSourceKind.smb) ...[
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: TextField(
+                              controller: tokenCtrl,
+                              decoration: const InputDecoration(
+                                labelText: '域 / 工作组（选填，通常留空）',
                               ),
                             ),
                           ),
@@ -2615,6 +2708,7 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
       StorageSourceKind.server => Icons.dns_rounded,
       StorageSourceKind.alist => Icons.cloud_circle_rounded,
       StorageSourceKind.webdav => Icons.language_rounded,
+      StorageSourceKind.smb => Icons.lan_rounded,
       StorageSourceKind.cloud115 => Icons.cloud_done_rounded,
       StorageSourceKind.localCache => Icons.folder_special_rounded,
     };
@@ -2753,7 +2847,7 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
               ),
               onPressed: () => _showMountStorageDialog(),
               icon: const Icon(Icons.add_circle_outline_rounded, size: 15),
-              label: const Text('挂载 AList / WebDAV', style: TextStyle(fontSize: 12)),
+              label: const Text('挂载 AList / WebDAV / SMB', style: TextStyle(fontSize: 12)),
             ),
             if (!_activeMount.isBuiltIn) ...[
               const SizedBox(width: 6),

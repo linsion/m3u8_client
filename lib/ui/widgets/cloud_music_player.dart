@@ -14,6 +14,7 @@ import '../../services/desktop_config_backup_service.dart';
 import '../../services/local_115_direct_service.dart';
 import '../../services/proxy_routing_service.dart';
 import '../../services/remote_storage_service.dart';
+import '../../services/smb_client_service.dart';
 import '../../state/app_state.dart';
 import '../theme.dart';
 import 'video_115_accelerate_button.dart';
@@ -1488,6 +1489,18 @@ class CloudMusicController extends ChangeNotifier with WidgetsBindingObserver {
           headers: headers,
           subtitle: '${mount.name} · ${entry.formattedSize}',
         );
+      case StorageSourceKind.smb:
+        if (mount == null) throw Exception('未找到对应的 SMB 存储挂载');
+        final url = await SmbClientService.instance.buildLocalStreamUrl(
+          mount,
+          entry.path,
+          fileNameHint: entry.name,
+        );
+        return (
+          url: url,
+          headers: const <String, String>{},
+          subtitle: '${mount.name} (SMB) · ${entry.formattedSize}',
+        );
       case StorageSourceKind.cloud115:
         await Local115DirectService.instance.ensureInitialized();
         var pickcode = entry.pickcode115.trim();
@@ -1571,6 +1584,12 @@ class CloudMusicController extends ChangeNotifier with WidgetsBindingObserver {
         return res.entries;
       case StorageSourceKind.webdav:
         final res = await RemoteStorageService.instance.listWebdavDirectory(
+          mount,
+          path.isEmpty ? mount.rootPath : path,
+        );
+        return res.entries;
+      case StorageSourceKind.smb:
+        final res = await SmbClientService.instance.listSmbDirectory(
           mount,
           path.isEmpty ? mount.rootPath : path,
         );
@@ -4686,6 +4705,8 @@ class _CloudMusicFolderPickerDialogState
                                                 Icons.cloud_circle_rounded,
                                               StorageSourceKind.webdav =>
                                                 Icons.language_rounded,
+                                              StorageSourceKind.smb =>
+                                                Icons.lan_rounded,
                                               StorageSourceKind.cloud115 =>
                                                 Icons.cloud_done_rounded,
                                               StorageSourceKind.localCache =>

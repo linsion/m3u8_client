@@ -8192,7 +8192,16 @@ struct TvMediaLibrarySectionView: View {
       editingMount = nil
       mountKind = defaultKind
       mountNameInput = ""
-      mountUrlInput = defaultKind == .alist ? "http://192.168.1.10:5244" : "http://192.168.1.10:5244/dav"
+      switch defaultKind {
+      case .alist:
+        mountUrlInput = "http://192.168.1.10:5244"
+      case .webdav:
+        mountUrlInput = "http://192.168.1.10:5244/dav"
+      case .smb:
+        mountUrlInput = "smb://192.168.1.10"
+      default:
+        mountUrlInput = "http://192.168.1.10:5244"
+      }
       mountUserInput = ""
       mountPassInput = ""
       mountTokenInput = ""
@@ -8387,7 +8396,7 @@ struct TvMediaLibrarySectionView: View {
         Button {
           openMountEditor(nil, defaultKind: .alist)
         } label: {
-          Label("挂载 AList / WebDAV", systemImage: "plus.circle.fill")
+          Label("挂载 AList / WebDAV / SMB", systemImage: "plus.circle.fill")
         }
         .buttonStyle(TvApplePillButtonStyle(compact: true))
         .focused($focusedMediaTop)
@@ -9362,8 +9371,8 @@ struct TvMediaLibrarySectionView: View {
         }
       }
 
-      // Cross-mount upload to any mounted AList / WebDAV / Server
-      ForEach(appState.storageMounts.filter { $0.id != entry.mountId && ($0.kind == .alist || $0.kind == .webdav || $0.kind == .server) }) { targetMount in
+      // Cross-mount upload to any mounted AList / WebDAV / SMB / Server
+      ForEach(appState.storageMounts.filter { $0.id != entry.mountId && ($0.kind == .alist || $0.kind == .webdav || $0.kind == .smb || $0.kind == .server) }) { targetMount in
         Button {
           appState.startCrossMountUploadWithProgress(
             entry: entry,
@@ -9429,12 +9438,12 @@ struct TvMediaLibrarySectionView: View {
       appState.activeLanQuickInputPlaceholder = "/"
       appState.activeLanQuickInputReceiver = { self.mountRootPathInput = $0 }
     case "mount_field_token":
-      appState.activeLanQuickInputPrompt = "AList Token"
-      appState.activeLanQuickInputPlaceholder = "alist-..."
+      appState.activeLanQuickInputPrompt = mountKind == .smb ? "SMB 域 / 工作组" : "AList Token"
+      appState.activeLanQuickInputPlaceholder = mountKind == .smb ? "WORKGROUP" : "alist-..."
       appState.activeLanQuickInputReceiver = { self.mountTokenInput = $0 }
     default:
       appState.activeLanQuickInputPrompt = "\(mountKind.title) 服务地址"
-      appState.activeLanQuickInputPlaceholder = "http://192.168.1.10:5244"
+      appState.activeLanQuickInputPlaceholder = mountKind == .smb ? "smb://192.168.1.10" : "http://192.168.1.10:5244"
       appState.activeLanQuickInputReceiver = { self.mountUrlInput = $0 }
     }
   }
@@ -9447,7 +9456,7 @@ struct TvMediaLibrarySectionView: View {
         VStack(alignment: .leading, spacing: 16) {
           HStack {
             Label(
-              editingMount == nil ? "挂载远程存储 (AList / OpenList / WebDAV)" : "编辑远程存储：\(editingMount?.name ?? "")",
+              editingMount == nil ? "挂载远程存储 (AList / WebDAV / SMB)" : "编辑远程存储：\(editingMount?.name ?? "")",
               systemImage: "externaldrive.badge.wifi"
             )
             .font(.system(size: 22, weight: .bold))
@@ -9461,11 +9470,26 @@ struct TvMediaLibrarySectionView: View {
           HStack(spacing: 12) {
             Text("协议类型：")
               .font(.system(size: 15, weight: .semibold))
-            ForEach([TvStorageSourceKind.alist, TvStorageSourceKind.webdav], id: \.self) { k in
+            ForEach([TvStorageSourceKind.alist, TvStorageSourceKind.webdav, TvStorageSourceKind.smb], id: \.self) { k in
               Button {
                 mountKind = k
-                if mountUrlInput.isEmpty || mountUrlInput == "http://192.168.1.10:5244" || mountUrlInput == "http://192.168.1.10:5244/dav" {
-                  mountUrlInput = k == .alist ? "http://192.168.1.10:5244" : "http://192.168.1.10:5244/dav"
+                let defaults: Set<String> = [
+                  "",
+                  "http://192.168.1.10:5244",
+                  "http://192.168.1.10:5244/dav",
+                  "smb://192.168.1.10"
+                ]
+                if defaults.contains(mountUrlInput) {
+                  switch k {
+                  case .alist:
+                    mountUrlInput = "http://192.168.1.10:5244"
+                  case .webdav:
+                    mountUrlInput = "http://192.168.1.10:5244/dav"
+                  case .smb:
+                    mountUrlInput = "smb://192.168.1.10"
+                  default:
+                    break
+                  }
                 }
                 bindMountQuickInputField(modalInitialFocus)
               } label: {
@@ -9478,21 +9502,27 @@ struct TvMediaLibrarySectionView: View {
 
           VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 12) {
-              TextField("显示名称（例如：家庭 AList / NAS WebDAV / CloudDrive2）", text: $mountNameInput)
+              TextField("显示名称（例如：家庭 NAS / 家庭 AList / 飞牛 SMB）", text: $mountNameInput)
                 .font(.system(size: 16))
                 .focused($modalInitialFocus, equals: "mount_field_name")
-              TvQrInputTriggerButton(prompt: "存储挂载显示名称", placeholder: "如：家庭 AList", labelText: "扫码名") { mountNameInput = $0 }
+              TvQrInputTriggerButton(prompt: "存储挂载显示名称", placeholder: "如：家庭 NAS", labelText: "扫码名") { mountNameInput = $0 }
             }
             HStack(spacing: 12) {
               TextField(
                 mountKind == .alist
                   ? "AList / OpenList 地址（例如 http://192.168.1.10:5244）"
-                  : "WebDAV 完整地址（例如 http://192.168.1.10:5244/dav）",
+                  : (mountKind == .smb
+                      ? "SMB 地址（例如 smb://192.168.1.10 或 smb://192.168.1.10/Movies）"
+                      : "WebDAV 完整地址（例如 http://192.168.1.10:5244/dav）"),
                 text: $mountUrlInput
               )
               .font(.system(size: 16))
               .focused($modalInitialFocus, equals: "mount_field_url")
-              TvQrInputTriggerButton(prompt: "\(mountKind.title) 服务地址", placeholder: "http://192.168.1.10:5244", labelText: "扫码地址") { mountUrlInput = $0 }
+              TvQrInputTriggerButton(
+                prompt: "\(mountKind.title) 服务地址",
+                placeholder: mountKind == .smb ? "smb://192.168.1.10" : "http://192.168.1.10:5244",
+                labelText: "扫码地址"
+              ) { mountUrlInput = $0 }
             }
 
             HStack(spacing: 12) {
@@ -9507,7 +9537,10 @@ struct TvMediaLibrarySectionView: View {
             }
 
             HStack(spacing: 12) {
-              TextField("默认起始路径（默认 /）", text: $mountRootPathInput)
+              TextField(
+                mountKind == .smb ? "默认共享目录（填 / 自动列出全部共享，或填 /Movies）" : "默认起始路径（默认 /）",
+                text: $mountRootPathInput
+              )
                 .font(.system(size: 16))
                 .focused($modalInitialFocus, equals: "mount_field_root")
               TvQrInputTriggerButton(prompt: "默认起始路径", placeholder: "/", labelText: "扫码路径") { mountRootPathInput = $0 }
@@ -9516,6 +9549,11 @@ struct TvMediaLibrarySectionView: View {
                   .font(.system(size: 16))
                   .focused($modalInitialFocus, equals: "mount_field_token")
                 TvQrInputTriggerButton(prompt: "AList Token", placeholder: "alist-...", labelText: "扫码Token") { mountTokenInput = $0 }
+              } else if mountKind == .smb {
+                TextField("SMB 域 / 工作组（选填，默认留空）", text: $mountTokenInput)
+                  .font(.system(size: 16))
+                  .focused($modalInitialFocus, equals: "mount_field_token")
+                TvQrInputTriggerButton(prompt: "SMB 域 / 工作组", placeholder: "WORKGROUP", labelText: "扫码域") { mountTokenInput = $0 }
               }
             }
           }
@@ -10232,7 +10270,7 @@ struct TvMediaLibrarySectionView: View {
             }
           }
 
-          ForEach(appState.storageMounts.filter { $0.id != entry.mountId && ($0.kind == .alist || $0.kind == .webdav || $0.kind == .server) }) { targetMount in
+          ForEach(appState.storageMounts.filter { $0.id != entry.mountId && ($0.kind == .alist || $0.kind == .webdav || $0.kind == .smb || $0.kind == .server) }) { targetMount in
             if !entry.isDir {
               Button {
                 let target = entry

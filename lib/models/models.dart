@@ -995,6 +995,7 @@ enum StorageSourceKind {
   server('server', '流光服务端', '服务端'),
   alist('alist', 'AList / OpenList', 'AList'),
   webdav('webdav', 'WebDAV 远程盘', 'WebDAV'),
+  smb('smb', 'SMB 局域网共享', 'SMB'),
   cloud115('cloud115', '115 网盘直连', '115网盘'),
   localCache('localCache', '本机离线目录', '本机');
 
