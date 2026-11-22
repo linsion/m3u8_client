@@ -10,6 +10,7 @@ import 'package:http/io_client.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/models.dart';
+import 'desktop_config_backup_service.dart';
 import 'm3u8_ad_remover.dart';
 
 /// Default subscription URL requested by the user.
@@ -8859,6 +8860,7 @@ class ProxyRoutingService extends ChangeNotifier {
       _prefSubscriptionsKey,
       jsonEncode(_subscriptions.map((s) => s.toJson()).toList()),
     );
+    unawaited(DesktopConfigBackupService.syncBackupNow());
   }
 
   Future<void> _persistNodes() async {
@@ -8871,6 +8873,7 @@ class ProxyRoutingService extends ChangeNotifier {
       if (_selectedNodeId != null && _selectedNodeId!.isNotEmpty) {
         await prefs.setString(_prefSelectedNodeIdKey, _selectedNodeId!);
       }
+      unawaited(DesktopConfigBackupService.syncBackupNow());
     } catch (_) {}
   }
 
@@ -8882,6 +8885,7 @@ class ProxyRoutingService extends ChangeNotifier {
         map[k.name] = v.toJson();
       });
       await prefs.setString(_prefScenarioRulesKey, jsonEncode(map));
+      unawaited(DesktopConfigBackupService.syncBackupNow());
     } catch (_) {}
   }
 

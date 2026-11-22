@@ -11,6 +11,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/models.dart';
 import 'api_client.dart';
 import 'cloud115_upload_protocol.dart';
+import 'desktop_config_backup_service.dart';
 import 'proxy_routing_service.dart';
 
 /// 1:1 port of `github.com/deadblue/elevengo/internal/crypto/m115`
@@ -541,6 +542,7 @@ class Local115DirectService extends ChangeNotifier {
       if (_userName.isNotEmpty) {
         await prefs.setString(_prefUserNameKey, _userName);
       }
+      unawaited(DesktopConfigBackupService.syncBackupNow());
     } catch (_) {}
     if (syncToServerApi != null && _cookie.isNotEmpty) {
       try {

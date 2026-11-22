@@ -10,6 +10,7 @@ import 'package:media_kit/media_kit.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../models/models.dart';
+import '../../services/desktop_config_backup_service.dart';
 import '../../services/local_115_direct_service.dart';
 import '../../services/proxy_routing_service.dart';
 import '../../services/remote_storage_service.dart';
@@ -1256,6 +1257,7 @@ class CloudMusicController extends ChangeNotifier with WidgetsBindingObserver {
           jsonEncode(playlists.map((p) => p.toJson()).toList()),
         );
         await prefs.setString(_prefActiveMusicPlaylistIdKey, activeId);
+        unawaited(DesktopConfigBackupService.syncBackupNow());
       } catch (_) {}
     }
 

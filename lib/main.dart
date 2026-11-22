@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
+import 'services/desktop_config_backup_service.dart';
 import 'services/tv_platform_service.dart';
 import 'state/app_state.dart';
 import 'ui/main_shell.dart';
@@ -14,6 +15,7 @@ import 'ui/theme.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await DesktopConfigBackupService.ensureRestoredBeforeInit();
   MediaKit.ensureInitialized();
   try {
     await WakelockPlus.enable();

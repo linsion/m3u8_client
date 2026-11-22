@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/models.dart';
 import '../services/api_client.dart';
+import '../services/desktop_config_backup_service.dart';
 import '../services/proxy_routing_service.dart';
 import '../services/telegram_notification_service.dart';
 import '../services/tv_platform_service.dart';
@@ -422,6 +423,7 @@ class AppState extends ChangeNotifier {
       await prefs.setString(_prefAiApiKeyKey, _aiApiKey);
       await prefs.setString(_prefAiBaseUrlKey, _aiBaseUrl);
       await prefs.setString(_prefAiModelKey, _aiModel);
+      unawaited(DesktopConfigBackupService.syncBackupNow());
     } catch (_) {}
   }
   bool get vodFilterM3u8Ads => _vodFilterM3u8Ads;
@@ -520,6 +522,7 @@ class AppState extends ChangeNotifier {
 
   Future<void> initialize() async {
     if (_initialized) return;
+    await DesktopConfigBackupService.ensureRestoredBeforeInit();
     try {
       _packageInfo = await PackageInfo.fromPlatform();
     } catch (error) {
@@ -618,6 +621,7 @@ class AppState extends ChangeNotifier {
         _tvMode = savedTvMode;
       }
       await proxyService.initialize();
+      unawaited(DesktopConfigBackupService.syncBackupNow());
     } catch (_) {
       // Ignore storage init errors
     }
@@ -698,6 +702,7 @@ class AppState extends ChangeNotifier {
         _prefServerConfigKey,
         jsonEncode(newConfig.toJson()),
       );
+      unawaited(DesktopConfigBackupService.syncBackupNow());
     } catch (_) {}
     notifyListeners();
     return connectAndBootstrap();
