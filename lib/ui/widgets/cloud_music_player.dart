@@ -6461,74 +6461,105 @@ class CloudMusicBottomDockBar extends StatelessWidget {
                                         isLocalFile:
                                             controller.coverIsLocalFile,
                                       ),
-                                      const SizedBox(width: 10),
+                                      const SizedBox(width: 8),
                                       Expanded(
                                         child: Column(
                                           crossAxisAlignment:
                                               CrossAxisAlignment.start,
                                           mainAxisSize: MainAxisSize.min,
                                           children: [
-                                            Row(
-                                              children: [
-                                                Container(
-                                                  padding: const EdgeInsets
-                                                      .symmetric(
-                                                    horizontal: 5,
-                                                    vertical: 1.5,
-                                                  ),
-                                                  decoration: BoxDecoration(
-                                                    color: VideoPlatformTheme
-                                                        .accent
-                                                        .withValues(
-                                                            alpha: 0.18),
-                                                    borderRadius:
-                                                        BorderRadius.circular(
-                                                            4),
-                                                    border: Border.all(
-                                                      color: VideoPlatformTheme
-                                                          .accent
-                                                          .withValues(
-                                                              alpha: 0.5),
-                                                    ),
-                                                  ),
-                                                  child: Text(
-                                                    meta.qualityTag,
-                                                    style: TextStyle(
-                                                      fontSize: 9.5,
-                                                      fontWeight:
-                                                          FontWeight.w800,
-                                                      color: VideoPlatformTheme
-                                                          .accent,
-                                                    ),
-                                                  ),
+                                            if (isCompact)
+                                              Text(
+                                                meta.title,
+                                                maxLines: 1,
+                                                overflow: TextOverflow.ellipsis,
+                                                style: TextStyle(
+                                                  fontSize: 13,
+                                                  fontWeight: FontWeight.w700,
+                                                  color: isFocused
+                                                      ? Colors.white
+                                                      : VideoPlatformTheme
+                                                          .textPrimary,
                                                 ),
-                                                const SizedBox(width: 6),
-                                                Expanded(
-                                                  child: Text(
-                                                    meta.title,
-                                                    maxLines: 1,
-                                                    overflow:
-                                                        TextOverflow.ellipsis,
-                                                    style: TextStyle(
-                                                      fontSize: 13,
-                                                      fontWeight:
-                                                          FontWeight.w700,
-                                                      color: isFocused
-                                                          ? Colors.white
-                                                          : VideoPlatformTheme
-                                                              .textPrimary,
+                                              )
+                                            else
+                                              Row(
+                                                children: [
+                                                  ConstrainedBox(
+                                                    constraints:
+                                                        const BoxConstraints(
+                                                      maxWidth: 115,
+                                                    ),
+                                                    child: Container(
+                                                      padding: const EdgeInsets
+                                                          .symmetric(
+                                                        horizontal: 5,
+                                                        vertical: 1.5,
+                                                      ),
+                                                      decoration: BoxDecoration(
+                                                        color:
+                                                            VideoPlatformTheme
+                                                                .accent
+                                                                .withValues(
+                                                                    alpha:
+                                                                        0.18),
+                                                        borderRadius:
+                                                            BorderRadius
+                                                                .circular(4),
+                                                        border: Border.all(
+                                                          color:
+                                                              VideoPlatformTheme
+                                                                  .accent
+                                                                  .withValues(
+                                                                      alpha:
+                                                                          0.5),
+                                                        ),
+                                                      ),
+                                                      child: Text(
+                                                        meta.qualityTag,
+                                                        maxLines: 1,
+                                                        overflow: TextOverflow
+                                                            .ellipsis,
+                                                        style: TextStyle(
+                                                          fontSize: 9.5,
+                                                          fontWeight:
+                                                              FontWeight.w800,
+                                                          color:
+                                                              VideoPlatformTheme
+                                                                  .accent,
+                                                        ),
+                                                      ),
                                                     ),
                                                   ),
-                                                ),
-                                              ],
-                                            ),
+                                                  const SizedBox(width: 6),
+                                                  Expanded(
+                                                    child: Text(
+                                                      meta.title,
+                                                      maxLines: 1,
+                                                      overflow:
+                                                          TextOverflow.ellipsis,
+                                                      style: TextStyle(
+                                                        fontSize: 13,
+                                                        fontWeight:
+                                                            FontWeight.w700,
+                                                        color: isFocused
+                                                            ? Colors.white
+                                                            : VideoPlatformTheme
+                                                                .textPrimary,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
                                             const SizedBox(height: 3),
                                             Text(
                                               controller.errorText.isNotEmpty
                                                   ? controller.errorText
                                                   : (lyricLine.isNotEmpty
                                                       ? '♪ $lyricLine'
-                                                      : '${meta.artist} · ${controller.mountNameFor(activeTrack)}'),
+                                                      : (isCompact
+                                                          ? '${meta.qualityTag} · ${meta.artist}'
+                                                          : '${meta.artist} · ${controller.mountNameFor(activeTrack)}')),
                                               maxLines: 1,
                                               overflow: TextOverflow.ellipsis,
                                               style: TextStyle(
@@ -6658,24 +6689,43 @@ class CloudMusicBottomDockBar extends StatelessWidget {
                             ),
                           ),
                           const SizedBox(width: 4),
-                          OutlinedButton.icon(
-                            style: OutlinedButton.styleFrom(
-                              visualDensity: VisualDensity.compact,
+                          InkWell(
+                            borderRadius: BorderRadius.circular(14),
+                            onTap: onExpandFullscreen,
+                            child: Container(
                               padding: const EdgeInsets.symmetric(
-                                horizontal: 8,
-                                vertical: 4,
+                                horizontal: 7,
+                                vertical: 5,
                               ),
-                            ),
-                            onPressed: onExpandFullscreen,
-                            icon: const Icon(Icons.lyrics_rounded, size: 14),
-                            label: Text(
-                              '${controller.currentIndex + 1}/${controller.queue.length}',
-                              style: const TextStyle(
-                                fontSize: 11,
-                                fontWeight: FontWeight.w700,
+                              decoration: BoxDecoration(
+                                color: VideoPlatformTheme.bgCard,
+                                borderRadius: BorderRadius.circular(14),
+                                border: Border.all(
+                                  color: VideoPlatformTheme.borderStrong,
+                                ),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    Icons.lyrics_rounded,
+                                    size: 13,
+                                    color: VideoPlatformTheme.accent,
+                                  ),
+                                  const SizedBox(width: 3),
+                                  Text(
+                                    '${controller.currentIndex + 1}/${controller.queue.length}',
+                                    style: TextStyle(
+                                      fontSize: 10.5,
+                                      fontWeight: FontWeight.w700,
+                                      color: VideoPlatformTheme.textPrimary,
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
                           ),
+                          const SizedBox(width: 2),
                           IconButton(
                             tooltip: '停止并关闭音乐播放器',
                             visualDensity: VisualDensity.compact,
@@ -7028,34 +7078,41 @@ class CloudMusicFullscreenModal extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final isMobile = MediaQuery.sizeOf(context).width < 720;
+    final mqSize = MediaQuery.sizeOf(context);
+    final isMobile = mqSize.width < 720 || mqSize.shortestSide < 600;
     return Dialog(
       backgroundColor: Colors.transparent,
       insetPadding: EdgeInsets.symmetric(
-        horizontal: isMobile ? 8 : 20,
-        vertical: isMobile ? 10 : 16,
+        horizontal: isMobile ? 6 : 20,
+        vertical: isMobile ? 6 : 16,
       ),
-      child: Container(
-        width: 1140,
-        height: 730,
-        clipBehavior: Clip.antiAlias,
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(isMobile ? 16 : 20),
-          border: Border.all(
-            color: VideoPlatformTheme.accent.withValues(alpha: 0.38),
-            width: 1.2,
-          ),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: 0.65),
-              blurRadius: 36,
-              offset: const Offset(0, 16),
+      child: SafeArea(
+        top: isMobile,
+        bottom: isMobile,
+        left: isMobile,
+        right: isMobile,
+        child: Container(
+          width: 1140,
+          height: 730,
+          clipBehavior: Clip.antiAlias,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(isMobile ? 16 : 20),
+            border: Border.all(
+              color: VideoPlatformTheme.accent.withValues(alpha: 0.38),
+              width: 1.2,
             ),
-          ],
-        ),
-        child: CloudMusicHallBody(
-          controller: controller,
-          isStandalonePage: false,
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.65),
+                blurRadius: 36,
+                offset: const Offset(0, 16),
+              ),
+            ],
+          ),
+          child: CloudMusicHallBody(
+            controller: controller,
+            isStandalonePage: false,
+          ),
         ),
       ),
     );
@@ -7541,8 +7598,9 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
               : 1;
           final posMs = _ctrl.position.inMilliseconds.clamp(0, durMs);
           final progress = (posMs / durMs).clamp(0.0, 1.0);
-          final screenW = MediaQuery.sizeOf(context).width;
-          final isWide = screenW >= 820;
+          final mqSize = MediaQuery.sizeOf(context);
+          final screenW = mqSize.width;
+          final isWide = screenW >= 820 && mqSize.height >= 480;
           final showMobileQueue =
               !isWide &&
               (_mobileViewIndex == 2 ||
@@ -7619,7 +7677,8 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                 // Floating movable / hideable / closable real-time speed tag on Music Hall modal
                 if (!widget.isStandalonePage)
                   Positioned(
-                    top: isWide ? 56 : 48,
+                    top: isWide ? 56 : null,
+                    bottom: isWide ? null : 96,
                     right: 14,
                     child: const GlobalFloatingSpeedBadge(
                       compact: true,
@@ -8119,18 +8178,19 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
   }) {
     if (!isWide) {
       return Padding(
-        padding: const EdgeInsets.fromLTRB(8, 4, 8, 4),
+        padding: const EdgeInsets.fromLTRB(6, 4, 6, 4),
         child: Row(
           children: [
             if (!widget.isStandalonePage)
               IconButton(
+                visualDensity: VisualDensity.compact,
                 tooltip: '收起播放器',
                 icon: const Icon(Icons.keyboard_arrow_down_rounded),
                 onPressed: () => Navigator.of(context).pop(),
               ),
             Expanded(
               child: Padding(
-                padding: const EdgeInsets.only(left: 8),
+                padding: const EdgeInsets.only(left: 4),
                 child: Text(
                   '音乐厅',
                   maxLines: 1,
@@ -8140,25 +8200,32 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
               ),
             ),
             IconButton(
+              visualDensity: VisualDensity.compact,
               focusNode: _topPickerBtnFocusNode,
               tooltip: '选择音乐',
               onPressed: _openFolderAndArchivePicker,
-              icon: const Icon(Icons.create_new_folder_outlined),
+              icon: const Icon(Icons.create_new_folder_outlined, size: 20),
             ),
             IconButton(
+              visualDensity: VisualDensity.compact,
               tooltip: '指定目录搜歌 / AI 智能建表',
               onPressed: () => _openSmartPlaylistDialog(initialTab: 0),
-              icon: const Icon(Icons.auto_awesome_rounded),
+              icon: const Icon(Icons.auto_awesome_rounded, size: 20),
             ),
             TextButton(
+              style: TextButton.styleFrom(
+                visualDensity: VisualDensity.compact,
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              ),
               onPressed: _openPlaylistManagerDialog,
-              child: const Text('列表管理'),
+              child: const Text('列表管理', style: TextStyle(fontSize: 13)),
             ),
             if (track != null)
               IconButton(
+                visualDensity: VisualDensity.compact,
                 tooltip: '退出播放',
                 onPressed: _exitMusicPlayer,
-                icon: const Icon(Icons.power_settings_new_rounded),
+                icon: const Icon(Icons.power_settings_new_rounded, size: 20),
               ),
           ],
         ),
@@ -8854,163 +8921,178 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
     ({String title, String artist, String qualityTag}) meta, {
     bool compact = false,
   }) {
-    final discSize = compact ? 155.0 : 270.0;
-    return Padding(
-      padding: EdgeInsets.all(compact ? 12 : 24),
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          SizedBox(
-            width: discSize + 40,
-            height: discSize + 16,
-            child: Stack(
-              alignment: Alignment.center,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final availH = constraints.maxHeight.isFinite
+            ? constraints.maxHeight
+            : 480.0;
+        final maxDisc = compact ? 155.0 : 270.0;
+        final discSize = (availH * 0.52).clamp(110.0, maxDisc);
+        return SingleChildScrollView(
+          padding: EdgeInsets.all(compact ? 12 : 20),
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              minHeight: math.max(0.0, availH - (compact ? 24 : 40)),
+            ),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                AnimatedContainer(
-                  duration: const Duration(milliseconds: 500),
-                  width: discSize + 10,
-                  height: discSize + 10,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    boxShadow: [
-                      BoxShadow(
-                        color: VideoPlatformTheme.accent.withValues(
-                          alpha: _ctrl.isPlaying ? 0.25 : 0.08,
+                SizedBox(
+                  width: discSize + 40,
+                  height: discSize + 16,
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      AnimatedContainer(
+                        duration: const Duration(milliseconds: 500),
+                        width: discSize + 10,
+                        height: discSize + 10,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          boxShadow: [
+                            BoxShadow(
+                              color: VideoPlatformTheme.accent.withValues(
+                                alpha: _ctrl.isPlaying ? 0.25 : 0.08,
+                              ),
+                              blurRadius: 36,
+                              spreadRadius: 6,
+                            ),
+                          ],
                         ),
-                        blurRadius: 36,
-                        spreadRadius: 6,
                       ),
-                    ],
-                  ),
-                ),
-                RotationTransition(
-                  turns: _vinylController,
-                  child: Container(
-                    width: discSize,
-                    height: discSize,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      gradient: const SweepGradient(
-                        colors: [
-                          Color(0xFF111318),
-                          Color(0xFF282C37),
-                          Color(0xFF111318),
-                          Color(0xFF282C37),
-                          Color(0xFF111318),
-                        ],
-                      ),
-                      border: Border.all(
-                        color: VideoPlatformTheme.accent.withValues(alpha: 0.45),
-                        width: 3,
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withValues(alpha: 0.55),
-                          blurRadius: 20,
+                      RotationTransition(
+                        turns: _vinylController,
+                        child: Container(
+                          width: discSize,
+                          height: discSize,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            gradient: const SweepGradient(
+                              colors: [
+                                Color(0xFF111318),
+                                Color(0xFF282C37),
+                                Color(0xFF111318),
+                                Color(0xFF282C37),
+                                Color(0xFF111318),
+                              ],
+                            ),
+                            border: Border.all(
+                              color: VideoPlatformTheme.accent
+                                  .withValues(alpha: 0.45),
+                              width: 3,
+                            ),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withValues(alpha: 0.55),
+                                blurRadius: 20,
+                              ),
+                            ],
+                          ),
+                          child: Stack(
+                            alignment: Alignment.center,
+                            children: [
+                              for (final factor in const [0.88, 0.76, 0.64])
+                                Container(
+                                  width: discSize * factor,
+                                  height: discSize * factor,
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    border: Border.all(
+                                      color:
+                                          Colors.white.withValues(alpha: 0.06),
+                                      width: 1,
+                                    ),
+                                  ),
+                                ),
+                              Container(
+                                width: discSize * 0.48,
+                                height: discSize * 0.48,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  border: Border.all(
+                                    color: VideoPlatformTheme.accent
+                                        .withValues(alpha: 0.75),
+                                    width: 2.5,
+                                  ),
+                                ),
+                                child: ClipOval(
+                                  child: _buildAlbumCoverWidget(),
+                                ),
+                              ),
+                              Container(
+                                width: 14,
+                                height: 14,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: VideoPlatformTheme.bgPrimary,
+                                  border: Border.all(
+                                    color: Colors.white38,
+                                    width: 2,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
                         ),
-                      ],
-                    ),
-                    child: Stack(
-                      alignment: Alignment.center,
-                      children: [
-                        for (final factor in const [0.88, 0.76, 0.64])
-                          Container(
-                            width: discSize * factor,
-                            height: discSize * factor,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              border: Border.all(
-                                color: Colors.white.withValues(alpha: 0.06),
-                                width: 1,
+                      ),
+                      if (!compact && discSize >= 180)
+                        Positioned(
+                          top: 0,
+                          right: 14,
+                          child: AnimatedRotation(
+                            turns: _ctrl.isPlaying ? 0.02 : -0.07,
+                            duration: const Duration(milliseconds: 420),
+                            curve: Curves.easeInOutCubic,
+                            alignment: Alignment.topRight,
+                            child: SizedBox(
+                              width: 72,
+                              height: 130,
+                              child: CustomPaint(
+                                painter: _VinylTonearmPainter(
+                                  accentColor: VideoPlatformTheme.accent,
+                                ),
                               ),
                             ),
                           ),
-                        Container(
-                          width: discSize * 0.48,
-                          height: discSize * 0.48,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            border: Border.all(
-                              color: VideoPlatformTheme.accent
-                                  .withValues(alpha: 0.75),
-                              width: 2.5,
-                            ),
-                          ),
-                          child: ClipOval(
-                            child: _buildAlbumCoverWidget(),
-                          ),
                         ),
-                        Container(
-                          width: 14,
-                          height: 14,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: VideoPlatformTheme.bgPrimary,
-                            border: Border.all(
-                              color: Colors.white38,
-                              width: 2,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
+                    ],
                   ),
                 ),
-                if (!compact)
-                  Positioned(
-                    top: 0,
-                    right: 14,
-                    child: AnimatedRotation(
-                      turns: _ctrl.isPlaying ? 0.02 : -0.07,
-                      duration: const Duration(milliseconds: 420),
-                      curve: Curves.easeInOutCubic,
-                      alignment: Alignment.topRight,
-                      child: SizedBox(
-                        width: 72,
-                        height: 130,
-                        child: CustomPaint(
-                          painter: _VinylTonearmPainter(
-                            accentColor: VideoPlatformTheme.accent,
-                          ),
-                        ),
-                      ),
-                    ),
+                SizedBox(height: compact ? 8 : 14),
+                Text(
+                  meta.title,
+                  textAlign: TextAlign.center,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: compact ? 16 : 20,
+                    fontWeight: FontWeight.w800,
+                    color: VideoPlatformTheme.textPrimary,
                   ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '${meta.artist} · ${_ctrl.activeSubtitle.isNotEmpty ? _ctrl.activeSubtitle : track.formattedSize}',
+                  textAlign: TextAlign.center,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: VideoPlatformTheme.textSecondary,
+                  ),
+                ),
+                if (!compact) ...[
+                  const SizedBox(height: 14),
+                  _AnimatedAudioSpectrumBars(
+                    isPlaying: _ctrl.isPlaying,
+                    positionMs: _ctrl.position.inMilliseconds,
+                  ),
+                ],
               ],
             ),
           ),
-          SizedBox(height: compact ? 8 : 18),
-          Text(
-            meta.title,
-            textAlign: TextAlign.center,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              fontSize: compact ? 16 : 20,
-              fontWeight: FontWeight.w800,
-              color: VideoPlatformTheme.textPrimary,
-            ),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            '${meta.artist} · ${_ctrl.activeSubtitle.isNotEmpty ? _ctrl.activeSubtitle : track.formattedSize}',
-            textAlign: TextAlign.center,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              fontSize: 13,
-              color: VideoPlatformTheme.textSecondary,
-            ),
-          ),
-          if (!compact) ...[
-            const SizedBox(height: 18),
-            _AnimatedAudioSpectrumBars(
-              isPlaying: _ctrl.isPlaying,
-              positionMs: _ctrl.position.inMilliseconds,
-            ),
-          ],
-        ],
-      ),
+        );
+      },
     );
   }
 

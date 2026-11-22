@@ -4249,148 +4249,172 @@ class _FloatingMiniPlayerOverlayState
                         colors: [Color(0xDD000000), Color(0x00000000)],
                       ),
                     ),
-                    child: Row(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
                       children: [
-                        Icon(
-                          widget.session.isLive
-                              ? Icons.live_tv_rounded
-                              : Icons.picture_in_picture_alt_rounded,
-                          size: 14,
-                          color: VideoPlatformTheme.accent,
+                        Row(
+                          children: [
+                            Icon(
+                              widget.session.isLive
+                                  ? Icons.live_tv_rounded
+                                  : Icons.picture_in_picture_alt_rounded,
+                              size: 14,
+                              color: VideoPlatformTheme.accent,
+                            ),
+                            const SizedBox(width: 6),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(
+                                    widget.session.title,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                  if (widget.session.subtitle.isNotEmpty)
+                                    Text(
+                                      widget.session.subtitle,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        color: Colors.white70,
+                                        fontSize: 10,
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(width: 4),
+                            IconButton(
+                              visualDensity: VisualDensity.compact,
+                              padding: EdgeInsets.zero,
+                              constraints: const BoxConstraints(
+                                minWidth: 26,
+                                minHeight: 26,
+                              ),
+                              tooltip: _isLargeSize ? '缩小悬浮窗' : '放大悬浮窗',
+                              onPressed: () =>
+                                  setState(() => _isLargeSize = !_isLargeSize),
+                              icon: Icon(
+                                _isLargeSize
+                                    ? Icons.photo_size_select_small_rounded
+                                    : Icons.photo_size_select_large_rounded,
+                                size: 15,
+                                color: Colors.white,
+                              ),
+                            ),
+                            IconButton(
+                              visualDensity: VisualDensity.compact,
+                              padding: EdgeInsets.zero,
+                              constraints: const BoxConstraints(
+                                minWidth: 26,
+                                minHeight: 26,
+                              ),
+                              tooltip: '恢复大屏播放',
+                              onPressed: () => widget.onRestoreFullScreen(
+                                _player.state.position.inSeconds > 0
+                                    ? _player.state.position.inSeconds
+                                    : _lastKnownPosition.inSeconds,
+                              ),
+                              icon: const Icon(
+                                Icons.open_in_full_rounded,
+                                size: 15,
+                                color: Colors.white,
+                              ),
+                            ),
+                            IconButton(
+                              visualDensity: VisualDensity.compact,
+                              padding: EdgeInsets.zero,
+                              constraints: const BoxConstraints(
+                                minWidth: 26,
+                                minHeight: 26,
+                              ),
+                              tooltip: '关闭小窗',
+                              onPressed: widget.appState.closeMiniPlayer,
+                              icon: const Icon(
+                                Icons.close_rounded,
+                                size: 16,
+                                color: Colors.white,
+                              ),
+                            ),
+                          ],
                         ),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
+                        const SizedBox(height: 3),
+                        SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          child: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              Text(
-                                widget.session.title,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w600,
+                              if (!widget.session.isLive) ...[
+                                Video115AccelerateButton(
+                                  api: widget.appState.api,
+                                  downloadUrlBuilder: () =>
+                                      widget.session.streamUrl,
+                                  videoNameBuilder: () => widget.session.title,
+                                  headersBuilder: () => widget.session.headers,
+                                  player: _player,
+                                  selected115Url: _is115Playback
+                                      ? _selectedStreamUrl
+                                      : null,
+                                  compact: true,
+                                  overlayStyle: true,
+                                  onResolved: (resolved) async {
+                                    if (!mounted) return;
+                                    final playerSec =
+                                        _player.state.position.inSeconds;
+                                    final curSec = playerSec > 2
+                                        ? playerSec
+                                        : (_lastKnownPosition.inSeconds > 2
+                                            ? _lastKnownPosition.inSeconds
+                                            : _pendingSeekSeconds);
+                                    _recoveryTimer?.cancel();
+                                    _isRecovering = false;
+                                    _userPaused = false;
+                                    _lastKnownDuration = Duration.zero;
+                                    setState(
+                                      () => _acceleratedStream = resolved,
+                                    );
+                                    await _startPlayback(
+                                      overrideResumeSeconds: curSec,
+                                    );
+                                  },
                                 ),
+                                const SizedBox(width: 4),
+                              ],
+                              VideoProxyNodeSelector(
+                                proxyService: widget.appState.proxyService,
+                                scenario: _playbackScenario,
+                                compact: true,
+                                overlayStyle: true,
+                                onProxyChanged: (_) {
+                                  _recoveryTimer?.cancel();
+                                  _isRecovering = false;
+                                  if (_acceleratedStream != null) {
+                                    setState(() => _acceleratedStream = null);
+                                  }
+                                  final resume = widget.session.isLive
+                                      ? null
+                                      : _lastKnownPosition.inSeconds;
+                                  unawaited(
+                                    _startPlayback(
+                                      overrideResumeSeconds: resume,
+                                    ),
+                                  );
+                                },
                               ),
-                              if (widget.session.subtitle.isNotEmpty)
-                                Text(
-                                  widget.session.subtitle,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(
-                                    color: Colors.white70,
-                                    fontSize: 10,
-                                  ),
-                                ),
+                              const SizedBox(width: 4),
+                              VideoDownloadSpeedBadge(
+                                player: _player,
+                                compact: true,
+                              ),
                             ],
-                          ),
-                        ),
-                        if (!widget.session.isLive) ...[
-                          const SizedBox(width: 4),
-                          Video115AccelerateButton(
-                            api: widget.appState.api,
-                            downloadUrlBuilder: () => widget.session.streamUrl,
-                            videoNameBuilder: () => widget.session.title,
-                            headersBuilder: () => widget.session.headers,
-                            player: _player,
-                            selected115Url: _is115Playback
-                                ? _selectedStreamUrl
-                                : null,
-                            compact: true,
-                            overlayStyle: true,
-                            onResolved: (resolved) async {
-                              if (!mounted) return;
-                              final playerSec = _player.state.position.inSeconds;
-                              final curSec = playerSec > 2
-                                  ? playerSec
-                                  : (_lastKnownPosition.inSeconds > 2
-                                        ? _lastKnownPosition.inSeconds
-                                        : _pendingSeekSeconds);
-                              _recoveryTimer?.cancel();
-                              _isRecovering = false;
-                              _userPaused = false;
-                              _lastKnownDuration = Duration.zero;
-                              setState(() => _acceleratedStream = resolved);
-                              await _startPlayback(overrideResumeSeconds: curSec);
-                            },
-                          ),
-                        ],
-                        const SizedBox(width: 4),
-                        VideoProxyNodeSelector(
-                          proxyService: widget.appState.proxyService,
-                          scenario: _playbackScenario,
-                          compact: true,
-                          overlayStyle: true,
-                          onProxyChanged: (_) {
-                            _recoveryTimer?.cancel();
-                            _isRecovering = false;
-                            if (_acceleratedStream != null) {
-                              setState(() => _acceleratedStream = null);
-                            }
-                            final resume = widget.session.isLive
-                                ? null
-                                : _lastKnownPosition.inSeconds;
-                            unawaited(_startPlayback(overrideResumeSeconds: resume));
-                          },
-                        ),
-                        const SizedBox(width: 3),
-                        VideoDownloadSpeedBadge(
-                          player: _player,
-                          compact: true,
-                        ),
-                        const SizedBox(width: 2),
-                        IconButton(
-                          visualDensity: VisualDensity.compact,
-                          padding: EdgeInsets.zero,
-                          constraints: const BoxConstraints(
-                            minWidth: 26,
-                            minHeight: 26,
-                          ),
-                          tooltip: _isLargeSize ? '缩小悬浮窗' : '放大悬浮窗',
-                          onPressed: () =>
-                              setState(() => _isLargeSize = !_isLargeSize),
-                          icon: Icon(
-                            _isLargeSize
-                                ? Icons.photo_size_select_small_rounded
-                                : Icons.photo_size_select_large_rounded,
-                            size: 15,
-                            color: Colors.white,
-                          ),
-                        ),
-                        IconButton(
-                          visualDensity: VisualDensity.compact,
-                          padding: EdgeInsets.zero,
-                          constraints: const BoxConstraints(
-                            minWidth: 26,
-                            minHeight: 26,
-                          ),
-                          tooltip: '恢复大屏播放',
-                          onPressed: () => widget.onRestoreFullScreen(
-                            _player.state.position.inSeconds > 0
-                                ? _player.state.position.inSeconds
-                                : _lastKnownPosition.inSeconds,
-                          ),
-                          icon: const Icon(
-                            Icons.open_in_full_rounded,
-                            size: 15,
-                            color: Colors.white,
-                          ),
-                        ),
-                        IconButton(
-                          visualDensity: VisualDensity.compact,
-                          padding: EdgeInsets.zero,
-                          constraints: const BoxConstraints(
-                            minWidth: 26,
-                            minHeight: 26,
-                          ),
-                          tooltip: '关闭小窗',
-                          onPressed: widget.appState.closeMiniPlayer,
-                          icon: const Icon(
-                            Icons.close_rounded,
-                            size: 16,
-                            color: Colors.white,
                           ),
                         ),
                       ],

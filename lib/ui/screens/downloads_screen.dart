@@ -2053,118 +2053,151 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
         backgroundColor: Colors.black,
         insetPadding:
             isMobileDialog ? EdgeInsets.zero : const EdgeInsets.all(14),
-        child: ConstrainedBox(
-          constraints: BoxConstraints(
-            maxWidth: isMobileDialog ? double.infinity : 1200,
-            maxHeight: isMobileDialog ? double.infinity : 820,
-          ),
-          child: Column(
-            children: [
-              Container(
-                height: 46,
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                decoration: BoxDecoration(
-                  color: VideoPlatformTheme.bgElevated,
-                  border: Border(
-                    bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
-                  ),
-                ),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        widget.title,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 14,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
+        child: SafeArea(
+          top: isMobileDialog,
+          bottom: isMobileDialog,
+          left: isMobileDialog,
+          right: isMobileDialog,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxWidth: isMobileDialog ? double.infinity : 1200,
+              maxHeight: isMobileDialog ? double.infinity : 820,
+            ),
+            child: Column(
+              children: [
+                Container(
+                  height: 46,
+                  padding:
+                      EdgeInsets.symmetric(horizontal: isMobileDialog ? 6 : 12),
+                  decoration: BoxDecoration(
+                    color: VideoPlatformTheme.bgElevated,
+                    border: Border(
+                      bottom:
+                          BorderSide(color: VideoPlatformTheme.borderSubtle),
                     ),
-                    InkWell(
-                      borderRadius: BorderRadius.circular(12),
-                      onTap: () {
-                        setState(() {
-                          _fitMode = _fitMode == 'fit' ? 'cover' : 'fit';
-                        });
-                      },
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 8,
-                          vertical: 4,
+                  ),
+                  child: Row(
+                    children: [
+                      if (isMobileDialog)
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          icon: const Icon(
+                            Icons.arrow_back_ios_new_rounded,
+                            size: 17,
+                          ),
+                          onPressed: () => Navigator.of(context).pop(),
                         ),
+                      Expanded(
                         child: Text(
-                          _fitMode == 'cover' ? '比例:铺满' : '比例:适应',
-                          style: TextStyle(
-                            fontSize: 12,
+                          widget.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 13.5,
                             fontWeight: FontWeight.w600,
-                            color: _fitMode == 'cover'
-                                ? VideoPlatformTheme.accent
-                                : VideoPlatformTheme.textSecondary,
                           ),
                         ),
                       ),
-                    ),
-                    if (Platform.isAndroid || Platform.isIOS)
-                      IconButton(
-                        tooltip: '横竖屏切换',
-                        visualDensity: VisualDensity.compact,
-                        icon: const Icon(
-                          Icons.screen_rotation_rounded,
-                          size: 17,
-                        ),
-                        onPressed: _toggleOrientation,
-                      ),
-                    if (widget.onEnterMiniPlayer != null)
-                      TextButton.icon(
-                        onPressed: () {
-                          final pos = _player.state.position.inSeconds;
-                          Navigator.of(context).pop();
-                          widget.onEnterMiniPlayer!(pos);
+                      InkWell(
+                        borderRadius: BorderRadius.circular(12),
+                        onTap: () {
+                          setState(() {
+                            _fitMode = _fitMode == 'fit' ? 'cover' : 'fit';
+                          });
                         },
-                        icon: const Icon(
-                          Icons.picture_in_picture_alt_rounded,
-                          size: 16,
-                        ),
-                        label: const Text('小窗播放'),
-                      ),
-                    IconButton(
-                      visualDensity: VisualDensity.compact,
-                      icon: const Icon(Icons.close, size: 18),
-                      onPressed: () => Navigator.of(context).pop(),
-                    ),
-                  ],
-                ),
-              ),
-              Expanded(
-                child: LayoutBuilder(
-                  builder: (context, stageConstraints) {
-                    return Video(
-                      controller: _controller,
-                      width: stageConstraints.maxWidth,
-                      height: stageConstraints.maxHeight,
-                      fit: _fitMode == 'cover' ? BoxFit.cover : BoxFit.contain,
-                      fill: Colors.black,
-                      controls: (state) => Stack(
-                        fit: StackFit.expand,
-                        children: [
-                          AdaptiveVideoControls(state),
-                          Positioned(
-                            top: 12,
-                            right: 12,
-                            child: VideoDownloadSpeedBadge(
-                              player: _player,
-                              compact: true,
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 4,
+                          ),
+                          child: Text(
+                            _fitMode == 'cover' ? '铺满' : '适应',
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                              color: _fitMode == 'cover'
+                                  ? VideoPlatformTheme.accent
+                                  : VideoPlatformTheme.textSecondary,
                             ),
                           ),
-                        ],
+                        ),
                       ),
-                    );
-                  },
+                      if (Platform.isAndroid || Platform.isIOS)
+                        IconButton(
+                          tooltip: '横竖屏切换',
+                          visualDensity: VisualDensity.compact,
+                          icon: const Icon(
+                            Icons.screen_rotation_rounded,
+                            size: 17,
+                          ),
+                          onPressed: _toggleOrientation,
+                        ),
+                      if (widget.onEnterMiniPlayer != null)
+                        isMobileDialog
+                            ? IconButton(
+                                tooltip: '小窗播放',
+                                visualDensity: VisualDensity.compact,
+                                onPressed: () {
+                                  final pos = _player.state.position.inSeconds;
+                                  Navigator.of(context).pop();
+                                  widget.onEnterMiniPlayer!(pos);
+                                },
+                                icon: const Icon(
+                                  Icons.picture_in_picture_alt_rounded,
+                                  size: 17,
+                                ),
+                              )
+                            : TextButton.icon(
+                                onPressed: () {
+                                  final pos = _player.state.position.inSeconds;
+                                  Navigator.of(context).pop();
+                                  widget.onEnterMiniPlayer!(pos);
+                                },
+                                icon: const Icon(
+                                  Icons.picture_in_picture_alt_rounded,
+                                  size: 16,
+                                ),
+                                label: const Text('小窗播放'),
+                              ),
+                      IconButton(
+                        visualDensity: VisualDensity.compact,
+                        icon: const Icon(Icons.close, size: 18),
+                        onPressed: () => Navigator.of(context).pop(),
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-            ],
+                Expanded(
+                  child: LayoutBuilder(
+                    builder: (context, stageConstraints) {
+                      return Video(
+                        controller: _controller,
+                        width: stageConstraints.maxWidth,
+                        height: stageConstraints.maxHeight,
+                        fit: _fitMode == 'cover'
+                            ? BoxFit.cover
+                            : BoxFit.contain,
+                        fill: Colors.black,
+                        controls: (state) => Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            AdaptiveVideoControls(state),
+                            Positioned(
+                              top: 12,
+                              right: 12,
+                              child: VideoDownloadSpeedBadge(
+                                player: _player,
+                                compact: true,
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),
