@@ -317,6 +317,7 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
           result = await Local115DirectService.instance.list115Directory(
             cid: targetCid,
             mountId: mount.id,
+            fallbackServerApi: widget.appState.api,
           );
           if (targetCid == '0') {
             _cloud115Breadcrumbs = [(cid: '0', name: '115根目录')];

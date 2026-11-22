@@ -3216,12 +3216,40 @@ class Local115DirectService extends ChangeNotifier {
     return _cidParentMap[cid] ?? '0';
   }
 
+  /// Synchronizes the 115 cookie from the backend server settings (`/api/settings`)
+  /// if the local device does not currently have a valid 115 cookie.
+  Future<bool> syncCookieFromServerIfNeeded(ApiClient? api) async {
+    await ensureInitialized();
+    if (hasLocalCookie) return true;
+    if (api == null) return false;
+    try {
+      final settings = await api.fetchServerSettings();
+      final raw = settings.raw;
+      final srvCookie =
+          (raw['cookie_115'] ?? raw['115_cookie'] ?? raw['cookies'] ?? '')
+              .toString()
+              .trim();
+      final norm = normalizeCookieString(srvCookie);
+      if (norm.contains('UID=') &&
+          norm.contains('CID=') &&
+          norm.contains('SEID=')) {
+        await saveCookie(norm);
+        return true;
+      }
+    } catch (_) {}
+    return hasLocalCookie;
+  }
+
   Future<FileDirectoryListing> list115Directory({
     required String cid,
     String mountId = 'builtin_115',
     int maxPages = 15,
+    ApiClient? fallbackServerApi,
   }) async {
     await ensureInitialized();
+    if (!hasLocalCookie && fallbackServerApi != null) {
+      await syncCookieFromServerIfNeeded(fallbackServerApi);
+    }
     if (!hasLocalCookie) {
       throw const ApiException('请先扫码或使用 Cookie 登录 115 网盘账号');
     }
@@ -3242,42 +3270,67 @@ class Local115DirectService extends ChangeNotifier {
 
       List<dynamic>? pageItems;
       int totalCount = 0;
-      for (final urlStr in candidateUrls) {
-        try {
-          final res = await _getJson(
-            Uri.parse(urlStr),
-            timeout: const Duration(seconds: 15),
-          );
-          if (res is Map<String, dynamic>) {
-            root ??= res;
-            final stateVal = res['state'];
-            final isStateOk = stateVal == true ||
-                (int.tryParse((stateVal ?? 0).toString()) ?? 0) == 1;
-            final errNo = int.tryParse(
-                  (res['errNo'] ?? res['errno'] ?? res['errCode'] ?? 0)
-                      .toString(),
-                ) ??
-                0;
-            if (isStateOk) {
-              anyStateOk = true;
-              root = res;
-            }
-            totalCount = int.tryParse((res['count'] ?? 0).toString()) ?? 0;
-            if (res['data'] is List) {
-              final arr = res['data'] as List;
-              if (arr.isNotEmpty) {
-                root = res;
-                pageItems = arr;
+      for (var attempt = 0; attempt < 2 && pageItems == null; attempt++) {
+        bool hitAuthError = false;
+        for (final urlStr in candidateUrls) {
+          try {
+            final res = await _getJson(
+              Uri.parse(urlStr),
+              timeout: const Duration(seconds: 15),
+            );
+            if (res is Map<String, dynamic>) {
+              root ??= res;
+              final stateVal = res['state'];
+              final isStateOk = stateVal == true ||
+                  (int.tryParse((stateVal ?? 0).toString()) ?? 0) == 1;
+              final errNo = int.tryParse(
+                    (res['errNo'] ?? res['errno'] ?? res['errCode'] ?? 0)
+                        .toString(),
+                  ) ??
+                  0;
+              final errMsg =
+                  (res['error'] ?? res['msg'] ?? '').toString().trim();
+              if (!isStateOk &&
+                  (errNo == 99 ||
+                      errNo == 990001 ||
+                      errMsg.contains('登录'))) {
+                hitAuthError = true;
+              }
+              if (isStateOk) {
                 anyStateOk = true;
-                break;
-              } else if (isStateOk && errNo == 0) {
                 root = res;
-                pageItems = const [];
-                break;
+              }
+              totalCount = int.tryParse((res['count'] ?? 0).toString()) ?? 0;
+              if (res['data'] is List) {
+                final arr = res['data'] as List;
+                if (arr.isNotEmpty) {
+                  root = res;
+                  pageItems = arr;
+                  anyStateOk = true;
+                  break;
+                } else if (isStateOk && errNo == 0) {
+                  root = res;
+                  pageItems = const [];
+                  break;
+                }
               }
             }
+          } catch (_) {}
+        }
+        if (pageItems == null &&
+            hitAuthError &&
+            attempt == 0 &&
+            fallbackServerApi != null) {
+          final oldCookie = _cookie;
+          await clearCookie();
+          final synced = await syncCookieFromServerIfNeeded(fallbackServerApi);
+          if (!synced || _cookie == oldCookie) {
+            break;
           }
-        } catch (_) {}
+          root = null;
+        } else {
+          break;
+        }
       }
 
       if (pageItems == null || pageItems.isEmpty) {

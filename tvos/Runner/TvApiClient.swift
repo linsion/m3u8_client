@@ -9596,7 +9596,19 @@ final class TvLocal115DirectClient {
       let fid = TvApiClient.stringValue(item["fid"], fallback: TvApiClient.stringValue(item["file_id"])).trimmingCharacters(in: .whitespacesAndNewlines)
       let itemCid = TvApiClient.stringValue(item["cid"], fallback: TvApiClient.stringValue(item["category_id"])).trimmingCharacters(in: .whitespacesAndNewlines)
       let hasValidFid = !fid.isEmpty && fid != "0"
-      let isDir = !hasValidFid && !itemCid.isEmpty && itemCid != "0"
+      let fcStr = TvApiClient.stringValue(item["fc"]).trimmingCharacters(in: .whitespacesAndNewlines)
+      let isDir: Bool
+      if fcStr == "0" {
+        isDir = true
+      } else if fcStr == "1" {
+        isDir = false
+      } else {
+        isDir = !hasValidFid && !itemCid.isEmpty && itemCid != "0"
+      }
+      let folderCid = hasValidFid ? fid : itemCid
+      if isDir && (folderCid.isEmpty || folderCid == "0" || folderCid == cleanCid) {
+        continue
+      }
       let name = TvApiClient.stringValue(
         item["n"],
         fallback: TvApiClient.stringValue(
@@ -9627,9 +9639,9 @@ final class TvLocal115DirectClient {
       let ts = TvApiClient.intValue(item["te"], fallback: TvApiClient.intValue(item["tp"], fallback: TvApiClient.intValue(item["t"], fallback: 0)))
       let modStr = ts > 100000 ? df.string(from: Date(timeIntervalSince1970: TimeInterval(ts))) : TvApiClient.stringValue(item["te"])
       let thumb = TvApiClient.stringValue(item["u"])
-      let entryPath = isDir ? itemCid : (hasValidFid ? fid : pickcode)
+      let entryPath = isDir ? folderCid : (hasValidFid ? fid : pickcode)
       if isDir {
-        registerFolder(cid: itemCid, parentCid: cleanCid, name: name)
+        registerFolder(cid: folderCid, parentCid: cleanCid, name: name)
       }
       entries.append(
         TvFileEntry(
@@ -9645,8 +9657,8 @@ final class TvLocal115DirectClient {
           rawDownloadUrl: "",
           thumbUrl: thumb,
           pickcode115: pickcode,
-          fid115: isDir ? itemCid : fid,
-          cid115: isDir ? itemCid : cleanCid
+          fid115: isDir ? folderCid : fid,
+          cid115: isDir ? folderCid : cleanCid
         )
       )
     }

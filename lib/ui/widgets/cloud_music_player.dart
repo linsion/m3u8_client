@@ -15,6 +15,7 @@ import '../../services/proxy_routing_service.dart';
 import '../../services/remote_storage_service.dart';
 import '../../state/app_state.dart';
 import '../theme.dart';
+import 'video_115_accelerate_button.dart';
 import 'video_download_speed_badge.dart';
 
 class CloudLrcLine {
@@ -1530,6 +1531,7 @@ class CloudMusicController extends ChangeNotifier with WidgetsBindingObserver {
         final res = await Local115DirectService.instance.list115Directory(
           cid: (path.isEmpty || path == '/') ? '0' : path,
           mountId: mount.id,
+          fallbackServerApi: _boundAppState?.api,
         );
         return res.entries;
       case StorageSourceKind.localCache:
@@ -4998,11 +5000,64 @@ class _CloudMusicFolderPickerDialogState
                             ? Center(
                                 child: Padding(
                                   padding: const EdgeInsets.all(16),
-                                  child: Text(
-                                    '加载目录失败：$_error',
-                                    style: TextStyle(
-                                      color: VideoPlatformTheme.danger,
-                                    ),
+                                  child: Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Text(
+                                        '加载目录失败：$_error',
+                                        textAlign: TextAlign.center,
+                                        style: TextStyle(
+                                          color: VideoPlatformTheme.danger,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 12),
+                                      Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          if (activeMount?.kind ==
+                                              StorageSourceKind.cloud115) ...[
+                                            FilledButton.icon(
+                                              onPressed: () async {
+                                                final ok =
+                                                    await show115QuickLoginDialog(
+                                                  context: context,
+                                                  api: _ctrl.boundAppState?.api,
+                                                );
+                                                if (ok && mounted) {
+                                                  await _loadDir(
+                                                    _currentPath.isEmpty
+                                                        ? '0'
+                                                        : _currentPath,
+                                                    title: _currentTitle,
+                                                    pushCrumb: false,
+                                                  );
+                                                }
+                                              },
+                                              icon: const Icon(
+                                                Icons.qr_code_scanner_rounded,
+                                                size: 16,
+                                              ),
+                                              label: const Text(
+                                                '立即扫码登录 115 网盘',
+                                              ),
+                                            ),
+                                            const SizedBox(width: 8),
+                                          ],
+                                          OutlinedButton.icon(
+                                            onPressed: () => _loadDir(
+                                              _currentPath,
+                                              title: _currentTitle,
+                                              pushCrumb: false,
+                                            ),
+                                            icon: const Icon(
+                                              Icons.refresh_rounded,
+                                              size: 16,
+                                            ),
+                                            label: const Text('重试'),
+                                          ),
+                                        ],
+                                      ),
+                                    ],
                                   ),
                                 ),
                               )
@@ -12151,6 +12206,7 @@ class _SmartPlaylistDirectoryPickerDialogState
   final List<({String path, String title})> _breadcrumbs = [];
   List<FileEntry> _entries = const [];
   bool _isLoading = false;
+  String? _error;
   late final List<SavedMusicFolderItem> _selected;
 
   @override
@@ -12195,6 +12251,7 @@ class _SmartPlaylistDirectoryPickerDialogState
     if (mount == null) return;
     setState(() {
       _isLoading = true;
+      _error = null;
       _currentPath = path;
       _currentTitle = title;
       if (pushCrumb) {
@@ -12220,9 +12277,12 @@ class _SmartPlaylistDirectoryPickerDialogState
         _entries = filtered;
         _isLoading = false;
       });
-    } catch (_) {
+    } catch (e) {
       if (!mounted) return;
-      setState(() => _isLoading = false);
+      setState(() {
+        _error = '$e';
+        _isLoading = false;
+      });
     }
   }
 
@@ -12605,7 +12665,74 @@ class _SmartPlaylistDirectoryPickerDialogState
                     clipBehavior: Clip.antiAlias,
                     child: _isLoading
                         ? const Center(child: CircularProgressIndicator())
-                        : (_entries.isEmpty
+                        : (_error != null
+                            ? Center(
+                                child: Padding(
+                                  padding: const EdgeInsets.all(16),
+                                  child: Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Text(
+                                        '加载目录失败：$_error',
+                                        textAlign: TextAlign.center,
+                                        style: TextStyle(
+                                          fontSize: 12.5,
+                                          color: VideoPlatformTheme.danger,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 12),
+                                      Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          if (activeMount?.kind ==
+                                              StorageSourceKind.cloud115) ...[
+                                            FilledButton.icon(
+                                              onPressed: () async {
+                                                final ok =
+                                                    await show115QuickLoginDialog(
+                                                  context: context,
+                                                  api: widget.controller
+                                                      .boundAppState?.api,
+                                                );
+                                                if (ok && mounted) {
+                                                  await _loadDir(
+                                                    _currentPath.isEmpty
+                                                        ? '0'
+                                                        : _currentPath,
+                                                    title: _currentTitle,
+                                                    pushCrumb: false,
+                                                  );
+                                                }
+                                              },
+                                              icon: const Icon(
+                                                Icons.qr_code_scanner_rounded,
+                                                size: 16,
+                                              ),
+                                              label: const Text(
+                                                '立即扫码登录 115 网盘',
+                                              ),
+                                            ),
+                                            const SizedBox(width: 8),
+                                          ],
+                                          OutlinedButton.icon(
+                                            onPressed: () => _loadDir(
+                                              _currentPath,
+                                              title: _currentTitle,
+                                              pushCrumb: false,
+                                            ),
+                                            icon: const Icon(
+                                              Icons.refresh_rounded,
+                                              size: 16,
+                                            ),
+                                            label: const Text('重试'),
+                                          ),
+                                        ],
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              )
+                            : (_entries.isEmpty
                             ? Center(
                                 child: Text(
                                   '当前目录下暂无子文件夹（可直接点击右上角「勾选当前目录」或底部「确定选择」）',
@@ -12895,7 +13022,7 @@ class _SmartPlaylistDirectoryPickerDialogState
                                     ),
                                   );
                                 },
-                              )),
+                              ))),
                   ),
                 ),
               ],

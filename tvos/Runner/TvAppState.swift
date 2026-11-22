@@ -3987,6 +3987,21 @@ final class TvAppState: ObservableObject {
       )
       return res.entries
     case .cloud115:
+      if !TvLocal115DirectClient.shared.hasLocalCookie {
+        let srvSettings = await api.fetchServerSettings()
+        let srvCookie = TvApiClient.stringValue(
+          srvSettings["cookie_115"],
+          fallback: TvApiClient.stringValue(
+            srvSettings["115_cookie"],
+            fallback: TvApiClient.stringValue(srvSettings["cookies"])
+          )
+        )
+        let norm = TvLocal115DirectClient.normalizeCookieString(srvCookie)
+        if norm.contains("UID=") && norm.contains("CID=") && norm.contains("SEID=") {
+          TvLocal115DirectClient.shared.savedCookie = norm
+          self.is115LoggedIn = true
+        }
+      }
       let cid = (path.isEmpty || path == "/") ? "0" : path
       var allEntries: [TvFileEntry] = []
       var existingIds = Set<String>()

@@ -14244,6 +14244,7 @@ struct TvMusicFolderPickerSheet: View {
   @State private var showKeywordPlaylistSheet: Bool = false
   @State private var keywordPlaylistQuery: String = ""
   @State private var keywordPlaylistName: String = ""
+  @State private var show115LoginSheet: Bool = false
 
   private var filteredEntries: [TvFileEntry] {
     let kw = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -14429,13 +14430,26 @@ struct TvMusicFolderPickerSheet: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
           } else if let err = errorText {
-            VStack(spacing: 12) {
+            VStack(spacing: 16) {
               Text(err)
+                .font(.system(size: 16, weight: .semibold))
                 .foregroundColor(.red)
-              Button("重试") {
-                loadDirectory(path: currentPath, title: currentTitle)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 40)
+              HStack(spacing: 14) {
+                if selectedMount?.kind == .cloud115 {
+                  Button {
+                    show115LoginSheet = true
+                  } label: {
+                    Label("立即扫码登录 115 网盘", systemImage: "qrcode.viewfinder")
+                  }
+                  .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+                }
+                Button("重试") {
+                  loadDirectory(path: currentPath, title: currentTitle)
+                }
+                .buttonStyle(TvApplePillButtonStyle(compact: true))
               }
-              .buttonStyle(TvApplePillButtonStyle(compact: true))
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
           } else if filteredEntries.isEmpty {
@@ -14579,6 +14593,16 @@ struct TvMusicFolderPickerSheet: View {
       if !stepBackFolderIfPossible() {
         appState.showMusicFolderPickerSheet = false
       }
+    }
+    .sheet(isPresented: $show115LoginSheet) {
+      Tv115QuickLoginSheet(
+        isPresented: $show115LoginSheet,
+        onLoginCompleted: {
+          appState.is115LoggedIn = TvLocal115DirectClient.shared.hasLocalCookie
+          loadDirectory(path: currentPath.isEmpty ? "0" : currentPath, title: currentTitle, pushCrumb: false)
+        }
+      )
+      .environmentObject(appState)
     }
     .sheet(isPresented: $showKeywordPlaylistSheet) {
       ZStack {

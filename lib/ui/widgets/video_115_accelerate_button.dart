@@ -301,7 +301,7 @@ class _Video115AccelerateButtonState extends State<Video115AccelerateButton> {
 /// Returns `true` if login succeeded.
 Future<bool> show115QuickLoginDialog({
   required BuildContext context,
-  required ApiClient api,
+  ApiClient? api,
 }) async {
   final svc = Local115DirectService.instance;
   await svc.ensureInitialized();
@@ -315,10 +315,10 @@ Future<bool> show115QuickLoginDialog({
 }
 
 class _QuickLogin115Dialog extends StatefulWidget {
-  final ApiClient api;
+  final ApiClient? api;
 
   const _QuickLogin115Dialog({
-    required this.api,
+    this.api,
   });
 
   @override
