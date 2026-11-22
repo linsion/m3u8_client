@@ -4901,15 +4901,14 @@ class _CloudMusicFolderPickerDialogState
                                                         : Colors.transparent),
                                                 borderRadius:
                                                     BorderRadius.circular(8),
-                                                border: Border.all(
-                                                  color: isFocused
-                                                      ? const Color(0xFFFFE066)
-                                                      : (checked
-                                                          ? VideoPlatformTheme
-                                                              .accent
-                                                          : Colors.transparent),
-                                                  width: isFocused ? 2.2 : 1.0,
-                                                ),
+                  border: Border.all(
+                    color: isFocused
+                        ? const Color(0xFFFFE066)
+                        : (checked
+                            ? VideoPlatformTheme.accent
+                            : Colors.transparent),
+                    width: 1.2,
+                  ),
                                               ),
                                               child: ListTile(
                                                 dense: true,
@@ -6076,15 +6075,26 @@ class CloudMusicBottomDockBar extends StatelessWidget {
                             color: VideoPlatformTheme.textPrimary,
                           ),
                         ),
+                        if (controller.player != null) ...[
+                          const SizedBox(width: 6),
+                          VideoDownloadSpeedBadge(
+                            player: controller.player!,
+                            compact: true,
+                          ),
+                        ],
+                        if (controller.player != null && screenW > 540) ...[
+                          const SizedBox(width: 6),
+                          PlayerVolumeControl(
+                            player: controller.player!,
+                            compact: true,
+                            sliderWidth: screenW > 860 ? 64 : 46,
+                            showPercentage: screenW > 960,
+                            onVolumeChanged: (v) =>
+                                controller.setVolume(v / 100.0),
+                          ),
+                        ],
                         if (screenW > 860) ...[
                           const SizedBox(width: 8),
-                          if (controller.player != null) ...[
-                            VideoDownloadSpeedBadge(
-                              player: controller.player!,
-                              compact: true,
-                            ),
-                            const SizedBox(width: 10),
-                          ],
                           Text(
                             '${formatDuration(controller.position)} / ${formatDuration(controller.duration)}',
                             style: TextStyle(
@@ -7854,7 +7864,6 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                 alignment: WrapAlignment.center,
                 children: [
                   FilledButton.icon(
-                    autofocus: true,
                     style: FilledButton.styleFrom(
                       minimumSize: const Size(160, 40),
                       padding: const EdgeInsets.symmetric(
@@ -8974,26 +8983,29 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                           color: hasBarFocus
                               ? const Color(0xFFFFE066)
                               : Colors.transparent,
-                          width: hasBarFocus ? 2.0 : 1.0,
+                          width: 1.5,
                         ),
                       ),
                       child: Row(
                         children: [
-                          Text(
-                            CloudMusicBottomDockBar.formatDuration(
-                              _ctrl.position,
-                            ),
-                            style: TextStyle(
-                              fontSize: 11.5,
-                              fontWeight: hasBarFocus
-                                  ? FontWeight.w700
-                                  : FontWeight.w500,
-                              fontFeatures: const [
-                                FontFeature.tabularFigures(),
-                              ],
-                              color: hasBarFocus
-                                  ? Colors.white
-                                  : VideoPlatformTheme.textSecondary,
+                          SizedBox(
+                            width: 44,
+                            child: Text(
+                              CloudMusicBottomDockBar.formatDuration(
+                                _ctrl.position,
+                              ),
+                              style: TextStyle(
+                                fontSize: 11.5,
+                                fontWeight: hasBarFocus
+                                    ? FontWeight.w700
+                                    : FontWeight.w500,
+                                fontFeatures: const [
+                                  FontFeature.tabularFigures(),
+                                ],
+                                color: hasBarFocus
+                                    ? Colors.white
+                                    : VideoPlatformTheme.textSecondary,
+                              ),
                             ),
                           ),
                           Expanded(
@@ -9031,20 +9043,31 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                               ),
                             ),
                           ),
-                          Text(
-                            CloudMusicBottomDockBar.formatDuration(
-                              _ctrl.duration,
-                            ),
-                            style: TextStyle(
-                              fontSize: 11.5,
-                              fontFeatures: const [
-                                FontFeature.tabularFigures(),
-                              ],
-                              color: hasBarFocus
-                                  ? Colors.white
-                                  : VideoPlatformTheme.textSecondary,
+                          SizedBox(
+                            width: 44,
+                            child: Text(
+                              CloudMusicBottomDockBar.formatDuration(
+                                _ctrl.duration,
+                              ),
+                              textAlign: TextAlign.right,
+                              style: TextStyle(
+                                fontSize: 11.5,
+                                fontFeatures: const [
+                                  FontFeature.tabularFigures(),
+                                ],
+                                color: hasBarFocus
+                                    ? Colors.white
+                                    : VideoPlatformTheme.textSecondary,
+                              ),
                             ),
                           ),
+                          if (_ctrl.player != null) ...[
+                            const SizedBox(width: 8),
+                            VideoDownloadSpeedBadge(
+                              player: _ctrl.player!,
+                              compact: true,
+                            ),
+                          ],
                           if (hasBarFocus && isWide) ...[
                             const SizedBox(width: 8),
                             Container(
@@ -9168,6 +9191,14 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                     size: 28,
                   ),
                 ),
+                if (_ctrl.player != null)
+                  PlayerVolumeControl(
+                    player: _ctrl.player!,
+                    compact: true,
+                    sliderWidth: 54,
+                    showPercentage: false,
+                    onVolumeChanged: (v) => _ctrl.setVolume(v / 100.0),
+                  ),
                 PopupMenuButton<String>(
                   tooltip: '更多播放控制',
                   onSelected: (action) {
@@ -9563,32 +9594,39 @@ class _CloudMusicSmartPlaylistDialogState
     _initDefaultSources();
   }
 
-  Future<void> _initDefaultSources() async {
+  void _populateDefaultSourcesSync() {
+    if (_selectedSources.isNotEmpty) return;
     if (widget.initialSources != null && widget.initialSources!.isNotEmpty) {
       _selectedSources.addAll(widget.initialSources!);
+    } else if (_ctrl.savedMusicFolders.isNotEmpty) {
+      _selectedSources.addAll(_ctrl.savedMusicFolders);
+    } else if (_ctrl.activePlaylist != null &&
+        _ctrl.activePlaylist!.sources.isNotEmpty) {
+      _selectedSources.addAll(_ctrl.activePlaylist!.sources);
+    } else if (_ctrl.availableMounts.isNotEmpty) {
+      final m = _ctrl.availableMounts.first;
+      _selectedSources.add(
+        SavedMusicFolderItem(
+          mountId: m.id,
+          mountName: m.name,
+          sourceKind: m.kind,
+          path: m.rootPath,
+          title: m.name,
+        ),
+      );
+    }
+  }
+
+  Future<void> _initDefaultSources() async {
+    _populateDefaultSourcesSync();
+    if (_selectedSources.isNotEmpty && _ctrl.availableMounts.isNotEmpty) {
       return;
     }
     await _ctrl.refreshAvailableMounts();
     if (!mounted) return;
-    setState(() {
-      if (_ctrl.savedMusicFolders.isNotEmpty) {
-        _selectedSources.addAll(_ctrl.savedMusicFolders);
-      } else if (_ctrl.activePlaylist != null &&
-          _ctrl.activePlaylist!.sources.isNotEmpty) {
-        _selectedSources.addAll(_ctrl.activePlaylist!.sources);
-      } else if (_ctrl.availableMounts.isNotEmpty) {
-        final m = _ctrl.availableMounts.first;
-        _selectedSources.add(
-          SavedMusicFolderItem(
-            mountId: m.id,
-            mountName: m.name,
-            sourceKind: m.kind,
-            path: m.rootPath,
-            title: m.name,
-          ),
-        );
-      }
-    });
+    if (_selectedSources.isEmpty) {
+      setState(_populateDefaultSourcesSync);
+    }
   }
 
   @override
@@ -9986,7 +10024,8 @@ class _CloudMusicSmartPlaylistDialogState
       borderRadius: BorderRadius.circular(10),
       onTap: () => setState(() => _activeTab = index),
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+        height: 38,
+        padding: const EdgeInsets.symmetric(horizontal: 12),
         decoration: BoxDecoration(
           color: selected
               ? VideoPlatformTheme.accent.withValues(alpha: 0.22)
@@ -9996,7 +10035,7 @@ class _CloudMusicSmartPlaylistDialogState
             color: selected
                 ? VideoPlatformTheme.accent
                 : VideoPlatformTheme.borderSubtle,
-            width: selected ? 1.5 : 1.0,
+            width: 1.2,
           ),
         ),
         child: Row(
@@ -10059,38 +10098,44 @@ class _CloudMusicSmartPlaylistDialogState
               ),
               const SizedBox(width: 8),
               Expanded(
-                child: _selectedSources.isEmpty
-                    ? Text(
-                        '尚未选择目录，请点击右侧「选择指定目录」',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: VideoPlatformTheme.danger,
-                        ),
-                      )
-                    : SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        child: Row(
-                          children: [
-                            for (int i = 0; i < _selectedSources.length; i++)
-                              Padding(
-                                padding: const EdgeInsets.only(right: 6),
-                                child: InputChip(
-                                  visualDensity: VisualDensity.compact,
-                                  label: Text(
-                                    '${_selectedSources[i].mountName}: ${_selectedSources[i].title}',
-                                    style: const TextStyle(fontSize: 11.5),
+                child: SizedBox(
+                  height: 32,
+                  child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: _selectedSources.isEmpty
+                        ? Text(
+                            '尚未选择目录，请点击右侧「选择指定目录」',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: VideoPlatformTheme.danger,
+                            ),
+                          )
+                        : SingleChildScrollView(
+                            scrollDirection: Axis.horizontal,
+                            child: Row(
+                              children: [
+                                for (int i = 0; i < _selectedSources.length; i++)
+                                  Padding(
+                                    padding: const EdgeInsets.only(right: 6),
+                                    child: InputChip(
+                                      visualDensity: VisualDensity.compact,
+                                      label: Text(
+                                        '${_selectedSources[i].mountName}: ${_selectedSources[i].title}',
+                                        style: const TextStyle(fontSize: 11.5),
+                                      ),
+                                      onDeleted: _selectedSources.length > 1
+                                          ? () => setState(() {
+                                                _selectedSources.removeAt(i);
+                                                _scannedAllTracks = const [];
+                                              })
+                                          : null,
+                                    ),
                                   ),
-                                  onDeleted: _selectedSources.length > 1
-                                      ? () => setState(() {
-                                            _selectedSources.removeAt(i);
-                                            _scannedAllTracks = const [];
-                                          })
-                                      : null,
-                                ),
-                              ),
-                          ],
-                        ),
-                      ),
+                              ],
+                            ),
+                          ),
+                  ),
+                ),
               ),
               const SizedBox(width: 8),
               OutlinedButton.icon(
@@ -10102,46 +10147,50 @@ class _CloudMusicSmartPlaylistDialogState
           ),
           if (_ctrl.savedMusicFolders.isNotEmpty) ...[
             const SizedBox(height: 6),
-            SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: Row(
-                children: [
-                  Text(
-                    '常用目录快选: ',
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: VideoPlatformTheme.textMuted,
-                    ),
-                  ),
-                  for (final fav in _ctrl.savedMusicFolders)
-                    Padding(
-                      padding: const EdgeInsets.only(right: 6),
-                      child: FilterChip(
-                        visualDensity: VisualDensity.compact,
-                        label: Text(
-                          '${fav.mountName}: ${fav.title}',
-                          style: const TextStyle(fontSize: 11),
-                        ),
-                        selected: _selectedSources
-                            .any((s) => s.uniqueKey == fav.uniqueKey),
-                        onSelected: (sel) {
-                          setState(() {
-                            if (sel) {
-                              if (!_selectedSources
-                                  .any((s) => s.uniqueKey == fav.uniqueKey)) {
-                                _selectedSources.add(fav);
-                              }
-                            } else {
-                              _selectedSources.removeWhere(
-                                (s) => s.uniqueKey == fav.uniqueKey,
-                              );
-                            }
-                            _scannedAllTracks = const [];
-                          });
-                        },
+            SizedBox(
+              height: 30,
+              child: SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  children: [
+                    Text(
+                      '常用目录快选: ',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: VideoPlatformTheme.textMuted,
                       ),
                     ),
-                ],
+                    for (final fav in _ctrl.savedMusicFolders)
+                      Padding(
+                        padding: const EdgeInsets.only(right: 6),
+                        child: FilterChip(
+                          showCheckmark: false,
+                          visualDensity: VisualDensity.compact,
+                          label: Text(
+                            '${fav.mountName}: ${fav.title}',
+                            style: const TextStyle(fontSize: 11),
+                          ),
+                          selected: _selectedSources
+                              .any((s) => s.uniqueKey == fav.uniqueKey),
+                          onSelected: (sel) {
+                            setState(() {
+                              if (sel) {
+                                if (!_selectedSources
+                                    .any((s) => s.uniqueKey == fav.uniqueKey)) {
+                                  _selectedSources.add(fav);
+                                }
+                              } else {
+                                _selectedSources.removeWhere(
+                                  (s) => s.uniqueKey == fav.uniqueKey,
+                                );
+                              }
+                              _scannedAllTracks = const [];
+                            });
+                          },
+                        ),
+                      ),
+                  ],
+                ),
               ),
             ),
           ],
@@ -10154,41 +10203,46 @@ class _CloudMusicSmartPlaylistDialogState
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Row(
-          children: [
-            Expanded(
-              flex: 3,
-              child: TextField(
-                controller: _keywordCtrl,
-                onChanged: (v) {
-                  if (!_playlistNameManuallyEdited) {
-                    _newPlaylistNameCtrl.text = v.trim();
-                  }
-                },
-                onSubmitted: (_) => _runKeywordSearchInSources(),
-                decoration: const InputDecoration(
-                  labelText: '输入指定人名 (歌手) 或关键词',
-                  hintText: '例如：周杰伦、陈奕迅、粤语、无损 (多个词用空格或逗号分隔)',
-                  prefixIcon: Icon(Icons.person_search_rounded, size: 18),
-                  isDense: true,
+        SizedBox(
+          height: 40,
+          child: Row(
+            children: [
+              Expanded(
+                flex: 3,
+                child: TextField(
+                  controller: _keywordCtrl,
+                  onChanged: (v) {
+                    if (!_playlistNameManuallyEdited) {
+                      _newPlaylistNameCtrl.text = v.trim();
+                    }
+                  },
+                  onSubmitted: (_) => _runKeywordSearchInSources(),
+                  decoration: const InputDecoration(
+                    labelText: '输入指定人名 (歌手) 或关键词',
+                    hintText: '例如：周杰伦、陈奕迅、粤语、无损 (多个词用空格或逗号分隔)',
+                    floatingLabelBehavior: FloatingLabelBehavior.always,
+                    prefixIcon: Icon(Icons.person_search_rounded, size: 18),
+                    isDense: true,
+                  ),
                 ),
               ),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              flex: 2,
-              child: TextField(
-                controller: _newPlaylistNameCtrl,
-                onChanged: (_) => _playlistNameManuallyEdited = true,
-                decoration: const InputDecoration(
-                  labelText: '新建播放列表名称',
-                  hintText: '默认使用查找的人名或关键词',
-                  prefixIcon: Icon(Icons.queue_music_rounded, size: 18),
-                  isDense: true,
+              const SizedBox(width: 10),
+              Expanded(
+                flex: 2,
+                child: TextField(
+                  controller: _newPlaylistNameCtrl,
+                  onChanged: (_) => _playlistNameManuallyEdited = true,
+                  decoration: const InputDecoration(
+                    labelText: '新建播放列表名称',
+                    hintText: '默认使用查找的人名或关键词',
+                    floatingLabelBehavior: FloatingLabelBehavior.always,
+                    prefixIcon: Icon(Icons.queue_music_rounded, size: 18),
+                    isDense: true,
+                  ),
                 ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
         const SizedBox(height: 8),
         Wrap(
@@ -10197,18 +10251,21 @@ class _CloudMusicSmartPlaylistDialogState
           crossAxisAlignment: WrapCrossAlignment.center,
           children: [
             ChoiceChip(
+              showCheckmark: false,
               visualDensity: VisualDensity.compact,
               label: const Text('匹配任一关键词 (OR)', style: TextStyle(fontSize: 11.5)),
               selected: !_matchAllKeywords,
               onSelected: (_) => setState(() => _matchAllKeywords = false),
             ),
             ChoiceChip(
+              showCheckmark: false,
               visualDensity: VisualDensity.compact,
               label: const Text('同时包含所有关键词 (AND)', style: TextStyle(fontSize: 11.5)),
               selected: _matchAllKeywords,
               onSelected: (_) => setState(() => _matchAllKeywords = true),
             ),
             FilterChip(
+              showCheckmark: false,
               visualDensity: VisualDensity.compact,
               label: const Text('包含子目录与压缩包', style: TextStyle(fontSize: 11.5)),
               selected: _includeSubfolders,
@@ -10451,6 +10508,7 @@ class _CloudMusicSmartPlaylistDialogState
                       ('claude', 'Claude'),
                     ])
                       ChoiceChip(
+                        showCheckmark: false,
                         visualDensity: VisualDensity.compact,
                         label: Text(
                           item.$2,
@@ -10466,37 +10524,42 @@ class _CloudMusicSmartPlaylistDialogState
                   ],
                 ),
                 const SizedBox(height: 8),
-                Row(
-                  children: [
-                    Expanded(
-                      flex: 3,
-                      child: TextField(
-                        controller: _inlineAiKeyCtrl,
-                        decoration: const InputDecoration(
-                          labelText: 'AI API Key',
-                          hintText: '输入 sk-... 或 AIza...',
-                          isDense: true,
+                SizedBox(
+                  height: 40,
+                  child: Row(
+                    children: [
+                      Expanded(
+                        flex: 3,
+                        child: TextField(
+                          controller: _inlineAiKeyCtrl,
+                          decoration: const InputDecoration(
+                            labelText: 'AI API Key',
+                            hintText: '输入 sk-... 或 AIza...',
+                            floatingLabelBehavior: FloatingLabelBehavior.always,
+                            isDense: true,
+                          ),
                         ),
                       ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      flex: 2,
-                      child: TextField(
-                        controller: _inlineAiModelCtrl,
-                        decoration: const InputDecoration(
-                          labelText: '模型 (可选)',
-                          hintText: 'gpt-4o-mini / deepseek-chat',
-                          isDense: true,
+                      const SizedBox(width: 8),
+                      Expanded(
+                        flex: 2,
+                        child: TextField(
+                          controller: _inlineAiModelCtrl,
+                          decoration: const InputDecoration(
+                            labelText: '模型 (可选)',
+                            hintText: 'gpt-4o-mini / deepseek-chat',
+                            floatingLabelBehavior: FloatingLabelBehavior.always,
+                            isDense: true,
+                          ),
                         ),
                       ),
-                    ),
-                    const SizedBox(width: 8),
-                    FilledButton(
-                      onPressed: _saveInlineAiSettings,
-                      child: const Text('保存 Key'),
-                    ),
-                  ],
+                      const SizedBox(width: 8),
+                      FilledButton(
+                        onPressed: _saveInlineAiSettings,
+                        child: const Text('保存 Key'),
+                      ),
+                    ],
+                  ),
                 ),
               ],
             ],
@@ -10526,6 +10589,7 @@ class _CloudMusicSmartPlaylistDialogState
               ('era', '按年代 / 时期'),
             ])
               ChoiceChip(
+                showCheckmark: false,
                 visualDensity: VisualDensity.compact,
                 label: Text(dim.$2, style: const TextStyle(fontSize: 11.5)),
                 selected: _aiDimension == dim.$1,
@@ -10536,35 +10600,39 @@ class _CloudMusicSmartPlaylistDialogState
           ],
         ),
         const SizedBox(height: 8),
-        Row(
-          children: [
-            Expanded(
-              child: TextField(
-                controller: _aiCustomInstructionCtrl,
-                decoration: const InputDecoration(
-                  labelText: '自定义分类要求 (可选)',
-                  hintText: '例如：帮我按粤语怀旧、周杰伦精选、适合开车听的快歌分成三类',
-                  isDense: true,
+        SizedBox(
+          height: 40,
+          child: Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _aiCustomInstructionCtrl,
+                  decoration: const InputDecoration(
+                    labelText: '自定义分类要求 (可选)',
+                    hintText: '例如：帮我按粤语怀旧、周杰伦精选、适合开车听的快歌分成三类',
+                    floatingLabelBehavior: FloatingLabelBehavior.always,
+                    isDense: true,
+                  ),
                 ),
               ),
-            ),
-            const SizedBox(width: 10),
-            FilledButton.icon(
-              onPressed: _isAnalyzingAi
-                  ? null
-                  : () => _runAiDirectoryAnalysis(createImmediately: false),
-              icon: const Icon(Icons.auto_awesome_rounded, size: 16),
-              label: const Text('AI 分析目录并预览分类'),
-            ),
-            const SizedBox(width: 8),
-            OutlinedButton.icon(
-              onPressed: _isAnalyzingAi
-                  ? null
-                  : () => _runAiDirectoryAnalysis(createImmediately: true),
-              icon: const Icon(Icons.playlist_add_check_rounded, size: 16),
-              label: const Text('AI 分析并直接生成列表'),
-            ),
-          ],
+              const SizedBox(width: 10),
+              FilledButton.icon(
+                onPressed: _isAnalyzingAi
+                    ? null
+                    : () => _runAiDirectoryAnalysis(createImmediately: false),
+                icon: const Icon(Icons.auto_awesome_rounded, size: 16),
+                label: const Text('AI 分析目录并预览分类'),
+              ),
+              const SizedBox(width: 8),
+              OutlinedButton.icon(
+                onPressed: _isAnalyzingAi
+                    ? null
+                    : () => _runAiDirectoryAnalysis(createImmediately: true),
+                icon: const Icon(Icons.playlist_add_check_rounded, size: 16),
+                label: const Text('AI 分析并直接生成列表'),
+              ),
+            ],
+          ),
         ),
         const SizedBox(height: 10),
         if (_isAnalyzingAi)
@@ -10840,6 +10908,7 @@ class _SmartPlaylistDirectoryPickerDialogState
                     Padding(
                       padding: const EdgeInsets.only(right: 8),
                       child: ChoiceChip(
+                        showCheckmark: false,
                         label: Text(m.name),
                         selected: activeMount?.id == m.id,
                         onSelected: (_) => _selectMount(m),

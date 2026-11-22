@@ -47,6 +47,7 @@ class MainShell extends StatefulWidget {
 
 class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   int _selectedIndex = 0;
+  int _lastPrimaryTabIndex = 0;
   final List<int> _tabHistory = <int>[0];
   bool _isSidebarCollapsed = false;
   bool _isMobileSidebarOpen = false;
@@ -58,6 +59,54 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   final Map<int, FocusNode> _sidebarTabFocusNodes = {
     for (int i = 0; i <= 9; i++) i: FocusNode(debugLabel: 'SidebarTab_$i'),
   };
+
+  static bool _isUtilityTab(int index) => index == 6 || index == 8;
+
+  static String _tabDisplayName(int index) {
+    return switch (index) {
+      0 => '影视片库',
+      1 => '电视直播',
+      2 => '下载工作台',
+      3 => '视频资料库',
+      4 => '历史与收藏',
+      5 => 'Telegram 会话',
+      6 => '代理服务器',
+      7 => '终端命令行',
+      8 => '偏好设置',
+      9 => '流光音乐',
+      _ => '影视片库',
+    };
+  }
+
+  int _resolvePreviousTabIndex() {
+    for (var i = _tabHistory.length - 1; i >= 0; i--) {
+      final candidate = _tabHistory[i];
+      if (candidate != _selectedIndex) {
+        return candidate;
+      }
+    }
+    if (_lastPrimaryTabIndex != _selectedIndex) {
+      return _lastPrimaryTabIndex;
+    }
+    return 0;
+  }
+
+  void _navigateBackToPreviousTab() {
+    while (_tabHistory.isNotEmpty && _tabHistory.last == _selectedIndex) {
+      _tabHistory.removeLast();
+    }
+    int target;
+    if (_tabHistory.isNotEmpty) {
+      target = _tabHistory.last;
+    } else if (_lastPrimaryTabIndex != _selectedIndex) {
+      target = _lastPrimaryTabIndex;
+      _tabHistory.add(target);
+    } else {
+      target = 0;
+      _tabHistory.add(0);
+    }
+    _selectTab(target, recordHistory: false);
+  }
 
   @override
   void initState() {
@@ -86,6 +135,12 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     final screenW = MediaQuery.maybeSizeOf(context)?.width ?? 1024;
     widget.appState.setImmersiveFullscreen(false);
     setState(() {
+      if (!_isUtilityTab(_selectedIndex)) {
+        _lastPrimaryTabIndex = _selectedIndex;
+      }
+      if (!_isUtilityTab(index)) {
+        _lastPrimaryTabIndex = index;
+      }
       if (recordHistory && index != _selectedIndex) {
         _tabHistory.remove(index);
         _tabHistory.add(index);
@@ -495,7 +550,13 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       return;
     }
 
-    // Step 5: On TV / Desktop layout, step focus back from Content Area -> Main Navigation Bar/Sidebar -> Tab 0 Focus
+    // Step 4.5: If on Proxy (6) or Settings (8), pressing Back / Escape returns directly to the previous screen
+    if (_isUtilityTab(_selectedIndex)) {
+      _navigateBackToPreviousTab();
+      return;
+    }
+
+    // Step 5: On TV / Desktop layout, step focus back from Content Area -> Main Navigation Bar/Sidebar -> Previous Tab / Tab 0 Focus
     final screenW = MediaQuery.maybeSizeOf(context)?.width ?? 1024;
     final isDesktopOrTv = screenW >= 860 || state.tvMode;
     if (isDesktopOrTv && !fromEdgeSwipe) {
@@ -504,25 +565,14 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
         return;
       }
       if (_selectedIndex != 0) {
-        _tabHistory
-          ..clear()
-          ..add(0);
-        _selectTab(0, recordHistory: false);
-        _focusSidebarTab(0);
+        _navigateBackToPreviousTab();
+        _focusSidebarTab(_selectedIndex);
         return;
       }
     } else {
       // Mobile layout (or edge swipe): step back through tab navigation history first
-      while (_tabHistory.isNotEmpty && _tabHistory.last == _selectedIndex) {
-        _tabHistory.removeLast();
-      }
-      if (_tabHistory.isNotEmpty) {
-        final prevTab = _tabHistory.removeLast();
-        _selectTab(prevTab, recordHistory: false);
-        return;
-      }
-      if (_selectedIndex != 0) {
-        _selectTab(0, recordHistory: false);
+      if (_selectedIndex != 0 || _tabHistory.length > 1) {
+        _navigateBackToPreviousTab();
         return;
       }
     }
@@ -605,6 +655,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                             ),
                           ),
                         Expanded(
+                          key: const ValueKey('main_shell_body_expanded'),
                           child: Stack(
                             children: [
                               Row(
@@ -623,6 +674,9 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                                       ),
                                     ),
                                   Expanded(
+                                    key: const ValueKey(
+                                      'main_shell_content_expanded',
+                                    ),
                                     child: Stack(
                                       fit: StackFit.expand,
                                       children: [
@@ -645,15 +699,45 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                                             ),
                                           ),
                                         ),
-                                        if (_selectedIndex != 5)
+                                        if (_lastPrimaryTabIndex != 5 &&
+                                            (_selectedIndex ==
+                                                    _lastPrimaryTabIndex ||
+                                                _isUtilityTab(_selectedIndex)))
+                                          Offstage(
+                                            offstage: _selectedIndex !=
+                                                _lastPrimaryTabIndex,
+                                            child: TickerMode(
+                                              enabled: _selectedIndex ==
+                                                  _lastPrimaryTabIndex,
+                                              child: ExcludeFocus(
+                                                excluding: _selectedIndex !=
+                                                    _lastPrimaryTabIndex,
+                                                child: FocusTraversalGroup(
+                                                  child: KeyedSubtree(
+                                                    key: ValueKey(
+                                                      'primary_${_lastPrimaryTabIndex}_${state.themeId}',
+                                                    ),
+                                                    child: _buildScreenForTab(
+                                                      _lastPrimaryTabIndex,
+                                                      state,
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        if (_isUtilityTab(_selectedIndex))
                                           FocusTraversalGroup(
                                             child: KeyedSubtree(
                                               key: ValueKey(
                                                 _selectedIndex == 8
                                                     ? 'settings'
-                                                    : '${_selectedIndex}_${state.themeId}',
+                                                    : 'utility_${_selectedIndex}_${state.themeId}',
                                               ),
-                                              child: _buildActiveScreen(state),
+                                              child: _buildScreenForTab(
+                                                _selectedIndex,
+                                                state,
+                                              ),
                                             ),
                                           ),
                                       ],
@@ -791,6 +875,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                   context,
                   sources: state.visibleSources,
                   selectedSource: state.selectedSource,
+                  appState: state,
                   onSelect: (src) {
                     setState(() => _selectedIndex = 0);
                     state.selectVodSource(src);
@@ -1164,9 +1249,25 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                       icon: const Icon(Icons.history_rounded, size: 20),
                     ),
                     IconButton(
-                      tooltip: '系统设置',
-                      onPressed: () => _selectTab(8),
-                      icon: const Icon(Icons.settings_outlined, size: 20),
+                      tooltip: _selectedIndex == 8
+                          ? '返回${_tabDisplayName(_resolvePreviousTabIndex())}'
+                          : '系统设置',
+                      onPressed: () {
+                        if (_selectedIndex == 8) {
+                          _navigateBackToPreviousTab();
+                        } else {
+                          _selectTab(8);
+                        }
+                      },
+                      icon: Icon(
+                        _selectedIndex == 8
+                            ? Icons.settings_rounded
+                            : Icons.settings_outlined,
+                        size: 20,
+                        color: _selectedIndex == 8
+                            ? VideoPlatformTheme.accent
+                            : null,
+                      ),
                     ),
                     IconButton(
                       tooltip: '退出登录',
@@ -1361,6 +1462,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                       context,
                       sources: state.visibleSources,
                       selectedSource: state.selectedSource,
+                      appState: state,
                       onSelect: (src) {
                         _selectTab(0);
                         state.selectVodSource(src);
@@ -1414,7 +1516,13 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       onFocusChange: (_) {
         if (mounted) setState(() {});
       },
-      onTap: () => _selectTab(index),
+      onTap: () {
+        if (selected && _isUtilityTab(index)) {
+          _navigateBackToPreviousTab();
+        } else {
+          _selectTab(index);
+        }
+      },
       child: Builder(
         builder: (ctx) {
           final isFocused = Focus.of(ctx).hasPrimaryFocus;
@@ -1730,10 +1838,16 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
             ),
           ),
           const SizedBox(width: 8),
-          // 3. Compact Proxy indicator button (tap -> Proxy settings, long-press -> toggle)
+          // 3. Compact Proxy indicator button (tap -> Proxy settings / back, long-press -> toggle)
           InkWell(
             borderRadius: BorderRadius.circular(18),
-            onTap: () => _selectTab(6),
+            onTap: () {
+              if (_selectedIndex == 6) {
+                _navigateBackToPreviousTab();
+              } else {
+                _selectTab(6);
+              }
+            },
             onLongPress: () =>
                 state.proxyService.setProxyEnabled(!proxyEnabled),
             child: Container(
@@ -1811,8 +1925,8 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
           if (isSubPage)
             IconButton(
               visualDensity: VisualDensity.compact,
-              tooltip: '返回影视首页',
-              onPressed: () => _selectTab(0),
+              tooltip: '返回${_tabDisplayName(_resolvePreviousTabIndex())}',
+              onPressed: _navigateBackToPreviousTab,
               icon: const Icon(Icons.arrow_back_ios_new_rounded, size: 17),
             )
           else
@@ -2030,21 +2144,31 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     final svc = state.proxyService;
     final enabled = svc.proxyEnabled;
     final active = svc.activeNode;
+    final isOnProxyTab = _selectedIndex == 6;
+    final prevName = _tabDisplayName(_resolvePreviousTabIndex());
 
     return InkWell(
       borderRadius: BorderRadius.circular(6),
       onFocusChange: (_) {
         if (mounted) setState(() {});
       },
-      onTap: () => _selectTab(6),
+      onTap: () {
+        if (isOnProxyTab) {
+          _navigateBackToPreviousTab();
+        } else {
+          _selectTab(6);
+        }
+      },
       onLongPress: () => svc.setProxyEnabled(!enabled),
       child: Builder(
         builder: (ctx) {
           final isFocused = Focus.of(ctx).hasPrimaryFocus;
           return Tooltip(
-            message: enabled
-                ? '代理已开启 (${active?.displayTitle ?? "未选节点"}) · 点击进入代理与分流管理，长按快速开关'
-                : '代理已关闭 · 点击配置良心云订阅与分场景路由，长按快速开启',
+            message: isOnProxyTab
+                ? '点击返回$prevName · 长按快速开关代理'
+                : (enabled
+                    ? '代理已开启 (${active?.displayTitle ?? "未选节点"}) · 点击进入代理与分流管理，长按快速开关'
+                    : '代理已关闭 · 点击配置良心云订阅与分场景路由，长按快速开启'),
             child: Container(
               height: 34,
               padding: const EdgeInsets.symmetric(horizontal: 10),
@@ -2527,7 +2651,13 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
         onFocusChange: (_) {
           if (mounted) setState(() {});
         },
-        onTap: () => _selectTab(index),
+        onTap: () {
+          if (selected && _isUtilityTab(index)) {
+            _navigateBackToPreviousTab();
+          } else {
+            _selectTab(index);
+          }
+        },
         child: Builder(
           builder: (ctx) {
             final isFocused = Focus.of(ctx).hasPrimaryFocus;
@@ -3026,6 +3156,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                             context,
                             sources: visibleSources,
                             selectedSource: state.selectedSource,
+                            appState: state,
                             onSelect: (src) {
                               _selectTab(0);
                               state.selectVodSource(src);
@@ -3439,8 +3570,10 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildActiveScreen(AppState state) {
-    switch (_selectedIndex) {
+  Widget _buildScreenForTab(int tabIndex, AppState state) {
+    final prevTab = _resolvePreviousTabIndex();
+    final prevLabel = _tabDisplayName(prevTab);
+    switch (tabIndex) {
       case 0:
         return VodHomeScreen(appState: state);
       case 1:
@@ -3454,11 +3587,19 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       case 5:
         return TelegramScreen(appState: state);
       case 6:
-        return ProxyServerScreen(appState: state);
+        return ProxyServerScreen(
+          appState: state,
+          onBackToPrevious: _navigateBackToPreviousTab,
+          previousTabLabel: prevLabel,
+        );
       case 7:
         return TerminalScreen(appState: state);
       case 8:
-        return SettingsScreen(appState: state);
+        return SettingsScreen(
+          appState: state,
+          onBackToPrevious: _navigateBackToPreviousTab,
+          previousTabLabel: prevLabel,
+        );
       case 9:
         return CloudMusicStandaloneScreen(appState: state);
       default:
@@ -4005,10 +4146,13 @@ class _FloatingMiniPlayerOverlayState
   @override
   Widget build(BuildContext context) {
     final screenSize = MediaQuery.sizeOf(context);
+    final baseNormalWidth = widget.session.isLive ? 410.0 : 360.0;
     final width = _isLargeSize
-        ? (screenSize.width - 20).clamp(320.0, 440.0)
-        : 340.0;
-    final height = _isLargeSize ? 248.0 : 200.0;
+        ? (screenSize.width - 20).clamp(360.0, 520.0)
+        : (screenSize.width - 16).clamp(280.0, baseNormalWidth);
+    final height = _isLargeSize
+        ? 292.0
+        : (widget.session.isLive ? 236.0 : 210.0);
 
     return Positioned(
       right: _right.clamp(8.0, (screenSize.width - width - 8).clamp(8.0, 4000.0)),

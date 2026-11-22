@@ -150,6 +150,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
   bool _bypassClientProxyForCurrentEpisode = false;
   bool _didTryServerResolveForEpisode = false;
   int _playAttemptSessionId = 0;
+  DateTime _lastStreamOpenInitiatedAt = DateTime.fromMillisecondsSinceEpoch(0);
   final Set<int> _triedGroupIndicesForEpisode = <int>{};
   ({
     int groupIndex,
@@ -204,10 +205,18 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     final firstFrame = nextW > 0 && !_hasRenderedFirstFrame;
     final dimChanged = (nextW > 0 && nextH > 0) &&
         (nextW != _videoWidth || nextH != _videoHeight);
-    if (firstFrame || dimChanged) {
+    final clearStaleError = nextW > 0 && (_playError != null || _isResolvingPlay);
+    if (nextW > 0) {
+      _startupWatchdogTimer?.cancel();
+    }
+    if (firstFrame || dimChanged || clearStaleError) {
       final prevPortrait = _isPortraitVideo;
       setState(() {
-        if (firstFrame) _hasRenderedFirstFrame = true;
+        if (nextW > 0) {
+          _hasRenderedFirstFrame = true;
+          _playError = null;
+          _isResolvingPlay = false;
+        }
         if (nextW > 0 && nextH > 0) {
           _videoWidth = nextW;
           _videoHeight = nextH;
@@ -444,6 +453,23 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     });
     _errorSub = _player.stream.error.listen((err) {
       if (err.isNotEmpty && mounted) {
+        if (_isResolvingPlay || _activeStreamUrl.isEmpty) return;
+
+        final hasStartedPlaying = _hasRenderedFirstFrame ||
+            _player.state.duration > Duration.zero ||
+            _player.state.position > Duration.zero ||
+            (_player.state.width ?? 0) > 0 ||
+            (_player.state.height ?? 0) > 0;
+        if (hasStartedPlaying) return;
+
+        // Ignore transient libmpv abort/demuxer messages emitted within 380ms of
+        // calling `_player.open()` (e.g. when aborting a previous stream or probing).
+        final sinceOpenMs =
+            DateTime.now().difference(_lastStreamOpenInitiatedAt).inMilliseconds;
+        if (sinceOpenMs >= 0 && sinceOpenMs < 380) {
+          return;
+        }
+
         final lower = err.toLowerCase();
         final isNonFatalDecodeError =
             lower.contains('error while decoding') ||
@@ -451,15 +477,27 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
             lower.contains('co located pocs') ||
             lower.contains('reference picture missing') ||
             lower.contains('non-existing pps') ||
+            lower.contains('non-existing sps') ||
             lower.contains('invalid data found when processing input') ||
             lower.contains('concealing') ||
-            lower.contains('packet corrupt');
+            lower.contains('packet corrupt') ||
+            lower.contains('missing picture in access unit') ||
+            lower.contains('no frame!') ||
+            lower.contains('discarding') ||
+            lower.contains('overread') ||
+            lower.contains('cabac') ||
+            lower.contains('deblocking') ||
+            lower.contains('pps id out of range') ||
+            lower.contains('loading aborted') ||
+            lower.contains('operation was aborted');
         if (isNonFatalDecodeError) return;
 
-        final hasStartedPlaying = _player.state.duration > Duration.zero ||
-            _player.state.position > Duration.zero ||
-            (_player.state.width ?? 0) > 0;
-        if (hasStartedPlaying) return;
+        // If the stream is actively buffering or receiving bytes via our local relay,
+        // do not prematurely trigger fallback on non-fatal probe warnings.
+        if (_player.state.buffering &&
+            LocalProxyTunnelBridge.recentDownstreamBytesPerSecond > 1024) {
+          return;
+        }
 
         _triggerFastStartupFallback(reason: '当前播放地址不可用');
       }
@@ -702,8 +740,14 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
 
   void _onPositionUpdate(Duration pos) {
     if (pos > Duration.zero) {
-      if (!_hasRenderedFirstFrame && mounted) {
-        setState(() => _hasRenderedFirstFrame = true);
+      _startupWatchdogTimer?.cancel();
+      if ((!_hasRenderedFirstFrame || _playError != null || _isResolvingPlay) &&
+          mounted) {
+        setState(() {
+          _hasRenderedFirstFrame = true;
+          _playError = null;
+          _isResolvingPlay = false;
+        });
       }
       if ((pos - _lastValidPosition).inSeconds.abs() >= 3) {
         _prematureEofRecoveryCount = 0;
@@ -831,15 +875,20 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       );
       if (!mounted) return;
 
-      // Match saved exact progress or history or preferred line/episode
-      final exactProgress = widget.appState.getVodProgress(
-        _activeSource.id,
-        _activeVodId,
-      );
-      final savedHist = widget.appState.findHistoryItem(
-        _activeSource,
-        _activeVodId,
-      );
+      // Match saved exact progress or history or preferred line/episode (when watch history is enabled)
+      final historyEnabled = widget.appState.watchHistoryEnabled;
+      final exactProgress = historyEnabled
+          ? widget.appState.getVodProgress(
+              _activeSource.id,
+              _activeVodId,
+            )
+          : null;
+      final savedHist = historyEnabled
+          ? widget.appState.findHistoryItem(
+              _activeSource,
+              _activeVodId,
+            )
+          : null;
       final targetLine = widget.preferredLine ?? savedHist?.line;
       final targetEpTitle = widget.preferredEpisodeTitle ??
           exactProgress?.episodeName ??
@@ -869,6 +918,31 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
           exactProgress.groupIndex >= 0 &&
           exactProgress.groupIndex < detail.playGroups.length) {
         groupIdx = exactProgress.groupIndex;
+      }
+
+      // If no explicit override was passed and the chosen group uses HTML share-page URLs (`/share/`)
+      // while a direct `.m3u8`/`.mp4` play group is available, prefer the direct `.m3u8` group!
+      if (overrideGroupIndex == null &&
+          widget.initialGroupIndex == null &&
+          widget.preferredLine == null &&
+          detail.playGroups.length > 1) {
+        final chosenGrp = detail.playGroups[groupIdx];
+        final chosenFirstUrl = chosenGrp.episodes.isNotEmpty
+            ? chosenGrp.episodes.first.rawUrl.toLowerCase()
+            : '';
+        final chosenIsDirectMedia = chosenFirstUrl.contains('.m3u8') ||
+            chosenFirstUrl.contains('.mp4') ||
+            chosenFirstUrl.contains('.flv');
+        if (!chosenIsDirectMedia) {
+          final directM3u8Idx = detail.playGroups.indexWhere((g) {
+            if (g.episodes.isEmpty) return false;
+            final u = g.episodes.first.rawUrl.toLowerCase();
+            return u.contains('.m3u8') || u.contains('.mp4') || u.contains('.flv');
+          });
+          if (directM3u8Idx >= 0) {
+            groupIdx = directM3u8Idx;
+          }
+        }
       }
 
       Episode? initialEp;
@@ -1124,6 +1198,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     if (mounted) {
       setState(() {
         _using115Direct = false;
+        _playError = null;
         _hasRenderedFirstFrame =
             (_player.state.width ?? 0) > 0 || _player.state.position > Duration.zero;
       });
@@ -1131,6 +1206,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
 
     _activeStreamUrl = finalMediaTarget;
     _activeStreamHeaders = headers;
+    _lastStreamOpenInitiatedAt = DateTime.now();
     final startOffset = (!_hasAppliedInitialSeek && _pendingSeekSeconds > 3)
         ? Duration(seconds: _pendingSeekSeconds.round())
         : null;
@@ -1147,15 +1223,19 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       await _player.setRate(_playbackSpeed);
     }
 
-    // Startup watchdog: give proxy tunnels adequate time for TLS + first segment
-    // and never abort while downstream bytes are actively flowing!
-    final watchdogMs = _usingClientProxy ? 6800 : 4800;
+    // Startup watchdog: give VOD CDNs, M3U8 ad-stripping, and proxy tunnels adequate time
+    // (15s direct/relay, 18s client proxy) for TLS + playlist + key + first segment,
+    // and never abort while video has rendered, buffered, or downstream bytes are flowing!
+    final watchdogMs = _usingClientProxy ? 18000 : 15000;
     _startupWatchdogTimer = Timer(Duration(milliseconds: watchdogMs), () {
       if (!mounted || activeAttemptId != _playAttemptSessionId) return;
-      final hasStarted = _player.state.duration > Duration.zero ||
+      final hasStarted = _hasRenderedFirstFrame ||
+          _player.state.duration > Duration.zero ||
           _player.state.position > Duration.zero ||
+          _player.state.buffer > Duration.zero ||
           (_player.state.width ?? 0) > 0 ||
-          LocalProxyTunnelBridge.recentDownstreamBytesPerSecond > 512;
+          (_player.state.height ?? 0) > 0 ||
+          LocalProxyTunnelBridge.recentDownstreamBytesPerSecond > 256;
       if (!hasStarted) {
         _triggerFastStartupFallback(reason: '当前线路响应超时');
       }
@@ -1299,7 +1379,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         _playError = null;
       });
       _showAdToast(
-        '⚡ $reason，已极速切换至最快可用线路：${backupLine.episode.groupName} (${backupLine.latencyMs}ms)',
+        '⚡ 正在为您自动切换至最快可用线路：${backupLine.episode.groupName} (${backupLine.latencyMs}ms)',
       );
       unawaited(
         _openResolvedStream(
@@ -1307,6 +1387,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
           forceProxy: _useServerProxy ||
               (backupLine.resolved.backendProxyPlayback &&
                   backupLine.resolved.directUrl.isEmpty),
+          attemptId: _playAttemptSessionId,
         ),
       );
       return;
@@ -1317,6 +1398,13 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         !_didTryServerResolveForEpisode &&
         currentEp != null) {
       _didTryServerResolveForEpisode = true;
+      final activeAttempt = _playAttemptSessionId;
+      if (mounted) {
+        setState(() {
+          _isResolvingPlay = true;
+          _playError = null;
+        });
+      }
       unawaited(
         widget.appState.api
             .resolveVodPlayback(
@@ -1326,15 +1414,29 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
           forceServerResolve: true,
         )
             .then((srvResolved) {
-          if (!mounted) return;
-          setState(() => _resolvedPlayback = srvResolved);
+          if (!mounted || activeAttempt != _playAttemptSessionId) return;
+          final sameDirectFailed = resolved != null &&
+              srvResolved.directUrl.isNotEmpty &&
+              srvResolved.directUrl == resolved.directUrl;
+          setState(() {
+            _resolvedPlayback = srvResolved;
+            _isResolvingPlay = false;
+            _playError = null;
+          });
           _openResolvedStream(
             srvResolved,
             forceProxy: _useServerProxy ||
+                sameDirectFailed ||
                 (srvResolved.backendProxyPlayback &&
                     srvResolved.directUrl.isEmpty),
+            attemptId: activeAttempt,
           );
-        }).catchError((_) {}),
+        }).catchError((Object err) {
+          if (mounted && activeAttempt == _playAttemptSessionId) {
+            setState(() => _isResolvingPlay = false);
+            _triggerFastStartupFallback(reason: '服务端解析未就绪');
+          }
+        }),
       );
       return;
     }
@@ -1343,18 +1445,20 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     if (_usingClientProxy &&
         !_bypassClientProxyForCurrentEpisode &&
         resolved != null) {
+      final activeAttempt = _playAttemptSessionId;
       if (_clientProxyRetryCountForEpisode < 1) {
         _clientProxyRetryCountForEpisode++;
         unawaited(
           widget.appState.proxyService
               .reportActiveNodeLag(reason: '代理加载视频缓慢，极速切换备用节点')
               .then((_) {
-            if (mounted) {
+            if (mounted && activeAttempt == _playAttemptSessionId) {
               _openResolvedStream(
                 resolved,
                 forceProxy: _useServerProxy,
                 skipM3u8Clean: true,
                 bypassClientProxy: false,
+                attemptId: activeAttempt,
               );
             }
           }),
@@ -1367,11 +1471,12 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         forceProxy: _useServerProxy,
         skipM3u8Clean: true,
         bypassClientProxy: true,
+        attemptId: activeAttempt,
       );
       return;
     }
 
-    // 4. Try the next untested play line in `_detail.playGroups` if available (do NOT auto-switch to server relay)
+    // 4. Try the next untested play line in `_detail.playGroups` if available
     final detail = _detail;
     if (detail != null && currentEp != null && detail.playGroups.length > 1) {
       for (var i = 0; i < detail.playGroups.length; i++) {
@@ -1387,8 +1492,9 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
           );
           setState(() {
             _selectedGroupIndex = i;
+            _playError = null;
           });
-          _showAdToast('⚡ 当前线路不可用，正在尝试备用线路：${nextGrp.name}');
+          _showAdToast('⚡ 正在自动切换至备用播放线路：${nextGrp.name}');
           _selectAndPlayEpisode(
             nextEp,
             resumeSeconds: _pendingSeekSeconds,
@@ -1397,6 +1503,39 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
           return;
         }
       }
+    }
+
+    // 5. Last-resort fallback: if direct/client-proxy failed across all lines and a server proxy URL exists, try server proxy once
+    if (resolved != null &&
+        resolved.serverProxyUrl.isNotEmpty &&
+        !_activeStreamUrl.contains('/api/vod/proxy')) {
+      _showAdToast('⚡ 正在尝试服务端中转通道播放...');
+      unawaited(
+        _openResolvedStream(
+          resolved,
+          forceProxy: true,
+          skipM3u8Clean: true,
+          bypassClientProxy: true,
+          attemptId: _playAttemptSessionId,
+        ),
+      );
+      return;
+    }
+
+    // Before showing a fatal error overlay, double-check that video hasn't started or buffered in the meantime
+    if (_hasRenderedFirstFrame ||
+        _player.state.duration > Duration.zero ||
+        _player.state.position > Duration.zero ||
+        (_player.state.width ?? 0) > 0 ||
+        (_player.state.height ?? 0) > 0) {
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        _isResolvingPlay = false;
+        _playError = reason;
+      });
     }
   }
 
@@ -3985,6 +4124,26 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                   color: VideoPlatformTheme.textSecondary,
                                 ),
                               ),
+                              const SizedBox(width: 8),
+                              VideoDownloadSpeedBadge(
+                                player: _player,
+                                compact: true,
+                              ),
+                              const SizedBox(width: 6),
+                              PlayerVolumeControl(
+                                player: _player,
+                                compact: true,
+                                overlayStyle: isFullscreen,
+                                sliderWidth:
+                                    MediaQuery.sizeOf(context).width < 720
+                                        ? 52
+                                        : 76,
+                                onVolumeChanged: (val) {
+                                  if (mounted) {
+                                    setState(() => _volumePercent = val);
+                                  }
+                                },
+                              ),
                               if (hasBarFocus) ...[
                                 const SizedBox(width: 8),
                                 Container(
@@ -4370,6 +4529,8 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                     fit: videoFit,
                     aspectRatio: effectiveAspectRatio,
                     controls: NoVideoControls,
+                    pauseUponEnteringBackgroundMode: false,
+                    resumeUponEnteringForegroundMode: true,
                   ),
               if (_isHorizontalSeeking)
                 Center(
@@ -4571,6 +4732,20 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                       ],
                     ),
                   ),
+                ),
+              ),
+            // Always-visible compact download speed badge when full stage OSD is auto-hidden
+            if (_currentEpisode != null &&
+                !(isFullscreen
+                    ? _fullscreenControlsVisible
+                    : (!widget.appState.tvMode &&
+                        (!isMobilePortrait || _mobileStageOsdVisible))))
+              Positioned(
+                top: 10,
+                right: 12,
+                child: VideoDownloadSpeedBadge(
+                  player: _player,
+                  compact: true,
                 ),
               ),
             // Floating proxy node selector + download speed HUD + quick "跳过广告" pill on video stage
@@ -4897,7 +5072,9 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                   ),
                 ),
               ),
-            if (_playError != null && !_isResolvingPlay)
+            if (_playError != null &&
+                !_isResolvingPlay &&
+                !_hasRenderedFirstFrame)
               Container(
                 color: const Color(0xCC000000),
                 padding: const EdgeInsets.all(20),
@@ -5182,6 +5359,11 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                             color: VideoPlatformTheme.textMuted,
                           ),
                         ),
+                        const SizedBox(width: 6),
+                        VideoDownloadSpeedBadge(
+                          player: _player,
+                          compact: true,
+                        ),
                       ],
                     ),
                   ),
@@ -5269,6 +5451,18 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                           ),
                         ),
                         const Spacer(),
+                        PlayerVolumeControl(
+                          player: _player,
+                          compact: true,
+                          sliderWidth: 44,
+                          showPercentage: false,
+                          onVolumeChanged: (val) {
+                            if (mounted) {
+                              setState(() => _volumePercent = val);
+                            }
+                          },
+                        ),
+                        const SizedBox(width: 4),
                         // Aspect ratio / Fit-Cover quick toggle pill
                         InkWell(
                           borderRadius: BorderRadius.circular(12),

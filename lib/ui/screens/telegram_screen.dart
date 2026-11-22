@@ -8868,6 +8868,20 @@ class _TelegramScreenState extends State<TelegramScreen> {
                     ),
                     onPressed: _cycleAudioPlayMode,
                   ),
+                if (_audioPlayer != null) ...[
+                  VideoDownloadSpeedBadge(
+                    player: _audioPlayer!,
+                    compact: true,
+                  ),
+                  const SizedBox(width: 4),
+                  PlayerVolumeControl(
+                    player: _audioPlayer!,
+                    compact: true,
+                    sliderWidth: isMobile ? 44 : 64,
+                    showPercentage: !isMobile,
+                  ),
+                  const SizedBox(width: 2),
+                ],
                 InkWell(
                   borderRadius: BorderRadius.circular(6),
                   onTap: _cycleAudioSpeed,
@@ -19397,6 +19411,13 @@ class _TelegramPhotoGalleryDialogState
                                     },
                                   ),
                                 ],
+                                if (_videoPlayer != null) ...[
+                                  const SizedBox(width: 6),
+                                  VideoDownloadSpeedBadge(
+                                    player: _videoPlayer!,
+                                    compact: true,
+                                  ),
+                                ],
                                 const SizedBox(width: 6),
                                 Listener(
                                   onPointerSignal: (signal) {
@@ -19433,40 +19454,40 @@ class _TelegramPhotoGalleryDialogState
                                           1,
                                         ),
                                       ),
-                                      if (!isMobileDialog) ...[
-                                        SizedBox(
-                                          width: 82,
-                                          child: ExcludeFocus(
-                                            child: SliderTheme(
-                                              data: SliderTheme.of(context)
-                                                  .copyWith(
-                                                trackHeight: 3.0,
-                                                thumbShape:
-                                                    const RoundSliderThumbShape(
-                                                  enabledThumbRadius: 5.5,
-                                                ),
-                                                overlayShape:
-                                                    const RoundSliderOverlayShape(
-                                                  overlayRadius: 10,
-                                                ),
-                                                activeTrackColor:
-                                                    const Color(0xFF5EB5F7),
-                                                inactiveTrackColor:
-                                                    Colors.white24,
-                                                thumbColor: Colors.white,
+                                      SizedBox(
+                                        width: isMobileDialog ? 54 : 82,
+                                        child: ExcludeFocus(
+                                          child: SliderTheme(
+                                            data: SliderTheme.of(context)
+                                                .copyWith(
+                                              trackHeight: 3.0,
+                                              thumbShape:
+                                                  const RoundSliderThumbShape(
+                                                enabledThumbRadius: 5.5,
                                               ),
-                                              child: Slider(
-                                                value: (_isMuted
-                                                        ? 0.0
-                                                        : _volume)
-                                                    .clamp(0.0, 100.0),
-                                                min: 0,
-                                                max: 100,
-                                                onChanged: _setVolume,
+                                              overlayShape:
+                                                  const RoundSliderOverlayShape(
+                                                overlayRadius: 10,
                                               ),
+                                              activeTrackColor:
+                                                  const Color(0xFF5EB5F7),
+                                              inactiveTrackColor:
+                                                  Colors.white24,
+                                              thumbColor: Colors.white,
+                                            ),
+                                            child: Slider(
+                                              value: (_isMuted
+                                                      ? 0.0
+                                                      : _volume)
+                                                  .clamp(0.0, 100.0),
+                                              min: 0,
+                                              max: 100,
+                                              onChanged: _setVolume,
                                             ),
                                           ),
                                         ),
+                                      ),
+                                      if (!isMobileDialog)
                                         SizedBox(
                                           width: 34,
                                           child: Text(
@@ -19480,7 +19501,6 @@ class _TelegramPhotoGalleryDialogState
                                             ),
                                           ),
                                         ),
-                                      ],
                                     ],
                                   ),
                                 ),

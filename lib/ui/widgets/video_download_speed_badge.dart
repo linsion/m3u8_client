@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart';
 
@@ -266,16 +267,217 @@ class _VideoDownloadSpeedBadgeState extends State<VideoDownloadSpeedBadge> {
                   : VideoPlatformTheme.accent,
             ),
             SizedBox(width: compact ? 3 : 4.5),
-            Text(
-              label,
-              style: TextStyle(
-                color: Colors.white,
-                fontSize: compact ? 10 : 11.5,
-                fontFamily: 'monospace',
-                fontWeight: FontWeight.w600,
-                letterSpacing: 0.2,
+            ConstrainedBox(
+              constraints: BoxConstraints(minWidth: compact ? 60 : 72),
+              child: Text(
+                label,
+                textAlign: TextAlign.right,
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: compact ? 10 : 11.5,
+                  fontFamily: 'monospace',
+                  fontFeatures: const [FontFeature.tabularFigures()],
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 0.2,
+                ),
               ),
             ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Visible, responsive Volume & Mute control widget for any [Player] (`media_kit`).
+/// Supports click-to-mute/unmute, drag slider, and mouse wheel volume scrolling.
+class PlayerVolumeControl extends StatefulWidget {
+  final Player player;
+  final bool compact;
+  final bool overlayStyle;
+  final double? sliderWidth;
+  final bool showPercentage;
+  final ValueChanged<double>? onVolumeChanged;
+
+  const PlayerVolumeControl({
+    super.key,
+    required this.player,
+    this.compact = false,
+    this.overlayStyle = false,
+    this.sliderWidth,
+    this.showPercentage = true,
+    this.onVolumeChanged,
+  });
+
+  @override
+  State<PlayerVolumeControl> createState() => _PlayerVolumeControlState();
+}
+
+class _PlayerVolumeControlState extends State<PlayerVolumeControl> {
+  StreamSubscription<double>? _volSub;
+  double _volume = 100.0;
+  double _preMuteVolume = 100.0;
+
+  @override
+  void initState() {
+    super.initState();
+    _syncFromPlayer();
+    _subscribe();
+  }
+
+  @override
+  void didUpdateWidget(covariant PlayerVolumeControl oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.player != widget.player) {
+      _volSub?.cancel();
+      _syncFromPlayer();
+      _subscribe();
+    }
+  }
+
+  void _syncFromPlayer() {
+    final v = widget.player.state.volume;
+    _volume = (v.isFinite ? v : 100.0).clamp(0.0, 100.0);
+    if (_volume > 0) {
+      _preMuteVolume = _volume;
+    }
+  }
+
+  void _subscribe() {
+    _volSub = widget.player.stream.volume.listen((v) {
+      if (!mounted) return;
+      final clamped = (v.isFinite ? v : 100.0).clamp(0.0, 100.0);
+      if (clamped > 0) {
+        _preMuteVolume = clamped;
+      }
+      if ((clamped - _volume).abs() > 0.5) {
+        setState(() => _volume = clamped);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _volSub?.cancel();
+    super.dispose();
+  }
+
+  void _applyVolume(double next) {
+    final clamped = next.clamp(0.0, 100.0);
+    if (clamped > 0) {
+      _preMuteVolume = clamped;
+    }
+    setState(() => _volume = clamped);
+    widget.player.setVolume(clamped);
+    widget.onVolumeChanged?.call(clamped);
+  }
+
+  void _toggleMute() {
+    if (_volume <= 0.5) {
+      final restore = _preMuteVolume > 5.0 ? _preMuteVolume : 100.0;
+      _applyVolume(restore);
+    } else {
+      _preMuteVolume = _volume;
+      _applyVolume(0.0);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isMuted = _volume <= 0.5;
+    final compact = widget.compact;
+    final sliderW = widget.sliderWidth ?? (compact ? 64.0 : 84.0);
+    final fgColor =
+        widget.overlayStyle ? Colors.white : VideoPlatformTheme.textPrimary;
+    final subColor =
+        widget.overlayStyle ? Colors.white70 : VideoPlatformTheme.textSecondary;
+
+    return Listener(
+      onPointerSignal: (event) {
+        if (event is PointerScrollEvent) {
+          final delta = event.scrollDelta.dy < 0 ? 5.0 : -5.0;
+          _applyVolume(_volume + delta);
+        }
+      },
+      child: Container(
+        padding: EdgeInsets.symmetric(
+          horizontal: compact ? 6 : 8,
+          vertical: compact ? 2 : 3,
+        ),
+        decoration: BoxDecoration(
+          color: widget.overlayStyle
+              ? const Color(0xB80B121B)
+              : VideoPlatformTheme.bgCard,
+          borderRadius: BorderRadius.circular(compact ? 8 : 14),
+          border: Border.all(
+            color: widget.overlayStyle
+                ? Colors.white.withValues(alpha: 0.18)
+                : VideoPlatformTheme.borderSubtle,
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            InkWell(
+              borderRadius: BorderRadius.circular(10),
+              onTap: _toggleMute,
+              child: Padding(
+                padding: const EdgeInsets.all(2),
+                child: Icon(
+                  isMuted
+                      ? Icons.volume_off_rounded
+                      : (_volume < 50
+                          ? Icons.volume_down_rounded
+                          : Icons.volume_up_rounded),
+                  size: compact ? 15 : 17,
+                  color: isMuted ? VideoPlatformTheme.danger : VideoPlatformTheme.accent,
+                ),
+              ),
+            ),
+            SizedBox(
+              width: sliderW,
+              height: compact ? 20 : 24,
+              child: ExcludeFocus(
+                child: SliderTheme(
+                  data: SliderTheme.of(context).copyWith(
+                    trackHeight: compact ? 2.6 : 3.2,
+                    thumbShape: RoundSliderThumbShape(
+                      enabledThumbRadius: compact ? 5.0 : 6.0,
+                    ),
+                    overlayShape: RoundSliderOverlayShape(
+                      overlayRadius: compact ? 9.0 : 11.0,
+                    ),
+                    activeTrackColor: VideoPlatformTheme.accent,
+                    inactiveTrackColor: widget.overlayStyle
+                        ? Colors.white24
+                        : VideoPlatformTheme.borderStrong,
+                    thumbColor: fgColor,
+                  ),
+                  child: Slider(
+                    value: _volume.clamp(0.0, 100.0),
+                    min: 0.0,
+                    max: 100.0,
+                    onChanged: _applyVolume,
+                  ),
+                ),
+              ),
+            ),
+            if (widget.showPercentage) ...[
+              const SizedBox(width: 2),
+              SizedBox(
+                width: compact ? 28 : 32,
+                child: Text(
+                  '${_volume.round()}%',
+                  textAlign: TextAlign.right,
+                  style: TextStyle(
+                    fontSize: compact ? 10 : 11,
+                    fontWeight: FontWeight.w600,
+                    fontFamily: 'monospace',
+                    color: isMuted ? VideoPlatformTheme.danger : subColor,
+                  ),
+                ),
+              ),
+            ],
           ],
         ),
       ),

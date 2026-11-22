@@ -143,6 +143,7 @@ class AppState extends ChangeNotifier {
   static const _prefAiApiKeyKey = 'm3u8_ai_api_key_v1';
   static const _prefAiBaseUrlKey = 'm3u8_ai_base_url_v1';
   static const _prefAiModelKey = 'm3u8_ai_model_v1';
+  static const _prefWatchHistoryEnabledKey = 'm3u8_watch_history_enabled_v1';
 
   ServerConfig _serverConfig = const ServerConfig();
   late final ApiClient api;
@@ -152,6 +153,7 @@ class AppState extends ChangeNotifier {
   String _aiApiKey = '';
   String _aiBaseUrl = '';
   String _aiModel = '';
+  bool _watchHistoryEnabled = true;
   bool _vodFilterM3u8Ads = true;
   int _vodSkipIntroSeconds = 0;
   int _vodSkipOutroSeconds = 0;
@@ -201,6 +203,7 @@ class AppState extends ChangeNotifier {
   Set<String> _pinnedSourceIds = {};
   Set<String> _hiddenSourceIds = {};
   final Map<String, int> _sourceLatencyMs = {};
+  final Set<String> _testingSourceIds = {};
   bool _isTestingSources = false;
 
   // Library (Favorites & Watch History)
@@ -421,6 +424,7 @@ class AppState extends ChangeNotifier {
     } catch (_) {}
   }
   bool get vodFilterM3u8Ads => _vodFilterM3u8Ads;
+  bool get watchHistoryEnabled => _watchHistoryEnabled;
   int get vodSkipIntroSeconds => _vodSkipIntroSeconds;
   int get vodSkipOutroSeconds => _vodSkipOutroSeconds;
   bool get tvMode => _tvMode;
@@ -465,6 +469,7 @@ class AppState extends ChangeNotifier {
   Set<String> get pinnedSourceIds => _pinnedSourceIds;
   Set<String> get hiddenSourceIds => _hiddenSourceIds;
   Map<String, int> get sourceLatencyMs => _sourceLatencyMs;
+  Set<String> get testingSourceIds => _testingSourceIds;
   bool get isTestingSources => _isTestingSources;
 
   List<VodSource> get visibleSources {
@@ -545,6 +550,7 @@ class AppState extends ChangeNotifier {
         }
       }
       _aggregatedSearch = prefs.getBool(_prefAggregatedSearchKey) ?? false;
+      _watchHistoryEnabled = prefs.getBool(_prefWatchHistoryEnabledKey) ?? true;
       _vodFilterM3u8Ads = prefs.getBool(_prefVodFilterM3u8AdsKey) ?? true;
       _vodSkipIntroSeconds = prefs.getInt(_prefVodSkipIntroSecKey) ?? 0;
       _vodSkipOutroSeconds = prefs.getInt(_prefVodSkipOutroSecKey) ?? 0;
@@ -722,6 +728,16 @@ class AppState extends ChangeNotifier {
     if (_searchKeyword.isNotEmpty) {
       await performSearch(_searchKeyword);
     }
+  }
+
+  Future<void> setWatchHistoryEnabled(bool value) async {
+    if (_watchHistoryEnabled == value) return;
+    _watchHistoryEnabled = value;
+    notifyListeners();
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_prefWatchHistoryEnabledKey, value);
+    } catch (_) {}
   }
 
   Future<bool> connectAndBootstrap({String? preferredSourceId}) async {
@@ -1195,12 +1211,49 @@ class AppState extends ChangeNotifier {
     } catch (_) {}
   }
 
-  Future<void> batchTestVodSources() async {
+  Future<int> testSingleVodSource(
+    VodSource src, {
+    Duration? timeout,
+    bool forceRefresh = true,
+  }) async {
+    if (_testingSourceIds.contains(src.id)) {
+      return _sourceLatencyMs[src.id] ?? -1;
+    }
+    _testingSourceIds.add(src.id);
+    notifyListeners();
+
+    final effectiveTimeout = timeout ??
+        Duration(
+          milliseconds: (src.isTvBox && src.tvboxType == 3) ? 9000 : 6000,
+        );
+    final sw = Stopwatch()..start();
+    int latency = -1;
+    try {
+      final res = await api
+          .fetchVodList(src, page: 1, forceRefresh: forceRefresh)
+          .timeout(effectiveTimeout);
+      sw.stop();
+      if (res.items.isNotEmpty || res.categories.isNotEmpty) {
+        latency = sw.elapsedMilliseconds.clamp(1, 99999);
+      }
+    } catch (_) {
+      sw.stop();
+      latency = -1;
+    } finally {
+      _sourceLatencyMs[src.id] = latency;
+      _testingSourceIds.remove(src.id);
+      notifyListeners();
+    }
+    return latency;
+  }
+
+  Future<void> batchTestVodSources({List<VodSource>? targetSources}) async {
     if (_isTestingSources || _sources.isEmpty) return;
     _isTestingSources = true;
     notifyListeners();
 
-    final targets = _sources.take(28).toList();
+    final candidates = targetSources ?? visibleSources;
+    final targets = candidates.take(40).toList();
     final fastTargets =
         targets.where((s) => !s.isTvBox || s.tvboxType != 3).toList();
     final spiderTargets =
@@ -1214,31 +1267,24 @@ class AppState extends ChangeNotifier {
       for (var i = 0; i < list.length; i += concurrency) {
         final batch = list.skip(i).take(concurrency);
         await Future.wait(
-          batch.map((src) async {
-            final sw = Stopwatch()..start();
-            try {
-              final res =
-                  await api.fetchVodList(src, page: 1).timeout(timeout);
-              sw.stop();
-              _sourceLatencyMs[src.id] =
-                  (res.items.isNotEmpty || res.categories.isNotEmpty)
-                      ? sw.elapsedMilliseconds
-                      : -1;
-            } catch (_) {
-              sw.stop();
-              _sourceLatencyMs[src.id] = -1;
-            }
-            notifyListeners();
-          }),
+          batch.map(
+            (src) => testSingleVodSource(
+              src,
+              timeout: timeout,
+              forceRefresh: true,
+            ),
+          ),
         );
       }
     }
 
-    await runBatch(fastTargets, 5, const Duration(milliseconds: 6000));
-    await runBatch(spiderTargets, 2, const Duration(milliseconds: 9000));
-
-    _isTestingSources = false;
-    notifyListeners();
+    try {
+      await runBatch(fastTargets, 5, const Duration(milliseconds: 6000));
+      await runBatch(spiderTargets, 2, const Duration(milliseconds: 9000));
+    } finally {
+      _isTestingSources = false;
+      notifyListeners();
+    }
   }
 
   void sortSourcesByLatency() {
@@ -1572,6 +1618,7 @@ class AppState extends ChangeNotifier {
     required double positionSeconds,
     required double durationSeconds,
   }) async {
+    if (!_watchHistoryEnabled) return;
     final key = source.librarySourceKey;
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     _deletedHistoryKeys.remove(_libraryItemKey(key, detail.vodId));
@@ -2073,6 +2120,7 @@ class AppState extends ChangeNotifier {
     required int positionSeconds,
     required int durationSeconds,
   }) async {
+    if (!_watchHistoryEnabled) return;
     if (sourceKey.isEmpty || vodId.isEmpty) return;
     final key = '$sourceKey::$vodId';
     _vodProgressMap[key] = VodPlaybackProgress(

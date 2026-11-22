@@ -4842,14 +4842,19 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
                         ),
                       ),
                     ),
-                    if (!isMobileDialog) ...[
-                      VideoDownloadSpeedBadge(
-                        player: _player,
-                        compact: true,
-                        backgroundColor: VideoPlatformTheme.bgCard,
-                      ),
-                      const SizedBox(width: 4),
-                    ],
+                    VideoDownloadSpeedBadge(
+                      player: _player,
+                      compact: true,
+                      backgroundColor: VideoPlatformTheme.bgCard,
+                    ),
+                    const SizedBox(width: 4),
+                    PlayerVolumeControl(
+                      player: _player,
+                      compact: true,
+                      sliderWidth: isMobileDialog ? 46 : 70,
+                      showPercentage: !isMobileDialog,
+                    ),
+                    const SizedBox(width: 4),
                     if (widget.onEnterMiniPlayer != null)
                       IconButton(
                         tooltip: '转入右下角小窗悬浮播放',
@@ -4891,6 +4896,8 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
                               ? BoxFit.cover
                               : BoxFit.contain,
                           fill: Colors.black,
+                          pauseUponEnteringBackgroundMode: false,
+                          resumeUponEnteringForegroundMode: true,
                         ),
                         Positioned(
                           top: 12,

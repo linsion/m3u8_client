@@ -276,6 +276,13 @@ class _LibraryHistoryScreenState extends State<LibraryHistoryScreen> {
 
   @override
   Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: widget.appState,
+      builder: (context, _) => _buildContent(context),
+    );
+  }
+
+  Widget _buildContent(BuildContext context) {
     final state = widget.appState;
     final rawItems = _tabIndex == 0 ? state.history : state.favorites;
     final kind = _tabIndex == 0 ? 'history' : 'favorites';
@@ -322,6 +329,74 @@ class _LibraryHistoryScreenState extends State<LibraryHistoryScreen> {
                 const SizedBox(width: 10),
                 _buildTabButton(1, '我的收藏 (${state.favorites.length})'),
                 const SizedBox(width: 12),
+                if (_tabIndex == 0) ...[
+                  Tooltip(
+                    message: state.watchHistoryEnabled
+                        ? '已开启观看历史记录（点击可暂停记录观看历史与播放进度）'
+                        : '已暂停观看历史记录（点击可重新开启记录）',
+                    child: InkWell(
+                      key: const ValueKey('library_watch_history_toggle_btn'),
+                      borderRadius: BorderRadius.circular(6),
+                      onTap: () => state.setWatchHistoryEnabled(
+                        !state.watchHistoryEnabled,
+                      ),
+                      child: Container(
+                        height: 32,
+                        padding: const EdgeInsets.symmetric(horizontal: 10),
+                        decoration: BoxDecoration(
+                          color: state.watchHistoryEnabled
+                              ? VideoPlatformTheme.accent
+                                  .withValues(alpha: 0.14)
+                              : VideoPlatformTheme.bgCard,
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(
+                            color: state.watchHistoryEnabled
+                                ? VideoPlatformTheme.accent
+                                    .withValues(alpha: 0.55)
+                                : VideoPlatformTheme.borderSubtle,
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              state.watchHistoryEnabled
+                                  ? Icons.history_toggle_off_rounded
+                                  : Icons.pause_circle_outline_rounded,
+                              size: 15,
+                              color: state.watchHistoryEnabled
+                                  ? VideoPlatformTheme.accent
+                                  : VideoPlatformTheme.textMuted,
+                            ),
+                            const SizedBox(width: 5),
+                            Text(
+                              state.watchHistoryEnabled ? '记录已开启' : '记录已关闭',
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                                color: state.watchHistoryEnabled
+                                    ? VideoPlatformTheme.accent
+                                    : VideoPlatformTheme.textSecondary,
+                              ),
+                            ),
+                            const SizedBox(width: 4),
+                            SizedBox(
+                              height: 20,
+                              child: Switch(
+                                value: state.watchHistoryEnabled,
+                                activeColor: VideoPlatformTheme.accent,
+                                materialTapTargetSize:
+                                    MaterialTapTargetSize.shrinkWrap,
+                                onChanged: state.setWatchHistoryEnabled,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                ],
                 if (!state.tvMode)
                   SizedBox(
                     width: 190,
@@ -524,6 +599,42 @@ class _LibraryHistoryScreenState extends State<LibraryHistoryScreen> {
             ),
           ),
         ),
+        if (_tabIndex == 0 && !state.watchHistoryEnabled)
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            decoration: BoxDecoration(
+              color: VideoPlatformTheme.warning.withValues(alpha: 0.12),
+              border: Border(
+                bottom: BorderSide(
+                  color: VideoPlatformTheme.warning.withValues(alpha: 0.35),
+                ),
+              ),
+            ),
+            child: Row(
+              children: [
+                Icon(
+                  Icons.visibility_off_outlined,
+                  size: 16,
+                  color: VideoPlatformTheme.warning,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    '当前已关闭观看历史记录（无痕观看模式）：播放视频时将不再新增或更新历史记录与播放进度。',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: VideoPlatformTheme.textPrimary,
+                    ),
+                  ),
+                ),
+                TextButton(
+                  onPressed: () => state.setWatchHistoryEnabled(true),
+                  child: const Text('重新开启', style: TextStyle(fontSize: 12)),
+                ),
+              ],
+            ),
+          ),
         if (sourceCounts.length > 1)
           Container(
             height: 38,

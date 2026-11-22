@@ -100,7 +100,10 @@ class _DiscontinuityBlock {
 /// Intelligent HLS (`.m3u8`) ad segment detector and stripper for VOD streams.
 class M3u8AdRemover {
   static final RegExp _extInfRegex = RegExp(r'^#EXTINF:([0-9.]+)');
-  static final RegExp _uriAttrRegex = RegExp(r'URI="([^"]+)"');
+  static final RegExp _uriAttrRegex = RegExp(
+    r'''URI=(?:"([^"]+)"|'([^']+)')''',
+    caseSensitive: false,
+  );
   static final RegExp _knownAdUrlPattern = RegExp(
     r'(\/ad\/|\/ads\/|\/advert|adjump|guanggao|ad_ts|adsegment|\/gg\/)',
     caseSensitive: false,
@@ -434,7 +437,7 @@ class M3u8AdRemover {
         keptBlocks.add(
           _DiscontinuityBlock(
             segments: cleanSegs,
-            blockIndex: keptBlocks.length,
+            blockIndex: block.blockIndex,
           ),
         );
       }
@@ -460,11 +463,14 @@ class M3u8AdRemover {
     String? lastEmittedKey;
     for (var bIdx = 0; bIdx < keptBlocks.length; bIdx++) {
       final block = keptBlocks[bIdx];
-      // Only emit `#EXT-X-DISCONTINUITY` between kept blocks if their encryption
-      // key or directory actually changed
+      // Preserve `#EXT-X-DISCONTINUITY` between adjacent non-ad blocks (genuine PTS reset),
+      // or when encryption key / directory changed after stripping an intermediate ad block.
       if (bIdx > 0) {
         final prevBlock = keptBlocks[bIdx - 1];
-        if (prevBlock.dirSignature != block.dirSignature ||
+        final wasAdjacentInOriginal =
+            block.blockIndex == prevBlock.blockIndex + 1;
+        if (wasAdjacentInOriginal ||
+            prevBlock.dirSignature != block.dirSignature ||
             prevBlock.keySignature != block.keySignature) {
           out.writeln('#EXT-X-DISCONTINUITY');
         }
@@ -480,7 +486,9 @@ class M3u8AdRemover {
         out.writeln(seg.absoluteUri);
       }
     }
-    out.writeln('#EXT-X-ENDLIST');
+    if (content.contains('#EXT-X-ENDLIST')) {
+      out.writeln('#EXT-X-ENDLIST');
+    }
 
     return (
       cleanedM3u8: out.toString(),
@@ -491,7 +499,7 @@ class M3u8AdRemover {
 
   static String _rewriteTagUriAttribute(String tagLine, Uri baseUri) {
     return tagLine.replaceAllMapped(_uriAttrRegex, (match) {
-      final raw = match.group(1) ?? '';
+      final raw = (match.group(1) ?? match.group(2) ?? '').trim();
       if (raw.isEmpty) return match.group(0)!;
       final resolved = baseUri.resolve(raw).toString();
       return 'URI="$resolved"';

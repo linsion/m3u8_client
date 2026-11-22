@@ -87,10 +87,14 @@ const MethodChannel _qrScannerChannel =
 
 class ProxyServerScreen extends StatefulWidget {
   final AppState appState;
+  final VoidCallback? onBackToPrevious;
+  final String? previousTabLabel;
 
   const ProxyServerScreen({
     super.key,
     required this.appState,
+    this.onBackToPrevious,
+    this.previousTabLabel,
   });
 
   @override
@@ -541,6 +545,7 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
   }
 
   /// Top master control header:
+  /// - Return to previous screen button (if available)
   /// - Global Proxy ON/OFF toggle switch
   /// - Manual vs Auto-Fastest switcher
   /// - Active node & real-time latency pill
@@ -551,6 +556,41 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
     final statusMsg = _proxySvc.lastStatusMessage;
     final isErr = _proxySvc.lastStatusIsError;
     final isCompact = MediaQuery.sizeOf(context).width < 680;
+    final prevLabel = (widget.previousTabLabel ?? '').trim();
+
+    final backButton = widget.onBackToPrevious == null
+        ? null
+        : Tooltip(
+            message: prevLabel.isNotEmpty
+                ? '返回 $prevLabel 并继续之前的操作 (Esc)'
+                : '返回上一界面并继续之前的操作 (Esc)',
+            child: OutlinedButton.icon(
+              key: const ValueKey('proxy_back_to_previous_btn'),
+              style: OutlinedButton.styleFrom(
+                visualDensity: VisualDensity.compact,
+                padding: EdgeInsets.symmetric(
+                  horizontal: isCompact ? 10 : 12,
+                  vertical: 6,
+                ),
+                foregroundColor: VideoPlatformTheme.accent,
+                side: BorderSide(
+                  color: VideoPlatformTheme.accent.withValues(alpha: 0.65),
+                  width: 1.2,
+                ),
+                backgroundColor:
+                    VideoPlatformTheme.accent.withValues(alpha: 0.10),
+              ),
+              onPressed: widget.onBackToPrevious,
+              icon: const Icon(Icons.arrow_back_rounded, size: 15),
+              label: Text(
+                prevLabel.isNotEmpty ? '返回 $prevLabel' : '返回上一页',
+                style: const TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+          );
 
     final switchBadge = Container(
       padding: EdgeInsets.symmetric(
@@ -713,7 +753,16 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
                   crossAxisAlignment: WrapCrossAlignment.center,
                   alignment: WrapAlignment.spaceBetween,
                   children: [
-                    switchBadge,
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (backButton != null) ...[
+                          backButton,
+                          const SizedBox(width: 8),
+                        ],
+                        switchBadge,
+                      ],
+                    ),
                     modeSegmented,
                   ],
                 ),
@@ -768,6 +817,10 @@ class _ProxyServerScreenState extends State<ProxyServerScreen> {
                 Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
+                    if (backButton != null) ...[
+                      backButton,
+                      const SizedBox(width: 10),
+                    ],
                     switchBadge,
                     const SizedBox(width: 12),
                     Flexible(child: activeNodeWidget),

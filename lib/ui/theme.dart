@@ -293,15 +293,15 @@ class VideoPlatformTheme {
         labelStyle: TextStyle(color: p.textSecondary, fontSize: 13),
         border: OutlineInputBorder(
           borderRadius: BorderRadius.circular(6),
-          borderSide: BorderSide(color: p.borderSubtle),
+          borderSide: BorderSide(color: p.borderSubtle, width: 1.2),
         ),
         enabledBorder: OutlineInputBorder(
           borderRadius: BorderRadius.circular(6),
-          borderSide: BorderSide(color: p.borderSubtle),
+          borderSide: BorderSide(color: p.borderSubtle, width: 1.2),
         ),
         focusedBorder: OutlineInputBorder(
           borderRadius: BorderRadius.circular(6),
-          borderSide: BorderSide(color: p.accent, width: 2.2),
+          borderSide: BorderSide(color: p.accent, width: 1.2),
         ),
       ),
       filledButtonTheme: FilledButtonThemeData(
@@ -320,18 +320,16 @@ class VideoPlatformTheme {
             return p.accent;
           }),
           foregroundColor: WidgetStateProperty.all(Colors.white),
-          elevation: WidgetStateProperty.resolveWith(
-            (states) => states.contains(WidgetState.focused) ? 8 : 0,
-          ),
-          shadowColor: WidgetStateProperty.all(p.accent.withValues(alpha: 0.85)),
+          elevation: WidgetStateProperty.all(0),
+          shadowColor: WidgetStateProperty.all(Colors.transparent),
           padding: WidgetStateProperty.all(
             const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
           ),
           side: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.focused)) {
-              return const BorderSide(color: Colors.white, width: 2.2);
+              return const BorderSide(color: Colors.white, width: 1.2);
             }
-            return BorderSide.none;
+            return const BorderSide(color: Colors.transparent, width: 1.2);
           }),
           shape: WidgetStateProperty.all(
             RoundedRectangleBorder(
@@ -367,15 +365,13 @@ class VideoPlatformTheme {
             }
             return p.textPrimary;
           }),
-          elevation: WidgetStateProperty.resolveWith(
-            (states) => states.contains(WidgetState.focused) ? 6 : 0,
-          ),
-          shadowColor: WidgetStateProperty.all(p.accent.withValues(alpha: 0.7)),
+          elevation: WidgetStateProperty.all(0),
+          shadowColor: WidgetStateProperty.all(Colors.transparent),
           side: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.focused)) {
-              return const BorderSide(color: Colors.white, width: 2.2);
+              return const BorderSide(color: Colors.white, width: 1.2);
             }
-            return BorderSide(color: p.borderStrong);
+            return BorderSide(color: p.borderStrong, width: 1.2);
           }),
           padding: WidgetStateProperty.all(
             const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
@@ -416,9 +412,9 @@ class VideoPlatformTheme {
           }),
           side: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.focused)) {
-              return const BorderSide(color: Colors.white, width: 2.0);
+              return const BorderSide(color: Colors.white, width: 1.2);
             }
-            return BorderSide.none;
+            return const BorderSide(color: Colors.transparent, width: 1.2);
           }),
           padding: WidgetStateProperty.all(
             const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
@@ -441,6 +437,7 @@ class VideoPlatformTheme {
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
         backgroundColor: p.bgCard,
         selectedColor: p.accent,
+        showCheckmark: false,
         checkmarkColor: Colors.white,
         color: WidgetStateProperty.resolveWith((states) {
           if (states.contains(WidgetState.focused)) {
@@ -455,12 +452,12 @@ class VideoPlatformTheme {
         }),
         side: WidgetStateBorderSide.resolveWith((states) {
           if (states.contains(WidgetState.focused)) {
-            return const BorderSide(color: Color(0xFFFFE066), width: 2.2);
+            return const BorderSide(color: Color(0xFFFFE066), width: 1.2);
           }
           if (states.contains(WidgetState.selected)) {
-            return BorderSide(color: p.accent, width: 1.4);
+            return BorderSide(color: p.accent, width: 1.2);
           }
-          return BorderSide(color: p.borderSubtle);
+          return BorderSide(color: p.borderSubtle, width: 1.2);
         }),
         labelStyle: TextStyle(
           fontSize: 12,
@@ -500,9 +497,9 @@ class VideoPlatformTheme {
           }),
           side: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.focused)) {
-              return const BorderSide(color: Colors.white, width: 2.4);
+              return const BorderSide(color: Colors.white, width: 1.2);
             }
-            return BorderSide.none;
+            return const BorderSide(color: Colors.transparent, width: 1.2);
           }),
           shape: WidgetStateProperty.all(
             RoundedRectangleBorder(

@@ -875,9 +875,64 @@ class ApiClient {
     throw const ApiException('未找到该视频的详情信息');
   }
 
-  bool _isDirectPlayableVodUrl(String rawUrl) {
+  /// Unwraps player wrapper URLs such as `https://player.example.com/dp/?url=https://cdn.example.com/1.m3u8`
+  /// when the outer URL is an HTML/PHP wrapper and its query parameter holds a direct media stream URL.
+  ({String url, Map<String, String> headers}) _unwrapEmbeddedDirectStreamUrl(
+    String rawUrl,
+    Map<String, String> baseHeaders,
+  ) {
     final split = _splitInlineStreamHeaders(rawUrl);
+    final mergedHeaders = <String, String>{
+      ...baseHeaders,
+      ...split.headers,
+    };
     final uri = Uri.tryParse(split.cleanUrl);
+    if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
+      return (url: split.cleanUrl, headers: mergedHeaders);
+    }
+    final pathLower = uri.path.toLowerCase();
+    final outerIsMedia = pathLower.endsWith('.m3u8') ||
+        pathLower.endsWith('.mp4') ||
+        pathLower.endsWith('.flv') ||
+        pathLower.endsWith('.ts') ||
+        pathLower.endsWith('.mkv') ||
+        pathLower.endsWith('.webm') ||
+        pathLower.endsWith('.m4v') ||
+        pathLower.contains('.m3u8/');
+    if (!outerIsMedia && uri.queryParameters.isNotEmpty) {
+      for (final qKey in const ['url', 'v', 'src', 'play', 'video']) {
+        final candidate = (uri.queryParameters[qKey] ?? '').trim();
+        if (candidate.isEmpty) continue;
+        final innerSplit = _splitInlineStreamHeaders(candidate);
+        final innerUri = Uri.tryParse(innerSplit.cleanUrl);
+        if (innerUri == null ||
+            (innerUri.scheme != 'http' && innerUri.scheme != 'https')) {
+          continue;
+        }
+        final innerPath = innerUri.path.toLowerCase();
+        final innerIsMedia = innerPath.endsWith('.m3u8') ||
+            innerPath.endsWith('.mp4') ||
+            innerPath.endsWith('.flv') ||
+            innerPath.endsWith('.ts') ||
+            innerPath.endsWith('.mkv') ||
+            innerPath.endsWith('.webm') ||
+            innerPath.endsWith('.m4v') ||
+            innerPath.contains('.m3u8/');
+        if (innerIsMedia) {
+          mergedHeaders.addAll(innerSplit.headers);
+          if (!mergedHeaders.containsKey('Referer')) {
+            mergedHeaders['Referer'] = '${uri.scheme}://${uri.authority}/';
+          }
+          return (url: innerSplit.cleanUrl, headers: mergedHeaders);
+        }
+      }
+    }
+    return (url: split.cleanUrl, headers: mergedHeaders);
+  }
+
+  bool _isDirectPlayableVodUrl(String rawUrl) {
+    final unwrapped = _unwrapEmbeddedDirectStreamUrl(rawUrl, const {});
+    final uri = Uri.tryParse(unwrapped.url);
     if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
       return false;
     }
@@ -893,8 +948,202 @@ class ApiClient {
         pathLower.endsWith('.flv') ||
         pathLower.endsWith('.ts') ||
         pathLower.endsWith('.mkv') ||
-        pathLower.contains('.m3u8/') ||
-        uri.query.toLowerCase().contains('.m3u8');
+        pathLower.endsWith('.webm') ||
+        pathLower.endsWith('.m4v') ||
+        pathLower.contains('.m3u8/');
+  }
+
+  static String? _tryDecryptMacCmsPlayerAaaaUrl(String html) {
+    final match = RegExp(
+      r'player_aaaa\s*=\s*(\{[\s\S]*?\})\s*(?:;|</script>)',
+      caseSensitive: false,
+    ).firstMatch(html);
+    if (match != null) {
+      try {
+        final obj = jsonDecode(match.group(1)!);
+        if (obj is Map) {
+          var rawUrl = (obj['url'] ?? '').toString().trim();
+          final encrypt = int.tryParse((obj['encrypt'] ?? 0).toString()) ?? 0;
+          if (rawUrl.isNotEmpty) {
+            if (encrypt == 1) {
+              rawUrl = Uri.decodeComponent(rawUrl);
+            } else if (encrypt == 2) {
+              final decodedB64 =
+                  utf8.decode(base64.decode(base64.normalize(rawUrl)), allowMalformed: true);
+              rawUrl = Uri.decodeComponent(decodedB64);
+            }
+            rawUrl = rawUrl.replaceAll(r'\/', '/').trim();
+            if (rawUrl.startsWith('http://') ||
+                rawUrl.startsWith('https://') ||
+                rawUrl.startsWith('//')) {
+              return VodDetail.normalizeTvboxEpisodeUrl(rawUrl);
+            }
+          }
+        }
+      } catch (_) {}
+    }
+    final normalizedHtml = html.replaceAll(r'\/', '/');
+    final directMediaMatch = RegExp(
+      r'''(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4|flv)(?:\?[^\s"'<>\\]*)?)''',
+      caseSensitive: false,
+    ).firstMatch(normalizedHtml);
+    if (directMediaMatch != null) {
+      return VodDetail.normalizeTvboxEpisodeUrl(directMediaMatch.group(1)!);
+    }
+    return null;
+  }
+
+  /// Client-side fallback sniffer/resolver for TVBox URLs:
+  /// - Unwraps query-embedded direct media URLs (`?url=https://...m3u8`)
+  /// - Follows HTTP 301/302/303/307/308 redirects to direct streams
+  /// - Parses JSON `jx` responses (`{"url": "https://..."}` / `{"data": {"url": "..."}}`)
+  /// - Extracts and decrypts MacCMS `player_aaaa` (`encrypt: 0, 1, 2`) or embedded `.m3u8`/`.mp4` from HTML pages
+  Future<({String url, Map<String, String> headers})?>
+      _tryClientSideResolveTvboxStream(
+    String rawUrl,
+    Map<String, String> baseHeaders, {
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final unwrapped = _unwrapEmbeddedDirectStreamUrl(rawUrl, baseHeaders);
+    var currentUrl = unwrapped.url;
+    final headers = <String, String>{
+      'User-Agent':
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+      ...unwrapped.headers,
+    };
+    if (_isDirectPlayableVodUrl(currentUrl)) {
+      return (url: currentUrl, headers: headers);
+    }
+    var uri = Uri.tryParse(currentUrl);
+    if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
+      return null;
+    }
+
+    final hc = HttpClient()
+      ..connectionTimeout = timeout
+      ..findProxy = ((Uri u) =>
+          _findProxyForUri(u, scenarioHint: RequestScenario.vodStream))
+      ..badCertificateCallback = (_, __, ___) => true;
+    try {
+      for (var hop = 0; hop < 4; hop++) {
+        final req = await hc.getUrl(uri!).timeout(timeout);
+        req.followRedirects = false;
+        headers.forEach((k, v) {
+          if (k.toLowerCase() != 'host' && v.trim().isNotEmpty) {
+            req.headers.set(k, v.trim());
+          }
+        });
+        final resp = await req.close().timeout(timeout);
+        final code = resp.statusCode;
+        final loc = resp.headers.value(HttpHeaders.locationHeader);
+        if ((code == 301 ||
+                code == 302 ||
+                code == 303 ||
+                code == 307 ||
+                code == 308) &&
+            loc != null &&
+            loc.trim().isNotEmpty) {
+          try {
+            final sock = await resp.detachSocket();
+            sock.destroy();
+          } catch (_) {}
+          final nextUri = uri.resolve(loc.trim());
+          currentUrl = nextUri.toString();
+          if (_isDirectPlayableVodUrl(currentUrl)) {
+            return (url: currentUrl, headers: headers);
+          }
+          uri = nextUri;
+          continue;
+        }
+        if (code < 200 || code >= 400) {
+          try {
+            final sock = await resp.detachSocket();
+            sock.destroy();
+          } catch (_) {}
+          return null;
+        }
+        final mime = resp.headers.contentType?.mimeType.toLowerCase() ?? '';
+        if (mime.contains('video/') ||
+            mime.contains('mpegurl') ||
+            mime.contains('m3u')) {
+          try {
+            final sock = await resp.detachSocket();
+            sock.destroy();
+          } catch (_) {}
+          return (url: uri.toString(), headers: headers);
+        }
+
+        // Read up to 96 KB to inspect for #EXTM3U, JSON parser payload, or HTML player_aaaa
+        final buf = BytesBuilder(copy: false);
+        await for (final chunk in resp.timeout(timeout)) {
+          if (chunk.isEmpty) continue;
+          buf.add(chunk);
+          if (buf.length >= 96 * 1024) break;
+        }
+        try {
+          final sock = await resp.detachSocket();
+          sock.destroy();
+        } catch (_) {}
+
+        final bytes = buf.takeBytes();
+        if (bytes.isEmpty) return null;
+        // Check MPEG-TS sync byte or MP4 ftyp box or FLV magic
+        if ((bytes.length >= 189 && bytes[0] == 0x47 && bytes[188] == 0x47) ||
+            (bytes.length >= 8 &&
+                bytes[4] == 0x66 &&
+                bytes[5] == 0x74 &&
+                bytes[6] == 0x79 &&
+                bytes[7] == 0x70) ||
+            (bytes.length >= 3 &&
+                bytes[0] == 0x46 &&
+                bytes[1] == 0x4C &&
+                bytes[2] == 0x56)) {
+          return (url: uri.toString(), headers: headers);
+        }
+
+        final text = utf8
+            .decode(bytes, allowMalformed: true)
+            .replaceFirst('\uFEFF', '')
+            .trimLeft();
+        if (text.startsWith('#EXTM3U') || text.startsWith('#EXT')) {
+          return (url: uri.toString(), headers: headers);
+        }
+        if (text.startsWith('{')) {
+          try {
+            final decoded = jsonDecode(text);
+            if (decoded is Map<String, dynamic>) {
+              final parsed = ResolvedPlayback.fromJson(decoded);
+              if (parsed.directUrl.isNotEmpty) {
+                final innerSplit = _splitInlineStreamHeaders(parsed.directUrl);
+                final resolvedUri = uri.resolve(innerSplit.cleanUrl);
+                final nextHeaders = <String, String>{
+                  ...headers,
+                  ...parsed.headers,
+                  ...innerSplit.headers,
+                };
+                return (url: resolvedUri.toString(), headers: nextHeaders);
+              }
+            }
+          } catch (_) {}
+        }
+        final extractedFromHtml = _tryDecryptMacCmsPlayerAaaaUrl(text);
+        if (extractedFromHtml != null && extractedFromHtml.isNotEmpty) {
+          final innerSplit = _splitInlineStreamHeaders(extractedFromHtml);
+          final nextHeaders = <String, String>{
+            ...headers,
+            'Referer': '${uri.scheme}://${uri.authority}/',
+            ...innerSplit.headers,
+          };
+          return (url: innerSplit.cleanUrl, headers: nextHeaders);
+        }
+        break;
+      }
+    } catch (_) {
+      return null;
+    } finally {
+      hc.close(force: true);
+    }
+    return null;
   }
 
   /// Resolve playback URL for an episode.
@@ -907,25 +1156,25 @@ class ApiClient {
     required String episodeUrl,
     bool forceServerResolve = false,
   }) async {
+    final unwrappedEpisode = _unwrapEmbeddedDirectStreamUrl(episodeUrl, const {});
     final route = _proxyService?.resolveEffectiveRoute(
       RequestScenario.vodStream,
-      targetUri: Uri.tryParse(episodeUrl.trim()),
+      targetUri: Uri.tryParse(unwrappedEpisode.url.trim()),
     );
     final forceRelay = route == ScenarioRouteMode.serverRelay;
 
     if (!forceServerResolve &&
         !forceRelay &&
         _config.preferDirectPlayback &&
-        _isDirectPlayableVodUrl(episodeUrl)) {
-      final split = _splitInlineStreamHeaders(episodeUrl);
+        _isDirectPlayableVodUrl(unwrappedEpisode.url)) {
       final headers = <String, String>{
         'User-Agent':
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        ...split.headers,
+        ...unwrappedEpisode.headers,
       };
-      final proxyUrl = buildServerVodProxyUrl(split.cleanUrl, headers);
+      final proxyUrl = buildServerVodProxyUrl(unwrappedEpisode.url, headers);
       return ResolvedPlayback(
-        directUrl: split.cleanUrl,
+        directUrl: unwrappedEpisode.url,
         proxyUrl: proxyUrl,
         serverProxyUrl: proxyUrl,
         headers: headers,
@@ -945,20 +1194,71 @@ class ApiClient {
       final data = await _getJson(
         '/api/vod/play',
         query: query,
-        timeout: Duration(seconds: source.isTvBox ? 12 : 10),
+        timeout: Duration(seconds: source.isTvBox ? 24 : 12),
       );
       if (data is Map<String, dynamic>) {
         final rawResolved = ResolvedPlayback.fromJson(data);
-        final splitDirect = _splitInlineStreamHeaders(rawResolved.directUrl);
-        final mergedHeaders = <String, String>{
-          ...splitDirect.headers,
-          ...rawResolved.headers,
+        final unwrappedDirect = _unwrapEmbeddedDirectStreamUrl(
+          rawResolved.directUrl,
+          rawResolved.headers,
+        );
+        var cleanDirect = unwrappedDirect.url;
+        var mergedHeaders = <String, String>{
+          ...unwrappedDirect.headers,
         };
-        final cleanDirect = splitDirect.cleanUrl;
+        final needSniffOrParse = data['parse'] == 1 ||
+            data['parse'] == '1' ||
+            data['jx'] == 1 ||
+            data['jx'] == '1' ||
+            (cleanDirect.isNotEmpty && !_isDirectPlayableVodUrl(cleanDirect));
+        if (needSniffOrParse &&
+            cleanDirect.startsWith('http') &&
+            !cleanDirect.contains('/api/vod/proxy')) {
+          final clientSniffed = await _tryClientSideResolveTvboxStream(
+            cleanDirect,
+            mergedHeaders,
+          );
+          if (clientSniffed != null && clientSniffed.url.isNotEmpty) {
+            cleanDirect = clientSniffed.url;
+            mergedHeaders = clientSniffed.headers;
+          } else if (!_isDirectPlayableVodUrl(cleanDirect)) {
+            try {
+              final extracted = await extractWebVideo(cleanDirect);
+              if (extracted.isNotEmpty) {
+                final best = extracted.first;
+                final s = _splitInlineStreamHeaders(best.url);
+                if (s.cleanUrl.isNotEmpty) {
+                  cleanDirect = s.cleanUrl;
+                  mergedHeaders = {
+                    ...mergedHeaders,
+                    ...best.headers,
+                    ...s.headers,
+                  };
+                }
+              }
+            } catch (_) {}
+          }
+        }
+        final proxyUrl = (cleanDirect.isNotEmpty &&
+                cleanDirect != rawResolved.directUrl &&
+                _isDirectPlayableVodUrl(cleanDirect))
+            ? buildServerVodProxyUrl(cleanDirect, mergedHeaders)
+            : (rawResolved.proxyUrl.isNotEmpty
+                ? rawResolved.proxyUrl
+                : (cleanDirect.isNotEmpty
+                    ? buildServerVodProxyUrl(cleanDirect, mergedHeaders)
+                    : ''));
+        final serverProxyUrl = (cleanDirect.isNotEmpty &&
+                cleanDirect != rawResolved.directUrl &&
+                _isDirectPlayableVodUrl(cleanDirect))
+            ? proxyUrl
+            : (rawResolved.serverProxyUrl.isNotEmpty
+                ? rawResolved.serverProxyUrl
+                : proxyUrl);
         final resolved = ResolvedPlayback(
           directUrl: cleanDirect,
-          proxyUrl: rawResolved.proxyUrl,
-          serverProxyUrl: rawResolved.serverProxyUrl,
+          proxyUrl: proxyUrl,
+          serverProxyUrl: serverProxyUrl,
           headers: mergedHeaders,
           parseVia: forceRelay ? '服务端代理中转' : rawResolved.parseVia,
           backendProxyPlayback:
@@ -968,23 +1268,44 @@ class ApiClient {
         return resolved;
       }
     } catch (_) {
-      // Fallback: if `/api/vod/play` failed but `episodeUrl` is itself a direct stream URL
-      if (_isDirectPlayableVodUrl(episodeUrl)) {
-        final split = _splitInlineStreamHeaders(episodeUrl);
+      // Fallback 1: if `/api/vod/play` failed but `episodeUrl` is itself a direct stream URL
+      if (_isDirectPlayableVodUrl(unwrappedEpisode.url)) {
         final headers = <String, String>{
           'User-Agent':
               'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-          ...split.headers,
+          ...unwrappedEpisode.headers,
         };
-        final proxyUrl = buildServerVodProxyUrl(split.cleanUrl, headers);
+        final proxyUrl = buildServerVodProxyUrl(unwrappedEpisode.url, headers);
         return ResolvedPlayback(
-          directUrl: split.cleanUrl,
+          directUrl: unwrappedEpisode.url,
           proxyUrl: proxyUrl,
           serverProxyUrl: proxyUrl,
           headers: headers,
           parseVia: '客户端直连回退',
           backendProxyPlayback: false,
         );
+      }
+      // Fallback 2: try client-side TVBox stream sniffer / JSON parser / MacCMS player_aaaa extractor
+      if (unwrappedEpisode.url.startsWith('http://') ||
+          unwrappedEpisode.url.startsWith('https://')) {
+        final clientSniffed = await _tryClientSideResolveTvboxStream(
+          unwrappedEpisode.url,
+          unwrappedEpisode.headers,
+        );
+        if (clientSniffed != null && clientSniffed.url.isNotEmpty) {
+          final proxyUrl = buildServerVodProxyUrl(
+            clientSniffed.url,
+            clientSniffed.headers,
+          );
+          return ResolvedPlayback(
+            directUrl: clientSniffed.url,
+            proxyUrl: proxyUrl,
+            serverProxyUrl: proxyUrl,
+            headers: clientSniffed.headers,
+            parseVia: '客户端智能嗅探解析',
+            backendProxyPlayback: false,
+          );
+        }
       }
       rethrow;
     }
@@ -1572,17 +1893,53 @@ class ApiClient {
   }
 
   static String _stripTvboxUrlDollarSuffixStatic(String raw) {
-    var u = raw.trim();
+    var u = raw.trim().replaceAll('&amp;', '&');
     if (u.isEmpty) return '';
+    if (u.startsWith('//') && u.length > 4) {
+      u = 'https:$u';
+    }
     String pipeSuffix = '';
     final pipeIdx = u.indexOf('|');
     if (pipeIdx > 0) {
       pipeSuffix = u.substring(pipeIdx);
       u = u.substring(0, pipeIdx).trim();
     }
-    final dollarIdx = u.indexOf(r'$');
-    if (dollarIdx > 0) {
-      u = u.substring(0, dollarIdx).trim();
+    var schemeIdx = u.indexOf('://');
+    final firstDollar = u.indexOf(r'$');
+    // 1. If `$` appears BEFORE `://` (e.g. `正片$https://example.com/1.m3u8`),
+    // strip the episode title prefix before `$` instead of truncating the URL!
+    if (firstDollar >= 0 && schemeIdx > firstDollar) {
+      u = u.substring(firstDollar + 1).trim();
+      if (u.startsWith('//') && u.length > 4) {
+        u = 'https:$u';
+      }
+      schemeIdx = u.indexOf('://');
+    }
+    // 2. If `$` appears AFTER `://`, only strip it if it is a TVBox live line
+    // comment label (e.g. `http://.../1.m3u8$IPV6`, `http://.../live$高清`),
+    // and NEVER truncate URLs where `$` is part of the path or query string
+    // (such as `https://cdn.example.com/v1/play$hd.m3u8` or `?token=a$b`).
+    final tailDollar = u.lastIndexOf(r'$');
+    if (tailDollar > 0 && (schemeIdx < 0 || tailDollar > schemeIdx + 3)) {
+      final before = u.substring(0, tailDollar).trim();
+      final after = u.substring(tailDollar + 1).trim();
+      final isCommentLabel = !after.contains('/') &&
+          !after.contains('.') &&
+          !after.contains('=') &&
+          !after.contains('&') &&
+          !after.contains('?') &&
+          (before.toLowerCase().endsWith('.m3u8') ||
+              before.toLowerCase().endsWith('.flv') ||
+              before.toLowerCase().endsWith('.ts') ||
+              before.toLowerCase().endsWith('.mp4') ||
+              RegExp(r'[^\x00-\x7F]').hasMatch(after) ||
+              RegExp(
+                r'^(ipv[46]|hd|fhd|uhd|sd|4k|1080p|720p|line\d*)$',
+                caseSensitive: false,
+              ).hasMatch(after));
+      if (isCommentLabel) {
+        u = before;
+      }
     }
     while (u.endsWith('?')) {
       u = u.substring(0, u.length - 1);
@@ -1590,7 +1947,8 @@ class ApiClient {
     return '$u$pipeSuffix';
   }
 
-  /// Extract inline headers from TVBox pipe (`|Key=Val&...`) or `@Key=Val` URLs such as:
+  /// Extract inline headers from TVBox pipe (`|Key=Val&...`), JSON (`#{"User-Agent":...}` / `|{"Referer":...}`),
+  /// or `@Key=Val` URLs such as:
   /// - `https://example.com/live.flv|User-Agent=okhttp/3.15&Referer=https://example.com/`
   /// - `https://img3.doubanio.com/...jpg@Referer=https://api.douban.com/@User-Agent=Mozilla/5.0...`
   static ({String cleanUrl, Map<String, String> headers})
@@ -1622,6 +1980,25 @@ class ApiClient {
       }
     }
 
+    // 0. Handle trailing `#{"User-Agent":"...","Referer":"..."}` JSON header fragment
+    final hashJsonIdx = working.indexOf('#{');
+    if (hashJsonIdx > 0) {
+      final jsonPart = working.substring(hashJsonIdx + 1).trim();
+      try {
+        final decoded = jsonDecode(jsonPart);
+        if (decoded is Map) {
+          decoded.forEach((k, v) {
+            if (k != null && v != null) {
+              putNormalizedHeader(k.toString(), v.toString());
+            }
+          });
+          working = _stripTvboxUrlDollarSuffixStatic(
+            working.substring(0, hashJsonIdx).trim(),
+          );
+        }
+      } catch (_) {}
+    }
+
     // 1. Handle TVBox `@Referer=...` / `@User-Agent=...` / `@Cookie=...` suffixes
     final atHeaderRegex = RegExp(
       r'@(Referer|Referrer|User-Agent|UA|Cookie|Origin|Authorization|Accept)=',
@@ -1644,23 +2021,38 @@ class ApiClient {
         }
         putNormalizedHeader(key, val);
       }
-      working = working.substring(0, firstStart).trim();
+      working = _stripTvboxUrlDollarSuffixStatic(
+        working.substring(0, firstStart).trim(),
+      );
     }
 
-    // 2. Handle `|Key=Val&Key2=Val2` pipe suffixes
+    // 2. Handle `|Key=Val&Key2=Val2` or `|{"User-Agent":"..."}` pipe suffixes
     final pipeIdx = working.indexOf('|');
     if (pipeIdx >= 0) {
       final headerPart = working.substring(pipeIdx + 1).trim();
       working = _stripTvboxUrlDollarSuffixStatic(
         working.substring(0, pipeIdx).trim(),
       );
-      for (final pair in headerPart.split('&')) {
-        final eq = pair.indexOf('=');
-        if (eq <= 0) continue;
-        putNormalizedHeader(
-          pair.substring(0, eq),
-          pair.substring(eq + 1),
-        );
+      if (headerPart.startsWith('{')) {
+        try {
+          final decoded = jsonDecode(headerPart);
+          if (decoded is Map) {
+            decoded.forEach((k, v) {
+              if (k != null && v != null) {
+                putNormalizedHeader(k.toString(), v.toString());
+              }
+            });
+          }
+        } catch (_) {}
+      } else {
+        for (final pair in headerPart.split('&')) {
+          final eq = pair.indexOf('=');
+          if (eq <= 0) continue;
+          putNormalizedHeader(
+            pair.substring(0, eq),
+            pair.substring(eq + 1),
+          );
+        }
       }
     }
 

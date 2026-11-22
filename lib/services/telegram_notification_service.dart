@@ -392,6 +392,7 @@ class TelegramNotificationService extends ChangeNotifier {
     _connectedIdsKey = idsKey;
 
     if (!_running || idsKey.isEmpty) return;
+    if (Platform.environment.containsKey('FLUTTER_TEST')) return;
 
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     _lastStreamEventMs = nowMs;

@@ -11,10 +11,14 @@ import '../widgets/video_115_accelerate_button.dart';
 
 class SettingsScreen extends StatefulWidget {
   final AppState appState;
+  final VoidCallback? onBackToPrevious;
+  final String? previousTabLabel;
 
   const SettingsScreen({
     super.key,
     required this.appState,
+    this.onBackToPrevious,
+    this.previousTabLabel,
   });
 
   @override
@@ -443,6 +447,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
           orElse: () => VideoPlatformTheme.presets.first,
         );
 
+        final prevLabel = (widget.previousTabLabel ?? '').trim();
+
         return SingleChildScrollView(
           controller: _settingsScrollController,
           padding: const EdgeInsets.all(20),
@@ -476,6 +482,48 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
+                            if (widget.onBackToPrevious != null) ...[
+                              Tooltip(
+                                message: prevLabel.isNotEmpty
+                                    ? '返回 $prevLabel 并继续之前的操作 (Esc)'
+                                    : '返回上一界面并继续之前的操作 (Esc)',
+                                child: OutlinedButton.icon(
+                                  key: const ValueKey(
+                                    'settings_back_to_previous_btn',
+                                  ),
+                                  style: OutlinedButton.styleFrom(
+                                    visualDensity: VisualDensity.compact,
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 12,
+                                      vertical: 6,
+                                    ),
+                                    foregroundColor: VideoPlatformTheme.accent,
+                                    side: BorderSide(
+                                      color: VideoPlatformTheme.accent
+                                          .withValues(alpha: 0.65),
+                                      width: 1.2,
+                                    ),
+                                    backgroundColor: VideoPlatformTheme.accent
+                                        .withValues(alpha: 0.10),
+                                  ),
+                                  onPressed: widget.onBackToPrevious,
+                                  icon: const Icon(
+                                    Icons.arrow_back_rounded,
+                                    size: 15,
+                                  ),
+                                  label: Text(
+                                    prevLabel.isNotEmpty
+                                        ? '返回 $prevLabel'
+                                        : '返回上一页',
+                                    style: const TextStyle(
+                                      fontSize: 12.5,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 14),
+                            ],
                             Icon(
                               Icons.verified_rounded,
                               size: 20,
@@ -688,6 +736,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       value: state.aggregatedSearch,
                       activeColor: VideoPlatformTheme.accent,
                       onChanged: state.setAggregatedSearch,
+                    ),
+                    SwitchListTile(
+                      key: const ValueKey('settings_watch_history_switch'),
+                      contentPadding: EdgeInsets.zero,
+                      dense: true,
+                      title: const Text(
+                        '开启观看历史记录',
+                        style: TextStyle(fontSize: 13),
+                      ),
+                      subtitle: Text(
+                        '开启后自动记录点播观看历史与剧集播放进度，并在首页显示继续观看（关闭后停止记录且隐藏首页历史栏）',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: VideoPlatformTheme.textMuted,
+                        ),
+                      ),
+                      value: state.watchHistoryEnabled,
+                      activeColor: VideoPlatformTheme.accent,
+                      onChanged: state.setWatchHistoryEnabled,
                     ),
                     const SizedBox(height: 8),
                     Wrap(
@@ -1222,14 +1289,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     const SizedBox(height: 12),
                     ConstrainedBox(
                       constraints: const BoxConstraints(maxHeight: 280),
-                      child: Container(
-                        decoration: BoxDecoration(
-                          color: VideoPlatformTheme.bgCard,
+                      child: Material(
+                        color: VideoPlatformTheme.bgCard,
+                        shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(6),
-                          border: Border.all(
+                          side: BorderSide(
                             color: VideoPlatformTheme.borderSubtle,
                           ),
                         ),
+                        clipBehavior: Clip.antiAlias,
                         child: ListView.separated(
                           shrinkWrap: true,
                           itemCount: state.sources.length,
@@ -1359,38 +1427,39 @@ class _SettingsScreenState extends State<SettingsScreen> {
     required String subtitle,
     required Widget child,
   }) {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(18),
-      decoration: BoxDecoration(
-        color: VideoPlatformTheme.bgElevated,
+    return Material(
+      color: VideoPlatformTheme.bgElevated,
+      shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: VideoPlatformTheme.borderSubtle),
+        side: BorderSide(color: VideoPlatformTheme.borderSubtle),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            title,
-            style: TextStyle(
-              fontSize: 15,
-              fontWeight: FontWeight.w600,
-              color: VideoPlatformTheme.textPrimary,
+      child: Padding(
+        padding: const EdgeInsets.all(18),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              title,
+              style: TextStyle(
+                fontSize: 15,
+                fontWeight: FontWeight.w600,
+                color: VideoPlatformTheme.textPrimary,
+              ),
             ),
-          ),
-          const SizedBox(height: 2),
-          Text(
-            subtitle,
-            style: TextStyle(
-              fontSize: 12,
-              color: VideoPlatformTheme.textMuted,
+            const SizedBox(height: 2),
+            Text(
+              subtitle,
+              style: TextStyle(
+                fontSize: 12,
+                color: VideoPlatformTheme.textMuted,
+              ),
             ),
-          ),
-          const SizedBox(height: 14),
-          const Divider(height: 1),
-          const SizedBox(height: 14),
-          child,
-        ],
+            const SizedBox(height: 14),
+            const Divider(height: 1),
+            const SizedBox(height: 14),
+            child,
+          ],
+        ),
       ),
     );
   }

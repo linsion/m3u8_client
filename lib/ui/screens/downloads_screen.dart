@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -27,7 +28,7 @@ class DownloadsScreen extends StatefulWidget {
 class _DownloadsScreenState extends State<DownloadsScreen> {
   String _statusFilter = 'all'; // all, active, completed, failed
   String _taskSearchQuery = '';
-  String _taskSortMode = 'default'; // default, progress_desc, name_asc
+  String _taskSortMode = 'default'; // default, progress_desc, speed_desc, name_asc
   final TextEditingController _taskSearchCtrl = TextEditingController();
   final Map<String, String> _localOfflinePathByTaskId = {};
   final Map<String, double> _localSaveProgressByTaskId = {};
@@ -84,16 +85,48 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
       res = res.where(
         (t) =>
             t.name.toLowerCase().contains(kw) ||
-            t.url.toLowerCase().contains(kw),
+            t.url.toLowerCase().contains(kw) ||
+            t.outputFile.toLowerCase().contains(kw),
       );
     }
     final list = res.toList();
     if (_taskSortMode == 'progress_desc') {
       list.sort((a, b) => b.progress.compareTo(a.progress));
+    } else if (_taskSortMode == 'speed_desc') {
+      list.sort((a, b) => b.speed.compareTo(a.speed));
     } else if (_taskSortMode == 'name_asc') {
       list.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
     }
     return list;
+  }
+
+  static String _formatBytesPerSec(double bytesPerSec) {
+    if (bytesPerSec <= 0) return '0 B/s';
+    if (bytesPerSec < 1024) return '${bytesPerSec.toStringAsFixed(0)} B/s';
+    if (bytesPerSec < 1024 * 1024) {
+      return '${(bytesPerSec / 1024).toStringAsFixed(1)} KB/s';
+    }
+    return '${(bytesPerSec / (1024 * 1024)).toStringAsFixed(2)} MB/s';
+  }
+
+  static String _detectTaskTypeBadge(DownloadTask task) {
+    final t = task.urlType.trim().toLowerCase();
+    final u = task.url.toLowerCase();
+    if (u.startsWith('magnet:') || t == 'magnet') return 'MAGNET';
+    if (u.contains('.mp4') || t == 'mp4') return 'MP4';
+    if (u.contains('.mkv') || t == 'mkv') return 'MKV';
+    if (u.contains('.flv') || t == 'flv') return 'FLV';
+    return 'HLS / M3U8';
+  }
+
+  static String _extractUrlHost(String rawUrl) {
+    final trimmed = rawUrl.trim();
+    if (trimmed.startsWith('magnet:')) return 'BitTorrent 磁力网络';
+    final uri = Uri.tryParse(trimmed);
+    if (uri != null && uri.host.isNotEmpty) {
+      return uri.host;
+    }
+    return '直连流媒体';
   }
 
   Future<void> _showBatchImportUrlsDialog() async {
@@ -110,26 +143,58 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
           builder: (ctx, setDialogState) {
             return AlertDialog(
               backgroundColor: VideoPlatformTheme.bgElevated,
-              title: const Text(
-                '批量新建下载任务（多行链接导入）',
-                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(14),
+                side: BorderSide(color: VideoPlatformTheme.borderStrong),
+              ),
+              title: Row(
+                children: [
+                  Container(
+                    width: 30,
+                    height: 30,
+                    decoration: BoxDecoration(
+                      color: VideoPlatformTheme.accent.withValues(alpha: 0.16),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Icon(
+                      Icons.playlist_add_rounded,
+                      size: 18,
+                      color: VideoPlatformTheme.accent,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  const Text(
+                    '批量新建下载任务（多行链接导入）',
+                    style: TextStyle(fontSize: 15.5, fontWeight: FontWeight.w700),
+                  ),
+                ],
               ),
               content: SizedBox(
-                width: 560,
+                width: 580,
                 child: SingleChildScrollView(
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
-                        '每行一条任务，支持以下格式：\n'
-                        '• 第01集\$https://example.com/ep1.m3u8\n'
-                        '• 第02集,https://example.com/ep2.mp4\n'
-                        '• https://example.com/video.m3u8（自动按序号命名）',
-                        style: TextStyle(
-                          fontSize: 12,
-                          height: 1.5,
-                          color: VideoPlatformTheme.textSecondary,
+                      Container(
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: VideoPlatformTheme.bgCard,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(
+                            color: VideoPlatformTheme.borderSubtle,
+                          ),
+                        ),
+                        child: Text(
+                          '每行一条任务，自动识别剧集名与链接：\n'
+                          '• 第01集\$https://example.com/ep1.m3u8\n'
+                          '• 第02集,https://example.com/ep2.mp4\n'
+                          '• https://example.com/video.m3u8（自动按序号命名）',
+                          style: TextStyle(
+                            fontSize: 12,
+                            height: 1.5,
+                            color: VideoPlatformTheme.textSecondary,
+                          ),
                         ),
                       ),
                       const SizedBox(height: 10),
@@ -145,7 +210,7 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
                               '第01集\$https://example.com/01/index.m3u8\n第02集\$https://example.com/02/index.m3u8',
                         ),
                       ),
-                      const SizedBox(height: 10),
+                      const SizedBox(height: 12),
                       Row(
                         children: [
                           Expanded(
@@ -280,12 +345,35 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
         return StatefulBuilder(
           builder: (ctx, setDialogState) {
             return AlertDialog(
-              title: const Text(
-                '新建下载任务 / 网页视频提取',
-                style: TextStyle(fontSize: 16),
+              backgroundColor: VideoPlatformTheme.bgElevated,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(14),
+                side: BorderSide(color: VideoPlatformTheme.borderStrong),
+              ),
+              title: Row(
+                children: [
+                  Container(
+                    width: 30,
+                    height: 30,
+                    decoration: BoxDecoration(
+                      color: VideoPlatformTheme.accent.withValues(alpha: 0.16),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Icon(
+                      Icons.radar_rounded,
+                      size: 18,
+                      color: VideoPlatformTheme.accent,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  const Text(
+                    '新建下载任务 / 网页视频提取',
+                    style: TextStyle(fontSize: 15.5, fontWeight: FontWeight.w700),
+                  ),
+                ],
               ),
               content: SizedBox(
-                width: 540,
+                width: 560,
                 child: SingleChildScrollView(
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
@@ -376,7 +464,7 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
                                 ),
                                 decoration: BoxDecoration(
                                   color: VideoPlatformTheme.bgCard,
-                                  borderRadius: BorderRadius.circular(6),
+                                  borderRadius: BorderRadius.circular(8),
                                   border: Border.all(
                                     color: VideoPlatformTheme.borderSubtle,
                                   ),
@@ -578,7 +666,7 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
                       isSubmitting ? null : () => Navigator.of(ctx).pop(),
                   child: const Text('取消'),
                 ),
-                FilledButton(
+                FilledButton.icon(
                   onPressed: isSubmitting
                       ? null
                       : () async {
@@ -617,7 +705,8 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
                             });
                           }
                         },
-                  child: Text(isSubmitting ? '提交中...' : '创建任务'),
+                  icon: const Icon(Icons.download_rounded, size: 16),
+                  label: Text(isSubmitting ? '提交中...' : '创建任务'),
                 ),
               ],
             );
@@ -758,173 +847,359 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
     final allTasks = state.tasks;
     final filtered = _filterTasks(allTasks);
 
-    final activeCount = allTasks.where((t) => t.isActive).length;
+    final activeTasks = allTasks.where((t) => t.isActive).toList();
+    final activeCount = activeTasks.length;
     final completedCount = allTasks.where((t) => t.isCompleted).length;
     final failedCount = allTasks.where((t) => t.isFailed).length;
+    final totalActiveSpeed =
+        activeTasks.fold<double>(0.0, (sum, t) => sum + t.speed);
+    final isCompact = MediaQuery.sizeOf(context).width < 720;
 
     return Column(
       children: [
-        // Top action bar
+        // 1. Dashboard Summary Header + Action Bar
         Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          padding: EdgeInsets.fromLTRB(
+            isCompact ? 12 : 18,
+            12,
+            isCompact ? 12 : 18,
+            12,
+          ),
           decoration: BoxDecoration(
-            color: VideoPlatformTheme.bgElevated,
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [
+                activeCount > 0
+                    ? VideoPlatformTheme.accent.withValues(alpha: 0.12)
+                    : VideoPlatformTheme.bgElevated,
+                VideoPlatformTheme.bgElevated,
+              ],
+            ),
             border: Border(
               bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
             ),
           ),
-          child: Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            crossAxisAlignment: WrapCrossAlignment.center,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              _buildFilterChip('all', '全部 (${allTasks.length})'),
-              _buildFilterChip('active', '进行中 ($activeCount)'),
-              _buildFilterChip('completed', '已完成 ($completedCount)'),
-              _buildFilterChip('failed', '失败 ($failedCount)'),
-              const SizedBox(width: 6),
-              SizedBox(
-                width: 190,
-                height: 32,
-                child: TextField(
-                  controller: _taskSearchCtrl,
-                  onChanged: (v) => setState(() => _taskSearchQuery = v),
-                  style: const TextStyle(fontSize: 12),
-                  decoration: InputDecoration(
-                    hintText: '搜索任务名称或链接...',
-                    prefixIcon: const Icon(Icons.search_rounded, size: 15),
-                    suffixIcon: _taskSearchQuery.isNotEmpty
-                        ? IconButton(
-                            padding: EdgeInsets.zero,
-                            icon: const Icon(Icons.clear_rounded, size: 14),
-                            onPressed: () {
-                              _taskSearchCtrl.clear();
-                              setState(() => _taskSearchQuery = '');
-                            },
-                          )
-                        : null,
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 8),
-                  ),
-                ),
-              ),
-              PopupMenuButton<String>(
-                tooltip: '队列排序方式',
-                initialValue: _taskSortMode,
-                onSelected: (v) => setState(() => _taskSortMode = v),
-                itemBuilder: (_) => const [
-                  PopupMenuItem(value: 'default', child: Text('默认队列顺序')),
-                  PopupMenuItem(
-                    value: 'progress_desc',
-                    child: Text('按下载进度排序'),
-                  ),
-                  PopupMenuItem(value: 'name_asc', child: Text('按名称 A-Z 排序')),
-                ],
-                child: Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                  decoration: BoxDecoration(
-                    color: VideoPlatformTheme.bgCard,
-                    borderRadius: BorderRadius.circular(5),
-                    border: Border.all(color: VideoPlatformTheme.borderSubtle),
-                  ),
-                  child: const Row(
-                    mainAxisSize: MainAxisSize.min,
+              // Top Summary Row: Metrics Cards & Primary Action Buttons
+              Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                alignment: WrapAlignment.spaceBetween,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    crossAxisAlignment: WrapCrossAlignment.center,
                     children: [
-                      Icon(Icons.sort_rounded, size: 15),
-                      SizedBox(width: 4),
-                      Text('排序', style: TextStyle(fontSize: 12)),
+                      _buildSummaryStatPill(
+                        icon: Icons.downloading_rounded,
+                        label: '进行中',
+                        value: '$activeCount',
+                        color: activeCount > 0
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.textSecondary,
+                        highlighted: activeCount > 0,
+                      ),
+                      _buildSummaryStatPill(
+                        icon: Icons.speed_rounded,
+                        label: '总速率',
+                        value: _formatBytesPerSec(totalActiveSpeed),
+                        color: totalActiveSpeed > 0
+                            ? const Color(0xFF22C55E)
+                            : VideoPlatformTheme.textSecondary,
+                        highlighted: totalActiveSpeed > 0,
+                      ),
+                      _buildSummaryStatPill(
+                        icon: Icons.task_alt_rounded,
+                        label: '已完成',
+                        value: '$completedCount',
+                        color: completedCount > 0
+                            ? const Color(0xFF10B981)
+                            : VideoPlatformTheme.textSecondary,
+                      ),
+                      if (failedCount > 0)
+                        _buildSummaryStatPill(
+                          icon: Icons.error_outline_rounded,
+                          label: '异常',
+                          value: '$failedCount',
+                          color: VideoPlatformTheme.danger,
+                          highlighted: true,
+                        ),
                     ],
                   ),
-                ),
-              ),
-              FilledButton.icon(
-                onPressed: _showCreateTaskDialog,
-                icon: const Icon(Icons.add, size: 16),
-                label: const Text('新建 / 嗅探'),
-              ),
-              OutlinedButton.icon(
-                onPressed: _showBatchImportUrlsDialog,
-                icon: const Icon(Icons.playlist_add_rounded, size: 16),
-                label: const Text('批量导入'),
-              ),
-              OutlinedButton.icon(
-                onPressed: () {
-                  _dismissedClipboardUrl = null;
-                  _checkClipboardForVideoLink();
-                  state.refreshDownloadTasks();
-                },
-                icon: const Icon(Icons.refresh, size: 16),
-                label: const Text('刷新'),
-              ),
-              if (failedCount > 0)
-                OutlinedButton.icon(
-                  onPressed: () async {
-                    final failedTasks =
-                        allTasks.where((t) => t.isFailed).toList();
-                    for (final t in failedTasks) {
-                      try {
-                        await state.api.retryDownloadTask(t.id);
-                      } catch (_) {}
-                    }
-                    await state.refreshDownloadTasks();
-                  },
-                  icon: Icon(
-                    Icons.replay_rounded,
-                    size: 15,
-                    color: VideoPlatformTheme.warning,
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      FilledButton.icon(
+                        onPressed: _showCreateTaskDialog,
+                        icon: const Icon(Icons.add_rounded, size: 16),
+                        label: const Text('新建 / 嗅探'),
+                      ),
+                      OutlinedButton.icon(
+                        onPressed: _showBatchImportUrlsDialog,
+                        icon: const Icon(Icons.playlist_add_rounded, size: 16),
+                        label: const Text('批量导入'),
+                      ),
+                      OutlinedButton.icon(
+                        onPressed: () {
+                          _dismissedClipboardUrl = null;
+                          _checkClipboardForVideoLink();
+                          state.refreshDownloadTasks();
+                        },
+                        icon: const Icon(Icons.refresh_rounded, size: 16),
+                        label: const Text('刷新'),
+                      ),
+                      if (failedCount > 0)
+                        OutlinedButton.icon(
+                          onPressed: () async {
+                            final failedTasks =
+                                allTasks.where((t) => t.isFailed).toList();
+                            for (final t in failedTasks) {
+                              try {
+                                await state.api.retryDownloadTask(t.id);
+                              } catch (_) {}
+                            }
+                            await state.refreshDownloadTasks();
+                          },
+                          icon: Icon(
+                            Icons.replay_rounded,
+                            size: 15,
+                            color: VideoPlatformTheme.warning,
+                          ),
+                          label: Text('全部重试 ($failedCount)'),
+                        ),
+                      if (completedCount > 0)
+                        TextButton.icon(
+                          onPressed: () async {
+                            final ids = allTasks
+                                .where((t) => t.isCompleted)
+                                .map((t) => t.id)
+                                .toList();
+                            await state.api.batchDeleteDownloadTasks(ids);
+                            await state.refreshDownloadTasks();
+                          },
+                          icon: const Icon(
+                            Icons.cleaning_services_outlined,
+                            size: 15,
+                          ),
+                          label: const Text('清理已完成记录'),
+                        ),
+                    ],
                   ),
-                  label: Text('重试失败 ($failedCount)'),
-                ),
-              if (completedCount > 0)
-                TextButton(
-                  onPressed: () async {
-                    final ids = allTasks
-                        .where((t) => t.isCompleted)
-                        .map((t) => t.id)
-                        .toList();
-                    await state.api.batchDeleteDownloadTasks(ids);
-                    await state.refreshDownloadTasks();
-                  },
-                  child: const Text('清理已完成记录'),
-                ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              // Second Row: Status Filter Chips + Search Field + Sort Selector
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                alignment: WrapAlignment.spaceBetween,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: [
+                      _buildFilterChip(
+                        'all',
+                        '全部 (${allTasks.length})',
+                        Icons.list_alt_rounded,
+                      ),
+                      _buildFilterChip(
+                        'active',
+                        '进行中 ($activeCount)',
+                        Icons.downloading_rounded,
+                      ),
+                      _buildFilterChip(
+                        'completed',
+                        '已完成 ($completedCount)',
+                        Icons.check_circle_outline_rounded,
+                      ),
+                      _buildFilterChip(
+                        'failed',
+                        '失败 ($failedCount)',
+                        Icons.error_outline_rounded,
+                      ),
+                    ],
+                  ),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      SizedBox(
+                        width: isCompact ? 180 : 220,
+                        height: 33,
+                        child: TextField(
+                          controller: _taskSearchCtrl,
+                          onChanged: (v) =>
+                              setState(() => _taskSearchQuery = v),
+                          style: const TextStyle(fontSize: 12),
+                          decoration: InputDecoration(
+                            hintText: '搜索任务名称或链接...',
+                            prefixIcon:
+                                const Icon(Icons.search_rounded, size: 15),
+                            suffixIcon: _taskSearchQuery.isNotEmpty
+                                ? IconButton(
+                                    padding: EdgeInsets.zero,
+                                    icon: const Icon(
+                                      Icons.clear_rounded,
+                                      size: 14,
+                                    ),
+                                    onPressed: () {
+                                      _taskSearchCtrl.clear();
+                                      setState(() => _taskSearchQuery = '');
+                                    },
+                                  )
+                                : null,
+                            contentPadding:
+                                const EdgeInsets.symmetric(horizontal: 8),
+                          ),
+                        ),
+                      ),
+                      PopupMenuButton<String>(
+                        tooltip: '队列排序方式',
+                        initialValue: _taskSortMode,
+                        onSelected: (v) => setState(() => _taskSortMode = v),
+                        itemBuilder: (_) => const [
+                          PopupMenuItem(
+                            value: 'default',
+                            child: Text('默认队列顺序'),
+                          ),
+                          PopupMenuItem(
+                            value: 'progress_desc',
+                            child: Text('按下载进度排序'),
+                          ),
+                          PopupMenuItem(
+                            value: 'speed_desc',
+                            child: Text('按实时速度排序'),
+                          ),
+                          PopupMenuItem(
+                            value: 'name_asc',
+                            child: Text('按名称 A-Z 排序'),
+                          ),
+                        ],
+                        child: Container(
+                          height: 33,
+                          padding: const EdgeInsets.symmetric(horizontal: 10),
+                          decoration: BoxDecoration(
+                            color: VideoPlatformTheme.bgCard,
+                            borderRadius: BorderRadius.circular(7),
+                            border: Border.all(
+                              color: _taskSortMode != 'default'
+                                  ? VideoPlatformTheme.accent
+                                  : VideoPlatformTheme.borderSubtle,
+                            ),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.sort_rounded,
+                                size: 15,
+                                color: _taskSortMode != 'default'
+                                    ? VideoPlatformTheme.accent
+                                    : VideoPlatformTheme.textSecondary,
+                              ),
+                              const SizedBox(width: 4),
+                              Text(
+                                switch (_taskSortMode) {
+                                  'progress_desc' => '进度排序',
+                                  'speed_desc' => '速度排序',
+                                  'name_asc' => '名称排序',
+                                  _ => '排序',
+                                },
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: _taskSortMode != 'default'
+                                      ? VideoPlatformTheme.accent
+                                      : VideoPlatformTheme.textSecondary,
+                                  fontWeight: _taskSortMode != 'default'
+                                      ? FontWeight.w600
+                                      : FontWeight.w400,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
             ],
           ),
         ),
-        // Smart Clipboard Sniffer Banner
+
+        // 2. Smart Clipboard Sniffer Banner
         if (_sniffedClipboardUrl != null)
           Container(
             width: double.infinity,
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
             decoration: BoxDecoration(
-              color: VideoPlatformTheme.accent.withValues(alpha: 0.14),
-              border: Border(
-                bottom: BorderSide(
-                  color: VideoPlatformTheme.accent.withValues(alpha: 0.4),
-                ),
+              gradient: LinearGradient(
+                colors: [
+                  VideoPlatformTheme.accent.withValues(alpha: 0.16),
+                  VideoPlatformTheme.accent.withValues(alpha: 0.06),
+                ],
+              ),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(
+                color: VideoPlatformTheme.accent.withValues(alpha: 0.45),
               ),
             ),
             child: Row(
               children: [
-                Icon(
-                  Icons.radar_rounded,
-                  size: 18,
-                  color: VideoPlatformTheme.accent,
+                Container(
+                  width: 32,
+                  height: 32,
+                  decoration: BoxDecoration(
+                    color: VideoPlatformTheme.accent.withValues(alpha: 0.2),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Icon(
+                    Icons.radar_rounded,
+                    size: 18,
+                    color: VideoPlatformTheme.accent,
+                  ),
                 ),
-                const SizedBox(width: 8),
+                const SizedBox(width: 10),
                 Expanded(
-                  child: Text(
-                    '智能嗅探到剪贴板视频流：$_sniffedClipboardUrl',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 12.5,
-                      color: VideoPlatformTheme.textPrimary,
-                      fontWeight: FontWeight.w500,
-                    ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '智能嗅探到剪贴板视频流',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                          color: VideoPlatformTheme.accent,
+                        ),
+                      ),
+                      Text(
+                        _sniffedClipboardUrl!,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: VideoPlatformTheme.textPrimary,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
                 const SizedBox(width: 8),
-                TextButton.icon(
+                OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                  ),
                   onPressed: () {
                     final url = _sniffedClipboardUrl!;
                     showDialog<void>(
@@ -949,10 +1224,13 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
                     );
                   },
                   icon: const Icon(Icons.play_arrow_rounded, size: 16),
-                  label: const Text('直接流式播放'),
+                  label: const Text('直接播放'),
                 ),
-                const SizedBox(width: 4),
-                FilledButton.tonalIcon(
+                const SizedBox(width: 6),
+                FilledButton.icon(
+                  style: FilledButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                  ),
                   onPressed: () async {
                     final messenger = ScaffoldMessenger.of(context);
                     final url = _sniffedClipboardUrl!;
@@ -986,7 +1264,8 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
                 ),
                 IconButton(
                   tooltip: '忽略此剪贴板链接',
-                  icon: const Icon(Icons.close, size: 16),
+                  visualDensity: VisualDensity.compact,
+                  icon: const Icon(Icons.close_rounded, size: 17),
                   onPressed: () {
                     setState(() {
                       _dismissedClipboardUrl = _sniffedClipboardUrl;
@@ -997,28 +1276,11 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
               ],
             ),
           ),
+
+        // 3. Task Cards List or Empty State
         Expanded(
           child: filtered.isEmpty
-              ? Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        Icons.download_done_rounded,
-                        size: 40,
-                        color: VideoPlatformTheme.textMuted,
-                      ),
-                      SizedBox(height: 10),
-                      Text(
-                        '当前队列暂无下载任务',
-                        style: TextStyle(
-                          color: VideoPlatformTheme.textSecondary,
-                          fontSize: 13,
-                        ),
-                      ),
-                    ],
-                  ),
-                )
+              ? _buildEmptyState(allTasks.isEmpty)
               : ListView.separated(
                   padding: const EdgeInsets.all(16),
                   itemCount: filtered.length,
@@ -1033,31 +1295,175 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
     );
   }
 
-  Widget _buildFilterChip(String key, String label) {
+  Widget _buildSummaryStatPill({
+    required IconData icon,
+    required String label,
+    required String value,
+    required Color color,
+    bool highlighted = false,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
+      decoration: BoxDecoration(
+        color: highlighted
+            ? color.withValues(alpha: 0.13)
+            : VideoPlatformTheme.bgCard,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(
+          color: highlighted
+              ? color.withValues(alpha: 0.45)
+              : VideoPlatformTheme.borderSubtle,
+        ),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 15, color: color),
+          const SizedBox(width: 6),
+          Text(
+            '$label ',
+            style: TextStyle(
+              fontSize: 11.5,
+              color: VideoPlatformTheme.textSecondary,
+            ),
+          ),
+          Text(
+            value,
+            style: TextStyle(
+              fontSize: 12.5,
+              fontWeight: FontWeight.w800,
+              color: highlighted ? color : VideoPlatformTheme.textPrimary,
+              fontFeatures: const [FontFeature.tabularFigures()],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEmptyState(bool queueIsTotallyEmpty) {
+    return Center(
+      child: Container(
+        constraints: const BoxConstraints(maxWidth: 420),
+        padding: const EdgeInsets.all(24),
+        decoration: BoxDecoration(
+          color: VideoPlatformTheme.bgElevated,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: VideoPlatformTheme.borderSubtle),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 56,
+              height: 56,
+              decoration: BoxDecoration(
+                color: VideoPlatformTheme.accent.withValues(alpha: 0.12),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(
+                queueIsTotallyEmpty
+                    ? Icons.cloud_download_outlined
+                    : Icons.filter_alt_off_rounded,
+                size: 28,
+                color: VideoPlatformTheme.accent,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              queueIsTotallyEmpty ? '当前队列暂无下载任务' : '没有符合当前筛选条件的下载任务',
+              style: TextStyle(
+                color: VideoPlatformTheme.textPrimary,
+                fontSize: 14.5,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              queueIsTotallyEmpty
+                  ? '支持多线程高速下载 M3U8 / MP4 / 磁力链接，以及网页视频流智能嗅探与自动转封装 MP4'
+                  : '可以切换上方状态标签或清空搜索关键词查看全部任务',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: VideoPlatformTheme.textMuted,
+                fontSize: 12,
+                height: 1.45,
+              ),
+            ),
+            const SizedBox(height: 16),
+            Wrap(
+              spacing: 10,
+              runSpacing: 8,
+              alignment: WrapAlignment.center,
+              children: [
+                if (queueIsTotallyEmpty) ...[
+                  FilledButton.icon(
+                    onPressed: _showCreateTaskDialog,
+                    icon: const Icon(Icons.add_rounded, size: 16),
+                    label: const Text('新建 / 网页嗅探'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _showBatchImportUrlsDialog,
+                    icon: const Icon(Icons.playlist_add_rounded, size: 16),
+                    label: const Text('批量导入链接'),
+                  ),
+                ] else
+                  OutlinedButton.icon(
+                    onPressed: () {
+                      _taskSearchCtrl.clear();
+                      setState(() {
+                        _statusFilter = 'all';
+                        _taskSearchQuery = '';
+                      });
+                    },
+                    icon: const Icon(Icons.refresh_rounded, size: 15),
+                    label: const Text('查看全部任务'),
+                  ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildFilterChip(String key, String label, IconData icon) {
     final selected = _statusFilter == key;
     return InkWell(
-      borderRadius: BorderRadius.circular(5),
+      borderRadius: BorderRadius.circular(7),
       onTap: () => setState(() => _statusFilter = key),
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
         decoration: BoxDecoration(
           color: selected
               ? VideoPlatformTheme.accent
               : VideoPlatformTheme.bgCard,
-          borderRadius: BorderRadius.circular(5),
+          borderRadius: BorderRadius.circular(7),
           border: Border.all(
             color: selected
                 ? VideoPlatformTheme.accent
                 : VideoPlatformTheme.borderSubtle,
           ),
         ),
-        child: Text(
-          label,
-          style: TextStyle(
-            fontSize: 12,
-            color: selected ? Colors.white : VideoPlatformTheme.textSecondary,
-            fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
-          ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              icon,
+              size: 13.5,
+              color: selected ? Colors.white : VideoPlatformTheme.textSecondary,
+            ),
+            const SizedBox(width: 5),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 12,
+                color:
+                    selected ? Colors.white : VideoPlatformTheme.textSecondary,
+                fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+              ),
+            ),
+          ],
         ),
       ),
     );
@@ -1065,80 +1471,254 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
 
   Widget _buildTaskCard(DownloadTask task) {
     Color statusColor = VideoPlatformTheme.accent;
+    IconData statusIcon = Icons.downloading_rounded;
     if (task.isCompleted) {
       statusColor = VideoPlatformTheme.success;
+      statusIcon = Icons.check_circle_rounded;
     } else if (task.isFailed) {
       statusColor = VideoPlatformTheme.danger;
+      statusIcon = Icons.error_outline_rounded;
     } else if (task.status == 'Pending') {
       statusColor = VideoPlatformTheme.warning;
+      statusIcon = Icons.schedule_rounded;
+    } else if (task.status == 'Converting') {
+      statusColor = const Color(0xFFA855F7);
+      statusIcon = Icons.movie_filter_rounded;
+    } else if (task.status == 'Uploading') {
+      statusColor = const Color(0xFF38BDF8);
+      statusIcon = Icons.cloud_upload_rounded;
     }
 
-    final pct = task.progress.clamp(0.0, 100.0);
+    final pct = task.isCompleted ? 100.0 : task.progress.clamp(0.0, 100.0);
+    final typeBadge = _detectTaskTypeBadge(task);
+    final hostLabel = _extractUrlHost(task.url);
+    final hasLocalOffline = _localOfflinePathByTaskId.containsKey(task.id);
+    final localSavePct = _localSaveProgressByTaskId[task.id];
 
     return Container(
-      padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         color: VideoPlatformTheme.bgElevated,
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: VideoPlatformTheme.borderSubtle),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: task.isActive
+              ? VideoPlatformTheme.accent.withValues(alpha: 0.45)
+              : (task.isFailed
+                  ? VideoPlatformTheme.danger.withValues(alpha: 0.4)
+                  : VideoPlatformTheme.borderSubtle),
+          width: task.isActive ? 1.3 : 1.0,
+        ),
       ),
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // Top Row: Leading Icon + Status Badge + Type Badge + Title + Speed Pill + Percentage
           Row(
             children: [
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                width: 34,
+                height: 34,
                 decoration: BoxDecoration(
-                  color: statusColor.withValues(alpha: 0.16),
-                  borderRadius: BorderRadius.circular(4),
-                  border: Border.all(color: statusColor.withValues(alpha: 0.5)),
-                ),
-                child: Text(
-                  task.statusLabel,
-                  style: TextStyle(
-                    fontSize: 11,
-                    color: statusColor,
-                    fontWeight: FontWeight.w600,
+                  color: statusColor.withValues(alpha: 0.14),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                    color: statusColor.withValues(alpha: 0.38),
                   ),
                 ),
+                child: Icon(statusIcon, size: 18, color: statusColor),
               ),
               const SizedBox(width: 10),
               Expanded(
-                child: Text(
-                  task.name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w600,
-                    color: VideoPlatformTheme.textPrimary,
-                  ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 7,
+                            vertical: 1.5,
+                          ),
+                          decoration: BoxDecoration(
+                            color: statusColor.withValues(alpha: 0.16),
+                            borderRadius: BorderRadius.circular(4),
+                            border: Border.all(
+                              color: statusColor.withValues(alpha: 0.5),
+                            ),
+                          ),
+                          child: Text(
+                            task.statusLabel,
+                            style: TextStyle(
+                              fontSize: 10.5,
+                              color: statusColor,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 1.5,
+                          ),
+                          decoration: BoxDecoration(
+                            color: VideoPlatformTheme.bgCard,
+                            borderRadius: BorderRadius.circular(4),
+                            border: Border.all(
+                              color: VideoPlatformTheme.borderSubtle,
+                            ),
+                          ),
+                          child: Text(
+                            typeBadge,
+                            style: TextStyle(
+                              fontSize: 10,
+                              fontWeight: FontWeight.w700,
+                              color: VideoPlatformTheme.textSecondary,
+                            ),
+                          ),
+                        ),
+                        if (hasLocalOffline) ...[
+                          const SizedBox(width: 6),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 1.5,
+                            ),
+                            decoration: BoxDecoration(
+                              color: VideoPlatformTheme.success
+                                  .withValues(alpha: 0.15),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: Text(
+                              '已存本机',
+                              style: TextStyle(
+                                fontSize: 10,
+                                fontWeight: FontWeight.w700,
+                                color: VideoPlatformTheme.success,
+                              ),
+                            ),
+                          ),
+                        ],
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            task.name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 14,
+                              fontWeight: FontWeight.w700,
+                              color: VideoPlatformTheme.textPrimary,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 3),
+                    Row(
+                      children: [
+                        Icon(
+                          Icons.link_rounded,
+                          size: 13,
+                          color: VideoPlatformTheme.textMuted,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          hostLabel,
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            color: VideoPlatformTheme.textSecondary,
+                          ),
+                        ),
+                        if (task.totalSegments > 0) ...[
+                          const SizedBox(width: 8),
+                          Text(
+                            '· 分片 ${task.downloadedSegments} / ${task.totalSegments}',
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
+                              color: VideoPlatformTheme.accent,
+                              fontFeatures: const [
+                                FontFeature.tabularFigures(),
+                              ],
+                            ),
+                          ),
+                        ],
+                        if (task.outputFile.trim().isNotEmpty) ...[
+                          const SizedBox(width: 8),
+                          Flexible(
+                            child: Text(
+                              '· ${_resolveTaskFileName(task)}',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: VideoPlatformTheme.textMuted,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ],
                 ),
               ),
               const SizedBox(width: 8),
+              // Real-time Speed Pill & Percentage Badge
               if (task.isActive)
-                Text(
-                  task.formattedSpeed,
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: VideoPlatformTheme.accent,
-                    fontWeight: FontWeight.w600,
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 9,
+                    vertical: 4,
+                  ),
+                  decoration: BoxDecoration(
+                    color: VideoPlatformTheme.accent.withValues(alpha: 0.14),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(
+                      color: VideoPlatformTheme.accent.withValues(alpha: 0.4),
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.speed_rounded,
+                        size: 13,
+                        color: VideoPlatformTheme.accent,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        task.formattedSpeed,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: VideoPlatformTheme.accent,
+                          fontWeight: FontWeight.w700,
+                          fontFeatures: const [FontFeature.tabularFigures()],
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-              const SizedBox(width: 12),
+              const SizedBox(width: 10),
               Text(
                 '${pct.toStringAsFixed(1)}%',
                 style: TextStyle(
-                  fontSize: 12,
-                  color: VideoPlatformTheme.textSecondary,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w800,
+                  color: task.isCompleted
+                      ? VideoPlatformTheme.success
+                      : VideoPlatformTheme.textPrimary,
+                  fontFeatures: const [FontFeature.tabularFigures()],
                 ),
               ),
             ],
           ),
           const SizedBox(height: 10),
+
+          // Progress Bar
           ClipRRect(
-            borderRadius: BorderRadius.circular(3),
+            borderRadius: BorderRadius.circular(4),
             child: LinearProgressIndicator(
               value: pct / 100.0,
               minHeight: 6,
@@ -1146,107 +1726,212 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
               color: statusColor,
             ),
           ),
-          const SizedBox(height: 10),
+
+          // Error Banner if task failed
+          if (task.error.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(
+                color: VideoPlatformTheme.danger.withValues(alpha: 0.10),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(
+                  color: VideoPlatformTheme.danger.withValues(alpha: 0.35),
+                ),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.warning_amber_rounded,
+                    size: 15,
+                    color: VideoPlatformTheme.danger,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      '错误原因：${task.error}',
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        color: VideoPlatformTheme.danger,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+
+          const SizedBox(height: 9),
+
+          // Bottom Row: Source URL + Copy URL + Task Action Buttons
           Row(
             children: [
               Expanded(
-                child: Text(
-                  task.error.isNotEmpty
-                      ? '错误：${task.error}'
-                      : (task.totalSegments > 0
-                          ? '分片进度：${task.downloadedSegments} / ${task.totalSegments} · ${task.url}'
-                          : task.url),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 11,
-                    color: task.error.isNotEmpty
-                        ? VideoPlatformTheme.danger
-                        : VideoPlatformTheme.textMuted,
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(4),
+                  onTap: () {
+                    Clipboard.setData(ClipboardData(text: task.url));
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('已复制任务源链接到剪贴板'),
+                        duration: Duration(seconds: 2),
+                      ),
+                    );
+                  },
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 2),
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.copy_rounded,
+                          size: 12,
+                          color: VideoPlatformTheme.textMuted,
+                        ),
+                        const SizedBox(width: 5),
+                        Expanded(
+                          child: Text(
+                            task.url,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: VideoPlatformTheme.textMuted,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ),
               const SizedBox(width: 8),
-              if (task.isCompleted) ...[
-                TextButton.icon(
-                  onPressed: () => _playTaskOutput(task),
-                  icon: const Icon(Icons.play_circle_outline, size: 16),
-                  label: Text(
-                    _localOfflinePathByTaskId.containsKey(task.id)
-                        ? '离线播放'
-                        : '客户端播放',
+              Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  if (task.isCompleted) ...[
+                    FilledButton.tonalIcon(
+                      style: FilledButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 4,
+                        ),
+                      ),
+                      onPressed: () => _playTaskOutput(task),
+                      icon: const Icon(
+                        Icons.play_circle_outline_rounded,
+                        size: 15,
+                      ),
+                      label: Text(
+                        hasLocalOffline ? '离线播放' : '客户端播放',
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                    ),
+                    OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 9,
+                          vertical: 4,
+                        ),
+                      ),
+                      onPressed: () =>
+                          _playTaskOutput(task, inMiniPlayer: true),
+                      icon: const Icon(
+                        Icons.picture_in_picture_alt_rounded,
+                        size: 14,
+                      ),
+                      label: const Text('小窗', style: TextStyle(fontSize: 12)),
+                    ),
+                    OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 9,
+                          vertical: 4,
+                        ),
+                      ),
+                      onPressed: localSavePct != null
+                          ? null
+                          : () => _saveTaskToLocalOffline(task),
+                      icon: Icon(
+                        hasLocalOffline
+                            ? Icons.offline_pin_rounded
+                            : Icons.save_alt_rounded,
+                        size: 15,
+                        color:
+                            hasLocalOffline ? VideoPlatformTheme.success : null,
+                      ),
+                      label: Text(
+                        localSavePct != null
+                            ? '缓存中 ${(localSavePct * 100).toStringAsFixed(0)}%'
+                            : (hasLocalOffline ? '已存本机' : '保存本机离线'),
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                    ),
+                    OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 9,
+                          vertical: 4,
+                        ),
+                      ),
+                      onPressed: () async {
+                        try {
+                          await widget.appState.api.uploadTaskTo115(task.id);
+                          if (mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('已触发上传 115 网盘')),
+                            );
+                          }
+                        } catch (e) {
+                          if (mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(content: Text('上传 115 失败：$e')),
+                            );
+                          }
+                        }
+                      },
+                      icon: const Icon(Icons.cloud_upload_outlined, size: 15),
+                      label: const Text('上传115', style: TextStyle(fontSize: 12)),
+                    ),
+                  ],
+                  if (task.isFailed)
+                    FilledButton.tonalIcon(
+                      style: FilledButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 4,
+                        ),
+                      ),
+                      onPressed: () async {
+                        await widget.appState.api.retryDownloadTask(task.id);
+                        await widget.appState.refreshDownloadTasks();
+                      },
+                      icon: const Icon(Icons.refresh_rounded, size: 15),
+                      label: const Text('重试', style: TextStyle(fontSize: 12)),
+                    ),
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    tooltip: '删除任务',
+                    icon: Icon(
+                      Icons.delete_outline_rounded,
+                      size: 18,
+                      color: VideoPlatformTheme.textMuted,
+                    ),
+                    onPressed: () async {
+                      await widget.appState.api.deleteDownloadTask(task.id);
+                      await widget.appState.refreshDownloadTasks();
+                    },
                   ),
-                ),
-                TextButton.icon(
-                  onPressed: () => _playTaskOutput(task, inMiniPlayer: true),
-                  icon: const Icon(
-                    Icons.picture_in_picture_alt_rounded,
-                    size: 15,
-                  ),
-                  label: const Text('小窗'),
-                ),
-                TextButton.icon(
-                  onPressed: _localSaveProgressByTaskId.containsKey(task.id)
-                      ? null
-                      : () => _saveTaskToLocalOffline(task),
-                  icon: Icon(
-                    _localOfflinePathByTaskId.containsKey(task.id)
-                        ? Icons.offline_pin_rounded
-                        : Icons.save_alt_rounded,
-                    size: 16,
-                    color: _localOfflinePathByTaskId.containsKey(task.id)
-                        ? VideoPlatformTheme.success
-                        : null,
-                  ),
-                  label: Text(
-                    _localSaveProgressByTaskId.containsKey(task.id)
-                        ? '缓存中 ${(_localSaveProgressByTaskId[task.id]! * 100).toStringAsFixed(0)}%'
-                        : (_localOfflinePathByTaskId.containsKey(task.id)
-                            ? '已存本机'
-                            : '保存本机离线'),
-                  ),
-                ),
-                TextButton.icon(
-                  onPressed: () async {
-                    try {
-                      await widget.appState.api.uploadTaskTo115(task.id);
-                      if (mounted) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text('已触发上传 115 网盘')),
-                        );
-                      }
-                    } catch (e) {
-                      if (mounted) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(content: Text('上传 115 失败：$e')),
-                        );
-                      }
-                    }
-                  },
-                  icon: const Icon(Icons.cloud_upload_outlined, size: 16),
-                  label: const Text('上传115'),
-                ),
-              ],
-              if (task.isFailed)
-                TextButton.icon(
-                  onPressed: () async {
-                    await widget.appState.api.retryDownloadTask(task.id);
-                    await widget.appState.refreshDownloadTasks();
-                  },
-                  icon: const Icon(Icons.refresh, size: 16),
-                  label: const Text('重试'),
-                ),
-              IconButton(
-                tooltip: '删除任务',
-                icon: Icon(
-                  Icons.delete_outline,
-                  size: 18,
-                  color: VideoPlatformTheme.textMuted,
-                ),
-                onPressed: () async {
-                  await widget.appState.api.deleteDownloadTask(task.id);
-                  await widget.appState.refreshDownloadTasks();
-                },
+                ],
               ),
             ],
           ),

@@ -13,10 +13,13 @@ import 'package:m3u8_client/services/m3u8_ad_remover.dart';
 import 'package:m3u8_client/services/proxy_routing_service.dart';
 import 'package:m3u8_client/services/telegram_notification_service.dart';
 import 'package:m3u8_client/state/app_state.dart';
+import 'package:m3u8_client/ui/screens/downloads_screen.dart';
+import 'package:m3u8_client/ui/screens/library_history_screen.dart';
 import 'package:m3u8_client/ui/screens/proxy_server_screen.dart';
 import 'package:m3u8_client/ui/screens/telegram_screen.dart';
 import 'package:m3u8_client/ui/theme.dart';
 import 'package:m3u8_client/ui/widgets/mobile_edge_swipe_back.dart';
+import 'package:m3u8_client/ui/widgets/source_picker_sheet.dart';
 import 'package:m3u8_client/ui/widgets/video_115_accelerate_button.dart';
 import 'package:m3u8_client/ui/widgets/video_download_speed_badge.dart';
 import 'package:m3u8_client/ui/widgets/video_proxy_node_selector.dart';
@@ -163,6 +166,35 @@ class _FakeTelegramApiClient extends ApiClient {
     required String peer,
     required bool active,
   }) async {}
+
+  @override
+  Future<bool> verifyConnection() async => true;
+
+  @override
+  Future<List<VodSource>> fetchAllVodSources() async => const [];
+
+  @override
+  Future<({List<LibraryItem> favorites, List<LibraryItem> history})>
+      fetchLibrary() async => (
+            favorites: const <LibraryItem>[],
+            history: const <LibraryItem>[],
+          );
+
+  @override
+  Future<List<DownloadTask>> fetchDownloadTasks() async => const [];
+
+  @override
+  Future<ServerSettings> fetchServerSettings() async => const ServerSettings({});
+
+  @override
+  Future<({List<ProxyServiceConfig> services, List<ProxyRuntimeStatus> statuses})>
+      fetchProxyConfig() async => (
+            services: const <ProxyServiceConfig>[],
+            statuses: const <ProxyRuntimeStatus>[],
+          );
+
+  @override
+  Future<Map<String, dynamic>> fetch115Status() async => const {'logged_in': false};
 }
 
 class _PlaybackIndicatorPlayer extends PlatformPlayer {
@@ -1082,7 +1114,9 @@ proxies:
 
     // 2. Start a mock SOCKS5 proxy node that forwards to originServer
     final socksServer = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    final activeSocksSockets = <Socket>[];
     socksServer.listen((Socket client) async {
+      activeSocksSockets.add(client);
       final rx = <int>[];
       var stage = 0;
       Socket? upstream;
@@ -1104,7 +1138,13 @@ proxies:
                 final host = utf8.decode(rx.sublist(5, 5 + hostLen));
                 final port = (rx[5 + hostLen] << 8) | rx[5 + hostLen + 1];
                 rx.removeRange(0, 5 + hostLen + 2);
-                upstream = await Socket.connect(host, port);
+                try {
+                  upstream = await Socket.connect(host, port);
+                  activeSocksSockets.add(upstream!);
+                } catch (_) {
+                  client.destroy();
+                  return;
+                }
                 stage = 2;
                 client.add(const [0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0]);
                 if (rx.isNotEmpty) {
@@ -1180,6 +1220,9 @@ proxies:
 
     hc.close(force: true);
     svc.dispose();
+    for (final s in activeSocksSockets) {
+      s.destroy();
+    }
     await socksServer.close();
     await originServer.close(force: true);
   });
@@ -1767,10 +1810,12 @@ proxies:
 
     var socks1Hits = 0;
     var socks2Hits = 0;
+    final activeTestSockets = <Socket>[];
 
     Future<ServerSocket> startMockSocks(void Function() onHit) async {
       final srv = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
       srv.listen((Socket client) async {
+        activeTestSockets.add(client);
         final rx = <int>[];
         var stage = 0;
         Socket? upstream;
@@ -1793,7 +1838,13 @@ proxies:
                   final port = (rx[5 + hostLen] << 8) | rx[5 + hostLen + 1];
                   rx.removeRange(0, 5 + hostLen + 2);
                   onHit();
-                  upstream = await Socket.connect(host, port);
+                  try {
+                    upstream = await Socket.connect(host, port);
+                    activeTestSockets.add(upstream!);
+                  } catch (_) {
+                    client.destroy();
+                    return;
+                  }
                   stage = 2;
                   client.add(const [0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0]);
                   if (rx.isNotEmpty) {
@@ -1921,6 +1972,9 @@ proxies:
 
     hc.close(force: true);
     svc.dispose();
+    for (final s in activeTestSockets) {
+      s.destroy();
+    }
     await socks1.close();
     await socks2.close();
     await originServer.close(force: true);
@@ -2216,4 +2270,604 @@ proxies:
 
     appState.dispose();
   });
+
+  testWidgets(
+      'PlayerVolumeControl and VideoDownloadSpeedBadge render visibly and adjust volume / mute state interactively',
+      (WidgetTester tester) async {
+    final fakePlayer = _FakeMediaKitPlayer(initialVolume: 80.0);
+    addTearDown(fakePlayer.dispose);
+
+    LocalProxyTunnelBridge.recordDownstreamBytes(512 * 1024);
+
+    double? callbackVolume;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Center(
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                VideoDownloadSpeedBadge(
+                  player: fakePlayer,
+                  compact: true,
+                ),
+                const SizedBox(width: 8),
+                PlayerVolumeControl(
+                  player: fakePlayer,
+                  compact: true,
+                  showPercentage: true,
+                  onVolumeChanged: (val) => callbackVolume = val,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 50));
+
+    // 1. Speed badge and volume control (80%) are both visible
+    expect(find.byType(VideoDownloadSpeedBadge), findsOneWidget);
+    expect(find.byType(PlayerVolumeControl), findsOneWidget);
+    expect(find.text('80%'), findsOneWidget);
+    expect(find.byIcon(Icons.volume_up_rounded), findsOneWidget);
+
+    // 2. Tap mute button -> mutes to 0%
+    await tester.tap(find.byIcon(Icons.volume_up_rounded));
+    await tester.pump();
+    expect(fakePlayer.currentVolume, 0.0);
+    expect(callbackVolume, 0.0);
+    expect(find.text('0%'), findsOneWidget);
+    expect(find.byIcon(Icons.volume_off_rounded), findsOneWidget);
+
+    // 3. Tap unmute button -> restores previous 80% volume
+    await tester.tap(find.byIcon(Icons.volume_off_rounded));
+    await tester.pump();
+    expect(fakePlayer.currentVolume, 80.0);
+    expect(callbackVolume, 80.0);
+    expect(find.text('80%'), findsOneWidget);
+  });
+
+  test(
+      'TVBox link parser and stream relay handle dollar URLs, stringified headers, multi-quality lists, MacCMS player_aaaa, 302 redirected extensionless M3U8s, and disguised image-bed TS segments',
+      () async {
+    HttpOverrides.global = null;
+
+    // 1. splitTvboxUrlAndHeaders preserves '$' inside URL path/query while stripping title prefix and live comment labels
+    final dollarInPath = ApiClient.splitTvboxUrlAndHeaders(
+      r'正片$//cdn.example.com/v1/play$hd.m3u8?a=1&amp;b=2$3#{"User-Agent":"TVBox/1.0","Referer":"https://ref.example.com/"}',
+    );
+    expect(
+      dollarInPath.cleanUrl,
+      r'https://cdn.example.com/v1/play$hd.m3u8?a=1&b=2$3',
+    );
+    expect(dollarInPath.headers['User-Agent'], 'TVBox/1.0');
+    expect(dollarInPath.headers['Referer'], 'https://ref.example.com/');
+
+    final liveCommentSuffix = ApiClient.splitTvboxUrlAndHeaders(
+      r'http://[2409:8087:1::1]/ott/1.m3u8$IPV6|User-Agent=okhttp/3.15',
+    );
+    expect(liveCommentSuffix.cleanUrl, 'http://[2409:8087:1::1]/ott/1.m3u8');
+    expect(liveCommentSuffix.headers['User-Agent'], 'okhttp/3.15');
+
+    // 2. ResolvedPlayback.fromJson parses stringified JSON headers and multi-quality URL lists
+    final multiQualityResolved = ResolvedPlayback.fromJson({
+      'parse': 0,
+      'url': [
+        '4K臻彩',
+        '//cdn.example.com/4k/index.m3u8?token=1&amp;k=2',
+        '1080P',
+        'https://cdn.example.com/1080p/index.m3u8',
+      ],
+      'header': '{"User-Agent":"Mozilla/5.0","Referer":"https://spider.example.com/"}',
+    });
+    expect(
+      multiQualityResolved.directUrl,
+      'https://cdn.example.com/4k/index.m3u8?token=1&k=2',
+    );
+    expect(multiQualityResolved.headers['User-Agent'], 'Mozilla/5.0');
+    expect(
+      multiQualityResolved.headers['Referer'],
+      'https://spider.example.com/',
+    );
+
+    // 3. VodDetail.fromJson supports custom vod_play_note delimiter and newline-separated episodes
+    final customNoteDetail = VodDetail.fromJson({
+      'vod_id': '8899',
+      'vod_name': '测试剧集',
+      'vod_play_from': r'极速专线$$备用专线',
+      'vod_play_note': r'$$',
+      'vod_play_url':
+          '第1集\$https://cdn.example.com/ep1.m3u8\n第2集\$https://cdn.example.com/ep2.m3u8\$\$第1集\$https://bak.example.com/ep1.m3u8',
+    });
+    expect(customNoteDetail.playGroups.length, 2);
+    expect(customNoteDetail.playGroups[0].episodes.length, 2);
+    expect(
+      customNoteDetail.playGroups[0].episodes[1].rawUrl,
+      'https://cdn.example.com/ep2.m3u8',
+    );
+
+    // 3b. VodDetail.parsePlayGroups prioritizes direct .m3u8 play groups over HTML /share/ play groups
+    final shareVsM3u8Groups = VodDetail.parsePlayGroups(
+      r'hnm3u8$$$hnzym3u8',
+      r'第01集$https://hn.bfvvs.com/play/12345/share/abc#第02集$https://hn.bfvvs.com/play/12346/share/def$$$第01集$https://hn.bfvvs.com/play/12345/index.m3u8#第02集$https://hn.bfvvs.com/play/12346/index.m3u8',
+    );
+    expect(shareVsM3u8Groups.length, 2);
+    expect(shareVsM3u8Groups.first.name, 'hnzym3u8');
+    expect(
+      shareVsM3u8Groups.first.episodes.first.rawUrl,
+      'https://hn.bfvvs.com/play/12345/index.m3u8',
+    );
+
+    // 4. Mock server for wrapper unwrapping, MacCMS player_aaaa encrypt:2, 302 redirected extensionless M3U8, and PNG-disguised TS segment
+    final originServer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final port = originServer.port;
+    addTearDown(() => originServer.close(force: true));
+
+    // Create a 3-packet MPEG-TS payload (3 * 188 = 564 bytes, each starting with 0x47)
+    // prepended with an 8-byte fake PNG signature (89 50 4E 47 0D 0A 1A 0A)
+    final fakePngHeader = <int>[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    final realTsPayload = List<int>.generate(
+      188 * 3,
+      (i) => (i % 188 == 0) ? 0x47 : (i & 0xFF),
+    );
+    final disguisedSegmentBytes = <int>[...fakePngHeader, ...realTsPayload];
+
+    originServer.listen((HttpRequest req) async {
+      if (req.uri.path == '/vodplay/1001-1-1.html') {
+        final targetM3u8 = 'http://127.0.0.1:$port/tvbox/redirect_entry';
+        final enc2 = base64.encode(utf8.encode(Uri.encodeComponent(targetM3u8)));
+        req.response.headers.contentType = ContentType.html;
+        req.response.write(
+          '<html><body><script>var player_aaaa={"flag":"play","encrypt":2,"url":"$enc2"};</script></body></html>',
+        );
+        await req.response.close();
+        return;
+      }
+      if (req.uri.path == '/tvbox/redirect_entry') {
+        req.response.statusCode = HttpStatus.found;
+        req.response.headers.set(
+          HttpHeaders.locationHeader,
+          'http://127.0.0.1:$port/hls/2026/extensionless_stream?token=ok',
+        );
+        await req.response.close();
+        return;
+      }
+      if (req.uri.path == '/hls/2026/extensionless_stream') {
+        // Extensionless M3U8 with UTF-8 BOM, text/plain Content-Type, relative AES-128 key, and relative .jpg disguised segment.
+        // Simulate VOD CDNs (like hn.bfvvs.com / senlin / ffzy) that return 206 Partial Content whenever Range is forwarded.
+        if (req.headers.value(HttpHeaders.rangeHeader) != null) {
+          req.response.statusCode = HttpStatus.partialContent;
+        }
+        req.response.headers.contentType = ContentType.text;
+        req.response.write(
+          '\uFEFF#EXTM3U\n'
+          '#EXT-X-VERSION:3\n'
+          '#EXT-X-TARGETDURATION:4\n'
+          '#EXT-X-KEY:METHOD=AES-128,URI="enc.key",IV=0x00000000000000000000000000000000\n'
+          '#EXTINF:4.0,\n'
+          'disguised_seg01.jpg\n'
+          '#EXT-X-ENDLIST\n',
+        );
+        await req.response.close();
+        return;
+      }
+      if (req.uri.path == '/hls/2026/enc.key') {
+        req.response.headers.contentType =
+            ContentType('application', 'octet-stream');
+        req.response.add(List<int>.filled(16, 0x41));
+        await req.response.close();
+        return;
+      }
+      if (req.uri.path == '/hls/2026/disguised_seg01.jpg') {
+        req.response.headers.contentType = ContentType('image', 'png');
+        req.response.contentLength = disguisedSegmentBytes.length;
+        req.response.add(disguisedSegmentBytes);
+        await req.response.close();
+        return;
+      }
+      req.response.statusCode = HttpStatus.notFound;
+      await req.response.close();
+    });
+
+    final api = ApiClient(
+      ServerConfig(
+        baseUrl: 'http://127.0.0.1:$port',
+        preferDirectPlayback: true,
+      ),
+    );
+    const tvboxSource = VodSource(
+      id: 'tvbox_0_1',
+      name: '测试TVBox源',
+      api: 'csp_Test',
+      isTvBox: true,
+      tvboxSiteIndex: 1,
+      tvboxSourceIndex: 0,
+      tvboxType: 3,
+    );
+
+    // 4a. Wrapper URL (`?url=http://...m3u8`) is unwrapped in 0ms instead of feeding HTML wrapper to libmpv
+    final wrappedResolved = await api.resolveVodPlayback(
+      tvboxSource,
+      playGroup: '线路1',
+      episodeUrl:
+          'https://player.example.com/dplayer/?url=http://127.0.0.1:$port/direct/video.m3u8',
+    );
+    expect(
+      wrappedResolved.directUrl,
+      'http://127.0.0.1:$port/direct/video.m3u8',
+    );
+    expect(wrappedResolved.headers['Referer'], 'https://player.example.com/');
+
+    // 4b. MacCMS HTML page (`/vodplay/1001-1-1.html`) with `player_aaaa` (`encrypt: 2`)
+    // is automatically decrypted & resolved on the client when `/api/vod/play` returns 404
+    final htmlResolved = await api.resolveVodPlayback(
+      tvboxSource,
+      playGroup: '线路1',
+      episodeUrl: 'http://127.0.0.1:$port/vodplay/1001-1-1.html',
+    );
+    expect(
+      htmlResolved.directUrl,
+      'http://127.0.0.1:$port/tvbox/redirect_entry',
+    );
+
+    // 4c. Route the resolved redirect_entry through LocalProxyTunnelBridge:
+    // It should follow the 302 redirect to `/hls/2026/extensionless_stream`, recognize `\uFEFF#EXTM3U`,
+    // resolve relative `disguised_seg01.jpg` against `/hls/2026/`, rewrite it to `/__m3u8_proxy__/segment.ts`,
+    // and strip the 8-byte fake PNG header so the segment starts with `0x47`!
+    final bridge = LocalProxyTunnelBridge(resolveDefaultNode: () => null);
+    addTearDown(bridge.stop);
+    await bridge.ensureStarted();
+
+    final relayedMaster = bridge.buildStreamRelayUrl(
+      targetUrl: htmlResolved.directUrl,
+      headers: htmlResolved.headers,
+      forceDirect: true,
+    );
+
+    final hc = HttpClient();
+    addTearDown(() => hc.close(force: true));
+    final m3u8Req = await hc.getUrl(Uri.parse(relayedMaster));
+    // Simulate libmpv / Lavf always sending `Range: bytes=0-`
+    m3u8Req.headers.set(HttpHeaders.rangeHeader, 'bytes=0-');
+    final m3u8Resp = await m3u8Req.close();
+    expect(m3u8Resp.statusCode, 200);
+    final m3u8Text = await utf8.decoder.bind(m3u8Resp).join();
+    expect(m3u8Text, contains('#EXTINF:4.0,'));
+    expect(m3u8Text, contains('/__m3u8_proxy__/enc.key?'));
+    expect(m3u8Text, contains('/__m3u8_proxy__/segment.ts?'));
+
+    final keyLine = m3u8Text
+        .split('\n')
+        .map((l) => l.trim())
+        .firstWhere((l) => l.startsWith('#EXT-X-KEY:'));
+    final keyUrl = RegExp(r'URI="([^"]+)"').firstMatch(keyLine)!.group(1)!;
+    final keyReq = await hc.getUrl(Uri.parse(keyUrl));
+    keyReq.headers.set(HttpHeaders.rangeHeader, 'bytes=0-');
+    final keyResp = await keyReq.close();
+    expect(keyResp.statusCode, 200);
+    final keyBytes =
+        await keyResp.fold<List<int>>(<int>[], (a, b) => a..addAll(b));
+    expect(keyBytes.length, 16);
+
+    final segRelayUrl = m3u8Text
+        .split('\n')
+        .map((l) => l.trim())
+        .firstWhere((l) => l.startsWith('http://127.0.0.1:'));
+    final segReq = await hc.getUrl(Uri.parse(segRelayUrl));
+    segReq.headers.set(HttpHeaders.rangeHeader, 'bytes=0-');
+    final segResp = await segReq.close();
+    expect(segResp.statusCode, 200);
+    expect(segResp.headers.contentType?.mimeType, 'video/mp2t');
+    final segBytes =
+        await segResp.fold<List<int>>(<int>[], (a, b) => a..addAll(b));
+    expect(segBytes.length, realTsPayload.length);
+    expect(segBytes[0], 0x47);
+    expect(segBytes[188], 0x47);
+    expect(segBytes[376], 0x47);
+  });
+
+  testWidgets(
+      'MainShell preserves previous screen state when visiting Proxy or Settings and returns via back button',
+      (WidgetTester tester) async {
+    tester.view.physicalSize = const Size(1440, 900);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    SharedPreferences.setMockInitialValues({});
+    final appState = AppState(customApi: _FakeTelegramApiClient());
+    await appState.proxyService.initialize();
+    await appState.updateServerConfig(
+      const ServerConfig(
+        baseUrl: 'https://127.0.0.1:59999',
+        authMode: AuthMode.none,
+      ),
+    );
+    addTearDown(appState.dispose);
+
+    await tester.pumpWidget(M3u8VideoClientApp(appState: appState));
+    await tester.pump(const Duration(milliseconds: 100));
+
+    // Switch to Tab 2 (下载工作台)
+    appState.onNavigateToTab?.call(2);
+    await tester.pump(const Duration(milliseconds: 100));
+
+    // Enter text in the Download screen's URL input field to verify state preservation
+    final downloadTextFields = find.descendant(
+      of: find.byType(DownloadsScreen),
+      matching: find.byType(TextField),
+    );
+    expect(downloadTextFields, findsWidgets);
+    await tester.enterText(
+      downloadTextFields.first,
+      'https://example.com/preserved_task.m3u8',
+    );
+    await tester.pump();
+    expect(find.text('https://example.com/preserved_task.m3u8'), findsOneWidget);
+
+    // Navigate to Proxy screen (Tab 6)
+    appState.onNavigateToTab?.call(6);
+    await tester.pump(const Duration(milliseconds: 100));
+
+    // Verify Proxy screen shows the "返回 下载工作台" button and DownloadsScreen is still alive (offstage)
+    final proxyBackBtn = find.byKey(const ValueKey('proxy_back_to_previous_btn'));
+    expect(proxyBackBtn, findsOneWidget);
+    expect(find.text('返回 下载工作台'), findsOneWidget);
+    expect(
+      find.byType(DownloadsScreen, skipOffstage: false),
+      findsOneWidget,
+    );
+
+    // Click "返回 下载工作台" button on Proxy screen
+    await tester.tap(proxyBackBtn);
+    await tester.pump(const Duration(milliseconds: 100));
+
+    // Verify we returned to DownloadsScreen and our typed text was preserved!
+    expect(find.byType(DownloadsScreen), findsOneWidget);
+    expect(find.text('https://example.com/preserved_task.m3u8'), findsOneWidget);
+
+    // Navigate to Settings screen (Tab 8)
+    appState.onNavigateToTab?.call(8);
+    await tester.pump(const Duration(milliseconds: 100));
+
+    final settingsBackBtn =
+        find.byKey(const ValueKey('settings_back_to_previous_btn'));
+    expect(settingsBackBtn, findsOneWidget);
+    expect(find.text('返回 下载工作台'), findsOneWidget);
+
+    // Click "返回 下载工作台" button on Settings screen
+    await tester.tap(settingsBackBtn);
+    await tester.pump(const Duration(milliseconds: 100));
+
+    // Verify we returned to DownloadsScreen and our typed text is still preserved!
+    expect(find.byType(DownloadsScreen), findsOneWidget);
+    expect(find.text('https://example.com/preserved_task.m3u8'), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+  });
+
+  testWidgets(
+      'SourcePickerDialog renders redesigned source cards with latency speed test, sorting, and pin support',
+      (WidgetTester tester) async {
+    tester.view.physicalSize = const Size(1280, 840);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    const sources = <VodSource>[
+      VodSource(
+        id: 'custom_0',
+        name: '量子资源',
+        api: 'https://cj.lziapi.com/api.php/provide/vod/',
+        isTvBox: false,
+        customIndex: 0,
+      ),
+      VodSource(
+        id: 'tvbox_0_1',
+        name: '玩偶哥哥',
+        api: 'csp_WoggGuard',
+        isTvBox: true,
+        tvboxType: 3,
+        tvboxSiteIndex: 1,
+        tvboxSourceIndex: 0,
+        tvboxSourceName: '饭太硬',
+      ),
+    ];
+
+    VodSource? picked;
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: VideoPlatformTheme.buildTheme(),
+        home: Scaffold(
+          body: SourcePickerDialog(
+            sources: sources,
+            selectedSource: sources.first,
+            onSelect: (s) => picked = s,
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    expect(find.text('切换片源站点'), findsOneWidget);
+    expect(find.text('共 2 个站点'), findsOneWidget);
+    expect(find.text('量子资源'), findsOneWidget);
+    expect(find.text('玩偶哥哥'), findsOneWidget);
+    expect(find.text('当前使用'), findsOneWidget);
+    expect(find.text('CMS JSON'), findsOneWidget);
+    expect(find.text('Spider JAR'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('source_picker_batch_test_btn')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('source_picker_sort_speed_btn')),
+      findsOneWidget,
+    );
+
+    // Trigger single-source speed test on the first card
+    final speedButtons = find.text('点击测速');
+    expect(speedButtons, findsNWidgets(2));
+    await tester.tap(speedButtons.first);
+    await tester.pump(const Duration(milliseconds: 200));
+
+    expect(find.text('160ms'), findsOneWidget);
+    expect(find.text('极速'), findsOneWidget);
+
+    // Tap the fastest pick button
+    final pickFastestBtn =
+        find.byKey(const ValueKey('source_picker_pick_fastest_btn'));
+    expect(pickFastestBtn, findsOneWidget);
+    await tester.tap(pickFastestBtn);
+    await tester.pumpAndSettle();
+    expect(picked?.id, 'custom_0');
+  });
+
+  testWidgets('watchHistoryEnabled toggle disables watch history and progress recording',
+      (WidgetTester tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final appState = AppState();
+    addTearDown(appState.dispose);
+
+    expect(appState.watchHistoryEnabled, isTrue);
+
+    const testSource = VodSource(
+      id: 'source_1',
+      name: '测试源',
+      api: 'https://example.com/api.php/provide/vod/',
+    );
+    const detail1 = VodDetail(
+      vodId: 'vod_101',
+      vodName: '测试电影A',
+      vodPic: 'https://example.com/a.jpg',
+      typeName: '科幻',
+      vodRemarks: 'HD',
+    );
+    await appState.recordWatchHistory(
+      source: testSource,
+      detail: detail1,
+      episodeTitle: '第1集',
+      lineName: 'hnm3u8',
+      positionSeconds: 120,
+      durationSeconds: 3600,
+    );
+    expect(appState.history.length, 1);
+
+    // Turn off watch history recording
+    await appState.setWatchHistoryEnabled(false);
+    expect(appState.watchHistoryEnabled, isFalse);
+
+    const detail2 = VodDetail(
+      vodId: 'vod_202',
+      vodName: '无痕观看电影B',
+      vodPic: 'https://example.com/b.jpg',
+      typeName: '动作',
+      vodRemarks: '4K',
+    );
+    await appState.recordWatchHistory(
+      source: testSource,
+      detail: detail2,
+      episodeTitle: '第1集',
+      lineName: 'hnm3u8',
+      positionSeconds: 300,
+      durationSeconds: 5400,
+    );
+    await appState.saveVodProgress(
+      sourceKey: testSource.librarySourceKey,
+      vodId: 'vod_202',
+      groupIndex: 0,
+      episodeIndex: 0,
+      episodeName: '第1集',
+      positionSeconds: 300,
+      durationSeconds: 5400,
+    );
+
+    // Neither history nor getVodProgress should record detail2 while disabled
+    expect(appState.history.length, 1);
+    expect(appState.history.first.vodId, 'vod_101');
+    expect(
+      appState.getVodProgress(testSource.librarySourceKey, 'vod_202'),
+      isNull,
+    );
+
+    // Render LibraryHistoryScreen and verify the incognito banner & quick toggle button
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: VideoPlatformTheme.buildTheme(),
+        home: Scaffold(
+          body: LibraryHistoryScreen(appState: appState),
+        ),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 100));
+
+    expect(find.text('记录已关闭'), findsOneWidget);
+    expect(
+      find.textContaining('当前已关闭观看历史记录（无痕观看模式）'),
+      findsOneWidget,
+    );
+
+    // Click '重新开启' in the banner
+    await tester.tap(find.text('重新开启'));
+    await tester.pump(const Duration(milliseconds: 100));
+
+    expect(appState.watchHistoryEnabled, isTrue);
+    expect(find.text('记录已开启'), findsOneWidget);
+  });
+}
+
+class _FakePlayerStream implements PlayerStream {
+  _FakePlayerStream(this.volume);
+
+  @override
+  final Stream<double> volume;
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _FakeMediaKitPlayer implements Player {
+  _FakeMediaKitPlayer({double initialVolume = 100.0})
+      : currentVolume = initialVolume {
+    _state = PlayerState(volume: initialVolume);
+    _stream = _FakePlayerStream(_volumeController.stream);
+  }
+
+  double currentVolume;
+  late PlayerState _state;
+  late final PlayerStream _stream;
+  final StreamController<double> _volumeController =
+      StreamController<double>.broadcast();
+
+  @override
+  PlayerState get state => _state;
+
+  @override
+  PlayerStream get stream => _stream;
+
+  @override
+  PlatformPlayer? get platform => null;
+
+  @override
+  Future<void> setVolume(double volume) async {
+    currentVolume = volume;
+    _state = _state.copyWith(volume: volume);
+    if (!_volumeController.isClosed) {
+      _volumeController.add(volume);
+    }
+  }
+
+  @override
+  Future<void> dispose() async {
+    await _volumeController.close();
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }

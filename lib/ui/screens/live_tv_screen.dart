@@ -41,12 +41,16 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
   StreamSubscription<VideoParams>? _videoParamsSub;
   StreamSubscription<Duration>? _posSub;
   StreamSubscription<bool>? _bufferingSub;
+  StreamSubscription<bool>? _playingSub;
   final GlobalKey _liveVideoWidgetKey =
       GlobalKey(debugLabel: 'LiveMainVideoWidget');
+  final GlobalKey _livePlayerPanelKey =
+      GlobalKey(debugLabel: 'LivePlayerPanel');
   int _liveVideoWidth = 0;
   int _liveVideoHeight = 0;
   String _liveAspectMode = 'fit'; // 'fit', 'cover', '16:9'
   bool? _liveLandscapeOverride;
+  DateTime _lastFullscreenToggleAt = DateTime.fromMillisecondsSinceEpoch(0);
   Timer? _startupTimer;
   Timer? _reconnectTimer;
   Timer? _liveBufferingLagTimer;
@@ -84,7 +88,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
   bool _liveOsdVisible = false;
   bool _showFullscreenChannelDrawer = false;
   Timer? _liveOsdTimer;
-  double _sidebarWidth = 340.0;
+  double _sidebarWidth = 264.0;
   final Set<String> _collapsedGroups = {};
 
   void _pokeLiveOsd({bool focusBottomBar = false}) {
@@ -163,7 +167,29 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     }
   }
 
+  void _ensureLivePlaybackContinuesAfterFullscreenChange(bool shouldKeepPlaying) {
+    if (!shouldKeepPlaying) return;
+    void checkAndResume() {
+      if (!mounted ||
+          _currentChannel == null ||
+          _playError != null ||
+          widget.appState.miniPlayerSession != null) {
+        return;
+      }
+      if (!_player.state.playing && !_isResolving) {
+        unawaited(_player.play());
+      }
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) => checkAndResume());
+    Future<void>.delayed(const Duration(milliseconds: 180), checkAndResume);
+    Future<void>.delayed(const Duration(milliseconds: 480), checkAndResume);
+  }
+
   void _toggleLiveOrientation() {
+    final shouldKeepPlaying = _currentChannel != null &&
+        (_player.state.playing || _hasActivePlayback || _isResolving);
+    _lastFullscreenToggleAt = DateTime.now();
     final mq = MediaQuery.maybeSizeOf(context);
     final currentlyLandscape = _liveLandscapeOverride ??
         (mq != null ? mq.width > mq.height : !_isLivePortraitVideo);
@@ -182,6 +208,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
         _applyLiveFullscreenOrientation();
       }
     }
+    _ensureLivePlaybackContinuesAfterFullscreenChange(shouldKeepPlaying);
   }
 
   void _cycleLiveAspectMode() {
@@ -197,6 +224,9 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
         widget.appState.isImmersiveFullscreen == next) {
       return;
     }
+    final shouldKeepPlaying = _currentChannel != null &&
+        (_player.state.playing || _hasActivePlayback || _isResolving);
+    _lastFullscreenToggleAt = DateTime.now();
     _liveOsdTimer?.cancel();
     setState(() {
       _isLiveFullscreen = next;
@@ -232,6 +262,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
         }
       }
     }
+    _ensureLivePlaybackContinuesAfterFullscreenChange(shouldKeepPlaying);
     if (next) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) {
@@ -332,14 +363,30 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     });
 
     _posSub = _player.stream.position.listen((pos) {
-      if (pos >= const Duration(seconds: 1) && mounted && !_isResolving) {
+      if (pos > Duration.zero && mounted && !_isResolving) {
         final wasActive = _hasActivePlayback;
         _hasActivePlayback = true;
         _consecutiveReconnects = 0;
         _startupTimer?.cancel();
-        if (!wasActive) {
-          setState(() {});
+        if (!wasActive || _playError != null) {
+          setState(() => _playError = null);
         }
+      }
+    });
+
+    _playingSub = _player.stream.playing.listen((playing) {
+      if (playing ||
+          !mounted ||
+          _isResolving ||
+          _currentChannel == null ||
+          _playError != null ||
+          widget.appState.miniPlayerSession != null) {
+        return;
+      }
+      final sinceFullscreenToggleMs =
+          DateTime.now().difference(_lastFullscreenToggleAt).inMilliseconds;
+      if (sinceFullscreenToggleMs >= 0 && sinceFullscreenToggleMs < 1800) {
+        unawaited(_player.play());
       }
     });
 
@@ -805,6 +852,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     _videoParamsSub?.cancel();
     _posSub?.cancel();
     _bufferingSub?.cancel();
+    _playingSub?.cancel();
     _groupScrollController.dispose();
     _playerFocusNode.dispose();
     _liveBottomBarFocusNode.dispose();
@@ -1232,12 +1280,15 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
           lowerRawUrl.contains('/huya/') ||
           lowerRawUrl.contains('/yy/');
       final watchdogMs = isFlvLiveStream
-          ? 12000
-          : (usingStreamRelay ? 6500 : 5000);
+          ? 14000
+          : (usingStreamRelay ? 12000 : 10000);
       _startupTimer = Timer(Duration(milliseconds: watchdogMs), () {
         if (!mounted || sessionId != _playSessionId) return;
         final hasFlow =
-            LocalProxyTunnelBridge.recentDownstreamBytesPerSecond > 512;
+            _player.state.position > Duration.zero ||
+            (_player.state.width ?? 0) > 0 ||
+            _player.state.buffer > Duration.zero ||
+            LocalProxyTunnelBridge.recentDownstreamBytesPerSecond > 256;
         if (!_hasActivePlayback && !_isResolving && !hasFlow) {
           _tryNextSignalOrReportError(channel, '连接信号源超时');
         }
@@ -1531,6 +1582,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                 child: _buildTopBar(state, filteredChannels),
               ),
             Expanded(
+              key: const ValueKey('live_tv_body_expanded'),
               child: LayoutBuilder(
                 builder: (context, constraints) {
                   final mqSize = MediaQuery.sizeOf(context);
@@ -1541,72 +1593,92 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                   final isPhoneLandscape =
                       isPhoneDevice &&
                       constraints.maxWidth > constraints.maxHeight;
+                  // Use screen width / 620px threshold so toggling MainShell sidebar on fullscreen
+                  // NEVER flips LiveTvScreen between Column and Row layouts!
                   final isDesktop = !isPhoneDevice &&
-                      (constraints.maxWidth >= 860 ||
-                          (widget.appState.tvMode &&
-                              constraints.maxWidth >= 680));
+                      (mqSize.width >= 760 ||
+                          constraints.maxWidth >= 620 ||
+                          widget.appState.tvMode);
                   if (isDesktop) {
+                    final hideSidebar =
+                        _isSidebarCollapsed || _isLiveFullscreen;
+                    final effectiveSidebarWidth = hideSidebar
+                        ? 0.0
+                        : _sidebarWidth.clamp(
+                            190.0,
+                            (constraints.maxWidth * 0.45).clamp(220.0, 480.0),
+                          );
                     return Row(
                       children: [
-                        if (!_isSidebarCollapsed && !_isLiveFullscreen) ...[
-                          FocusTraversalGroup(
-                            child: SizedBox(
-                              width: _sidebarWidth.clamp(
-                                220.0,
-                                (constraints.maxWidth * 0.55)
-                                    .clamp(260.0, 580.0),
-                              ),
-                              child: _buildChannelSidebar(
-                                state,
-                                groups.toList(),
-                                filteredChannels,
-                              ),
-                            ),
-                          ),
-                          // Draggable resize splitter + quick collapse handle
-                          MouseRegion(
-                            cursor: SystemMouseCursors.resizeLeftRight,
-                            child: GestureDetector(
-                              behavior: HitTestBehavior.opaque,
-                              onHorizontalDragUpdate: (details) {
-                                setState(() {
-                                  final maxW = (constraints.maxWidth * 0.55)
-                                      .clamp(260.0, 580.0);
-                                  final next = _sidebarWidth + details.delta.dx;
-                                  if (next < 150) {
-                                    _isSidebarCollapsed = true;
-                                  } else {
-                                    _sidebarWidth = next.clamp(220.0, maxW);
-                                  }
-                                });
-                              },
-                              onDoubleTap: () {
-                                setState(() => _sidebarWidth = 340.0);
-                              },
-                              child: Container(
-                                width: 6,
-                                color: VideoPlatformTheme.borderSubtle,
-                                alignment: Alignment.center,
-                                child: Container(
-                                  width: 2,
-                                  height: 36,
-                                  decoration: BoxDecoration(
-                                    color: VideoPlatformTheme.textMuted
-                                        .withValues(alpha: 0.5),
-                                    borderRadius: BorderRadius.circular(1),
+                        SizedBox(
+                          key: const ValueKey('live_desktop_sidebar_box'),
+                          width: effectiveSidebarWidth,
+                          child: hideSidebar
+                              ? const SizedBox.shrink()
+                              : FocusTraversalGroup(
+                                  child: _buildChannelSidebar(
+                                    state,
+                                    groups.toList(),
+                                    filteredChannels,
                                   ),
                                 ),
-                              ),
-                            ),
-                          ),
-                        ],
+                        ),
+                        SizedBox(
+                          key: const ValueKey('live_desktop_splitter_box'),
+                          width: hideSidebar ? 0.0 : 6.0,
+                          child: hideSidebar
+                              ? const SizedBox.shrink()
+                              : MouseRegion(
+                                  cursor: SystemMouseCursors.resizeLeftRight,
+                                  child: GestureDetector(
+                                    behavior: HitTestBehavior.opaque,
+                                    onHorizontalDragUpdate: (details) {
+                                      setState(() {
+                                        final maxW =
+                                            (constraints.maxWidth * 0.45)
+                                                .clamp(220.0, 480.0);
+                                        final next =
+                                            _sidebarWidth + details.delta.dx;
+                                        if (next < 140) {
+                                          _isSidebarCollapsed = true;
+                                        } else {
+                                          _sidebarWidth =
+                                              next.clamp(190.0, maxW);
+                                        }
+                                      });
+                                    },
+                                    onDoubleTap: () {
+                                      setState(() => _sidebarWidth = 264.0);
+                                    },
+                                    child: Container(
+                                      width: 6,
+                                      color: VideoPlatformTheme.borderSubtle,
+                                      alignment: Alignment.center,
+                                      child: Container(
+                                        width: 2,
+                                        height: 36,
+                                        decoration: BoxDecoration(
+                                          color: VideoPlatformTheme.textMuted
+                                              .withValues(alpha: 0.5),
+                                          borderRadius:
+                                              BorderRadius.circular(1),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                        ),
                         Expanded(
+                          key: const ValueKey('live_desktop_player_expanded'),
                           child: Stack(
                             fit: StackFit.expand,
                             children: [
-                              _buildPlayerPanel(
-                                groups: groups.toList(),
-                                visibleChannels: filteredChannels,
+                              KeyedSubtree(
+                                key: _livePlayerPanelKey,
+                                child: _buildPlayerPanel(
+                                  groups: groups.toList(),
+                                  visibleChannels: filteredChannels,
+                                ),
                               ),
                               // Edge toggle handle to collapse/expand channel list (hidden in fullscreen unless OSD is awake)
                               if (!_isLiveFullscreen)
@@ -1692,32 +1764,32 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                     );
                   }
                   final double baseLive16x9Height =
-                      (constraints.maxWidth * 9 / 16).clamp(235.0, 380.0);
+                      (constraints.maxWidth * 9 / 16).clamp(280.0, 480.0);
                   final double mobileLiveStageHeight = _isLivePortraitVideo
-                      ? (constraints.maxHeight * 0.50).clamp(300.0, 500.0)
+                      ? (constraints.maxHeight * 0.62).clamp(360.0, 640.0)
                       : math
-                          .max(baseLive16x9Height, constraints.maxHeight * 0.36)
-                          .clamp(250.0, 410.0);
+                          .max(baseLive16x9Height, constraints.maxHeight * 0.48)
+                          .clamp(310.0, 560.0);
+                  final isMobileFullStage =
+                      _isLiveFullscreen || isPhoneLandscape;
                   return Column(
                     children: [
-                      if (_isLiveFullscreen || isPhoneLandscape)
-                        Expanded(
+                      SizedBox(
+                        key: const ValueKey('live_mobile_player_box'),
+                        width: double.infinity,
+                        height: isMobileFullStage
+                            ? constraints.maxHeight
+                            : mobileLiveStageHeight,
+                        child: KeyedSubtree(
+                          key: _livePlayerPanelKey,
                           child: _buildPlayerPanel(
-                            compact: false,
-                            groups: groups.toList(),
-                            visibleChannels: filteredChannels,
-                          ),
-                        )
-                      else ...[
-                        SizedBox(
-                          width: double.infinity,
-                          height: mobileLiveStageHeight,
-                          child: _buildPlayerPanel(
-                            compact: true,
+                            compact: !isMobileFullStage,
                             groups: groups.toList(),
                             visibleChannels: filteredChannels,
                           ),
                         ),
+                      ),
+                      if (!isMobileFullStage) ...[
                         if (_currentChannel != null)
                           _buildMobileLiveControlStrip(
                             _currentChannel!,
@@ -1805,21 +1877,29 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
             ),
           ),
           // Prev / Next channel buttons
-          IconButton(
-            visualDensity: VisualDensity.compact,
-            padding: EdgeInsets.zero,
-            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-            tooltip: '上一频道',
-            onPressed: () => _stepChannel(activeList, -1),
-            icon: const Icon(Icons.skip_previous_rounded, size: 20),
+          VideoDownloadSpeedBadge(player: _player, compact: true),
+          const SizedBox(width: 4),
+          PlayerVolumeControl(
+            player: _player,
+            compact: true,
+            sliderWidth: 46,
+            showPercentage: false,
           ),
           IconButton(
             visualDensity: VisualDensity.compact,
             padding: EdgeInsets.zero,
-            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+            constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
+            tooltip: '上一频道',
+            onPressed: () => _stepChannel(activeList, -1),
+            icon: const Icon(Icons.skip_previous_rounded, size: 19),
+          ),
+          IconButton(
+            visualDensity: VisualDensity.compact,
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
             tooltip: '下一频道',
             onPressed: () => _stepChannel(activeList, 1),
-            icon: const Icon(Icons.skip_next_rounded, size: 20),
+            icon: const Icon(Icons.skip_next_rounded, size: 19),
           ),
           if (ch.urls.length > 1) ...[
             const SizedBox(width: 4),
@@ -3516,6 +3596,8 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                                   aspectRatio: liveAspect,
                                   fill: Colors.black,
                                   controls: NoVideoControls,
+                                  pauseUponEnteringBackgroundMode: false,
+                                  resumeUponEnteringForegroundMode: true,
                                 );
                               },
                             ),
@@ -3570,7 +3652,19 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                                   ),
                                 ),
                               ),
-                            // Top-right proxy selector + real-time download speed HUD + Fullscreen button
+                            // Top-right real-time speed badge when compact or when fullscreen OSD auto-hides
+                            if (ch != null &&
+                                _digitInputBuffer.isEmpty &&
+                                (compact || (_isLiveFullscreen && !_liveOsdVisible)))
+                              Positioned(
+                                top: 10,
+                                right: 12,
+                                child: VideoDownloadSpeedBadge(
+                                  player: _player,
+                                  compact: true,
+                                ),
+                              ),
+                            // Top-right proxy selector + real-time download speed HUD + volume + Fullscreen button
                             if (ch != null &&
                                 !compact &&
                                 _digitInputBuffer.isEmpty &&
@@ -3632,6 +3726,13 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                                     ),
                                     const SizedBox(width: 8),
                                     VideoDownloadSpeedBadge(player: _player),
+                                    const SizedBox(width: 8),
+                                    PlayerVolumeControl(
+                                      player: _player,
+                                      compact: true,
+                                      overlayStyle: true,
+                                      sliderWidth: 68,
+                                    ),
                                     const SizedBox(width: 8),
                                     StatefulBuilder(
                                       builder: (aspCtx, setAspState) {
@@ -4563,6 +4664,18 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                 ),
               ],
             ),
+          ),
+          const SizedBox(width: 8),
+          VideoDownloadSpeedBadge(
+            player: _player,
+            compact: true,
+          ),
+          const SizedBox(width: 8),
+          PlayerVolumeControl(
+            player: _player,
+            compact: true,
+            overlayStyle: overlayMode,
+            sliderWidth: MediaQuery.sizeOf(context).width < 880 ? 58 : 78,
           ),
           const SizedBox(width: 8),
           Expanded(

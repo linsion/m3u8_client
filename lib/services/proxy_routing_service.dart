@@ -2379,6 +2379,10 @@ class LocalProxyTunnelBridge {
       })> _pendingPrefetchQueue = Queue();
   int _activePrefetchWorkers = 0;
   Timer? _initialPrefetchTimer;
+  Uri? _lastPlaylistBaseUri;
+  Map<String, String> _lastPlaylistCustomHeaders = const {};
+  bool _lastPlaylistForceDirect = false;
+  bool _lastPlaylistCleanAds = false;
 
   int get prefetchedSegmentCount => _prefetchedSegmentCache.length;
   int get activePrefetchWorkerCount => _activePrefetchWorkers;
@@ -2505,6 +2509,55 @@ class LocalProxyTunnelBridge {
     ).cleanedM3u8;
   }
 
+  /// Returns true if [input] begins with a known image/container magic signature
+  /// (PNG, JPEG, GIF, BMP, RIFF/WebP, or ICO) commonly used by TVBox CDNs to disguise MPEG-TS segments.
+  static bool _hasDisguisedImageHeaderMagic(List<int> input) {
+    if (input.length < 4) return false;
+    final b0 = input[0];
+    final b1 = input[1];
+    final b2 = input[2];
+    final b3 = input[3];
+    // PNG: 89 50 4E 47
+    if (b0 == 0x89 && b1 == 0x50 && b2 == 0x4E && b3 == 0x47) return true;
+    // JPEG: FF D8 FF
+    if (b0 == 0xFF && b1 == 0xD8 && b2 == 0xFF) return true;
+    // GIF: 47 49 46 38 ("GIF8")
+    if (b0 == 0x47 && b1 == 0x49 && b2 == 0x46 && b3 == 0x38) return true;
+    // BMP: 42 4D ("BM")
+    if (b0 == 0x42 && b1 == 0x4D) return true;
+    // RIFF/WebP: 52 49 46 46 ("RIFF")
+    if (b0 == 0x52 && b1 == 0x49 && b2 == 0x46 && b3 == 0x46) return true;
+    // ICO: 00 00 01 00
+    if (b0 == 0x00 && b1 == 0x00 && b2 == 0x01 && b3 == 0x00) return true;
+    return false;
+  }
+
+  /// Strips fake image-bed headers (PNG, JPEG, GIF, BMP, WebP, etc.) prepended by
+  /// TVBox VOD CDNs before real MPEG-TS (`0x47` sync byte at 188-byte stride) data.
+  /// Never modifies normal TS segments (`input[0] == 0x47`) or AES-128 encrypted TS ciphertext.
+  static ({Uint8List bytes, int strippedBytes}) stripDisguisedTsImageHeader(
+    Uint8List input,
+  ) {
+    if (input.isEmpty ||
+        input[0] == 0x47 ||
+        input.length < 377 ||
+        !_hasDisguisedImageHeaderMagic(input)) {
+      return (bytes: input, strippedBytes: 0);
+    }
+    final maxScan = min(input.length - 376, 4096);
+    for (var i = 1; i < maxScan; i++) {
+      if (input[i] == 0x47 &&
+          input[i + 188] == 0x47 &&
+          input[i + 376] == 0x47) {
+        return (
+          bytes: Uint8List.sublistView(input, i),
+          strippedBytes: i,
+        );
+      }
+    }
+    return (bytes: input, strippedBytes: 0);
+  }
+
   /// Builds a local HTTP stream relay URL (`http://127.0.0.1:<port>/__m3u8_proxy__/...`)
   /// so `libmpv` can play HLS `.m3u8` / `.ts` / `.mp4` streams over plain local HTTP
   /// while [LocalProxyTunnelBridge] fetches, pools, and concurrently prefetches
@@ -2515,6 +2568,7 @@ class LocalProxyTunnelBridge {
     bool cleanM3u8Ads = false,
     bool forceDirect = false,
     String? preferredNodeId,
+    String? forceSuffix,
   }) {
     final p = port;
     if (p <= 0) return targetUrl;
@@ -2529,24 +2583,26 @@ class LocalProxyTunnelBridge {
         ? ''
         : base64Url.encode(utf8.encode(jsonEncode(cleanHeaders)));
     final lower = targetUrl.toLowerCase();
-    String suffix = 'stream.bin';
-    if (lower.contains('.m3u8')) {
-      suffix = 'playlist.m3u8';
-    } else if (lower.contains('.flv') ||
-        lower.contains('douyucdn') ||
-        lower.contains('/douyu/') ||
-        lower.contains('/huya/') ||
-        lower.contains('/yy/') ||
-        lower.contains('huya.com') ||
-        lower.contains('yy.com')) {
-      suffix = 'live.flv';
-    } else if (lower.contains('.ts')) {
-      suffix = 'segment.ts';
-    } else if (lower.contains('.mp4') ||
-        lower.contains('/api/telegram/video')) {
-      suffix = 'video.mp4';
-    } else if (lower.contains('.key')) {
-      suffix = 'enc.key';
+    String suffix = forceSuffix ?? 'stream.bin';
+    if (forceSuffix == null) {
+      if (lower.contains('.m3u8')) {
+        suffix = 'playlist.m3u8';
+      } else if (lower.contains('.flv') ||
+          lower.contains('douyucdn') ||
+          lower.contains('/douyu/') ||
+          lower.contains('/huya/') ||
+          lower.contains('/yy/') ||
+          lower.contains('huya.com') ||
+          lower.contains('yy.com')) {
+        suffix = 'live.flv';
+      } else if (lower.contains('.ts')) {
+        suffix = 'segment.ts';
+      } else if (lower.contains('.mp4') ||
+          lower.contains('/api/telegram/video')) {
+        suffix = 'video.mp4';
+      } else if (lower.contains('.key')) {
+        suffix = 'enc.key';
+      }
     }
     final qp = StringBuffer('u=$encodedUrl');
     if (encodedHeaders.isNotEmpty) {
@@ -2828,17 +2884,35 @@ class LocalProxyTunnelBridge {
       );
       final encodedUrl =
           reqUri?.queryParameters['u'] ?? reqUri?.queryParameters['url'] ?? '';
-      if (encodedUrl.isEmpty) {
+      String targetUrl = '';
+      var fallbackRelativeResolved = false;
+      if (encodedUrl.isNotEmpty) {
+        targetUrl = utf8.decode(
+          base64Url.decode(base64Url.normalize(encodedUrl)),
+          allowMalformed: true,
+        );
+      } else if (_lastPlaylistBaseUri != null && reqUri != null) {
+        // Fallback safety net: if libmpv ever resolved a relative URI (such as
+        // `/__m3u8_proxy__/enc.key` or `/20261120/index.m3u8`) without `?u=...`,
+        // resolve it against the last active playlist's base URI instead of returning 400!
+        var relPath = reqUri.path;
+        if (relPath.startsWith('/__m3u8_proxy__/')) {
+          relPath = relPath.substring('/__m3u8_proxy__/'.length);
+        }
+        if (relPath.isNotEmpty) {
+          final relWithQuery =
+              reqUri.hasQuery ? '$relPath?${reqUri.query}' : relPath;
+          targetUrl = _lastPlaylistBaseUri!.resolve(relWithQuery).toString();
+          fallbackRelativeResolved = true;
+        }
+      }
+      if (targetUrl.isEmpty) {
         client.add(latin1.encode('HTTP/1.1 400 Bad Request\r\n\r\n'));
         await client.flush();
         cleanup();
         return;
       }
 
-      final targetUrl = utf8.decode(
-        base64Url.decode(base64Url.normalize(encodedUrl)),
-        allowMalformed: true,
-      );
       final targetUri = Uri.tryParse(targetUrl);
       if (targetUri == null || targetUri.host.isEmpty) {
         client.add(latin1.encode('HTTP/1.1 400 Bad Request\r\n\r\n'));
@@ -2847,7 +2921,9 @@ class LocalProxyTunnelBridge {
         return;
       }
 
-      final customHeaders = <String, String>{};
+      final customHeaders = <String, String>{
+        if (fallbackRelativeResolved) ..._lastPlaylistCustomHeaders,
+      };
       final encodedHeaders = reqUri?.queryParameters['h'] ?? '';
       if (encodedHeaders.isNotEmpty) {
         try {
@@ -2874,8 +2950,29 @@ class LocalProxyTunnelBridge {
         }
       }
 
-      final cleanAds = reqUri?.queryParameters['clean'] == '1';
-      final rawForceDirect = reqUri?.queryParameters['direct'] == '1';
+      final reqPathLower = reqUri?.path.toLowerCase() ?? '';
+      final targetPathLower = targetUri.path.toLowerCase();
+      final isExplicitSeekableContainer = reqPathLower.endsWith('/video.mp4') ||
+          targetPathLower.endsWith('.mp4') ||
+          targetPathLower.endsWith('.mkv') ||
+          targetPathLower.endsWith('.webm') ||
+          targetPathLower.endsWith('.m4v') ||
+          targetPathLower.contains('/api/telegram/');
+      // libmpv / Lavf sends `Range: bytes=0-` by default on every HTTP GET request
+      // (including `.m3u8` playlists, `.ts` segments, and `enc.key` files).
+      // Stripping `bytes=0-` for non-MP4/non-Telegram requests prevents upstream VOD CDNs
+      // from returning `206 Partial Content` on `.m3u8` playlists and ensures `.ts` segment
+      // requests hit `_prefetchedSegmentCache` in 0ms!
+      if (rangeHeader != null &&
+          rangeHeader.toLowerCase() == 'bytes=0-' &&
+          !isExplicitSeekableContainer) {
+        rangeHeader = null;
+      }
+
+      final cleanAds = (reqUri?.queryParameters['clean'] == '1') ||
+          (fallbackRelativeResolved && _lastPlaylistCleanAds);
+      final rawForceDirect = (reqUri?.queryParameters['direct'] == '1') ||
+          (fallbackRelativeResolved && _lastPlaylistForceDirect);
       final explicitNodeId = reqUri?.queryParameters['nid']?.trim() ?? '';
       final isHead = rawHttpHeaderLines.first.toUpperCase().startsWith('HEAD ');
       final candidateNodes = <ProxyNode>[];
@@ -3069,6 +3166,7 @@ class LocalProxyTunnelBridge {
       tryOpenDirect(
         Uri uri, {
         String? activeRange,
+        int redirectsRemaining = 5,
         Duration timeout = const Duration(milliseconds: 8000),
       }) async {
         for (var attempt = 0; attempt < 2; attempt++) {
@@ -3079,11 +3177,34 @@ class LocalProxyTunnelBridge {
               hc,
               uri,
               timeout,
-              followRedirects: true,
+              followRedirects: false,
               activeRange: activeRange,
             );
+            if ((resp.statusCode == 301 ||
+                    resp.statusCode == 302 ||
+                    resp.statusCode == 303 ||
+                    resp.statusCode == 307 ||
+                    resp.statusCode == 308) &&
+                resp.headers.value(HttpHeaders.locationHeader) != null) {
+              final loc =
+                  resp.headers.value(HttpHeaders.locationHeader)!.trim();
+              await discardResponse(resp);
+              if (loc.isNotEmpty && redirectsRemaining > 0) {
+                final redirectedUri = uri.resolve(loc);
+                return await tryOpenDirect(
+                  redirectedUri,
+                  activeRange: activeRange,
+                  redirectsRemaining: redirectsRemaining - 1,
+                  timeout: timeout,
+                );
+              }
+            }
             if (resp.statusCode >= 200 && resp.statusCode < 400) {
-              return (resp: resp, finalUri: uri, hc: hc);
+              var resolvedFinalUri = uri;
+              for (final r in resp.redirects) {
+                resolvedFinalUri = resolvedFinalUri.resolveUri(r.location);
+              }
+              return (resp: resp, finalUri: resolvedFinalUri, hc: hc);
             }
             await discardResponse(resp);
             return null;
@@ -3282,15 +3403,16 @@ class LocalProxyTunnelBridge {
         return;
       }
 
-      final resp = opened.resp;
+      var resp = opened.resp;
       var currentUri = opened.finalUri;
-      final mime = resp.headers.contentType?.mimeType.toLowerCase() ?? '';
+      final isRelaySegment = segIndex != null ||
+          reqPathLower.endsWith('/segment.ts') ||
+          reqPathLower.endsWith('/enc.key') ||
+          reqPathLower.endsWith('/video.mp4') ||
+          reqPathLower.endsWith('/live.flv');
       final isLikelyM3u8 = !isHead &&
-          (resp.contentLength <= 0 || resp.contentLength <= 2 * 1024 * 1024) &&
-          (currentUri.path.toLowerCase().endsWith('.m3u8') ||
-              (reqUri?.path.toLowerCase().endsWith('.m3u8') ?? false) ||
-              mime.contains('mpegurl') ||
-              mime.contains('m3u'));
+          !isRelaySegment &&
+          (resp.contentLength <= 0 || resp.contentLength <= 2 * 1024 * 1024);
 
       Uint8List? preBufferedBinaryChunk;
       StreamIterator<List<int>>? activeStreamIterator;
@@ -3308,30 +3430,47 @@ class LocalProxyTunnelBridge {
         return;
       }
 
-      if (isLikelyM3u8 && resp.statusCode == 200) {
+      if (isLikelyM3u8 && (resp.statusCode == 200 || resp.statusCode == 206)) {
         final m3u8Buf = BytesBuilder(copy: false);
         var verifiedM3u8Header = false;
+        var verifiedJsonEnvelope = false;
         var abortedAsBinaryStream = false;
-        final iter = StreamIterator<List<int>>(
-          resp.timeout(const Duration(seconds: 8)),
+        var iter = StreamIterator<List<int>>(
+          resp.timeout(const Duration(seconds: 45)),
         );
         _clientDisconnectHandlers[client] = () {
           cancelPendingRequests();
           unawaited(iter.cancel());
         };
         try {
-          while (await iter.moveNext()) {
+          while (await iter.moveNext().timeout(const Duration(seconds: 8))) {
             final chunk = iter.current;
             if (chunk.isEmpty) continue;
             m3u8Buf.add(chunk);
             recordDownstreamBytes(chunk.length);
-            if (!verifiedM3u8Header && m3u8Buf.length >= 7) {
+            if (!verifiedM3u8Header &&
+                !verifiedJsonEnvelope &&
+                m3u8Buf.length >= 7) {
               final sample = m3u8Buf.toBytes();
               final headLen = sample.length > 256 ? 256 : sample.length;
-              final headText =
-                  utf8.decode(sample.sublist(0, headLen), allowMalformed: true).trimLeft();
-              if (headText.startsWith('#EXTM3U') || headText.startsWith('#EXT')) {
+              final headText = utf8
+                  .decode(sample.sublist(0, headLen), allowMalformed: true)
+                  .replaceFirst('\uFEFF', '')
+                  .trimLeft();
+              if (headText.startsWith('#EXTM3U') ||
+                  headText.startsWith('#EXT')) {
                 verifiedM3u8Header = true;
+              } else if (headText.startsWith('{') &&
+                  (resp.contentLength <= 0 || resp.contentLength <= 65536)) {
+                verifiedJsonEnvelope = true;
+              } else if (headText.startsWith('<!DOCTYPE') ||
+                  headText.toLowerCase().startsWith('<html') ||
+                  headText.contains('player_aaaa')) {
+                // HTML page returned on a non-segment request (e.g. MacCMS wrapper or error page):
+                // keep reading up to 256 KB so we can extract `player_aaaa` or reject 404/403 HTML cleanly
+                if (m3u8Buf.length >= 256 * 1024) {
+                  break;
+                }
               } else {
                 abortedAsBinaryStream = true;
                 break;
@@ -3343,7 +3482,97 @@ class LocalProxyTunnelBridge {
             }
           }
         } catch (_) {
-          if (!verifiedM3u8Header) {
+          if (!verifiedM3u8Header && !verifiedJsonEnvelope) {
+            abortedAsBinaryStream = true;
+          }
+        }
+
+        if (!_clientCleanups.containsKey(client)) return;
+
+        // If upstream returned a TVBox JSON parser response `{"url": "https://..."}`,
+        // unwrap it transparently and open the real media stream!
+        if (!abortedAsBinaryStream &&
+            verifiedJsonEnvelope &&
+            m3u8Buf.length > 0) {
+          final jsonBytes = m3u8Buf.takeBytes();
+          final jsonText = utf8
+              .decode(jsonBytes, allowMalformed: true)
+              .replaceFirst('\uFEFF', '')
+              .trim();
+          Uri? unwrappedStreamUri;
+          try {
+            final decoded = jsonDecode(jsonText);
+            if (decoded is Map<String, dynamic>) {
+              final parsed = ResolvedPlayback.fromJson(decoded);
+              if (parsed.directUrl.isNotEmpty) {
+                unwrappedStreamUri = currentUri.resolve(parsed.directUrl);
+                customHeaders.addAll(parsed.headers);
+              }
+            }
+          } catch (_) {}
+
+          if (unwrappedStreamUri != null) {
+            final nextOpened = await openTargetUri(
+              unwrappedStreamUri,
+              overrideRange: '',
+            );
+            if (!_clientCleanups.containsKey(client)) {
+              if (nextOpened != null) await discardResponse(nextOpened.resp);
+              return;
+            }
+            if (nextOpened != null) {
+              resp = nextOpened.resp;
+              currentUri = nextOpened.finalUri;
+              m3u8Buf.clear();
+              verifiedM3u8Header = false;
+              abortedAsBinaryStream = false;
+              iter = StreamIterator<List<int>>(
+                resp.timeout(const Duration(seconds: 45)),
+              );
+              _clientDisconnectHandlers[client] = () {
+                cancelPendingRequests();
+                unawaited(iter.cancel());
+              };
+              try {
+                while (
+                    await iter.moveNext().timeout(const Duration(seconds: 8))) {
+                  final chunk = iter.current;
+                  if (chunk.isEmpty) continue;
+                  m3u8Buf.add(chunk);
+                  recordDownstreamBytes(chunk.length);
+                  if (!verifiedM3u8Header && m3u8Buf.length >= 7) {
+                    final sample = m3u8Buf.toBytes();
+                    final headLen = sample.length > 256 ? 256 : sample.length;
+                    final headText = utf8
+                        .decode(sample.sublist(0, headLen), allowMalformed: true)
+                        .replaceFirst('\uFEFF', '')
+                        .trimLeft();
+                    if (headText.startsWith('#EXTM3U') ||
+                        headText.startsWith('#EXT')) {
+                      verifiedM3u8Header = true;
+                    } else {
+                      abortedAsBinaryStream = true;
+                      break;
+                    }
+                  }
+                  if (m3u8Buf.length > 2 * 1024 * 1024) {
+                    abortedAsBinaryStream = true;
+                    break;
+                  }
+                }
+              } catch (_) {
+                if (!verifiedM3u8Header) {
+                  abortedAsBinaryStream = true;
+                }
+              }
+            } else {
+              preBufferedBinaryChunk = jsonBytes;
+              activeStreamIterator = iter;
+              abortedAsBinaryStream = true;
+            }
+          } else {
+            preBufferedBinaryChunk = jsonBytes;
+            activeStreamIterator = iter;
             abortedAsBinaryStream = true;
           }
         }
@@ -3351,16 +3580,105 @@ class LocalProxyTunnelBridge {
         if (!_clientCleanups.containsKey(client)) return;
         if (!abortedAsBinaryStream && m3u8Buf.length > 0) {
           final rawBytes = m3u8Buf.takeBytes();
-          var text = utf8.decode(rawBytes, allowMalformed: true);
+          var text = utf8
+              .decode(rawBytes, allowMalformed: true)
+              .replaceFirst('\uFEFF', '');
+          final trimmedText = text.trimLeft();
+          final isHtmlResponse = trimmedText.startsWith('<!DOCTYPE') ||
+              trimmedText.toLowerCase().startsWith('<html') ||
+              trimmedText.contains('player_aaaa');
+          if (!text.contains('#EXTM3U') && isHtmlResponse) {
+            // Try extracting MacCMS `player_aaaa` or embedded `.m3u8` URL from HTML wrapper
+            String? extractedMediaUrl;
+            final playerMatch = RegExp(
+              r'player_aaaa\s*=\s*(\{[\s\S]*?\})\s*(?:;|</script>)',
+              caseSensitive: false,
+            ).firstMatch(text);
+            if (playerMatch != null) {
+              try {
+                final obj = jsonDecode(playerMatch.group(1)!);
+                if (obj is Map) {
+                  var rawUrl = (obj['url'] ?? '').toString().trim();
+                  final enc =
+                      int.tryParse((obj['encrypt'] ?? 0).toString()) ?? 0;
+                  if (rawUrl.isNotEmpty) {
+                    if (enc == 1) {
+                      rawUrl = Uri.decodeComponent(rawUrl);
+                    } else if (enc == 2) {
+                      final b64 = utf8.decode(
+                        base64.decode(base64.normalize(rawUrl)),
+                        allowMalformed: true,
+                      );
+                      rawUrl = Uri.decodeComponent(b64);
+                    }
+                    rawUrl = rawUrl.replaceAll(r'\/', '/').trim();
+                    if (rawUrl.startsWith('http://') ||
+                        rawUrl.startsWith('https://') ||
+                        rawUrl.startsWith('//')) {
+                      extractedMediaUrl =
+                          VodDetail.normalizeTvboxEpisodeUrl(rawUrl);
+                    }
+                  }
+                }
+              } catch (_) {}
+            }
+            if (extractedMediaUrl == null) {
+              final normalizedHtml = text.replaceAll(r'\/', '/');
+              final mediaMatch = RegExp(
+                r'''(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4|flv)(?:\?[^\s"'<>\\]*)?)''',
+                caseSensitive: false,
+              ).firstMatch(normalizedHtml);
+              if (mediaMatch != null) {
+                extractedMediaUrl =
+                    VodDetail.normalizeTvboxEpisodeUrl(mediaMatch.group(1)!);
+              }
+            }
+            if (extractedMediaUrl != null && extractedMediaUrl.isNotEmpty) {
+              final nextUri = currentUri.resolve(extractedMediaUrl);
+              customHeaders.putIfAbsent(
+                'Referer',
+                () => '${currentUri.scheme}://${currentUri.authority}/',
+              );
+              final nextOpened = await openTargetUri(
+                nextUri,
+                overrideRange: '',
+              );
+              if (nextOpened != null) {
+                final nextBuf = BytesBuilder(copy: false);
+                await for (final b
+                    in nextOpened.resp.timeout(const Duration(seconds: 8))) {
+                  if (b.isEmpty) continue;
+                  nextBuf.add(b);
+                  recordDownstreamBytes(b.length);
+                  if (nextBuf.length > 2 * 1024 * 1024) break;
+                }
+                final nextText = utf8
+                    .decode(nextBuf.takeBytes(), allowMalformed: true)
+                    .replaceFirst('\uFEFF', '');
+                if (nextText.contains('#EXTM3U')) {
+                  currentUri = nextOpened.finalUri;
+                  text = nextText;
+                }
+              }
+            }
+          }
           if (text.contains('#EXTM3U')) {
-            // Resolve Master Playlist (`#EXT-X-STREAM-INF`) on the same warm keep-alive connection!
-            for (var depth = 0; depth < 2; depth++) {
+            // Resolve Master Playlist (`#EXT-X-STREAM-INF`) on the same warm keep-alive connection
+            // unless it declares separate `#EXT-X-MEDIA:TYPE=AUDIO` renditions with external URIs!
+            final hasSeparateAudioRendition = RegExp(
+              r'''#EXT-X-MEDIA:[^\r\n]*TYPE=AUDIO[^\r\n]*URI=["'][^"']+["']''',
+              caseSensitive: false,
+            ).hasMatch(text);
+            for (var depth = 0;
+                depth < 2 && !hasSeparateAudioRendition;
+                depth++) {
               if (!text.contains('#EXT-X-STREAM-INF')) break;
               final variantUri =
                   M3u8AdRemover.extractBestVariantUri(text, currentUri);
               if (variantUri == null) break;
               final nextOpened = await openTargetUri(
                 variantUri,
+                overrideRange: '',
               );
               if (nextOpened == null) break;
               final nextBuf = BytesBuilder(copy: false);
@@ -3377,9 +3695,11 @@ class LocalProxyTunnelBridge {
               }
               if (nextTooLarge) break;
               final nextBytes = nextBuf.takeBytes();
-              final nextText = utf8.decode(nextBytes, allowMalformed: true);
+              final nextText = utf8
+                  .decode(nextBytes, allowMalformed: true)
+                  .replaceFirst('\uFEFF', '');
               if (!nextText.contains('#EXTM3U')) break;
-              currentUri = variantUri;
+              currentUri = nextOpened.finalUri;
               text = nextText;
             }
 
@@ -3400,6 +3720,11 @@ class LocalProxyTunnelBridge {
                 text = stripped.cleanedM3u8;
               }
             }
+
+            _lastPlaylistBaseUri = currentUri;
+            _lastPlaylistCustomHeaders = Map<String, String>.from(customHeaders);
+            _lastPlaylistForceDirect = forceDirect;
+            _lastPlaylistCleanAds = cleanAds;
 
             final rewrittenM3u8 = _rewriteM3u8PlaylistThroughRelay(
               text,
@@ -3435,19 +3760,70 @@ class LocalProxyTunnelBridge {
       }
 
       // Stream binary segment (.ts, .m4s, .mp4, .flv, .key) directly to libmpv
-      final contentTypeStr = resp.headers.value('content-type') ?? 'video/mp2t';
+      var clientClosed = false;
+      final body = activeStreamIterator ??
+          StreamIterator<List<int>>(resp.timeout(const Duration(seconds: 45)));
+      _clientDisconnectHandlers[client] = () {
+        clientClosed = true;
+        cancelPendingRequests();
+        unawaited(body.cancel());
+      };
+
+      var strippedHeaderBytes = 0;
+      if ((segIndex != null || reqPathLower.endsWith('/segment.ts')) &&
+          (rangeHeader == null || rangeHeader.isEmpty)) {
+        if (preBufferedBinaryChunk == null) {
+          final firstBuf = BytesBuilder(copy: false);
+          while (!clientClosed &&
+              firstBuf.length < 4096 &&
+              await body.moveNext()) {
+            if (body.current.isEmpty) continue;
+            firstBuf.add(body.current);
+            // If the first chunk does NOT begin with a disguised image header magic
+            // (PNG/JPEG/GIF/BMP/RIFF/ICO), break immediately with zero extra buffering!
+            if (firstBuf.length >= 4 &&
+                !_hasDisguisedImageHeaderMagic(firstBuf.toBytes())) {
+              break;
+            }
+            if (firstBuf.length >= 512) break;
+          }
+          if (firstBuf.length > 0) {
+            preBufferedBinaryChunk = firstBuf.takeBytes();
+          }
+        }
+        if (preBufferedBinaryChunk != null &&
+            preBufferedBinaryChunk.isNotEmpty) {
+          final stripped =
+              stripDisguisedTsImageHeader(preBufferedBinaryChunk);
+          if (stripped.strippedBytes > 0) {
+            preBufferedBinaryChunk = stripped.bytes;
+            strippedHeaderBytes = stripped.strippedBytes;
+          }
+        }
+      }
+
+      var contentTypeStr = resp.headers.value('content-type') ?? 'video/mp2t';
+      if ((segIndex != null || reqPathLower.endsWith('/segment.ts')) &&
+          (strippedHeaderBytes > 0 ||
+              contentTypeStr.toLowerCase().startsWith('image/') ||
+              contentTypeStr.toLowerCase().startsWith('text/'))) {
+        contentTypeStr = 'video/mp2t';
+      }
       final isFlvPayload = contentTypeStr.toLowerCase().contains('flv') ||
           currentUri.path.toLowerCase().endsWith('.flv') ||
-          (reqUri?.path.toLowerCase().endsWith('.flv') ?? false);
+          reqPathLower.endsWith('.flv');
       final statusReason = resp.statusCode == 206 ? 'Partial Content' : 'OK';
+      final effectiveContentLength = resp.contentLength >= strippedHeaderBytes
+          ? resp.contentLength - strippedHeaderBytes
+          : -1;
       final respHeader = StringBuffer()
         ..write('HTTP/1.1 ${resp.statusCode} $statusReason\r\n')
         ..write('Content-Type: $contentTypeStr\r\n');
-      if (resp.contentLength >= 0) {
-        respHeader.write('Content-Length: ${resp.contentLength}\r\n');
+      if (effectiveContentLength >= 0) {
+        respHeader.write('Content-Length: $effectiveContentLength\r\n');
       }
       final contentRange = resp.headers.value('content-range');
-      if (contentRange != null) {
+      if (contentRange != null && strippedHeaderBytes == 0) {
         respHeader.write('Content-Range: $contentRange\r\n');
       }
       final acceptRanges = resp.headers.value('accept-ranges');
@@ -3459,21 +3835,12 @@ class LocalProxyTunnelBridge {
         ..write('Connection: close\r\n\r\n');
       client.add(latin1.encode(respHeader.toString()));
 
-      var clientClosed = false;
-      final body = activeStreamIterator ??
-          StreamIterator<List<int>>(resp.timeout(const Duration(seconds: 45)));
-      _clientDisconnectHandlers[client] = () {
-        clientClosed = true;
-        cancelPendingRequests();
-        unawaited(body.cancel());
-      };
-
       final shouldCacheSegment = !isFlvPayload &&
           (rangeHeader == null || rangeHeader.isEmpty) &&
           resp.statusCode == 200 &&
           segIndex != null &&
-          resp.contentLength > 0 &&
-          resp.contentLength <= 8 * 1024 * 1024;
+          effectiveContentLength > 0 &&
+          effectiveContentLength <= 8 * 1024 * 1024;
       final segmentAccumulator =
           shouldCacheSegment ? BytesBuilder(copy: false) : null;
       var lookaheadTriggeredForProxySeg = false;
@@ -3664,7 +4031,7 @@ class LocalProxyTunnelBridge {
       if (!clientClosed &&
           prefetchGeneration == _prefetchGeneration &&
           segmentAccumulator != null &&
-          segmentAccumulator.length == resp.contentLength) {
+          segmentAccumulator.length == effectiveContentLength) {
         _storePrefetchedSegment(
           targetUrl,
           segmentAccumulator.takeBytes(),
@@ -4369,16 +4736,23 @@ class LocalProxyTunnelBridge {
           if (builder.length + chunk.length > maxBytes) return null;
           builder.add(chunk);
         }
-        final bytes = builder.takeBytes();
+        final rawBytes = builder.takeBytes();
         if (cancelled ||
             generation != _prefetchGeneration ||
-            bytes.isEmpty ||
+            rawBytes.isEmpty ||
             (response.contentLength >= 0 &&
-                bytes.length != response.contentLength)) {
+                rawBytes.length != response.contentLength)) {
           continue;
         }
-        _storePrefetchedSegment(url, bytes, contentType);
-        return (bytes: bytes, contentType: contentType);
+        final stripped = stripDisguisedTsImageHeader(rawBytes);
+        final cleanBytes = stripped.bytes;
+        final cleanContentType = (stripped.strippedBytes > 0 ||
+                contentType.toLowerCase().startsWith('image/') ||
+                contentType.toLowerCase().startsWith('text/'))
+            ? 'video/mp2t'
+            : contentType;
+        _storePrefetchedSegment(url, cleanBytes, cleanContentType);
+        return (bytes: cleanBytes, contentType: cleanContentType);
       } catch (_) {
         // Try the next route if the upstream failed.
       } finally {
@@ -4400,21 +4774,38 @@ class LocalProxyTunnelBridge {
     bool forceDirect = false,
     List<ProxyNode> candidateNodes = const <ProxyNode>[],
   }) {
-    final uriAttrRegex = RegExp(r'URI="([^"]+)"');
+    final uriAttrRegex = RegExp(
+      r'''URI=(?:"([^"]+)"|'([^']+)')''',
+      caseSensitive: false,
+    );
     final lines = const LineSplitter().convert(content);
     final sb = StringBuffer();
     final discoveredSegments = <String>[];
-    final isMediaPlaylist = content.contains('#EXT-X-ENDLIST');
+    final isMediaPlaylist =
+        content.contains('#EXT-X-ENDLIST') || content.contains('#EXTINF');
 
     final preferredNodeId =
         (!forceDirect && candidateNodes.isNotEmpty) ? candidateNodes.first.id : null;
+    var expectVariantPlaylist = false;
+    var expectMediaSegment = false;
     for (final rawLine in lines) {
       final line = rawLine.trim();
       if (line.isEmpty) continue;
       if (line.startsWith('#')) {
-        if (line.contains('URI="')) {
+        if (line.startsWith('#EXT-X-STREAM-INF')) {
+          expectVariantPlaylist = true;
+          expectMediaSegment = false;
+        } else if (line.startsWith('#EXTINF')) {
+          expectMediaSegment = true;
+          expectVariantPlaylist = false;
+        }
+        if (uriAttrRegex.hasMatch(line)) {
+          final upperLine = line.toUpperCase();
+          final isKeyTag = upperLine.startsWith('#EXT-X-KEY');
+          final isMapTag = upperLine.startsWith('#EXT-X-MAP');
+          final isMediaRenditionTag = upperLine.startsWith('#EXT-X-MEDIA');
           final rewrittenTag = line.replaceAllMapped(uriAttrRegex, (m) {
-            final rawUri = m.group(1) ?? '';
+            final rawUri = (m.group(1) ?? m.group(2) ?? '').trim();
             if (rawUri.isEmpty) return m.group(0)!;
             final abs = baseUri.resolve(rawUri).toString();
             final relayed = buildStreamRelayUrl(
@@ -4422,6 +4813,11 @@ class LocalProxyTunnelBridge {
               headers: headers,
               forceDirect: forceDirect,
               preferredNodeId: preferredNodeId,
+              forceSuffix: isKeyTag
+                  ? 'enc.key'
+                  : (isMapTag
+                      ? 'video.mp4'
+                      : (isMediaRenditionTag ? 'playlist.m3u8' : null)),
             );
             return 'URI="$relayed"';
           });
@@ -4431,15 +4827,25 @@ class LocalProxyTunnelBridge {
         }
       } else {
         final abs = baseUri.resolve(line).toString();
-        if (isMediaPlaylist && !abs.toLowerCase().contains('.m3u8')) {
+        final lowerAbs = abs.toLowerCase();
+        String? forcedSuffix;
+        if (expectVariantPlaylist || lowerAbs.contains('.m3u8')) {
+          forcedSuffix = 'playlist.m3u8';
+        } else if (expectMediaSegment || isMediaPlaylist) {
           discoveredSegments.add(abs);
+          forcedSuffix = (lowerAbs.endsWith('.m4s') || lowerAbs.endsWith('.mp4'))
+              ? 'video.mp4'
+              : 'segment.ts';
         }
+        expectVariantPlaylist = false;
+        expectMediaSegment = false;
         final relayed = buildStreamRelayUrl(
           targetUrl: abs,
           headers: headers,
           cleanM3u8Ads: cleanAds,
           forceDirect: forceDirect,
           preferredNodeId: preferredNodeId,
+          forceSuffix: forcedSuffix,
         );
         sb.writeln(relayed);
       }
@@ -4607,7 +5013,10 @@ class LocalProxyTunnelBridge {
     final targetStr = firstLineParts[1];
 
     // Check if this is a local HLS / media stream relay request (`/__m3u8_proxy__/...`)
-    if (method != 'CONNECT' && targetStr.contains('/__m3u8_proxy__/')) {
+    // or a root-relative path sent directly to our local relay listener (`127.0.0.1:<port>/...`)
+    if (method != 'CONNECT' &&
+        (targetStr.contains('/__m3u8_proxy__/') ||
+            (targetStr.startsWith('/') && _lastPlaylistBaseUri != null))) {
       await _handleStreamRelayRequest(
         client: client,
         targetStr: targetStr,

@@ -382,12 +382,34 @@ class VodDetail {
         .trim();
   }
 
-  static List<PlayGroup> parsePlayGroups(String playFrom, String playUrl) {
+  static String normalizeTvboxEpisodeUrl(String raw) {
+    var u = raw.trim().replaceAll('&amp;', '&');
+    if (u.startsWith('//') && u.length > 4) {
+      u = 'https:$u';
+    }
+    return u;
+  }
+
+  static List<PlayGroup> parsePlayGroups(
+    String playFrom,
+    String playUrl, {
+    String playNote = '',
+  }) {
     if (playUrl.trim().isEmpty) return const [];
+    final note = playNote.trim();
+    final groupDelimiter =
+        (!playUrl.contains(r'$$$') && note.isNotEmpty && playUrl.contains(note))
+            ? note
+            : r'$$$';
+    final fromDelimiter = (!playFrom.contains(r'$$$') &&
+            note.isNotEmpty &&
+            playFrom.contains(note))
+        ? note
+        : r'$$$';
     final fromParts = playFrom.isEmpty
         ? <String>['默认线路']
-        : playFrom.split(r'$$$').map((e) => e.trim()).toList();
-    final urlParts = playUrl.split(r'$$$');
+        : playFrom.split(fromDelimiter).map((e) => e.trim()).toList();
+    final urlParts = playUrl.split(groupDelimiter);
 
     final groups = <PlayGroup>[];
     for (var i = 0; i < urlParts.length; i++) {
@@ -397,21 +419,43 @@ class VodDetail {
       final groupRaw = urlParts[i].trim();
       if (groupRaw.isEmpty) continue;
 
-      final epStrings = groupRaw.split('#');
+      final rawLines = groupRaw.contains('#')
+          ? groupRaw.split('#')
+          : groupRaw.split(RegExp(r'[\r\n]+'));
+      final epStrings = <String>[];
+      for (final item in rawLines) {
+        final trimmedItem = item.trim();
+        if (trimmedItem.isEmpty) continue;
+        if (trimmedItem.contains('\n')) {
+          epStrings.addAll(
+            trimmedItem
+                .split(RegExp(r'[\r\n]+'))
+                .map((s) => s.trim())
+                .where((s) => s.isNotEmpty),
+          );
+        } else {
+          epStrings.add(trimmedItem);
+        }
+      }
       final episodes = <Episode>[];
       for (var j = 0; j < epStrings.length; j++) {
         final seg = epStrings[j].trim();
         if (seg.isEmpty) continue;
         final dollarIdx = seg.indexOf(r'$');
         final schemeIdx = seg.indexOf('://');
+        final protoRelIdx = seg.indexOf('//');
+        final effectiveSchemeIdx = schemeIdx >= 0
+            ? schemeIdx
+            : (protoRelIdx >= 0 ? protoRelIdx : -1);
         String title;
         String url;
-        if (dollarIdx >= 0 && (schemeIdx < 0 || dollarIdx < schemeIdx)) {
+        if (dollarIdx >= 0 &&
+            (effectiveSchemeIdx < 0 || dollarIdx < effectiveSchemeIdx)) {
           title = seg.substring(0, dollarIdx).trim();
-          url = seg.substring(dollarIdx + 1).trim();
+          url = normalizeTvboxEpisodeUrl(seg.substring(dollarIdx + 1));
         } else {
           title = '第 ${j + 1} 集';
-          url = seg;
+          url = normalizeTvboxEpisodeUrl(seg);
         }
         if (title.isEmpty) title = '第 ${j + 1} 集';
         if (url.isNotEmpty) {
@@ -430,30 +474,59 @@ class VodDetail {
       }
     }
 
-    // Prefer direct m3u8 groups first (just like web app does)
-    groups.sort((a, b) {
-      final aM3u8 = a.name.toLowerCase().contains('m3u8') ||
-          a.episodes.any((e) => e.rawUrl.toLowerCase().contains('.m3u8'));
-      final bM3u8 = b.name.toLowerCase().contains('m3u8') ||
-          b.episodes.any((e) => e.rawUrl.toLowerCase().contains('.m3u8'));
-      if (aM3u8 && !bM3u8) return -1;
-      if (!aM3u8 && bM3u8) return 1;
-      return 0;
-    });
+    // Prefer direct playable `.m3u8` / `.mp4` stream groups over HTML share-page wrappers (`/share/`)
+    int scorePlayGroup(PlayGroup g) {
+      if (g.episodes.isEmpty) return 0;
+      final firstUrl = g.episodes.first.rawUrl.toLowerCase();
+      final nameLower = g.name.toLowerCase();
+      if (firstUrl.contains('.m3u8') ||
+          firstUrl.contains('.mp4') ||
+          firstUrl.contains('.flv')) {
+        return 3;
+      }
+      if (nameLower.contains('m3u8')) {
+        return 2;
+      }
+      if (firstUrl.contains('/share/')) {
+        return 0;
+      }
+      return 1;
+    }
+
+    groups.sort((a, b) => scorePlayGroup(b).compareTo(scorePlayGroup(a)));
 
     return groups;
   }
 
+  static String _normalizePlayField(Object? raw) {
+    if (raw == null) return '';
+    if (raw is List) {
+      return raw
+          .map((item) {
+            if (item is Map) {
+              final name = (item['name'] ?? item['title'] ?? '').toString().trim();
+              final url = (item['url'] ?? item['play_url'] ?? '').toString().trim();
+              if (name.isNotEmpty && url.isNotEmpty) return '$name\$$url';
+              return url.isNotEmpty ? url : name;
+            }
+            return item?.toString().trim() ?? '';
+          })
+          .where((s) => s.isNotEmpty)
+          .join(r'$$$');
+    }
+    return raw.toString();
+  }
+
   factory VodDetail.fromJson(Map<String, dynamic> json) {
     final playFrom =
-        (json['vod_play_from'] ?? json['play_from'] ?? '').toString();
-    final playUrl = (json['vod_play_url'] ??
-            json['vod_url'] ??
-            json['play_url'] ??
-            '')
-        .toString();
+        _normalizePlayField(json['vod_play_from'] ?? json['play_from']);
+    final playUrl = _normalizePlayField(
+      json['vod_play_url'] ?? json['vod_url'] ?? json['play_url'],
+    );
+    final playNote =
+        (json['vod_play_note'] ?? json['play_note'] ?? '').toString().trim();
     final vodId = (json['vod_id'] ?? json['id'] ?? '').toString().trim();
-    var groups = parsePlayGroups(playFrom, playUrl);
+    var groups = parsePlayGroups(playFrom, playUrl, playNote: playNote);
     if (groups.isEmpty &&
         (vodId.startsWith('http://') ||
             vodId.startsWith('https://') ||
@@ -508,15 +581,119 @@ class ResolvedPlayback {
     this.proxyBufferSeconds = 120,
   });
 
-  factory ResolvedPlayback.fromJson(Map<String, dynamic> json) {
-    final headers = <String, String>{};
-    final rawHeader = json['header'];
+  static void _putNormalizedHeader(
+    Map<String, String> target,
+    String rawKey,
+    Object? rawValue,
+  ) {
+    if (rawValue == null) return;
+    final k = rawKey.trim();
+    final v = rawValue.toString().trim();
+    if (k.isEmpty || v.isEmpty) return;
+    final lower = k.toLowerCase();
+    if (lower == 'user-agent' || lower == 'ua' || lower == 'user_agent' || lower == 'useragent') {
+      target['User-Agent'] = v;
+    } else if (lower == 'referer' || lower == 'referrer') {
+      target['Referer'] = v;
+    } else if (lower == 'origin') {
+      target['Origin'] = v;
+    } else if (lower == 'cookie') {
+      target['Cookie'] = v;
+    } else {
+      target[k] = v;
+    }
+  }
+
+  static void _mergeDynamicHeaders(
+    Map<String, String> target,
+    Object? rawHeader,
+  ) {
+    if (rawHeader == null) return;
     if (rawHeader is Map) {
       rawHeader.forEach((key, value) {
-        if (value != null && value.toString().isNotEmpty) {
-          headers[key.toString()] = value.toString();
+        if (key != null) {
+          _putNormalizedHeader(target, key.toString(), value);
         }
       });
+    } else if (rawHeader is String && rawHeader.trim().isNotEmpty) {
+      final trimmed = rawHeader.trim();
+      if (trimmed.startsWith('{')) {
+        try {
+          final decoded = jsonDecode(trimmed);
+          if (decoded is Map) {
+            decoded.forEach((key, value) {
+              if (key != null) {
+                _putNormalizedHeader(target, key.toString(), value);
+              }
+            });
+            return;
+          }
+        } catch (_) {}
+      }
+      for (final line in trimmed.split(RegExp(r'[\r\n&]+'))) {
+        final sep = line.contains(':') ? ':' : '=';
+        final idx = line.indexOf(sep);
+        if (idx > 0) {
+          _putNormalizedHeader(
+            target,
+            line.substring(0, idx),
+            line.substring(idx + 1),
+          );
+        }
+      }
+    }
+  }
+
+  static String _extractResolvedUrlField(Object? rawField) {
+    if (rawField == null) return '';
+    if (rawField is List) {
+      for (final item in rawField) {
+        if (item is Map) {
+          final u = (item['url'] ?? item['direct_url'] ?? '').toString().trim();
+          if (u.startsWith('http://') ||
+              u.startsWith('https://') ||
+              u.startsWith('//') ||
+              u.startsWith('/')) {
+            return VodDetail.normalizeTvboxEpisodeUrl(u);
+          }
+        } else if (item != null) {
+          final s = item.toString().trim();
+          if (s.startsWith('http://') ||
+              s.startsWith('https://') ||
+              s.startsWith('//') ||
+              s.startsWith('/')) {
+            return VodDetail.normalizeTvboxEpisodeUrl(s);
+          }
+        }
+      }
+      return rawField.isNotEmpty
+          ? VodDetail.normalizeTvboxEpisodeUrl(rawField.first.toString())
+          : '';
+    }
+    if (rawField is Map) {
+      final inner = rawField['url'] ?? rawField['direct_url'] ?? '';
+      return _extractResolvedUrlField(inner);
+    }
+    return VodDetail.normalizeTvboxEpisodeUrl(rawField.toString());
+  }
+
+  factory ResolvedPlayback.fromJson(Map<String, dynamic> json) {
+    final headers = <String, String>{};
+    _mergeDynamicHeaders(headers, json['header']);
+    _mergeDynamicHeaders(headers, json['headers']);
+    for (final k in const [
+      'ua',
+      'user-agent',
+      'user_agent',
+      'userAgent',
+      'referer',
+      'referrer',
+      'origin',
+      'cookie',
+    ]) {
+      if (json[k] != null) {
+        _putNormalizedHeader(headers, k, json[k]);
+      }
     }
     final cfg = json['player_config'];
     bool backendProxy = json['force_proxy'] == true;
@@ -527,12 +704,25 @@ class ResolvedPlayback {
       }
       final b = int.tryParse((cfg['proxy_buffer_seconds'] ?? '120').toString());
       if (b != null && b > 0) bufferSec = b;
+      _mergeDynamicHeaders(headers, cfg['header'] ?? cfg['headers']);
+    }
+
+    var directUrl = _extractResolvedUrlField(
+      json['direct_url'] ?? json['url'] ?? json['play_url'],
+    );
+    if (directUrl.isEmpty && json['data'] is Map) {
+      final dataMap = json['data'] as Map;
+      directUrl = _extractResolvedUrlField(
+        dataMap['direct_url'] ?? dataMap['url'] ?? dataMap['play_url'],
+      );
+      _mergeDynamicHeaders(headers, dataMap['header'] ?? dataMap['headers']);
     }
 
     return ResolvedPlayback(
-      directUrl: (json['direct_url'] ?? json['url'] ?? '').toString().trim(),
+      directUrl: directUrl,
       proxyUrl: (json['proxy_url'] ?? '').toString().trim(),
-      serverProxyUrl: (json['server_proxy_url'] ?? json['proxy_url'] ?? '').toString().trim(),
+      serverProxyUrl:
+          (json['server_proxy_url'] ?? json['proxy_url'] ?? '').toString().trim(),
       headers: headers,
       parseVia: (json['parse_via'] ?? '').toString(),
       backendProxyPlayback: backendProxy,

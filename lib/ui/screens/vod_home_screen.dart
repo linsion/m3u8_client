@@ -2101,7 +2101,8 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
     required bool isMobile,
   }) {
     final historyItems = state.history;
-    if (historyItems.isEmpty ||
+    if (!state.watchHistoryEnabled ||
+        historyItems.isEmpty ||
         state.selectedTypeId.isNotEmpty ||
         state.searchKeyword.isNotEmpty ||
         state.directoryBreadcrumbs.isNotEmpty) {
@@ -2471,6 +2472,7 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                         context,
                         sources: state.visibleSources,
                         selectedSource: state.selectedSource,
+                        appState: state,
                         onSelect: state.selectVodSource,
                       );
                     },
@@ -2510,6 +2512,7 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                   context,
                   sources: state.sources,
                   selectedSource: state.selectedSource,
+                  appState: state,
                   onSelect: state.selectVodSource,
                 );
               },
