@@ -6,6 +6,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../ui/widgets/cloud_music_player.dart';
+
 class TvPlatformInfo {
   final bool isTv;
   final bool hasController;
@@ -70,6 +72,7 @@ class TvPlatformService {
   }) async {
     final clean = streamUrl.trim();
     if (clean.isEmpty) return false;
+    unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
     final encoded = Uri.encodeComponent(clean);
 
     Uri? targetUri;

@@ -861,7 +861,9 @@ struct TvQrInputTriggerButton: View {
 
 extension View {
   func withTvLanQuickInputOverlay(_ appState: TvAppState) -> some View {
-    self.overlay {
+    ZStack {
+      self
+        .disabled(appState.showLanQuickInputModal)
       if appState.showLanQuickInputModal {
         TvLanQuickInputModalView(
           prompt: appState.activeLanQuickInputPrompt,
@@ -871,6 +873,7 @@ extension View {
           }
         )
         .environmentObject(appState)
+        .zIndex(999)
       }
     }
   }
@@ -1770,6 +1773,7 @@ struct TvVodExpandedCategoryDrawerView: View {
         }
         .padding(54)
       }
+      .withTvLanQuickInputOverlay(appState)
       .onAppear {
         appState.startLanInputServer()
         appState.activeLanQuickInputPrompt = "筛选分类标签名称"
@@ -3131,6 +3135,7 @@ struct TvVodDetailSheetView: View {
     guard !group.episodes.isEmpty else { return }
     let safeEp = min(max(0, episodeIndex), group.episodes.count - 1)
 
+    appState.stopBackgroundAudioForVideoPlayback()
     previewLoadTask?.cancel()
     previewPlayer.pause()
     previewGroupIndex = safeGroup
@@ -3439,6 +3444,7 @@ final class TvLiveStreamController: ObservableObject {
     appState: TvAppState
   ) {
     guard !channel.urls.isEmpty else { return }
+    appState.stopBackgroundAudioForVideoPlayback()
     let safeIdx = min(max(0, urlIndex), channel.urls.count - 1)
     sessionId &+= 1
     let currentSession = sessionId
@@ -6997,6 +7003,7 @@ struct TvTelegramMiniPlayerOverlay: View {
   }
 
   private func startMiniStream(resumeAt: Double = 0) {
+    appState.stopBackgroundAudioForVideoPlayback()
     if let tok = miniStallObserver {
       NotificationCenter.default.removeObserver(tok)
       miniStallObserver = nil
@@ -8312,6 +8319,11 @@ struct TvMediaLibrarySectionView: View {
       )
       .environmentObject(appState)
     }
+    .onChange(of: appState.activeStorageMountId) { _ in
+      if showMountModal {
+        showMountModal = false
+      }
+    }
     .onAppear {
       appState.startLanInputServer()
       if appState.fileListing.entries.isEmpty {
@@ -9398,131 +9410,188 @@ struct TvMediaLibrarySectionView: View {
 
   // MARK: - Modal Dialogs
 
+  private func bindMountQuickInputField(_ focusId: String?) {
+    switch focusId {
+    case "mount_field_name":
+      appState.activeLanQuickInputPrompt = "存储挂载显示名称"
+      appState.activeLanQuickInputPlaceholder = "如：家庭 AList"
+      appState.activeLanQuickInputReceiver = { self.mountNameInput = $0 }
+    case "mount_field_user":
+      appState.activeLanQuickInputPrompt = "\(mountKind.title) 用户名"
+      appState.activeLanQuickInputPlaceholder = "admin"
+      appState.activeLanQuickInputReceiver = { self.mountUserInput = $0 }
+    case "mount_field_pass":
+      appState.activeLanQuickInputPrompt = "\(mountKind.title) 密码"
+      appState.activeLanQuickInputPlaceholder = "输入密码"
+      appState.activeLanQuickInputReceiver = { self.mountPassInput = $0 }
+    case "mount_field_root":
+      appState.activeLanQuickInputPrompt = "默认起始路径"
+      appState.activeLanQuickInputPlaceholder = "/"
+      appState.activeLanQuickInputReceiver = { self.mountRootPathInput = $0 }
+    case "mount_field_token":
+      appState.activeLanQuickInputPrompt = "AList Token"
+      appState.activeLanQuickInputPlaceholder = "alist-..."
+      appState.activeLanQuickInputReceiver = { self.mountTokenInput = $0 }
+    default:
+      appState.activeLanQuickInputPrompt = "\(mountKind.title) 服务地址"
+      appState.activeLanQuickInputPlaceholder = "http://192.168.1.10:5244"
+      appState.activeLanQuickInputReceiver = { self.mountUrlInput = $0 }
+    }
+  }
+
   @ViewBuilder
   private func mountEditorModal(theme: TvThemePalette) -> some View {
     ZStack {
       TvAmbientBackdropView(imageUrl: appState.ambientBackdropUrl)
-      VStack(alignment: .leading, spacing: 16) {
-        HStack {
-          Label(
-            editingMount == nil ? "挂载远程存储 (AList / OpenList / WebDAV)" : "编辑远程存储：\(editingMount?.name ?? "")",
-            systemImage: "externaldrive.badge.wifi"
-          )
-          .font(.system(size: 22, weight: .bold))
-          Spacer()
-          Button("关闭") {
-            showMountModal = false
-          }
-          .buttonStyle(TvApplePillButtonStyle(compact: true))
-        }
-
-        HStack(spacing: 12) {
-          Text("协议类型：")
-            .font(.system(size: 15, weight: .semibold))
-          ForEach([TvStorageSourceKind.alist, TvStorageSourceKind.webdav], id: \.self) { k in
-            Button {
-              mountKind = k
-              if mountUrlInput.isEmpty || mountUrlInput == "http://192.168.1.10:5244" || mountUrlInput == "http://192.168.1.10:5244/dav" {
-                mountUrlInput = k == .alist ? "http://192.168.1.10:5244" : "http://192.168.1.10:5244/dav"
-              }
-            } label: {
-              Label(k.title, systemImage: k.icon)
-            }
-            .buttonStyle(TvApplePillButtonStyle(isPrimary: mountKind == k, compact: true))
-            .focused($modalInitialFocus, equals: k == mountKind ? "mount_primary" : nil)
-          }
-        }
-
-        VStack(alignment: .leading, spacing: 10) {
-          HStack(spacing: 12) {
-            TextField("显示名称（例如：家庭 AList / NAS WebDAV / CloudDrive2）", text: $mountNameInput)
-              .font(.system(size: 16))
-            TvQrInputTriggerButton(prompt: "存储挂载显示名称", placeholder: "如：家庭 AList", labelText: "扫码名") { mountNameInput = $0 }
-          }
-          HStack(spacing: 12) {
-            TextField(
-              mountKind == .alist
-                ? "AList / OpenList 地址（例如 http://192.168.1.10:5244）"
-                : "WebDAV 完整地址（例如 http://192.168.1.10:5244/dav）",
-              text: $mountUrlInput
+      HStack(alignment: .center, spacing: 26) {
+        VStack(alignment: .leading, spacing: 16) {
+          HStack {
+            Label(
+              editingMount == nil ? "挂载远程存储 (AList / OpenList / WebDAV)" : "编辑远程存储：\(editingMount?.name ?? "")",
+              systemImage: "externaldrive.badge.wifi"
             )
-            .font(.system(size: 16))
-            TvQrInputTriggerButton(prompt: "\(mountKind.title) 服务地址", placeholder: "http://192.168.1.10:5244", labelText: "扫码地址") { mountUrlInput = $0 }
-          }
-
-          HStack(spacing: 12) {
-            TextField("用户名（选填，游客留空）", text: $mountUserInput)
-              .font(.system(size: 16))
-            TvQrInputTriggerButton(prompt: "\(mountKind.title) 用户名", placeholder: "admin", labelText: "扫码账号") { mountUserInput = $0 }
-            SecureField("密码（选填）", text: $mountPassInput)
-              .font(.system(size: 16))
-            TvQrInputTriggerButton(prompt: "\(mountKind.title) 密码", placeholder: "输入密码", labelText: "扫码密码") { mountPassInput = $0 }
-          }
-
-          HStack(spacing: 12) {
-            TextField("默认起始路径（默认 /）", text: $mountRootPathInput)
-              .font(.system(size: 16))
-            TvQrInputTriggerButton(prompt: "默认起始路径", placeholder: "/", labelText: "扫码路径") { mountRootPathInput = $0 }
-            if mountKind == .alist {
-              TextField("AList Token（选填，已填账号密码可留空）", text: $mountTokenInput)
-                .font(.system(size: 16))
-              TvQrInputTriggerButton(prompt: "AList Token", placeholder: "alist-...", labelText: "扫码Token") { mountTokenInput = $0 }
-            }
-          }
-        }
-
-        Text("💡 提示：也可以点击右上角「上传文件」用手机扫码，在手机网页上一键粘贴挂载 AList 或 WebDAV！")
-          .font(.system(size: 13))
-          .foregroundColor(.white.opacity(0.65))
-
-        HStack(spacing: 16) {
-          Button {
-            guard !mountUrlInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-              appState.showToast("请输入服务器地址")
-              return
-            }
-            let saved = appState.upsertStorageMount(
-              id: editingMount?.id,
-              name: mountNameInput,
-              kind: mountKind,
-              baseUrl: mountUrlInput,
-              username: mountUserInput,
-              password: mountPassInput,
-              token: mountTokenInput,
-              rootPath: mountRootPathInput
-            )
-            showMountModal = false
-            appState.switchStorageMount(saved.id)
-          } label: {
-            Label("保存并立即打开", systemImage: "checkmark.circle.fill")
-          }
-          .buttonStyle(TvApplePillButtonStyle(isPrimary: true))
-          .focused($modalInitialFocus, equals: "mount_save")
-
-          if let edit = editingMount, !edit.isBuiltIn {
-            Button(role: .destructive) {
-              appState.deleteStorageMount(edit.id)
+            .font(.system(size: 22, weight: .bold))
+            Spacer()
+            Button("关闭") {
               showMountModal = false
-            } label: {
-              Label("卸载此存储", systemImage: "trash.fill")
             }
-            .buttonStyle(TvApplePillButtonStyle(isDestructive: true))
+            .buttonStyle(TvApplePillButtonStyle(compact: true))
+          }
+
+          HStack(spacing: 12) {
+            Text("协议类型：")
+              .font(.system(size: 15, weight: .semibold))
+            ForEach([TvStorageSourceKind.alist, TvStorageSourceKind.webdav], id: \.self) { k in
+              Button {
+                mountKind = k
+                if mountUrlInput.isEmpty || mountUrlInput == "http://192.168.1.10:5244" || mountUrlInput == "http://192.168.1.10:5244/dav" {
+                  mountUrlInput = k == .alist ? "http://192.168.1.10:5244" : "http://192.168.1.10:5244/dav"
+                }
+                bindMountQuickInputField(modalInitialFocus)
+              } label: {
+                Label(k.title, systemImage: k.icon)
+              }
+              .buttonStyle(TvApplePillButtonStyle(isPrimary: mountKind == k, compact: true))
+              .focused($modalInitialFocus, equals: k == mountKind ? "mount_primary" : nil)
+            }
+          }
+
+          VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+              TextField("显示名称（例如：家庭 AList / NAS WebDAV / CloudDrive2）", text: $mountNameInput)
+                .font(.system(size: 16))
+                .focused($modalInitialFocus, equals: "mount_field_name")
+              TvQrInputTriggerButton(prompt: "存储挂载显示名称", placeholder: "如：家庭 AList", labelText: "扫码名") { mountNameInput = $0 }
+            }
+            HStack(spacing: 12) {
+              TextField(
+                mountKind == .alist
+                  ? "AList / OpenList 地址（例如 http://192.168.1.10:5244）"
+                  : "WebDAV 完整地址（例如 http://192.168.1.10:5244/dav）",
+                text: $mountUrlInput
+              )
+              .font(.system(size: 16))
+              .focused($modalInitialFocus, equals: "mount_field_url")
+              TvQrInputTriggerButton(prompt: "\(mountKind.title) 服务地址", placeholder: "http://192.168.1.10:5244", labelText: "扫码地址") { mountUrlInput = $0 }
+            }
+
+            HStack(spacing: 12) {
+              TextField("用户名（选填，游客留空）", text: $mountUserInput)
+                .font(.system(size: 16))
+                .focused($modalInitialFocus, equals: "mount_field_user")
+              TvQrInputTriggerButton(prompt: "\(mountKind.title) 用户名", placeholder: "admin", labelText: "扫码账号") { mountUserInput = $0 }
+              SecureField("密码（选填）", text: $mountPassInput)
+                .font(.system(size: 16))
+                .focused($modalInitialFocus, equals: "mount_field_pass")
+              TvQrInputTriggerButton(prompt: "\(mountKind.title) 密码", placeholder: "输入密码", labelText: "扫码密码") { mountPassInput = $0 }
+            }
+
+            HStack(spacing: 12) {
+              TextField("默认起始路径（默认 /）", text: $mountRootPathInput)
+                .font(.system(size: 16))
+                .focused($modalInitialFocus, equals: "mount_field_root")
+              TvQrInputTriggerButton(prompt: "默认起始路径", placeholder: "/", labelText: "扫码路径") { mountRootPathInput = $0 }
+              if mountKind == .alist {
+                TextField("AList Token（选填，已填账号密码可留空）", text: $mountTokenInput)
+                  .font(.system(size: 16))
+                  .focused($modalInitialFocus, equals: "mount_field_token")
+                TvQrInputTriggerButton(prompt: "AList Token", placeholder: "alist-...", labelText: "扫码Token") { mountTokenInput = $0 }
+              }
+            }
+          }
+
+          Text("💡 提示：点击任意输入框右侧「扫码...」可弹出大二维码，或直接扫描右侧二维码在手机上填写当前焦点项 / 一键挂载！")
+            .font(.system(size: 13))
+            .foregroundColor(.white.opacity(0.65))
+
+          HStack(spacing: 16) {
+            Button {
+              guard !mountUrlInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                appState.showToast("请输入服务器地址")
+                return
+              }
+              let saved = appState.upsertStorageMount(
+                id: editingMount?.id,
+                name: mountNameInput,
+                kind: mountKind,
+                baseUrl: mountUrlInput,
+                username: mountUserInput,
+                password: mountPassInput,
+                token: mountTokenInput,
+                rootPath: mountRootPathInput
+              )
+              showMountModal = false
+              appState.switchStorageMount(saved.id)
+            } label: {
+              Label("保存并立即打开", systemImage: "checkmark.circle.fill")
+            }
+            .buttonStyle(TvApplePillButtonStyle(isPrimary: true))
+            .focused($modalInitialFocus, equals: "mount_save")
+
+            if let edit = editingMount, !edit.isBuiltIn {
+              Button(role: .destructive) {
+                appState.deleteStorageMount(edit.id)
+                showMountModal = false
+              } label: {
+                Label("卸载此存储", systemImage: "trash.fill")
+              }
+              .buttonStyle(TvApplePillButtonStyle(isDestructive: true))
+            }
           }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+
+        TvInlineQrInputCard(
+          title: "📱 手机扫码输入",
+          subtitle: "当前目标：\(appState.activeLanQuickInputPrompt.isEmpty ? "\(mountKind.title) 服务地址" : appState.activeLanQuickInputPrompt)\n也可在手机网页直接整表挂载",
+          qrSize: 164
+        )
       }
       .padding(32)
-      .frame(width: 920)
+      .frame(width: 1180)
       .background(.regularMaterial)
       .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
       .focusSection()
     }
+    .withTvLanQuickInputOverlay(appState)
+    .onChange(of: modalInitialFocus) { newFocus in
+      if let f = newFocus, f.hasPrefix("mount_field_") {
+        bindMountQuickInputField(f)
+      }
+    }
     .onAppear {
+      appState.startLanInputServer()
+      bindMountQuickInputField("mount_field_url")
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
         modalInitialFocus = "mount_save"
       }
     }
     .onExitCommand {
-      showMountModal = false
+      if appState.showLanQuickInputModal {
+        appState.showLanQuickInputModal = false
+      } else {
+        showMountModal = false
+      }
     }
   }
 
@@ -9799,13 +9868,18 @@ struct TvMediaLibrarySectionView: View {
       .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
       .focusSection()
     }
+    .withTvLanQuickInputOverlay(appState)
     .onAppear {
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
         modalInitialFocus = "remote_dl_start"
       }
     }
     .onExitCommand {
-      showRemoteDownloadModal = false
+      if appState.showLanQuickInputModal {
+        appState.showLanQuickInputModal = false
+      } else {
+        showRemoteDownloadModal = false
+      }
     }
   }
 
@@ -9849,13 +9923,18 @@ struct TvMediaLibrarySectionView: View {
       .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
       .focusSection()
     }
+    .withTvLanQuickInputOverlay(appState)
     .onAppear {
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
         modalInitialFocus = "mkdir_confirm"
       }
     }
     .onExitCommand {
-      showNewFolderModal = false
+      if appState.showLanQuickInputModal {
+        appState.showLanQuickInputModal = false
+      } else {
+        showNewFolderModal = false
+      }
     }
   }
 
@@ -9900,13 +9979,18 @@ struct TvMediaLibrarySectionView: View {
       .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
       .focusSection()
     }
+    .withTvLanQuickInputOverlay(appState)
     .onAppear {
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
         modalInitialFocus = "rename_confirm"
       }
     }
     .onExitCommand {
-      renamingEntry = nil
+      if appState.showLanQuickInputModal {
+        appState.showLanQuickInputModal = false
+      } else {
+        renamingEntry = nil
+      }
     }
   }
 

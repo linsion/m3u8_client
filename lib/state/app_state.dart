@@ -11,6 +11,7 @@ import '../services/proxy_routing_service.dart';
 import '../services/telegram_notification_service.dart';
 import '../services/tv_platform_service.dart';
 import '../ui/theme.dart';
+import '../ui/widgets/cloud_music_player.dart';
 
 class DirectoryBreadcrumb {
   final String typeId;
@@ -2100,6 +2101,7 @@ class AppState extends ChangeNotifier {
 
   // Mini-Player Management
   void startMiniPlayer(MiniPlayerSession session) {
+    unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
     _miniPlayerSession = session;
     notifyListeners();
   }

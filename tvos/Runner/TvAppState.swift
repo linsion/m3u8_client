@@ -219,8 +219,22 @@ final class TvAppState: ObservableObject {
 
   // Detail & Active Playback
   @Published var selectedDetailItem: TvVodItem? = nil
-  @Published var activePlayback: TvPlaybackRequest? = nil
-  @Published var activeTelegramGallery: TvTelegramGallerySession? = nil
+  @Published var activePlayback: TvPlaybackRequest? = nil {
+    didSet {
+      if activePlayback != nil {
+        stopBackgroundAudioForVideoPlayback()
+      }
+    }
+  }
+  @Published var activeTelegramGallery: TvTelegramGallerySession? = nil {
+    didSet {
+      if let gallery = activeTelegramGallery,
+         gallery.mediaMessages.indices.contains(gallery.initialIndex),
+         gallery.mediaMessages[gallery.initialIndex].attachment?.isVideo == true {
+        stopBackgroundAudioForVideoPlayback()
+      }
+    }
+  }
   @Published var isResolvingPlay: Bool = false
 
   // 2. Live TV
@@ -321,7 +335,13 @@ final class TvAppState: ObservableObject {
   @Published var audioPlayMode: String = "sequential" // sequential, repeatAll, repeatOne, shuffle
 
   // Telegram Floating Mini-Player PIP State
-  @Published var miniPlayerMessage: TvTelegramMessage? = nil
+  @Published var miniPlayerMessage: TvTelegramMessage? = nil {
+    didSet {
+      if miniPlayerMessage != nil {
+        stopBackgroundAudioForVideoPlayback()
+      }
+    }
+  }
   @Published var miniPlayerChat: TvTelegramChat? = nil
 
   // 5. Downloads & Web Extract
@@ -1642,6 +1662,7 @@ final class TvAppState: ObservableObject {
     let group = detail.playGroups[groupIndex]
     guard episodeIndex >= 0, episodeIndex < group.episodes.count else { return }
     let ep = group.episodes[episodeIndex]
+    stopBackgroundAudioForVideoPlayback()
 
     let info: (finalStream: String, backupProxyUrl: String, headers: [String: String], viaBadge: String, resumeSec: Double)
     if let pre = preResolvedInfo, !pre.finalStream.isEmpty {
@@ -2037,6 +2058,7 @@ final class TvAppState: ObservableObject {
 
   func playLiveChannel(_ channel: TvLiveChannel, urlIndex: Int? = nil) {
     guard !channel.urls.isEmpty else { return }
+    stopBackgroundAudioForVideoPlayback()
     let resolvedIndex = urlIndex ?? preferredLiveUrlIndex(for: channel)
     let idx = min(max(0, resolvedIndex), channel.urls.count - 1)
     recordLiveChannelSelection(channel: channel, urlIndex: idx)
@@ -2663,13 +2685,15 @@ final class TvAppState: ObservableObject {
   }
 
   func openTelegramGallery(chat: TvTelegramChat, message: TvTelegramMessage, albumMessages: [TvTelegramMessage]? = nil) {
-    if isAudioPlaying {
-      audioPlayer?.pause()
-      isAudioPlaying = false
+    if message.attachment?.isVideo == true {
+      stopBackgroundAudioForVideoPlayback()
     }
     let visualMedia = telegramMessages.filter { $0.isVisualMedia }
     let items = visualMedia.isEmpty ? (albumMessages ?? [message]) : visualMedia
     let idx = items.firstIndex(where: { $0.id == message.id }) ?? 0
+    if items.indices.contains(idx), items[idx].attachment?.isVideo == true {
+      stopBackgroundAudioForVideoPlayback()
+    }
     self.galleryControlsVisible = true
     self.activeTelegramGallery = TvTelegramGallerySession(
       accountId: activeTelegramAccountId,
@@ -2680,6 +2704,7 @@ final class TvAppState: ObservableObject {
   }
 
   func openTelegramMiniPlayer(chat: TvTelegramChat, message: TvTelegramMessage) {
+    stopBackgroundAudioForVideoPlayback()
     self.miniPlayerChat = chat
     self.miniPlayerMessage = message
   }
@@ -2701,12 +2726,18 @@ final class TvAppState: ObservableObject {
         player.pause()
         isAudioPlaying = false
       } else {
+        if isCloudMusicPlaying || isCloudMusicLoading || cloudMusicPlayer != nil || isCloudMusicSessionDocked {
+          stopCloudMusicPlayer(clearPersistedQueue: false)
+        }
         player.playImmediately(atRate: audioSpeed)
         isAudioPlaying = true
       }
       return
     }
 
+    if isCloudMusicPlaying || isCloudMusicLoading || cloudMusicPlayer != nil || isCloudMusicSessionDocked {
+      stopCloudMusicPlayer(clearPersistedQueue: false)
+    }
     stopAudioPlayer()
     playingAudioChat = chat
     playingAudioMessage = message
@@ -3383,10 +3414,7 @@ final class TvAppState: ObservableObject {
       playCloudMusicFromDirectory(entry, openFullscreen: true)
       return
     }
-    if isCloudMusicPlaying {
-      cloudMusicPlayer?.pause()
-      isCloudMusicPlaying = false
-    }
+    stopBackgroundAudioForVideoPlayback()
     if entry.sourceKind == .localCache {
       let fileUrl = Self.resolveLocalOfflineUrl(relativePath: entry.path)
       guard FileManager.default.fileExists(atPath: fileUrl.path) else {
@@ -5873,6 +5901,17 @@ final class TvAppState: ObservableObject {
     cloudMusicPlayer = nil
     if let previousUrl {
       TvLocalHlsProxyServer.shared.releaseTelegramVideoProxyUrl(previousUrl)
+    }
+  }
+
+  /// Stops any active background music (`cloudMusicPlayer`) or Telegram audio (`audioPlayer`)
+  /// whenever any video playback starts across the app.
+  func stopBackgroundAudioForVideoPlayback() {
+    if isCloudMusicPlaying || isCloudMusicLoading || cloudMusicPlayer != nil || isCloudMusicSessionDocked {
+      stopCloudMusicPlayer(clearPersistedQueue: false)
+    }
+    if isAudioPlaying || audioPlayer != nil || playingAudioMessage != nil {
+      stopAudioPlayer()
     }
   }
 

@@ -10,6 +10,7 @@ import 'package:media_kit_video/media_kit_video.dart';
 import '../../models/models.dart';
 import '../../state/app_state.dart';
 import '../theme.dart';
+import '../widgets/cloud_music_player.dart';
 import '../widgets/mobile_edge_swipe_back.dart';
 import '../widgets/video_download_speed_badge.dart';
 
@@ -1987,6 +1988,7 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
   @override
   void initState() {
     super.initState();
+    unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
     _player = Player(
       configuration: PlayerConfiguration(
         bufferSize: (Platform.isAndroid || Platform.isIOS)

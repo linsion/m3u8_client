@@ -16,6 +16,7 @@ import '../../models/models.dart';
 import '../../services/proxy_routing_service.dart';
 import '../../state/app_state.dart';
 import '../theme.dart';
+import '../widgets/cloud_music_player.dart';
 import '../widgets/mobile_edge_swipe_back.dart';
 import '../widgets/video_115_accelerate_button.dart';
 import '../widgets/video_download_speed_badge.dart';
@@ -464,6 +465,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
   @override
   void initState() {
     super.initState();
+    CloudMusicController.registerExternalAudioStopper(_stopAndCloseAudioPlayer);
     _messageScrollController.addListener(_onMessageScroll);
     widget.appState.addListener(_onAppStateChanged);
     _nativeUtilsChannel.setMethodCallHandler(_handleNativeUtilsMethodCall);
@@ -1430,6 +1432,9 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
   @override
   void dispose() {
+    CloudMusicController.unregisterExternalAudioStopper(
+      _stopAndCloseAudioPlayer,
+    );
     if (widget.appState.activeChildBackHandler == _handleBackPress) {
       widget.appState.activeChildBackHandler = null;
     }
@@ -4268,10 +4273,18 @@ class _TelegramScreenState extends State<TelegramScreen> {
         _audioPlayer != null &&
         _audioErrorText.isEmpty &&
         !_isAudioLoading) {
+      if (!_audioPlayer!.state.playing) {
+        unawaited(
+          CloudMusicController.shared.stopAndClose(clearPersistedQueue: false),
+        );
+      }
       await _audioPlayer!.playOrPause();
       return;
     }
 
+    unawaited(
+      CloudMusicController.shared.stopAndClose(clearPersistedQueue: false),
+    );
     _ensureAudioPlayerInitialized();
     final openSeq = ++_audioOpenSeq;
     final playlist = _resolveAudioPlaylistFor(chat, msg);
@@ -15676,6 +15689,9 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
       final usingLocalRelay = streamUrl.contains('/__m3u8_proxy__/');
       var retriedPrematureEnd = false;
       _playingSub = p.stream.playing.listen((playing) {
+        if (playing) {
+          unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
+        }
         if (mounted) setState(() => _isPlaying = playing);
       });
       _posSub = p.stream.position.listen((pos) {
@@ -15739,6 +15755,7 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
       if (!mounted || _inlinePlayer != p) return;
       await p.setVolume(_isMuted ? 0 : _volume);
       if (!mounted || _inlinePlayer != p) return;
+      unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
       await p.open(
         Media(
           streamUrl,
@@ -17172,6 +17189,9 @@ class _TelegramPhotoGalleryDialogState
       _galleryPlayerSetup = _configureGalleryVideoPlayer(p);
 
       _playingSub = p.stream.playing.listen((playing) {
+        if (playing) {
+          unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
+        }
         if (mounted && _isVideoPlaying != playing) {
           setState(() => _isVideoPlaying = playing);
         }
@@ -17261,6 +17281,9 @@ class _TelegramPhotoGalleryDialogState
 
     _galleryOpening = true;
     _galleryWantsPlayback = play;
+    if (play) {
+      unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
+    }
     _galleryRetriedPrematureEnd = false;
     _videoPosition = resumeFrom;
     _videoBuffer = Duration.zero;

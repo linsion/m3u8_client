@@ -13,6 +13,7 @@ import '../../services/proxy_routing_service.dart';
 import '../../services/tv_platform_service.dart';
 import '../../state/app_state.dart';
 import '../theme.dart';
+import '../widgets/cloud_music_player.dart';
 import '../widgets/mobile_edge_swipe_back.dart';
 import '../widgets/video_115_accelerate_button.dart';
 import '../widgets/video_download_speed_badge.dart';
@@ -346,6 +347,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     FocusManager.instance.addListener(_onVodFocusManagerChanged);
     _activeSource = widget.source;
     _activeVodId = widget.vodId;
+    unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
     if (widget.appState.miniPlayerSession != null) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         widget.appState.closeMiniPlayer();
@@ -749,6 +751,9 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
 
   void _onPositionUpdate(Duration pos) {
     if (pos > Duration.zero) {
+      if (_player.state.playing) {
+        unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
+      }
       _startupWatchdogTimer?.cancel();
       if ((!_hasRenderedFirstFrame || _playError != null || _isResolvingPlay) &&
           mounted) {
@@ -1217,6 +1222,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     _activeStreamUrl = finalMediaTarget;
     _activeStreamHeaders = headers;
     _lastStreamOpenInitiatedAt = DateTime.now();
+    unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
     final startOffset = (!_hasAppliedInitialSeek && _pendingSeekSeconds > 3)
         ? Duration(seconds: _pendingSeekSeconds.round())
         : null;
@@ -1355,6 +1361,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       bypassClientProxy: true,
     );
     if (!mounted || attempt != _playAttemptSessionId) return;
+    unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
     await _player.open(
       Media(
         resolved.proxyStreamUrl,

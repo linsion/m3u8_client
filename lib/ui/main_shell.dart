@@ -3942,6 +3942,7 @@ class _FloatingMiniPlayerOverlayState
         : (!_hasAppliedInitialSeek && _pendingSeekSeconds > 2
               ? _pendingSeekSeconds
               : 0);
+    unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
     await _player.open(
       Media(
         streamUrl,
@@ -3976,6 +3977,7 @@ class _FloatingMiniPlayerOverlayState
   void _onPlayingChanged(bool playing) {
     _autoPlayGuardTimer?.cancel();
     if (playing) {
+      unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
       _lastPositionAdvanceAt = DateTime.now();
       return;
     }

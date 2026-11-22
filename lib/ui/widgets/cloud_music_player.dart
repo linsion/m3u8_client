@@ -763,6 +763,53 @@ class CloudMusicController extends ChangeNotifier with WidgetsBindingObserver {
 
   static final CloudMusicController shared = CloudMusicController._internal();
 
+  static final Set<FutureOr<void> Function()> _externalAudioStoppers = {};
+
+  static void registerExternalAudioStopper(FutureOr<void> Function() stopper) {
+    _externalAudioStoppers.add(stopper);
+  }
+
+  static void unregisterExternalAudioStopper(
+    FutureOr<void> Function() stopper,
+  ) {
+    _externalAudioStoppers.remove(stopper);
+  }
+
+  static void stopExternalAudioPlayersOnly() {
+    for (final stopper
+        in List<FutureOr<void> Function()>.from(_externalAudioStoppers)) {
+      try {
+        unawaited(Future<void>.sync(stopper));
+      } catch (_) {}
+    }
+  }
+
+  /// Stops any active background music playback (`CloudMusicController.shared`
+  /// and any registered external audio players such as Telegram audio)
+  /// whenever any video playback starts across the app.
+  static Future<void> stopAllBackgroundAudioForVideo() async {
+    final futures = <Future<void>>[];
+    if (shared._isPlaying ||
+        shared._isLoadingTrack ||
+        (shared._player?.state.playing ?? false) ||
+        shared._activeStreamUrl.isNotEmpty ||
+        shared._isSessionDocked) {
+      futures.add(shared.stopAndClose(clearPersistedQueue: false));
+    }
+    for (final stopper
+        in List<FutureOr<void> Function()>.from(_externalAudioStoppers)) {
+      try {
+        final res = stopper();
+        if (res is Future<void>) {
+          futures.add(res);
+        }
+      } catch (_) {}
+    }
+    if (futures.isNotEmpty) {
+      await Future.wait(futures);
+    }
+  }
+
   CloudEndpointResolver? _customEndpointResolver;
   AppState? _boundAppState;
 
@@ -3217,6 +3264,7 @@ class CloudMusicController extends ChangeNotifier with WidgetsBindingObserver {
     await _initialLoad;
     final track = currentTrack;
     if (track == null) return;
+    stopExternalAudioPlayersOnly();
     final now = DateTime.now();
     final longIdle =
         !_isPlaying &&

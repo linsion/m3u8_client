@@ -4565,6 +4565,7 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
   @override
   void initState() {
     super.initState();
+    unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
     _activeUrl = widget.streamUrl;
     _activeHeaders = widget.headers;
     _using115Direct = widget.fallback115 != null;
@@ -4599,6 +4600,7 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
   }
 
   Future<void> _openActiveStream({Duration? position}) async {
+    unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
     await _player.open(
       Media(_activeUrl, httpHeaders: _activeHeaders, start: position),
       play: true,

@@ -14,6 +14,7 @@ import '../../services/proxy_routing_service.dart';
 import '../../services/tv_platform_service.dart';
 import '../../state/app_state.dart';
 import '../theme.dart';
+import '../widgets/cloud_music_player.dart';
 import '../widgets/video_download_speed_badge.dart';
 import '../widgets/video_proxy_node_selector.dart';
 import '../widgets/video_proxy_stats_overlay.dart';
@@ -381,6 +382,9 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     });
 
     _playingSub = _player.stream.playing.listen((playing) {
+      if (playing) {
+        unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
+      }
       if (playing ||
           !mounted ||
           _isResolving ||
@@ -994,6 +998,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
       );
       if (!mounted || _subPlayers[slot] != p) return;
       final useRelay = relayed != playUrl && relayed.contains('/__m3u8_proxy__/');
+      unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
       await p.open(
         Media(
           useRelay ? relayed : playUrl,
@@ -1161,6 +1166,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     _startupTimer?.cancel();
     _reconnectTimer?.cancel();
     if (!isAutoReconnect) {
+      unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
       if (widget.appState.miniPlayerSession != null) {
         widget.appState.closeMiniPlayer();
       }
@@ -1253,6 +1259,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
       });
 
       await _applyPlayerStreamHeaders(headers, streamUrl: finalPlayUrl);
+      unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
       await _player.open(
         Media(
           finalPlayUrl,

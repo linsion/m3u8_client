@@ -2376,6 +2376,7 @@ struct TvPlayerModalView: View {
   }
 
   private func loadCurrentStream(forceProxy: Bool, resumeAt: Double? = nil) {
+    appState.stopBackgroundAudioForVideoPlayback()
     let sc: TvRequestScenario = request.isLive ? .liveStream : .vodStream
     appState.activateScenarioProxyTunnel(for: sc)
     let eff = appState.resolveEffectiveRoute(for: sc)
@@ -3696,6 +3697,7 @@ struct TvTelegramGalleryModalView: View {
       bufferedSec = 0
       return
     }
+    appState.stopBackgroundAudioForVideoPlayback()
 
     let streamUrl: String
     if let c115 = custom115Url, !c115.isEmpty {
@@ -4419,7 +4421,25 @@ struct Tv115QuickLoginSheet: View {
               .font(.system(size: 15))
               .foregroundColor(.white.opacity(0.68))
 
-            TextField("UID=...; CID=...; SEID=...", text: $cookieInput)
+            HStack(spacing: 12) {
+              TextField("UID=...; CID=...; SEID=...", text: $cookieInput)
+              TvQrInputTriggerButton(
+                prompt: "115 网盘 Cookie (UID=...; CID=...; SEID=...)",
+                placeholder: "粘贴包含 UID/CID/SEID 的 Cookie",
+                labelText: "扫码粘贴"
+              ) { text in
+                cookieInput = text
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return }
+                Task {
+                  await appState.save115Cookie(trimmed)
+                  if TvLocal115DirectClient.shared.hasLocalCookie {
+                    isPresented = false
+                    onLoginCompleted()
+                  }
+                }
+              }
+            }
 
             Button {
               let trimmed = cookieInput.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4453,6 +4473,7 @@ struct Tv115QuickLoginSheet: View {
       }
       .padding(48)
     }
+    .withTvLanQuickInputOverlay(appState)
     .onAppear {
       appState.startLanInputServer()
       guard !didRequestInitialQr else { return }
