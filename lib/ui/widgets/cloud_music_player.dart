@@ -4609,7 +4609,7 @@ class _CloudMusicFolderPickerDialogState
                                                   ? VideoPlatformTheme.accent
                                                   : VideoPlatformTheme
                                                       .borderSubtle),
-                                          width: isFocused ? 2.4 : 1.0,
+                                          width: 1.5,
                                         ),
                                         boxShadow: isFocused
                                             ? [
@@ -4751,14 +4751,14 @@ class _CloudMusicFolderPickerDialogState
                                                       : Colors.transparent,
                                                   borderRadius:
                                                       BorderRadius.circular(5),
-                                                  border: isFocused
-                                                      ? Border.all(
-                                                          color: const Color(
+                                                  border: Border.all(
+                                                    color: isFocused
+                                                        ? const Color(
                                                             0xFFFFE066,
-                                                          ),
-                                                          width: 1.8,
-                                                        )
-                                                      : null,
+                                                          )
+                                                        : Colors.transparent,
+                                                    width: 1.5,
+                                                  ),
                                                 ),
                                                 child: Text(
                                                   _breadcrumbs[i].title,
@@ -5065,14 +5065,15 @@ class _CloudMusicFolderPickerDialogState
                                                         : Colors.transparent),
                                                 borderRadius:
                                                     BorderRadius.circular(8),
-                  border: Border.all(
-                    color: isFocused
-                        ? const Color(0xFFFFE066)
-                        : (checked
-                            ? VideoPlatformTheme.accent
-                            : Colors.transparent),
-                    width: 1.2,
-                  ),
+                                                border: Border.all(
+                                                  color: isFocused
+                                                      ? const Color(0xFFFFE066)
+                                                      : (checked
+                                                          ? VideoPlatformTheme
+                                                              .accent
+                                                          : Colors.transparent),
+                                                  width: 1.5,
+                                                ),
                                               ),
                                               child: ListTile(
                                                 dense: true,
@@ -5132,7 +5133,7 @@ class _CloudMusicFolderPickerDialogState
                                                 ),
                                                 subtitle: Text(
                                                   e.isDir
-                                                      ? '文件夹 · 点击进入，右侧可勾选随机播放'
+                                                      ? '文件夹 · 点击进入，右侧可勾选目录'
                                                       : (e.isStreamableMusicArchive
                                                           ? '压缩包 (${e.formattedSize}) · 免整包下载直读音乐'
                                                           : '${audioMeta != null && audioMeta.artist.isNotEmpty ? "${audioMeta.artist} · " : ""}${audioMeta?.qualityTag ?? e.typeTagText} · ${e.formattedSize}'),
@@ -5227,15 +5228,14 @@ class _CloudMusicFolderPickerDialogState
                                                                     .warning,
                                                               ),
                                                             ),
-                                                          Checkbox(
-                                                            visualDensity:
-                                                                VisualDensity
-                                                                    .compact,
-                                                            value: checked,
-                                                            activeColor:
-                                                                VideoPlatformTheme
-                                                                    .accent,
-                                                            onChanged: (_) {
+                                                          const SizedBox(
+                                                            width: 4,
+                                                          ),
+                                                          InkWell(
+                                                            borderRadius:
+                                                                BorderRadius
+                                                                    .circular(8),
+                                                            onTap: () {
                                                               _toggleSelection(
                                                                 SavedMusicFolderItem(
                                                                   mountId:
@@ -5257,6 +5257,96 @@ class _CloudMusicFolderPickerDialogState
                                                                 ),
                                                               );
                                                             },
+                                                            child: Builder(
+                                                              builder: (chkCtx) {
+                                                                final isChkFocused =
+                                                                    Focus.of(
+                                                                      chkCtx,
+                                                                    ).hasPrimaryFocus;
+                                                                return Container(
+                                                                  padding:
+                                                                      const EdgeInsets
+                                                                          .symmetric(
+                                                                    horizontal:
+                                                                        9,
+                                                                    vertical: 5,
+                                                                  ),
+                                                                  decoration:
+                                                                      BoxDecoration(
+                                                                    color: isChkFocused
+                                                                        ? VideoPlatformTheme
+                                                                            .accent
+                                                                        : (checked
+                                                                            ? VideoPlatformTheme.accent.withValues(
+                                                                                alpha:
+                                                                                    0.22,
+                                                                              )
+                                                                            : VideoPlatformTheme
+                                                                                .bgElevated),
+                                                                    borderRadius:
+                                                                        BorderRadius
+                                                                            .circular(
+                                                                      8,
+                                                                    ),
+                                                                    border:
+                                                                        Border
+                                                                            .all(
+                                                                      color: isChkFocused
+                                                                          ? const Color(
+                                                                              0xFFFFE066,
+                                                                            )
+                                                                          : (checked
+                                                                              ? VideoPlatformTheme.accent
+                                                                              : VideoPlatformTheme.borderStrong),
+                                                                      width: 1.5,
+                                                                    ),
+                                                                  ),
+                                                                  child: Row(
+                                                                    mainAxisSize:
+                                                                        MainAxisSize
+                                                                            .min,
+                                                                    children: [
+                                                                      Icon(
+                                                                        checked
+                                                                            ? Icons
+                                                                                .check_box_rounded
+                                                                            : Icons
+                                                                                .check_box_outline_blank_rounded,
+                                                                        size:
+                                                                            16,
+                                                                        color: isChkFocused
+                                                                            ? Colors
+                                                                                .white
+                                                                            : (checked
+                                                                                ? VideoPlatformTheme.accent
+                                                                                : VideoPlatformTheme.textSecondary),
+                                                                      ),
+                                                                      const SizedBox(
+                                                                        width:
+                                                                            4,
+                                                                      ),
+                                                                      Text(
+                                                                        checked
+                                                                            ? '已选'
+                                                                            : '勾选',
+                                                                        style:
+                                                                            TextStyle(
+                                                                          fontSize:
+                                                                              11.5,
+                                                                          fontWeight:
+                                                                              FontWeight.w700,
+                                                                          color: isChkFocused
+                                                                              ? Colors.white
+                                                                              : (checked
+                                                                                  ? VideoPlatformTheme.accent
+                                                                                  : VideoPlatformTheme.textSecondary),
+                                                                        ),
+                                                                      ),
+                                                                    ],
+                                                                  ),
+                                                                );
+                                                              },
+                                                            ),
                                                           ),
                                                         ],
                                                       )
@@ -5304,12 +5394,12 @@ class _CloudMusicFolderPickerDialogState
                                           .withValues(alpha: 0.28)
                                       : Colors.transparent,
                                   borderRadius: BorderRadius.circular(6),
-                                  border: isFocused
-                                      ? Border.all(
-                                          color: const Color(0xFFFFE066),
-                                          width: 1.8,
-                                        )
-                                      : null,
+                                  border: Border.all(
+                                    color: isFocused
+                                        ? const Color(0xFFFFE066)
+                                        : Colors.transparent,
+                                    width: 1.5,
+                                  ),
                                 ),
                                 child: Row(
                                   mainAxisSize: MainAxisSize.min,
@@ -12068,20 +12158,32 @@ class _SmartPlaylistDirectoryPickerDialogState
     super.initState();
     _selected = List<SavedMusicFolderItem>.from(widget.initialSelected);
     if (widget.controller.availableMounts.isNotEmpty) {
-      _selectMount(widget.controller.availableMounts.first);
+      final mounts = widget.controller.availableMounts;
+      final preferred = _selected.isNotEmpty
+          ? (mounts
+                  .where((m) => m.id == _selected.first.mountId)
+                  .firstOrNull ??
+              mounts.first)
+          : mounts.first;
+      _selectMount(preferred);
     }
   }
 
   Future<void> _selectMount(StorageMount mount) async {
+    final defaultRoot = switch (mount.kind) {
+      StorageSourceKind.server => '',
+      StorageSourceKind.cloud115 => '0',
+      _ => mount.rootPath,
+    };
     setState(() {
       _activeMount = mount;
-      _currentPath = mount.rootPath;
+      _currentPath = defaultRoot;
       _currentTitle = mount.name;
       _breadcrumbs
         ..clear()
-        ..add((path: mount.rootPath, title: mount.name));
+        ..add((path: defaultRoot, title: mount.name));
     });
-    await _loadDir(mount.rootPath, title: mount.name, pushCrumb: false);
+    await _loadDir(defaultRoot, title: mount.name, pushCrumb: false);
   }
 
   Future<void> _loadDir(
@@ -12107,16 +12209,30 @@ class _SmartPlaylistDirectoryPickerDialogState
     try {
       final list = await widget.controller.listDirectoryForMount(mount, path);
       if (!mounted) return;
+      final filtered = list
+          .where((e) => e.isDir || e.isStreamableMusicArchive)
+          .toList()
+        ..sort((a, b) {
+          if (a.isDir != b.isDir) return a.isDir ? -1 : 1;
+          return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+        });
       setState(() {
-        _entries = list
-            .where((e) => e.isDir || e.isStreamableMusicArchive)
-            .toList();
+        _entries = filtered;
         _isLoading = false;
       });
     } catch (_) {
       if (!mounted) return;
       setState(() => _isLoading = false);
     }
+  }
+
+  bool _stepBackFolderIfPossible() {
+    if (_breadcrumbs.length >= 2) {
+      final prev = _breadcrumbs[_breadcrumbs.length - 2];
+      _loadDir(prev.path, title: prev.title);
+      return true;
+    }
+    return false;
   }
 
   SavedMusicFolderItem _currentDirItem() {
@@ -12126,8 +12242,12 @@ class _SmartPlaylistDirectoryPickerDialogState
       mountName: m.name,
       sourceKind: m.kind,
       path: _currentPath,
-      title: _currentTitle,
+      title: _currentTitle.isEmpty ? m.name : _currentTitle,
     );
+  }
+
+  bool _isItemSelected(SavedMusicFolderItem item) {
+    return _selected.any((s) => s.uniqueKey == item.uniqueKey);
   }
 
   void _toggleItem(SavedMusicFolderItem item) {
@@ -12147,209 +12267,666 @@ class _SmartPlaylistDirectoryPickerDialogState
     final activeMount = _activeMount;
     final screenSize = MediaQuery.sizeOf(context);
     final isMobile = screenSize.width < 680;
+    final currentDirChecked =
+        activeMount != null && _isItemSelected(_currentDirItem());
 
-    return AlertDialog(
-      backgroundColor: VideoPlatformTheme.bgElevated,
-      insetPadding: EdgeInsets.symmetric(
-        horizontal: isMobile ? 10 : 24,
-        vertical: isMobile ? 14 : 24,
-      ),
-      titlePadding: EdgeInsets.fromLTRB(
-        isMobile ? 14 : 20,
-        isMobile ? 12 : 16,
-        isMobile ? 10 : 14,
-        6,
-      ),
-      contentPadding: EdgeInsets.fromLTRB(
-        isMobile ? 12 : 20,
-        6,
-        isMobile ? 12 : 20,
-        10,
-      ),
-      title: Row(
-        children: [
-          Icon(
-            Icons.create_new_folder_rounded,
-            size: isMobile ? 19 : 21,
-            color: VideoPlatformTheme.accent,
+    return PopScope(
+      canPop: _breadcrumbs.length <= 1,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        if (!_stepBackFolderIfPossible()) {
+          Navigator.of(context).pop();
+        }
+      },
+      child: Focus(
+        canRequestFocus: false,
+        onKeyEvent: (node, event) {
+          if (event is KeyDownEvent &&
+              (event.logicalKey == LogicalKeyboardKey.goBack ||
+                  event.logicalKey == LogicalKeyboardKey.escape ||
+                  event.logicalKey == LogicalKeyboardKey.browserBack)) {
+            if (_stepBackFolderIfPossible()) {
+              return KeyEventResult.handled;
+            }
+          }
+          return KeyEventResult.ignored;
+        },
+        child: AlertDialog(
+          backgroundColor: VideoPlatformTheme.bgElevated,
+          insetPadding: EdgeInsets.symmetric(
+            horizontal: isMobile ? 10 : 24,
+            vertical: isMobile ? 14 : 24,
           ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              '选择要扫描或 AI 分析的音乐目录',
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontSize: isMobile ? 14.5 : 16,
-                fontWeight: FontWeight.w700,
+          titlePadding: EdgeInsets.fromLTRB(
+            isMobile ? 14 : 20,
+            isMobile ? 12 : 16,
+            isMobile ? 10 : 14,
+            6,
+          ),
+          contentPadding: EdgeInsets.fromLTRB(
+            isMobile ? 12 : 20,
+            6,
+            isMobile ? 12 : 20,
+            10,
+          ),
+          title: Row(
+            children: [
+              Icon(
+                Icons.create_new_folder_rounded,
+                size: isMobile ? 19 : 21,
+                color: VideoPlatformTheme.accent,
               ),
-            ),
-          ),
-        ],
-      ),
-      content: SizedBox(
-        width: isMobile ? screenSize.width : 660,
-        height: (screenSize.height * 0.62).clamp(280.0, 440.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: Row(
-                children: [
-                  for (final m in mounts)
-                    Padding(
-                      padding: const EdgeInsets.only(right: 8),
-                      child: ChoiceChip(
-                        showCheckmark: false,
-                        visualDensity: VisualDensity.compact,
-                        label: Text(
-                          m.name,
-                          style: TextStyle(fontSize: isMobile ? 11.5 : 12.5),
-                        ),
-                        selected: activeMount?.id == m.id,
-                        onSelected: (_) => _selectMount(m),
-                      ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  '选择要扫描或 AI 分析的音乐目录',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: isMobile ? 14.5 : 16,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              if (_selected.isNotEmpty)
+                Container(
+                  margin: const EdgeInsets.only(right: 6),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 3,
+                  ),
+                  decoration: BoxDecoration(
+                    color: VideoPlatformTheme.accent.withValues(alpha: 0.18),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: VideoPlatformTheme.accent.withValues(alpha: 0.5),
                     ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 8),
-            if (activeMount != null)
-              Row(
-                children: [
-                  if (_breadcrumbs.length >= 2) ...[
-                    InkWell(
-                      borderRadius: BorderRadius.circular(6),
-                      onTap: () {
-                        final prev = _breadcrumbs[_breadcrumbs.length - 2];
-                        _loadDir(prev.path, title: prev.title);
-                      },
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 7,
-                          vertical: 4,
-                        ),
-                        decoration: BoxDecoration(
-                          color: VideoPlatformTheme.bgCard,
-                          borderRadius: BorderRadius.circular(6),
-                          border: Border.all(
-                            color: VideoPlatformTheme.borderSubtle,
+                  ),
+                  child: Text(
+                    '已选 ${_selected.length} 项',
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w700,
+                      color: VideoPlatformTheme.accent,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          content: SizedBox(
+            width: isMobile ? screenSize.width : 660,
+            height: (screenSize.height * 0.62).clamp(280.0, 440.0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // 1. Fixed-size Mount Switcher Tabs (No ChoiceChip resize jitter on focus)
+                SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    children: [
+                      for (final m in mounts)
+                        Padding(
+                          padding: const EdgeInsets.only(right: 8),
+                          child: StatefulBuilder(
+                            builder: (mCtx, setMState) {
+                              final isSelected = activeMount?.id == m.id;
+                              return InkWell(
+                                borderRadius: BorderRadius.circular(16),
+                                onFocusChange: (_) {
+                                  if (mCtx.mounted) setMState(() {});
+                                },
+                                onTap: () => _selectMount(m),
+                                child: Builder(
+                                  builder: (ctx) {
+                                    final isFocused =
+                                        Focus.of(ctx).hasPrimaryFocus;
+                                    return Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 12,
+                                        vertical: 6,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: isSelected
+                                            ? (isFocused
+                                                ? VideoPlatformTheme.accentHover
+                                                : VideoPlatformTheme.accent)
+                                            : (isFocused
+                                                ? VideoPlatformTheme.accent
+                                                    .withValues(alpha: 0.32)
+                                                : VideoPlatformTheme.bgCard),
+                                        borderRadius: BorderRadius.circular(16),
+                                        border: Border.all(
+                                          color: isFocused
+                                              ? const Color(0xFFFFE066)
+                                              : (isSelected
+                                                  ? VideoPlatformTheme.accent
+                                                  : VideoPlatformTheme
+                                                      .borderSubtle),
+                                          width: 1.5,
+                                        ),
+                                      ),
+                                      child: Text(
+                                        m.name,
+                                        style: TextStyle(
+                                          fontSize: isMobile ? 11.5 : 12.5,
+                                          fontWeight: FontWeight.w700,
+                                          color: (isSelected || isFocused)
+                                              ? Colors.white
+                                              : VideoPlatformTheme.textPrimary,
+                                        ),
+                                      ),
+                                    );
+                                  },
+                                ),
+                              );
+                            },
                           ),
                         ),
-                        child: const Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(Icons.arrow_back_rounded, size: 13),
-                            SizedBox(width: 2),
-                            Text('上级', style: TextStyle(fontSize: 11)),
-                          ],
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                  ],
-                  Expanded(
-                    child: Text(
-                      '位置：${_breadcrumbs.map((b) => b.title).join(" / ")}',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 11.5,
-                        color: VideoPlatformTheme.textSecondary,
-                      ),
-                    ),
+                    ],
                   ),
-                  const SizedBox(width: 6),
-                  OutlinedButton.icon(
-                    style: OutlinedButton.styleFrom(
-                      visualDensity: VisualDensity.compact,
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 4,
-                      ),
-                    ),
-                    onPressed: () => _toggleItem(_currentDirItem()),
-                    icon: const Icon(Icons.check_box_outlined, size: 14),
-                    label: Text(
-                      isMobile ? '选此目录' : '勾选当前目录',
-                      style: const TextStyle(fontSize: 11.5),
-                    ),
-                  ),
-                ],
-              ),
-            const SizedBox(height: 8),
-            Expanded(
-              child: Material(
-                color: VideoPlatformTheme.bgCard,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
-                  side: BorderSide(color: VideoPlatformTheme.borderSubtle),
                 ),
-                clipBehavior: Clip.antiAlias,
-                child: _isLoading
-                    ? const Center(child: CircularProgressIndicator())
-                    : ListView.builder(
-                        itemCount: _entries.length,
-                        itemBuilder: (context, idx) {
-                          final e = _entries[idx];
-                          final item = SavedMusicFolderItem(
-                            mountId: activeMount!.id,
-                            mountName: activeMount.name,
-                            sourceKind: activeMount.kind,
-                            path: e.path,
-                            title: e.name,
-                            isArchive: e.isStreamableMusicArchive,
-                            size: e.size,
-                            pickcode115: e.pickcode115,
-                          );
-                          final checked = _selected
-                              .any((s) => s.uniqueKey == item.uniqueKey);
-                          return ListTile(
-                            dense: true,
-                            leading: Icon(
-                              e.isDir
-                                  ? Icons.folder_rounded
-                                  : Icons.folder_zip_rounded,
-                              color: VideoPlatformTheme.warning,
-                              size: 20,
+                const SizedBox(height: 8),
+                // 2. Fixed-height Location Bar (Always keeps "上级" button slot so layout never jumps)
+                if (activeMount != null)
+                  SizedBox(
+                    height: 34,
+                    child: Row(
+                      children: [
+                        StatefulBuilder(
+                          builder: (upCtx, setUpState) {
+                            final canGoUp = _breadcrumbs.length >= 2;
+                            return InkWell(
+                              borderRadius: BorderRadius.circular(6),
+                              onFocusChange: (_) {
+                                if (upCtx.mounted) setUpState(() {});
+                              },
+                              onTap: canGoUp ? _stepBackFolderIfPossible : null,
+                              child: Builder(
+                                builder: (ctx) {
+                                  final isFocused =
+                                      Focus.of(ctx).hasPrimaryFocus;
+                                  return Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                      vertical: 5,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: isFocused
+                                          ? VideoPlatformTheme.accent
+                                          : VideoPlatformTheme.bgCard,
+                                      borderRadius: BorderRadius.circular(6),
+                                      border: Border.all(
+                                        color: isFocused
+                                            ? const Color(0xFFFFE066)
+                                            : VideoPlatformTheme.borderSubtle,
+                                        width: 1.5,
+                                      ),
+                                    ),
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(
+                                          Icons.arrow_back_rounded,
+                                          size: 13,
+                                          color: isFocused
+                                              ? Colors.white
+                                              : (canGoUp
+                                                  ? VideoPlatformTheme
+                                                      .textPrimary
+                                                  : VideoPlatformTheme
+                                                      .textMuted),
+                                        ),
+                                        const SizedBox(width: 3),
+                                        Text(
+                                          '上级',
+                                          style: TextStyle(
+                                            fontSize: 11.5,
+                                            fontWeight: FontWeight.w600,
+                                            color: isFocused
+                                                ? Colors.white
+                                                : (canGoUp
+                                                    ? VideoPlatformTheme
+                                                        .textPrimary
+                                                    : VideoPlatformTheme
+                                                        .textMuted),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  );
+                                },
+                              ),
+                            );
+                          },
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            '位置：${_breadcrumbs.map((b) => b.title).join(" / ")}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              color: VideoPlatformTheme.textSecondary,
                             ),
-                            title: Text(
-                              e.name,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(fontSize: 13),
-                            ),
-                            onTap: e.isDir
-                                ? () => _loadDir(e.path, title: e.name)
-                                : () => _toggleItem(item),
-                            trailing: Checkbox(
-                              value: checked,
-                              onChanged: (_) => _toggleItem(item),
-                            ),
-                          );
-                        },
-                      ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        StatefulBuilder(
+                          builder: (curCtx, setCurState) {
+                            return InkWell(
+                              borderRadius: BorderRadius.circular(8),
+                              onFocusChange: (_) {
+                                if (curCtx.mounted) setCurState(() {});
+                              },
+                              onTap: () => _toggleItem(_currentDirItem()),
+                              child: Builder(
+                                builder: (ctx) {
+                                  final isFocused =
+                                      Focus.of(ctx).hasPrimaryFocus;
+                                  return Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 10,
+                                      vertical: 5,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: isFocused
+                                          ? VideoPlatformTheme.accent
+                                          : (currentDirChecked
+                                              ? VideoPlatformTheme.accent
+                                                  .withValues(alpha: 0.22)
+                                              : VideoPlatformTheme.bgCard),
+                                      borderRadius: BorderRadius.circular(8),
+                                      border: Border.all(
+                                        color: isFocused
+                                            ? const Color(0xFFFFE066)
+                                            : (currentDirChecked
+                                                ? VideoPlatformTheme.accent
+                                                : VideoPlatformTheme
+                                                    .borderStrong),
+                                        width: 1.5,
+                                      ),
+                                    ),
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(
+                                          currentDirChecked
+                                              ? Icons.check_box_rounded
+                                              : Icons.add_box_outlined,
+                                          size: 15,
+                                          color: isFocused
+                                              ? Colors.white
+                                              : (currentDirChecked
+                                                  ? VideoPlatformTheme.accent
+                                                  : VideoPlatformTheme
+                                                      .textPrimary),
+                                        ),
+                                        const SizedBox(width: 4),
+                                        Text(
+                                          currentDirChecked
+                                              ? (isMobile
+                                                  ? '已选当前'
+                                                  : '已勾选当前目录')
+                                              : (isMobile
+                                                  ? '选此目录'
+                                                  : '勾选当前目录'),
+                                          style: TextStyle(
+                                            fontSize: 11.5,
+                                            fontWeight: FontWeight.w700,
+                                            color: isFocused
+                                                ? Colors.white
+                                                : (currentDirChecked
+                                                    ? VideoPlatformTheme.accent
+                                                    : VideoPlatformTheme
+                                                        .textPrimary),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  );
+                                },
+                              ),
+                            );
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+                const SizedBox(height: 8),
+                // 3. Directory List with independently focusable "进入目录" and "勾选目录" actions
+                Expanded(
+                  child: Material(
+                    color: VideoPlatformTheme.bgCard,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      side: BorderSide(color: VideoPlatformTheme.borderSubtle),
+                    ),
+                    clipBehavior: Clip.antiAlias,
+                    child: _isLoading
+                        ? const Center(child: CircularProgressIndicator())
+                        : (_entries.isEmpty
+                            ? Center(
+                                child: Text(
+                                  '当前目录下暂无子文件夹（可直接点击右上角「勾选当前目录」或底部「确定选择」）',
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(
+                                    fontSize: 12.5,
+                                    color: VideoPlatformTheme.textMuted,
+                                  ),
+                                ),
+                              )
+                            : ListView.separated(
+                                padding: const EdgeInsets.all(6),
+                                itemCount: _entries.length,
+                                separatorBuilder: (_, __) => Divider(
+                                  height: 1,
+                                  color: VideoPlatformTheme.borderSubtle,
+                                ),
+                                itemBuilder: (context, idx) {
+                                  final e = _entries[idx];
+                                  final item = SavedMusicFolderItem(
+                                    mountId: activeMount!.id,
+                                    mountName: activeMount.name,
+                                    sourceKind: activeMount.kind,
+                                    path: e.path,
+                                    title: e.name,
+                                    isArchive: e.isStreamableMusicArchive,
+                                    size: e.size,
+                                    pickcode115: e.pickcode115,
+                                  );
+                                  final checked = _isItemSelected(item);
+                                  return Padding(
+                                    padding: const EdgeInsets.symmetric(
+                                      vertical: 2,
+                                    ),
+                                    child: Row(
+                                      children: [
+                                        // Left Action: Enter Folder (or Toggle Archive)
+                                        Expanded(
+                                          child: StatefulBuilder(
+                                            builder: (rowCtx, setRowState) {
+                                              return InkWell(
+                                                autofocus: idx == 0,
+                                                borderRadius:
+                                                    BorderRadius.circular(8),
+                                                onFocusChange: (_) {
+                                                  if (rowCtx.mounted) {
+                                                    setRowState(() {});
+                                                  }
+                                                },
+                                                onTap: e.isDir
+                                                    ? () => _loadDir(
+                                                          e.path,
+                                                          title: e.name,
+                                                        )
+                                                    : () => _toggleItem(item),
+                                                child: Builder(
+                                                  builder: (ctx) {
+                                                    final isFocused =
+                                                        Focus.of(ctx)
+                                                            .hasPrimaryFocus;
+                                                    return Container(
+                                                      padding:
+                                                          const EdgeInsets
+                                                              .symmetric(
+                                                        horizontal: 10,
+                                                        vertical: 8,
+                                                      ),
+                                                      decoration: BoxDecoration(
+                                                        color: isFocused
+                                                            ? VideoPlatformTheme
+                                                                .accent
+                                                                .withValues(
+                                                                    alpha: 0.24)
+                                                            : (checked
+                                                                ? VideoPlatformTheme
+                                                                    .accent
+                                                                    .withValues(
+                                                                        alpha:
+                                                                            0.12)
+                                                                : Colors
+                                                                    .transparent),
+                                                        borderRadius:
+                                                            BorderRadius
+                                                                .circular(8),
+                                                        border: Border.all(
+                                                          color: isFocused
+                                                              ? const Color(
+                                                                  0xFFFFE066,
+                                                                )
+                                                              : (checked
+                                                                  ? VideoPlatformTheme
+                                                                      .accent
+                                                                      .withValues(
+                                                                          alpha:
+                                                                              0.5)
+                                                                  : Colors
+                                                                      .transparent),
+                                                          width: 1.5,
+                                                        ),
+                                                      ),
+                                                      child: Row(
+                                                        children: [
+                                                          Icon(
+                                                            e.isDir
+                                                                ? Icons
+                                                                    .folder_rounded
+                                                                : Icons
+                                                                    .folder_zip_rounded,
+                                                            color:
+                                                                VideoPlatformTheme
+                                                                    .warning,
+                                                            size: 20,
+                                                          ),
+                                                          const SizedBox(
+                                                            width: 10,
+                                                          ),
+                                                          Expanded(
+                                                            child: Column(
+                                                              crossAxisAlignment:
+                                                                  CrossAxisAlignment
+                                                                      .start,
+                                                              mainAxisSize:
+                                                                  MainAxisSize
+                                                                      .min,
+                                                              children: [
+                                                                Text(
+                                                                  e.name,
+                                                                  maxLines: 1,
+                                                                  overflow:
+                                                                      TextOverflow
+                                                                          .ellipsis,
+                                                                  style:
+                                                                      TextStyle(
+                                                                    fontSize:
+                                                                        13,
+                                                                    fontWeight:
+                                                                        FontWeight
+                                                                            .w600,
+                                                                    color: isFocused
+                                                                        ? Colors
+                                                                            .white
+                                                                        : VideoPlatformTheme
+                                                                            .textPrimary,
+                                                                  ),
+                                                                ),
+                                                                if (e.isDir)
+                                                                  Text(
+                                                                    '点击进入子目录 · 右侧按钮可直接勾选此目录',
+                                                                    maxLines: 1,
+                                                                    overflow:
+                                                                        TextOverflow
+                                                                            .ellipsis,
+                                                                    style:
+                                                                        TextStyle(
+                                                                      fontSize:
+                                                                          10.5,
+                                                                      color: isFocused
+                                                                          ? Colors
+                                                                              .white70
+                                                                          : VideoPlatformTheme
+                                                                              .textMuted,
+                                                                    ),
+                                                                  ),
+                                                              ],
+                                                            ),
+                                                          ),
+                                                          if (e.isDir)
+                                                            Icon(
+                                                              Icons
+                                                                  .chevron_right_rounded,
+                                                              size: 18,
+                                                              color: isFocused
+                                                                  ? Colors.white
+                                                                  : VideoPlatformTheme
+                                                                      .textMuted,
+                                                            ),
+                                                        ],
+                                                      ),
+                                                    );
+                                                  },
+                                                ),
+                                              );
+                                            },
+                                          ),
+                                        ),
+                                        const SizedBox(width: 8),
+                                        // Right Action: Dedicated Focusable & Clickable Check/Uncheck Button
+                                        StatefulBuilder(
+                                          builder: (chkCtx, setChkState) {
+                                            return InkWell(
+                                              borderRadius:
+                                                  BorderRadius.circular(8),
+                                              onFocusChange: (_) {
+                                                if (chkCtx.mounted) {
+                                                  setChkState(() {});
+                                                }
+                                              },
+                                              onTap: () => _toggleItem(item),
+                                              child: Builder(
+                                                builder: (ctx) {
+                                                  final isFocused =
+                                                      Focus.of(ctx)
+                                                          .hasPrimaryFocus;
+                                                  return Container(
+                                                    padding: const EdgeInsets
+                                                        .symmetric(
+                                                      horizontal: 10,
+                                                      vertical: 8,
+                                                    ),
+                                                    decoration: BoxDecoration(
+                                                      color: isFocused
+                                                          ? VideoPlatformTheme
+                                                              .accent
+                                                          : (checked
+                                                              ? VideoPlatformTheme
+                                                                  .accent
+                                                                  .withValues(
+                                                                      alpha:
+                                                                          0.22)
+                                                              : VideoPlatformTheme
+                                                                  .bgElevated),
+                                                      borderRadius:
+                                                          BorderRadius.circular(
+                                                        8,
+                                                      ),
+                                                      border: Border.all(
+                                                        color: isFocused
+                                                            ? const Color(
+                                                                0xFFFFE066,
+                                                              )
+                                                            : (checked
+                                                                ? VideoPlatformTheme
+                                                                    .accent
+                                                                : VideoPlatformTheme
+                                                                    .borderStrong),
+                                                        width: 1.5,
+                                                      ),
+                                                    ),
+                                                    child: Row(
+                                                      mainAxisSize:
+                                                          MainAxisSize.min,
+                                                      children: [
+                                                        Icon(
+                                                          checked
+                                                              ? Icons
+                                                                  .check_box_rounded
+                                                              : Icons
+                                                                  .check_box_outline_blank_rounded,
+                                                          size: 17,
+                                                          color: isFocused
+                                                              ? Colors.white
+                                                              : (checked
+                                                                  ? VideoPlatformTheme
+                                                                      .accent
+                                                                  : VideoPlatformTheme
+                                                                      .textSecondary),
+                                                        ),
+                                                        const SizedBox(
+                                                          width: 4,
+                                                        ),
+                                                        Text(
+                                                          checked
+                                                              ? '已勾选'
+                                                              : '勾选目录',
+                                                          style: TextStyle(
+                                                            fontSize: 12,
+                                                            fontWeight:
+                                                                FontWeight.w700,
+                                                            color: isFocused
+                                                                ? Colors.white
+                                                                : (checked
+                                                                    ? VideoPlatformTheme
+                                                                        .accent
+                                                                    : VideoPlatformTheme
+                                                                        .textPrimary),
+                                                          ),
+                                                        ),
+                                                      ],
+                                                    ),
+                                                  );
+                                                },
+                                              ),
+                                            );
+                                          },
+                                        ),
+                                      ],
+                                    ),
+                                  );
+                                },
+                              )),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            if (_selected.isNotEmpty)
+              TextButton(
+                onPressed: () => setState(() => _selected.clear()),
+                child: const Text('清空已选'),
+              ),
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () {
+                if (_selected.isEmpty && _activeMount != null) {
+                  _selected.add(_currentDirItem());
+                }
+                Navigator.of(context).pop(_selected);
+              },
+              child: Text(
+                _selected.isEmpty
+                    ? '选择当前打开目录'
+                    : '确定选择 (${_selected.length})',
               ),
             ),
           ],
         ),
       ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: const Text('取消'),
-        ),
-        FilledButton(
-          onPressed: () {
-            if (_selected.isEmpty && _activeMount != null) {
-              _selected.add(_currentDirItem());
-            }
-            Navigator.of(context).pop(_selected);
-          },
-          child: Text('确定选择 (${_selected.isEmpty ? 1 : _selected.length})'),
-        ),
-      ],
     );
   }
 }

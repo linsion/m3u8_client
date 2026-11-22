@@ -16591,7 +16591,46 @@ class _TelegramPhotoGalleryDialogState
   }
 
   final DateTime _dialogOpenedAt = DateTime.now();
+  DateTime? _lastBackHandledAt;
   bool _hasAssignedInitialFocus = false;
+
+  bool _isGalleryBackKey(LogicalKeyboardKey key) {
+    return key == LogicalKeyboardKey.escape ||
+        key == LogicalKeyboardKey.goBack ||
+        key == LogicalKeyboardKey.browserBack ||
+        key == LogicalKeyboardKey.gameButtonB;
+  }
+
+  void _handleGalleryBackPress() {
+    if (!mounted) return;
+    final now = DateTime.now();
+    if (now.difference(_dialogOpenedAt) < const Duration(milliseconds: 220)) {
+      return;
+    }
+    if (_lastBackHandledAt != null &&
+        now.difference(_lastBackHandledAt!) <
+            const Duration(milliseconds: 240)) {
+      return;
+    }
+    _lastBackHandledAt = now;
+
+    if (_showProxyStatsOverlay) {
+      setState(() => _showProxyStatsOverlay = false);
+      return;
+    }
+
+    if (!_controlsHidden) {
+      _galleryAutoHideTimer?.cancel();
+      setState(() => _controlsHidden = true);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _controlsHidden) {
+          _restoreControlsFocusNode.requestFocus();
+        }
+      });
+      return;
+    }
+    Navigator.of(context).pop();
+  }
   late bool _albumScopeOnly;
   late int _currentIndex;
 
@@ -17877,42 +17916,14 @@ class _TelegramPhotoGalleryDialogState
       canPop: false,
       onPopInvokedWithResult: (didPop, _) {
         if (didPop) return;
-        if (DateTime.now().difference(_dialogOpenedAt) <
-            const Duration(milliseconds: 350)) {
-          return;
-        }
-        if (!_controlsHidden) {
-          _galleryAutoHideTimer?.cancel();
-          setState(() => _controlsHidden = true);
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (mounted && _controlsHidden) {
-              _restoreControlsFocusNode.requestFocus();
-            }
-          });
-          return;
-        }
-        Navigator.of(context).pop();
+        _handleGalleryBackPress();
       },
       child: Focus(
         canRequestFocus: false,
         onKeyEvent: (node, event) {
-          if (event.logicalKey == LogicalKeyboardKey.escape ||
-              event.logicalKey == LogicalKeyboardKey.goBack) {
+          if (_isGalleryBackKey(event.logicalKey)) {
             if (event is KeyDownEvent) {
-              if (DateTime.now().difference(_dialogOpenedAt) >=
-                  const Duration(milliseconds: 350)) {
-                if (!_controlsHidden) {
-                  _galleryAutoHideTimer?.cancel();
-                  setState(() => _controlsHidden = true);
-                  WidgetsBinding.instance.addPostFrameCallback((_) {
-                    if (mounted && _controlsHidden) {
-                      _restoreControlsFocusNode.requestFocus();
-                    }
-                  });
-                } else {
-                  Navigator.of(context).pop();
-                }
-              }
+              _handleGalleryBackPress();
             }
             return KeyEventResult.handled;
           }
@@ -19864,6 +19875,12 @@ class _TelegramPhotoGalleryDialogState
               focusNode: _restoreControlsFocusNode,
               autofocus: true,
               onKeyEvent: (node, event) {
+                if (_isGalleryBackKey(event.logicalKey)) {
+                  if (event is KeyDownEvent) {
+                    _handleGalleryBackPress();
+                  }
+                  return KeyEventResult.handled;
+                }
                 if (event is KeyDownEvent || event is KeyRepeatEvent) {
                   _restoreControlsBar();
                   _scheduleGalleryAutoHide();
