@@ -1877,8 +1877,6 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
             ),
           ),
           // Prev / Next channel buttons
-          VideoDownloadSpeedBadge(player: _player, compact: true),
-          const SizedBox(width: 4),
           PlayerVolumeControl(
             player: _player,
             compact: true,
@@ -3652,13 +3650,14 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                                   ),
                                 ),
                               ),
-                            // Top-right real-time speed badge when compact or when fullscreen OSD auto-hides
-                            if (ch != null &&
-                                _digitInputBuffer.isEmpty &&
-                                (compact || (_isLiveFullscreen && !_liveOsdVisible)))
+                            // Floating movable / hideable / closable download speed tag on Live TV stage
+                            if (ch != null && _digitInputBuffer.isEmpty)
                               Positioned(
-                                top: 10,
-                                right: 12,
+                                top: (!compact &&
+                                        (!_isLiveFullscreen || _liveOsdVisible))
+                                    ? 56
+                                    : 10,
+                                right: 14,
                                 child: VideoDownloadSpeedBadge(
                                   player: _player,
                                   compact: true,
@@ -3724,8 +3723,6 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                                         });
                                       },
                                     ),
-                                    const SizedBox(width: 8),
-                                    VideoDownloadSpeedBadge(player: _player),
                                     const SizedBox(width: 8),
                                     PlayerVolumeControl(
                                       player: _player,
@@ -4664,11 +4661,6 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                 ),
               ],
             ),
-          ),
-          const SizedBox(width: 8),
-          VideoDownloadSpeedBadge(
-            player: _player,
-            compact: true,
           ),
           const SizedBox(width: 8),
           PlayerVolumeControl(

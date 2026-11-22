@@ -45,6 +45,7 @@ class ApiClient {
     if (_proxyService != null) {
       _lastProxyConfigSignature = _computeProxySignature(_proxyService!);
       _proxyService!.addListener(_onProxyServiceChanged);
+      _proxyService!.attachServerVodProxyResolver(_buildServerVodProxyFallback);
     }
   }
 
@@ -99,11 +100,61 @@ class ApiClient {
   }
 
   void attachProxyService(ProxyRoutingService service) {
-    if (identical(_proxyService, service)) return;
+    if (identical(_proxyService, service)) {
+      service.attachServerVodProxyResolver(_buildServerVodProxyFallback);
+      return;
+    }
     _proxyService?.removeListener(_onProxyServiceChanged);
     _proxyService = service;
     _lastProxyConfigSignature = _computeProxySignature(service);
     service.addListener(_onProxyServiceChanged);
+    service.attachServerVodProxyResolver(_buildServerVodProxyFallback);
+  }
+
+  ({Uri proxyUri, Map<String, String> authHeaders})?
+      _buildServerVodProxyFallback(
+    Uri targetUri,
+    Map<String, String> targetHeaders,
+  ) {
+    final base = _config.normalizedBaseUrl.trim();
+    if (base.isEmpty) return null;
+    final host = targetUri.host.toLowerCase();
+    if (host.isEmpty ||
+        host == '127.0.0.1' ||
+        host == 'localhost' ||
+        host == '::1' ||
+        LocalProxyTunnelBridge.isDomesticCloudOrLanHost(host)) {
+      return null;
+    }
+    final baseUri = Uri.tryParse(base);
+    if (baseUri != null &&
+        baseUri.host.isNotEmpty &&
+        host == baseUri.host.toLowerCase() &&
+        targetUri.path.toLowerCase().startsWith('/api/')) {
+      return null;
+    }
+    final filteredHeaders = <String, String>{};
+    targetHeaders.forEach((k, v) {
+      final lower = k.toLowerCase();
+      if (lower != 'cookie' &&
+          lower != 'authorization' &&
+          lower != 'host' &&
+          v.trim().isNotEmpty) {
+        filteredHeaders[k] = v.trim();
+      }
+    });
+    final proxyUrlStr = resolveUrl(
+      buildServerVodProxyUrl(targetUri.toString(), filteredHeaders),
+    );
+    final proxyUri = Uri.tryParse(proxyUrlStr);
+    if (proxyUri == null || proxyUri.host.isEmpty) return null;
+    final auth = <String, String>{};
+    authHeaders.forEach((k, v) {
+      if (k.toLowerCase() != 'accept' && v.trim().isNotEmpty) {
+        auth[k] = v.trim();
+      }
+    });
+    return (proxyUri: proxyUri, authHeaders: auth);
   }
 
   String buildProxyDirectiveForUri(Uri uri, {RequestScenario? scenarioHint}) =>

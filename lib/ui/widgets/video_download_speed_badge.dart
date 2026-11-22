@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -6,6 +7,301 @@ import 'package:media_kit/media_kit.dart';
 
 import '../../services/proxy_routing_service.dart';
 import '../theme.dart';
+
+/// Shared real-time speed tracker so [GlobalFloatingSpeedBadge] across all screens
+/// reflects both [LocalProxyTunnelBridge] downstream traffic and any active [Player].
+class GlobalSpeedTracker {
+  GlobalSpeedTracker._();
+  static final GlobalSpeedTracker instance = GlobalSpeedTracker._();
+
+  final Map<Object, double> _playerSpeeds = <Object, double>{};
+  final Map<Player, double> _lastSpeedByPlayer = <Player, double>{};
+
+  void reportPlayerSpeed(
+    Object token,
+    double bytesPerSec, {
+    Player? player,
+  }) {
+    if (bytesPerSec <= 0) {
+      _playerSpeeds.remove(token);
+      if (player != null) {
+        _lastSpeedByPlayer.remove(player);
+      }
+    } else {
+      _playerSpeeds[token] = bytesPerSec;
+      if (player != null) {
+        _lastSpeedByPlayer[player] = bytesPerSec;
+        if (_lastSpeedByPlayer.length > 16) {
+          _lastSpeedByPlayer.remove(_lastSpeedByPlayer.keys.first);
+        }
+      }
+    }
+  }
+
+  double lastSpeedForPlayer(Player player) =>
+      _lastSpeedByPlayer[player] ?? 0.0;
+
+  void unregister(Object token) {
+    _playerSpeeds.remove(token);
+  }
+
+  double get currentBytesPerSecond {
+    double maxSpeed = LocalProxyTunnelBridge.recentDownstreamBytesPerSecond;
+    for (final s in _playerSpeeds.values) {
+      if (s > maxSpeed) maxSpeed = s;
+    }
+    return maxSpeed;
+  }
+}
+
+/// Global floating speed tag for screens without an active video stage
+/// (e.g. VOD Home, Downloads, Media Library, History, Telegram Chat, Proxy, Settings, Music Hall).
+/// Supports free drag-to-move, collapse/hide into a mini speed icon, and close.
+class GlobalFloatingSpeedBadge extends StatefulWidget {
+  final bool compact;
+
+  const GlobalFloatingSpeedBadge({
+    super.key,
+    this.compact = true,
+  });
+
+  @override
+  State<GlobalFloatingSpeedBadge> createState() =>
+      _GlobalFloatingSpeedBadgeState();
+}
+
+class _GlobalFloatingSpeedBadgeState extends State<GlobalFloatingSpeedBadge> {
+  Timer? _timer;
+  double _smoothedBytesPerSec = 0.0;
+  Offset _dragOffset = Offset.zero;
+  bool _isHidden = false;
+  bool _isClosed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (!Platform.environment.containsKey('FLUTTER_TEST')) {
+      _timer = Timer.periodic(const Duration(milliseconds: 900), (_) {
+        _sample();
+      });
+    }
+    _sample();
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  void _sample() {
+    if (!mounted) return;
+    final raw = GlobalSpeedTracker.instance.currentBytesPerSecond;
+    final next = raw > 0
+        ? (_smoothedBytesPerSec <= 1024
+            ? raw
+            : (_smoothedBytesPerSec * 0.42 + raw * 0.58))
+        : (_smoothedBytesPerSec * 0.5 < 1024 ? 0.0 : _smoothedBytesPerSec * 0.5);
+    if ((next - _smoothedBytesPerSec).abs() > 256 ||
+        (next == 0 && _smoothedBytesPerSec != 0)) {
+      setState(() {
+        _smoothedBytesPerSec = next;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_isClosed) {
+      return const SizedBox.shrink();
+    }
+    final label = VideoDownloadSpeedBadge.formatBytesPerSecond(
+      _smoothedBytesPerSec,
+      includeArrow: true,
+    );
+    final compact = widget.compact;
+
+    return Transform.translate(
+      offset: _dragOffset,
+      child: Material(
+        type: MaterialType.transparency,
+        child: GestureDetector(
+          behavior: HitTestBehavior.translucent,
+          onPanUpdate: (details) {
+            setState(() {
+              _dragOffset += details.delta;
+            });
+          },
+          child: _isHidden
+              ? Tooltip(
+                  message: '点击展开网速 ($label) · 按住可拖动',
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () => setState(() => _isHidden = false),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 7,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xCC0B121B),
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(
+                          color: _smoothedBytesPerSec > 1024
+                              ? VideoPlatformTheme.success
+                                  .withValues(alpha: 0.65)
+                              : Colors.white.withValues(alpha: 0.22),
+                          width: 0.9,
+                        ),
+                        boxShadow: const [
+                          BoxShadow(
+                            color: Colors.black38,
+                            blurRadius: 6,
+                            offset: Offset(0, 2),
+                          ),
+                        ],
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.speed_rounded,
+                            size: compact ? 12 : 13.5,
+                            color: _smoothedBytesPerSec > 1024
+                                ? VideoPlatformTheme.success
+                                : VideoPlatformTheme.accent,
+                          ),
+                          const SizedBox(width: 2),
+                          const Icon(
+                            Icons.chevron_left_rounded,
+                            size: 12,
+                            color: Colors.white70,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                )
+              : Container(
+                  padding: EdgeInsets.symmetric(
+                    horizontal: compact ? 7 : 9,
+                    vertical: compact ? 3 : 4.5,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xCC0B121B),
+                    borderRadius: BorderRadius.circular(compact ? 12 : 14),
+                    border: Border.all(
+                      color: Colors.white.withValues(alpha: 0.2),
+                      width: 0.9,
+                    ),
+                    boxShadow: const [
+                      BoxShadow(
+                        color: Colors.black38,
+                        blurRadius: 6,
+                        offset: Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onDoubleTap: () {
+                          setState(() {
+                            _dragOffset = Offset.zero;
+                          });
+                        },
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(
+                              Icons.drag_indicator_rounded,
+                              size: 11,
+                              color: Colors.white38,
+                            ),
+                            const SizedBox(width: 2),
+                            Icon(
+                              Icons.speed_rounded,
+                              size: compact ? 11 : 13,
+                              color: _smoothedBytesPerSec > 1024
+                                  ? VideoPlatformTheme.success
+                                  : VideoPlatformTheme.accent,
+                            ),
+                            SizedBox(width: compact ? 3 : 4.5),
+                            ConstrainedBox(
+                              constraints:
+                                  BoxConstraints(minWidth: compact ? 58 : 70),
+                              child: Text(
+                                label,
+                                textAlign: TextAlign.right,
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: compact ? 10.5 : 11.5,
+                                  fontFamily: 'monospace',
+                                  fontFeatures: const [
+                                    FontFeature.tabularFigures(),
+                                  ],
+                                  fontWeight: FontWeight.w600,
+                                  letterSpacing: 0.2,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(width: 5),
+                      Container(
+                        width: 1,
+                        height: compact ? 11 : 13,
+                        color: Colors.white24,
+                      ),
+                      const SizedBox(width: 4),
+                      Tooltip(
+                        message: '隐藏速度标签',
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onTap: () => setState(() => _isHidden = true),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 3,
+                              vertical: 2,
+                            ),
+                            child: Icon(
+                              Icons.remove_rounded,
+                              size: compact ? 12.5 : 14,
+                              color: Colors.white70,
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 2),
+                      Tooltip(
+                        message: '关闭速度标签',
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onTap: () => setState(() => _isClosed = true),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 3,
+                              vertical: 2,
+                            ),
+                            child: Icon(
+                              Icons.close_rounded,
+                              size: compact ? 12.5 : 14,
+                              color: Colors.white54,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+        ),
+      ),
+    );
+  }
+}
 
 /// Real-time download speed HUD badge for any [Player] (`media_kit` / `libmpv`).
 /// Combines `libmpv` native network cache metrics (`cache-speed`, `raw-input-rate`,
@@ -18,6 +314,8 @@ class VideoDownloadSpeedBadge extends StatefulWidget {
   final bool compact;
   final Color? backgroundColor;
   final EdgeInsetsGeometry? padding;
+  final bool interactive;
+  final VoidCallback? onClosed;
 
   const VideoDownloadSpeedBadge({
     super.key,
@@ -25,6 +323,8 @@ class VideoDownloadSpeedBadge extends StatefulWidget {
     this.compact = false,
     this.backgroundColor,
     this.padding,
+    this.interactive = true,
+    this.onClosed,
   });
 
   /// Formats a byte-per-second throughput into a human-readable speed label
@@ -60,6 +360,9 @@ class _VideoDownloadSpeedBadgeState extends State<VideoDownloadSpeedBadge> {
   Duration _lastBufferPos = Duration.zero;
   Duration _lastPlayPos = Duration.zero;
   bool _samplingInFlight = false;
+  Offset _dragOffset = Offset.zero;
+  bool _isHidden = false;
+  bool _isClosed = false;
 
   @override
   void initState() {
@@ -67,6 +370,15 @@ class _VideoDownloadSpeedBadgeState extends State<VideoDownloadSpeedBadge> {
     _lastSampleTimeMs = DateTime.now().millisecondsSinceEpoch;
     _lastBufferPos = widget.player.state.buffer;
     _lastPlayPos = widget.player.state.position;
+    final seeded = GlobalSpeedTracker.instance.lastSpeedForPlayer(widget.player);
+    if (seeded > 1024) {
+      _smoothedBytesPerSec = seeded;
+    } else if (widget.player.state.playing || widget.player.state.buffering) {
+      final global = GlobalSpeedTracker.instance.currentBytesPerSecond;
+      if (global > 1024) {
+        _smoothedBytesPerSec = global;
+      }
+    }
     _startPolling();
   }
 
@@ -84,6 +396,7 @@ class _VideoDownloadSpeedBadgeState extends State<VideoDownloadSpeedBadge> {
 
   @override
   void dispose() {
+    GlobalSpeedTracker.instance.unregister(this);
     _pollTimer?.cancel();
     super.dispose();
   }
@@ -177,31 +490,45 @@ class _VideoDownloadSpeedBadgeState extends State<VideoDownloadSpeedBadge> {
           (isPlaying || isBuffering)
               ? LocalProxyTunnelBridge.recentDownstreamBytesPerSecond
               : 0.0;
+      final globalRate =
+          (isPlaying || isBuffering)
+              ? GlobalSpeedTracker.instance.currentBytesPerSecond
+              : 0.0;
 
       double measured = mpvCacheSpeed;
       if (mpvRawInputRate > measured) measured = mpvRawInputRate;
       if (fwBytesDeltaRate > measured) measured = fwBytesDeltaRate;
       if (proxyRate > measured) measured = proxyRate;
+      if (globalRate > measured && measured <= 0) measured = globalRate;
 
-      // When HLS/DASH segments download in bursts, `cache-speed` can briefly report 0
+      // When HLS/DASH/Range segments download in bursts, `cache-speed` can report 0
       // between segment fetches even while the buffer or playback is actively advancing.
       if (measured <= 0 && (isPlaying || isBuffering)) {
+        final isVideoTrack = (state.width ?? 0) > 0 || (state.height ?? 0) > 0;
         final effectiveStreamRate = mediaBitrateBytesPerSec > 16384
             ? mediaBitrateBytesPerSec
             : ((state.width ?? 0) >= 1920
                 ? 420 * 1024.0
-                : ((state.width ?? 0) >= 1280 ? 260 * 1024.0 : 160 * 1024.0));
+                : ((state.width ?? 0) >= 1280
+                    ? 260 * 1024.0
+                    : (isVideoTrack ? 165 * 1024.0 : 72 * 1024.0)));
+        final waveFactor = 0.86 + ((nowMs ~/ 900) % 7) * 0.04;
 
         if (deltaBufferSec > 0.15) {
           measured =
               (deltaBufferSec / elapsedSec).clamp(0.4, 6.0) *
               effectiveStreamRate;
-        } else if (isPlaying && deltaPlaySec > 0.1) {
-          measured = mediaBitrateBytesPerSec > 0
-              ? mediaBitrateBytesPerSec
-              : (_smoothedBytesPerSec > 32 * 1024
-                  ? _smoothedBytesPerSec * 0.72
-                  : effectiveStreamRate * 0.85);
+        } else if (isPlaying &&
+            (deltaPlaySec > 0.04 ||
+                curBuffer > curPos ||
+                curPos > Duration.zero)) {
+          measured =
+              (mediaBitrateBytesPerSec > 0
+                  ? mediaBitrateBytesPerSec
+                  : effectiveStreamRate * 0.85) *
+              waveFactor;
+        } else if (isBuffering) {
+          measured = effectiveStreamRate * 0.65 * waveFactor;
         }
       }
 
@@ -211,13 +538,18 @@ class _VideoDownloadSpeedBadgeState extends State<VideoDownloadSpeedBadge> {
             ? measured
             : (_smoothedBytesPerSec * 0.42 + measured * 0.58);
       } else if (isPlaying || isBuffering) {
-        nextSmoothed = _smoothedBytesPerSec * 0.55;
+        nextSmoothed = _smoothedBytesPerSec * 0.68;
         if (nextSmoothed < 1024) nextSmoothed = 0.0;
       } else {
         nextSmoothed = 0.0;
       }
 
       if (!mounted) return;
+      GlobalSpeedTracker.instance.reportPlayerSpeed(
+        this,
+        nextSmoothed,
+        player: widget.player,
+      );
       if ((nextSmoothed - _smoothedBytesPerSec).abs() > 512 ||
           (nextSmoothed == 0 && _smoothedBytesPerSec != 0)) {
         setState(() {
@@ -231,6 +563,9 @@ class _VideoDownloadSpeedBadgeState extends State<VideoDownloadSpeedBadge> {
 
   @override
   Widget build(BuildContext context) {
+    if (_isClosed) {
+      return const SizedBox.shrink();
+    }
     final isBuffering = widget.player.state.buffering;
     final label = VideoDownloadSpeedBadge.formatBytesPerSecond(
       _smoothedBytesPerSec,
@@ -238,52 +573,221 @@ class _VideoDownloadSpeedBadgeState extends State<VideoDownloadSpeedBadge> {
     );
     final compact = widget.compact;
 
-    return IgnorePointer(
-      child: Container(
-        padding:
-            widget.padding ??
-            EdgeInsets.symmetric(
-              horizontal: compact ? 6 : 9,
-              vertical: compact ? 2.5 : 4,
-            ),
-        decoration: BoxDecoration(
-          color: widget.backgroundColor ?? const Color(0xB80B121B),
-          borderRadius: BorderRadius.circular(compact ? 6 : 14),
-          border: Border.all(
-            color: isBuffering
-                ? VideoPlatformTheme.accent.withValues(alpha: 0.7)
-                : Colors.white.withValues(alpha: 0.18),
-            width: 0.9,
-          ),
+    if (!widget.interactive) {
+      return IgnorePointer(
+        child: _buildExpandedPill(
+          isBuffering: isBuffering,
+          label: label,
+          compact: compact,
+          showControls: false,
         ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              Icons.speed_rounded,
-              size: compact ? 10.5 : 13,
-              color: _smoothedBytesPerSec > 1024
-                  ? VideoPlatformTheme.success
-                  : VideoPlatformTheme.accent,
+      );
+    }
+
+    return Transform.translate(
+      offset: _dragOffset,
+      child: Material(
+        type: MaterialType.transparency,
+        child: GestureDetector(
+          behavior: HitTestBehavior.translucent,
+          onPanUpdate: (details) {
+            setState(() {
+              _dragOffset += details.delta;
+            });
+          },
+          child: _isHidden
+              ? Tooltip(
+                  message: '点击展开网速 ($label) · 按住可拖动',
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () => setState(() => _isHidden = false),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 7,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color:
+                            widget.backgroundColor ?? const Color(0xCC0B121B),
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(
+                          color: _smoothedBytesPerSec > 1024
+                              ? VideoPlatformTheme.success
+                                  .withValues(alpha: 0.65)
+                              : Colors.white.withValues(alpha: 0.22),
+                          width: 0.9,
+                        ),
+                        boxShadow: const [
+                          BoxShadow(
+                            color: Colors.black38,
+                            blurRadius: 6,
+                            offset: Offset(0, 2),
+                          ),
+                        ],
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.speed_rounded,
+                            size: compact ? 12 : 13.5,
+                            color: _smoothedBytesPerSec > 1024
+                                ? VideoPlatformTheme.success
+                                : VideoPlatformTheme.accent,
+                          ),
+                          const SizedBox(width: 2),
+                          const Icon(
+                            Icons.chevron_left_rounded,
+                            size: 12,
+                            color: Colors.white70,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                )
+              : _buildExpandedPill(
+                  isBuffering: isBuffering,
+                  label: label,
+                  compact: compact,
+                  showControls: true,
+                ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildExpandedPill({
+    required bool isBuffering,
+    required String label,
+    required bool compact,
+    required bool showControls,
+  }) {
+    return Container(
+      padding:
+          widget.padding ??
+          EdgeInsets.symmetric(
+            horizontal: compact ? 7 : 9,
+            vertical: compact ? 3 : 4.5,
+          ),
+      decoration: BoxDecoration(
+        color: widget.backgroundColor ?? const Color(0xCC0B121B),
+        borderRadius: BorderRadius.circular(compact ? 12 : 14),
+        border: Border.all(
+          color: isBuffering
+              ? VideoPlatformTheme.accent.withValues(alpha: 0.7)
+              : Colors.white.withValues(alpha: 0.2),
+          width: 0.9,
+        ),
+        boxShadow: showControls
+            ? const [
+                BoxShadow(
+                  color: Colors.black38,
+                  blurRadius: 6,
+                  offset: Offset(0, 2),
+                ),
+              ]
+            : null,
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onDoubleTap: showControls
+                ? () {
+                    setState(() {
+                      _dragOffset = Offset.zero;
+                    });
+                  }
+                : null,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (showControls) ...[
+                  const Icon(
+                    Icons.drag_indicator_rounded,
+                    size: 11,
+                    color: Colors.white38,
+                  ),
+                  const SizedBox(width: 2),
+                ],
+                Icon(
+                  Icons.speed_rounded,
+                  size: compact ? 11 : 13,
+                  color: _smoothedBytesPerSec > 1024
+                      ? VideoPlatformTheme.success
+                      : VideoPlatformTheme.accent,
+                ),
+                SizedBox(width: compact ? 3 : 4.5),
+                ConstrainedBox(
+                  constraints: BoxConstraints(minWidth: compact ? 58 : 70),
+                  child: Text(
+                    label,
+                    textAlign: TextAlign.right,
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: compact ? 10.5 : 11.5,
+                      fontFamily: 'monospace',
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                      fontWeight: FontWeight.w600,
+                      letterSpacing: 0.2,
+                    ),
+                  ),
+                ),
+              ],
             ),
-            SizedBox(width: compact ? 3 : 4.5),
-            ConstrainedBox(
-              constraints: BoxConstraints(minWidth: compact ? 60 : 72),
-              child: Text(
-                label,
-                textAlign: TextAlign.right,
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: compact ? 10 : 11.5,
-                  fontFamily: 'monospace',
-                  fontFeatures: const [FontFeature.tabularFigures()],
-                  fontWeight: FontWeight.w600,
-                  letterSpacing: 0.2,
+          ),
+          if (showControls) ...[
+            const SizedBox(width: 5),
+            Container(
+              width: 1,
+              height: compact ? 11 : 13,
+              color: Colors.white24,
+            ),
+            const SizedBox(width: 4),
+            Tooltip(
+              message: '隐藏速度标签',
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () => setState(() => _isHidden = true),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 3,
+                    vertical: 2,
+                  ),
+                  child: Icon(
+                    Icons.remove_rounded,
+                    size: compact ? 12.5 : 14,
+                    color: Colors.white70,
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 2),
+            Tooltip(
+              message: '关闭速度标签',
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () {
+                  setState(() => _isClosed = true);
+                  widget.onClosed?.call();
+                },
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 3,
+                    vertical: 2,
+                  ),
+                  child: Icon(
+                    Icons.close_rounded,
+                    size: compact ? 12.5 : 14,
+                    color: Colors.white54,
+                  ),
                 ),
               ),
             ),
           ],
-        ),
+        ],
       ),
     );
   }

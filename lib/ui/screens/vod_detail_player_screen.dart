@@ -149,6 +149,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
   int _clientProxyRetryCountForEpisode = 0;
   bool _bypassClientProxyForCurrentEpisode = false;
   bool _didTryServerResolveForEpisode = false;
+  bool _didTryServerProxyFallbackForEpisode = false;
   int _playAttemptSessionId = 0;
   DateTime _lastStreamOpenInitiatedAt = DateTime.fromMillisecondsSinceEpoch(0);
   final Set<int> _triedGroupIndicesForEpisode = <int>{};
@@ -462,15 +463,16 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
             (_player.state.height ?? 0) > 0;
         if (hasStartedPlaying) return;
 
-        // Ignore transient libmpv abort/demuxer messages emitted within 380ms of
-        // calling `_player.open()` (e.g. when aborting a previous stream or probing).
+        final lower = err.toLowerCase();
+        // Only ignore transient abort/cancel notices right after `_player.open()`;
+        // never ignore real `Failed to open ...` stream errors.
         final sinceOpenMs =
             DateTime.now().difference(_lastStreamOpenInitiatedAt).inMilliseconds;
-        if (sinceOpenMs >= 0 && sinceOpenMs < 380) {
+        if (sinceOpenMs >= 0 &&
+            sinceOpenMs < 380 &&
+            !lower.contains('failed to open')) {
           return;
         }
-
-        final lower = err.toLowerCase();
         final isNonFatalDecodeError =
             lower.contains('error while decoding') ||
             lower.contains('decoding frame') ||
@@ -1017,6 +1019,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       _clientProxyRetryCountForEpisode = 0;
       _bypassClientProxyForCurrentEpisode = false;
       _didTryServerResolveForEpisode = false;
+      _didTryServerProxyFallbackForEpisode = false;
       _externalSubtitleName = null;
       if (resetTriedLines) {
         _triedGroupIndicesForEpisode
@@ -1476,8 +1479,67 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       return;
     }
 
-    // 4. Try the next untested play line in `_detail.playGroups` if available
+    // 4. Try the next untested play line in `_detail.playGroups` that provides a direct media stream
     final detail = _detail;
+    bool isDirectMediaUrl(String raw) {
+      final lower = raw.toLowerCase();
+      return lower.contains('.m3u8') ||
+          lower.contains('.mp4') ||
+          lower.contains('.flv') ||
+          lower.contains('.mkv');
+    }
+
+    if (detail != null && currentEp != null && detail.playGroups.length > 1) {
+      for (var i = 0; i < detail.playGroups.length; i++) {
+        if (!_triedGroupIndicesForEpisode.contains(i) &&
+            detail.playGroups[i].episodes.isNotEmpty) {
+          final nextGrp = detail.playGroups[i];
+          final nextEp = nextGrp.episodes.firstWhere(
+            (e) => e.title == currentEp.title,
+            orElse: () => currentEp.index < nextGrp.episodes.length
+                ? nextGrp.episodes[currentEp.index]
+                : nextGrp.episodes.first,
+          );
+          if (!isDirectMediaUrl(nextEp.rawUrl) &&
+              isDirectMediaUrl(currentEp.rawUrl)) {
+            continue;
+          }
+          _triedGroupIndicesForEpisode.add(i);
+          setState(() {
+            _selectedGroupIndex = i;
+            _playError = null;
+          });
+          _showAdToast('⚡ 正在自动切换至备用播放线路：${nextGrp.name}');
+          _selectAndPlayEpisode(
+            nextEp,
+            resumeSeconds: _pendingSeekSeconds,
+            resetTriedLines: false,
+          );
+          return;
+        }
+      }
+    }
+
+    // 5. Fallback: if direct/client-proxy failed and a server proxy URL exists, try server proxy via local relay
+    if (resolved != null &&
+        resolved.serverProxyUrl.isNotEmpty &&
+        !_activeStreamUrl.contains('/api/vod/proxy') &&
+        !_didTryServerProxyFallbackForEpisode) {
+      _didTryServerProxyFallbackForEpisode = true;
+      _showAdToast('⚡ 正在尝试服务端中转通道播放...');
+      unawaited(
+        _openResolvedStream(
+          resolved,
+          forceProxy: true,
+          skipM3u8Clean: false,
+          bypassClientProxy: false,
+          attemptId: _playAttemptSessionId,
+        ),
+      );
+      return;
+    }
+
+    // 6. Try any remaining untested play lines (including web share/iframe lines)
     if (detail != null && currentEp != null && detail.playGroups.length > 1) {
       for (var i = 0; i < detail.playGroups.length; i++) {
         if (!_triedGroupIndicesForEpisode.contains(i) &&
@@ -1503,23 +1565,6 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
           return;
         }
       }
-    }
-
-    // 5. Last-resort fallback: if direct/client-proxy failed across all lines and a server proxy URL exists, try server proxy once
-    if (resolved != null &&
-        resolved.serverProxyUrl.isNotEmpty &&
-        !_activeStreamUrl.contains('/api/vod/proxy')) {
-      _showAdToast('⚡ 正在尝试服务端中转通道播放...');
-      unawaited(
-        _openResolvedStream(
-          resolved,
-          forceProxy: true,
-          skipM3u8Clean: true,
-          bypassClientProxy: true,
-          attemptId: _playAttemptSessionId,
-        ),
-      );
-      return;
     }
 
     // Before showing a fatal error overlay, double-check that video hasn't started or buffered in the meantime
@@ -3259,10 +3304,6 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                             ),
                           ],
                           const Spacer(),
-                          VideoDownloadSpeedBadge(
-                            player: _player,
-                            backgroundColor: VideoPlatformTheme.bgCard,
-                          ),
                         ],
                       ),
                       const SizedBox(height: 8),
@@ -4125,11 +4166,6 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                 ),
                               ),
                               const SizedBox(width: 8),
-                              VideoDownloadSpeedBadge(
-                                player: _player,
-                                compact: true,
-                              ),
-                              const SizedBox(width: 6),
                               PlayerVolumeControl(
                                 player: _player,
                                 compact: true,
@@ -4734,14 +4770,15 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                   ),
                 ),
               ),
-            // Always-visible compact download speed badge when full stage OSD is auto-hidden
-            if (_currentEpisode != null &&
-                !(isFullscreen
-                    ? _fullscreenControlsVisible
-                    : (!widget.appState.tvMode &&
-                        (!isMobilePortrait || _mobileStageOsdVisible))))
+            // Floating movable / hideable / closable download speed badge on VOD stage
+            if (_currentEpisode != null)
               Positioned(
-                top: 10,
+                top: (isFullscreen
+                        ? _fullscreenControlsVisible
+                        : (!widget.appState.tvMode &&
+                            (!isMobilePortrait || _mobileStageOsdVisible)))
+                    ? 50
+                    : 10,
                 right: 12,
                 child: VideoDownloadSpeedBadge(
                   player: _player,
@@ -4851,8 +4888,6 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                 });
                               },
                             ),
-                            const SizedBox(width: 6),
-                            VideoDownloadSpeedBadge(player: _player),
                             if (_playError == null &&
                                 !_isResolvingPlay &&
                                 _currentEpisode != null) ...[
@@ -5359,11 +5394,6 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                             color: VideoPlatformTheme.textMuted,
                           ),
                         ),
-                        const SizedBox(width: 6),
-                        VideoDownloadSpeedBadge(
-                          player: _player,
-                          compact: true,
-                        ),
                       ],
                     ),
                   ),
@@ -5769,10 +5799,6 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                           ),
                         ),
                         const Spacer(),
-                        VideoDownloadSpeedBadge(
-                          player: _player,
-                          backgroundColor: VideoPlatformTheme.bgCard,
-                        ),
                       ],
                     ),
                     const SizedBox(height: 14),
@@ -5951,11 +5977,6 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         MediaQuery.sizeOf(context).width < 680 && !widget.appState.tvMode;
 
     final items = <Widget>[
-          // Real-time download speed indicator
-          VideoDownloadSpeedBadge(
-            player: _player,
-            backgroundColor: VideoPlatformTheme.bgCard,
-          ),
           // Prominent Fullscreen button in toolbar as well
           FilledButton.tonalIcon(
             onPressed: () => _toggleFullscreenMode(),

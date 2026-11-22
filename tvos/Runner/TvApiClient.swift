@@ -1905,6 +1905,7 @@ actor TvHlsSegmentCacheActor {
   private var slidingWindow: [SegmentEntry] = []
   private var nextSeqNumber: Int = 1
   private var prefetchTask: Task<Void, Never>? = nil
+  private var cachedRewrittenVodPlaylist: String? = nil
 
   func configureSession(gatewayUrl: String, resolvedUrl: String, headers: [String: String]) -> Int {
     prefetchTask?.cancel()
@@ -1914,6 +1915,7 @@ actor TvHlsSegmentCacheActor {
     cache.removeAll()
     cacheOrder.removeAll()
     slidingWindow.removeAll()
+    cachedRewrittenVodPlaylist = nil
     nextSeqNumber = 1
     generation &+= 1
     self.gatewayUrl = gatewayUrl
@@ -1928,7 +1930,20 @@ actor TvHlsSegmentCacheActor {
 
   func updateStreamUrl(_ newUrl: String, forGen gen: Int) {
     guard gen == generation, !newUrl.isEmpty else { return }
-    self.streamUrl = newUrl
+    if self.streamUrl != newUrl {
+      self.streamUrl = newUrl
+      self.cachedRewrittenVodPlaylist = nil
+    }
+  }
+
+  func cachedVodPlaylist(forGen gen: Int) -> String? {
+    guard gen == generation else { return nil }
+    return cachedRewrittenVodPlaylist
+  }
+
+  func setCachedVodPlaylist(_ playlist: String, forGen gen: Int) {
+    guard gen == generation else { return }
+    cachedRewrittenVodPlaylist = playlist
   }
 
   func mergeSlidingSegments(newSegments: [(inf: String, url: String)], forGen gen: Int) -> [SegmentEntry] {
@@ -4922,10 +4937,185 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     }
   }
 
+  private static let directFailedLock = NSLock()
+  private static var directFailedHostTimestamps: [String: TimeInterval] = [:]
+  private static let directFailedHostTtl: TimeInterval = 600
+
+  private static func hostCacheKey(for url: URL) -> String {
+    let host = (url.host ?? "").lowercased()
+    if let port = url.port {
+      return "\(host):\(port)"
+    }
+    return host
+  }
+
+  private static func isHostMarkedDirectFailed(_ url: URL) -> Bool {
+    let key = hostCacheKey(for: url)
+    guard !key.isEmpty else { return false }
+    directFailedLock.lock()
+    defer { directFailedLock.unlock() }
+    guard let ts = directFailedHostTimestamps[key] else { return false }
+    if Date().timeIntervalSince1970 - ts > directFailedHostTtl {
+      directFailedHostTimestamps.removeValue(forKey: key)
+      return false
+    }
+    return true
+  }
+
+  private static func markHostDirectFailed(_ url: URL) {
+    let key = hostCacheKey(for: url)
+    guard !key.isEmpty, !isDomesticOrLocalUrl(url.absoluteString) else { return }
+    directFailedLock.lock()
+    directFailedHostTimestamps[key] = Date().timeIntervalSince1970
+    directFailedLock.unlock()
+  }
+
+  private static func clearHostDirectFailed(_ url: URL) {
+    let key = hostCacheKey(for: url)
+    guard !key.isEmpty else { return }
+    directFailedLock.lock()
+    directFailedHostTimestamps.removeValue(forKey: key)
+    directFailedLock.unlock()
+  }
+
+  static func unwrapServerVodProxyLinesInM3u8(_ text: String) -> String {
+    guard text.contains("/api/vod/proxy") else { return text }
+    func extractInnerUrl(_ raw: String) -> String? {
+      let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard trimmed.contains("/api/vod/proxy") else { return nil }
+      let full = (trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://"))
+        ? trimmed
+        : "http://localhost\(trimmed.hasPrefix("/") ? "" : "/")\(trimmed)"
+      guard let comp = URLComponents(string: full),
+            let inner = comp.queryItems?.first(where: { $0.name == "url" })?.value?.trimmingCharacters(in: .whitespacesAndNewlines),
+            inner.hasPrefix("http://") || inner.hasPrefix("https://") else {
+        return nil
+      }
+      return inner
+    }
+
+    let lines = text.components(separatedBy: .newlines)
+    var out: [String] = []
+    out.reserveCapacity(lines.count)
+    for raw in lines {
+      let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+      if line.isEmpty {
+        out.append("")
+        continue
+      }
+      if line.hasPrefix("#") {
+        if line.contains("/api/vod/proxy"),
+           let uriRange = line.range(of: "URI=\"") {
+          let afterStart = uriRange.upperBound
+          if let endQuote = line[afterStart...].firstIndex(of: "\"") {
+            let rawUri = String(line[afterStart..<endQuote])
+            if let inner = extractInnerUrl(rawUri) {
+              out.append(String(line[..<afterStart]) + inner + String(line[endQuote...]))
+              continue
+            }
+          }
+        }
+        out.append(line)
+      } else {
+        out.append(extractInnerUrl(line) ?? line)
+      }
+    }
+    return out.joined(separator: "\n")
+  }
+
+  private static func hasDisguisedImageHeaderMagic(_ data: Data) -> Bool {
+    guard data.count >= 4 else { return false }
+    let b0 = data[data.startIndex]
+    let b1 = data[data.startIndex + 1]
+    let b2 = data[data.startIndex + 2]
+    let b3 = data[data.startIndex + 3]
+    if b0 == 0x89 && b1 == 0x50 && b2 == 0x4E && b3 == 0x47 { return true } // PNG
+    if b0 == 0xFF && b1 == 0xD8 && b2 == 0xFF { return true } // JPEG
+    if b0 == 0x47 && b1 == 0x49 && b2 == 0x46 && b3 == 0x38 { return true } // GIF8
+    if b0 == 0x42 && b1 == 0x4D { return true } // BMP
+    if b0 == 0x52 && b1 == 0x49 && b2 == 0x46 && b3 == 0x46 { return true } // RIFF/WebP
+    if b0 == 0x00 && b1 == 0x00 && b2 == 0x01 && b3 == 0x00 { return true } // ICO
+    return false
+  }
+
+  static func stripDisguisedTsImageHeader(_ data: Data) -> Data {
+    guard data.count >= 377,
+          data[data.startIndex] != 0x47,
+          hasDisguisedImageHeaderMagic(data) else {
+      return data
+    }
+    let maxScan = min(data.count - 376, 4096)
+    let base = data.startIndex
+    for i in 1..<maxScan {
+      if data[base + i] == 0x47 && data[base + i + 188] == 0x47 && data[base + i + 376] == 0x47 {
+        return data.subdata(in: (base + i)..<data.endIndex)
+      }
+    }
+    return data
+  }
+
+  private static func buildServerProxyFallbackRequest(
+    targetUrl: String,
+    headers: [String: String],
+    timeout: TimeInterval
+  ) -> URLRequest? {
+    let rawBase = UserDefaults.standard.string(forKey: "tv_server_url") ?? "https://jp2.linsionwinwin.top:8081"
+    let base = TvApiClient.normalizeBaseUrl(rawBase)
+    guard !base.isEmpty,
+          let target = URL(string: targetUrl),
+          let host = target.host?.lowercased(),
+          !host.isEmpty,
+          host != "127.0.0.1",
+          host != "localhost",
+          !isDomesticOrLocalUrl(targetUrl) else {
+      return nil
+    }
+    if let baseHost = URL(string: base)?.host?.lowercased(),
+       host == baseHost,
+       target.path.lowercased().hasPrefix("/api/") {
+      return nil
+    }
+    var cleanHeaders: [String: String] = [:]
+    for (k, v) in headers {
+      let lower = k.lowercased()
+      if lower != "cookie" && lower != "authorization" && lower != "host" && !v.isEmpty {
+        cleanHeaders[k] = v
+      }
+    }
+    guard var comp = URLComponents(string: "\(base)/api/vod/proxy") else { return nil }
+    var items = [URLQueryItem(name: "url", value: targetUrl)]
+    if !cleanHeaders.isEmpty,
+       let jsonData = try? JSONSerialization.data(withJSONObject: cleanHeaders) {
+      let b64 = jsonData.base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_")
+        .replacingOccurrences(of: "=", with: "")
+      items.append(URLQueryItem(name: "headers", value: b64))
+    }
+    comp.queryItems = items
+    guard let proxyUrl = comp.url else { return nil }
+    var req = URLRequest(url: proxyUrl)
+    req.httpMethod = "GET"
+    req.timeoutInterval = timeout
+    req.setValue(
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+      forHTTPHeaderField: "User-Agent"
+    )
+    let secret = (UserDefaults.standard.string(forKey: "tv_auth_secret") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    if !secret.isEmpty {
+      let token = secret.hasPrefix("auth_") ? secret : "auth_\(secret)"
+      req.setValue("access_token=\(token)", forHTTPHeaderField: "Cookie")
+    }
+    return req
+  }
+
   private func fetchAndRewritePlaylist(
     cfg: (gen: Int, gatewayUrl: String, streamUrl: String, headers: [String: String]),
     activeGen: Int
   ) async -> String? {
+    if let cachedVod = await store.cachedVodPlaylist(forGen: activeGen) {
+      return cachedVod
+    }
     var activeStreamUrl = cfg.streamUrl
     var playlistFetch = await fetchRawPlaylist(urlStr: activeStreamUrl, headers: cfg.headers)
     if playlistFetch == nil, !cfg.gatewayUrl.isEmpty, cfg.gatewayUrl != activeStreamUrl {
@@ -4936,26 +5126,44 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       }
     }
     guard var (text, finalUrl) = playlistFetch else { return nil }
+    text = Self.unwrapServerVodProxyLinesInM3u8(text)
 
-    // If this is a master playlist (#EXT-X-STREAM-INF), follow the highest-quality variant media playlist immediately
-    if text.contains("#EXT-X-STREAM-INF") {
-      let lines = text.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-      let variants = lines.filter { !$0.isEmpty && !$0.hasPrefix("#") }
-      if let bestVariant = variants.last ?? variants.first,
-         let variantUrl = URL(string: bestVariant, relativeTo: finalUrl)?.absoluteURL,
-         let childFetch = await fetchRawPlaylist(urlStr: variantUrl.absoluteString, headers: cfg.headers) {
-        text = childFetch.text
-        finalUrl = childFetch.finalUrl
-        await store.updateStreamUrl(finalUrl.absoluteString, forGen: activeGen)
+    // If this is a master playlist (#EXT-X-STREAM-INF), follow up to 2 levels of variant media playlists immediately
+    let hasSeparateAudioRendition = text.range(
+      of: "#EXT-X-MEDIA:[^\\r\\n]*TYPE=AUDIO[^\\r\\n]*URI=\"[^\"]+\"",
+      options: [.regularExpression, .caseInsensitive]
+    ) != nil
+    for _ in 0..<2 where !hasSeparateAudioRendition {
+      if !text.contains("#EXT-X-STREAM-INF") { break }
+      let mLines = text.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      let variants = mLines.filter { !$0.isEmpty && !$0.hasPrefix("#") }
+      guard let bestVariant = variants.last ?? variants.first,
+            let variantUrl = URL(string: bestVariant, relativeTo: finalUrl)?.absoluteURL,
+            let childFetch = await fetchRawPlaylist(urlStr: variantUrl.absoluteString, headers: cfg.headers) else {
+        break
       }
+      text = Self.unwrapServerVodProxyLinesInM3u8(childFetch.text)
+      finalUrl = childFetch.finalUrl
+      await store.updateStreamUrl(finalUrl.absoluteString, forGen: activeGen)
     }
+
+    let shouldFilterAds = (UserDefaults.standard.object(forKey: "tv_ad_filter") as? Bool) ?? true
+    if shouldFilterAds && text.contains("#EXT-X-DISCONTINUITY") {
+      text = TvApiClient.stripDiscontinuityAdsAndAbsolutize(m3u8Text: text, baseUrl: finalUrl)
+    }
+
+    var allowed = CharacterSet.urlQueryAllowed
+    allowed.remove(charactersIn: "&+=?#")
+    let localPort = self.port
 
     let lines = text.components(separatedBy: .newlines)
     var headerLines: [String] = ["#EXTM3U", "#EXT-X-VERSION:3"]
     var targetDurationLine = "#EXT-X-TARGETDURATION:10"
-    var parsedSegments: [(inf: String, url: String, discontinuity: Bool)] = []
+    var parsedSegments: [(inf: String, url: String, discontinuity: Bool, keyLine: String?, mapLine: String?)] = []
     var pendingInf: String? = nil
     var pendingDiscontinuity = false
+    var currentKeyLine: String? = nil
+    var currentMapLine: String? = nil
     var hasEndListTag = false
     var isExplicitVodTag = false
 
@@ -4971,21 +5179,37 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
         hasEndListTag = true
       } else if upper.hasPrefix("#EXT-X-DISCONTINUITY") && !upper.hasPrefix("#EXT-X-DISCONTINUITY-SEQUENCE") {
         pendingDiscontinuity = true
-      } else if upper.hasPrefix("#EXT-X-KEY") || upper.hasPrefix("#EXT-X-MAP") {
-        headerLines.append(Self.rewriteAttributeUri(in: t, baseUrl: finalUrl))
+      } else if upper.hasPrefix("#EXT-X-KEY") {
+        currentKeyLine = Self.rewriteAttributeUriThroughProxy(
+          in: t,
+          baseUrl: finalUrl,
+          localPort: localPort,
+          activeGen: activeGen,
+          allowed: allowed
+        )
+      } else if upper.hasPrefix("#EXT-X-MAP") {
+        currentMapLine = Self.rewriteAttributeUriThroughProxy(
+          in: t,
+          baseUrl: finalUrl,
+          localPort: localPort,
+          activeGen: activeGen,
+          allowed: allowed
+        )
       } else if upper.hasPrefix("#EXTINF") {
         pendingInf = t
       } else if !t.hasPrefix("#") {
         let absSegUrl = URL(string: t, relativeTo: finalUrl)?.absoluteURL.absoluteString ?? t
-        parsedSegments.append((inf: pendingInf ?? "#EXTINF:10.0,", url: absSegUrl, discontinuity: pendingDiscontinuity))
+        parsedSegments.append((
+          inf: pendingInf ?? "#EXTINF:10.0,",
+          url: absSegUrl,
+          discontinuity: pendingDiscontinuity,
+          keyLine: currentKeyLine,
+          mapLine: currentMapLine
+        ))
         pendingInf = nil
         pendingDiscontinuity = false
       }
     }
-
-    var allowed = CharacterSet.urlQueryAllowed
-    allowed.remove(charactersIn: "&+=?#")
-    let localPort = self.port
 
     // CRITICAL DISTINCTION:
     // - For VOD / finite playlists (`#EXT-X-ENDLIST` or `#EXT-X-PLAYLIST-TYPE:VOD` or >15 segments, such as 115 / AList movies),
@@ -4996,18 +5220,40 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       headerLines.append("#EXT-X-PLAYLIST-TYPE:VOD")
       headerLines.append(targetDurationLine)
       headerLines.append("#EXT-X-MEDIA-SEQUENCE:0")
+      var lastEmittedKey: String? = nil
+      var lastEmittedMap: String? = nil
       for seg in parsedSegments {
         if seg.discontinuity {
           headerLines.append("#EXT-X-DISCONTINUITY")
+        }
+        if seg.keyLine != lastEmittedKey {
+          if let k = seg.keyLine {
+            headerLines.append(k)
+          }
+          lastEmittedKey = seg.keyLine
+        }
+        if seg.mapLine != lastEmittedMap {
+          if let m = seg.mapLine {
+            headerLines.append(m)
+          }
+          lastEmittedMap = seg.mapLine
         }
         headerLines.append(seg.inf)
         let enc = seg.url.addingPercentEncoding(withAllowedCharacters: allowed) ?? seg.url
         headerLines.append("http://127.0.0.1:\(localPort)/seg.ts?gen=\(activeGen)&u=\(enc)")
       }
       headerLines.append("#EXT-X-ENDLIST")
-      return headerLines.joined(separator: "\n") + "\n"
+      let rewritten = headerLines.joined(separator: "\n") + "\n"
+      await store.setCachedVodPlaylist(rewritten, forGen: activeGen)
+      return rewritten
     }
 
+    if let k = currentKeyLine {
+      headerLines.append(k)
+    }
+    if let m = currentMapLine {
+      headerLines.append(m)
+    }
     let simpleSegments = parsedSegments.map { (inf: $0.inf, url: $0.url) }
     let window = await store.mergeSlidingSegments(newSegments: simpleSegments, forGen: activeGen)
     guard !window.isEmpty else { return text }
@@ -5047,41 +5293,90 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
   }
 
   private func fetchRawPlaylist(urlStr: String, headers: [String: String]) async -> (text: String, finalUrl: URL)? {
-    guard let u = URL(string: urlStr) else { return nil }
+    var effectiveUrlStr = urlStr
+    var logicalFinalUrl = URL(string: urlStr)
+    var preferServerProxyFirst = false
+    if urlStr.contains("/api/vod/proxy"),
+       let comp = URLComponents(string: urlStr),
+       let inner = comp.queryItems?.first(where: { $0.name == "url" })?.value?.trimmingCharacters(in: .whitespacesAndNewlines),
+       let innerUrl = URL(string: inner),
+       inner.hasPrefix("http") {
+      effectiveUrlStr = inner
+      logicalFinalUrl = innerUrl
+      preferServerProxyFirst = true
+    }
+    guard let u = URL(string: effectiveUrlStr),
+          let logicalBase = logicalFinalUrl else { return nil }
+
+    if preferServerProxyFirst {
+      if let srvReq = Self.buildServerProxyFallbackRequest(targetUrl: effectiveUrlStr, headers: headers, timeout: 7.5),
+         let (data, resp) = try? await directUrlSession.data(for: srvReq),
+         let http = resp as? HTTPURLResponse,
+         (200..<300).contains(http.statusCode),
+         let text = String(data: data, encoding: .utf8),
+         text.contains("#EXTM3U") {
+        TvNetworkSpeedMonitor.shared.recordDownstreamBytes(data.count)
+        return (text, logicalBase)
+      }
+    }
+
     var req = URLRequest(url: u)
     req.httpMethod = "GET"
-    req.timeoutInterval = 5.5
+    req.timeoutInterval = 4.8
     for (k, v) in headers where !v.isEmpty {
       req.setValue(v, forHTTPHeaderField: k)
     }
-    let sess = preferredSession(for: urlStr)
-    if let (data, resp) = try? await sess.data(for: req),
-       let http = resp as? HTTPURLResponse,
-       (200..<300).contains(http.statusCode),
-       let finalUrl = resp.url,
-       let text = String(data: data, encoding: .utf8),
-       text.contains("#EXTM3U") {
-      return (text, finalUrl)
+    let sess = preferredSession(for: effectiveUrlStr)
+    let skipDirect = (sess === directUrlSession) && Self.isHostMarkedDirectFailed(u)
+    if !skipDirect {
+      if let (data, resp) = try? await sess.data(for: req),
+         let http = resp as? HTTPURLResponse,
+         (200..<300).contains(http.statusCode),
+         let finalUrl = resp.url,
+         let text = String(data: data, encoding: .utf8),
+         text.contains("#EXTM3U") {
+        if sess === directUrlSession {
+          Self.clearHostDirectFailed(u)
+        }
+        TvNetworkSpeedMonitor.shared.recordDownstreamBytes(data.count)
+        return (text, finalUrl)
+      }
+      if sess === directUrlSession {
+        Self.markHostDirectFailed(u)
+      }
     }
     // If proxy node failed or blocked the VOD CDN, immediately fall back to directUrlSession
-    if sess !== directUrlSession {
+    if sess !== directUrlSession && !Self.isHostMarkedDirectFailed(u) {
       var directReq = req
-      directReq.timeoutInterval = 6.0
+      directReq.timeoutInterval = 4.8
       if let (data, resp) = try? await directUrlSession.data(for: directReq),
          let http = resp as? HTTPURLResponse,
          (200..<300).contains(http.statusCode),
          let finalUrl = resp.url,
          let text = String(data: data, encoding: .utf8),
          text.contains("#EXTM3U") {
+        Self.clearHostDirectFailed(u)
+        TvNetworkSpeedMonitor.shared.recordDownstreamBytes(data.count)
         return (text, finalUrl)
       }
+      Self.markHostDirectFailed(u)
+    }
+    // Fallback to backend server `/api/vod/proxy` when direct/proxy is geo-blocked or SSL-reset (e.g. ukzyvod3.ukubf5.com 403 or tsbfask.com:65)
+    if let srvReq = Self.buildServerProxyFallbackRequest(targetUrl: effectiveUrlStr, headers: headers, timeout: 8.5),
+       let (data, resp) = try? await directUrlSession.data(for: srvReq),
+       let http = resp as? HTTPURLResponse,
+       (200..<300).contains(http.statusCode),
+       let text = String(data: data, encoding: .utf8),
+       text.contains("#EXTM3U") {
+      TvNetworkSpeedMonitor.shared.recordDownstreamBytes(data.count)
+      return (text, logicalBase)
     }
     return nil
   }
 
   /// Downloads a `.ts` segment using 8 parallel HTTP Range requests (`HTTP 206 Partial Content`) when supported on throttled overseas IPTV CDNs,
   /// while using a direct single-connection GET for domestic 115 / LAN servers that disallow multi-range splitting,
-  /// and falling back to `fallbackDirectSession` if the proxy tunnel times out or is blocked by the CDN.
+  /// and falling back to `fallbackDirectSession` or backend `/api/vod/proxy` if direct/proxy times out or is blocked by the CDN.
   private static func downloadSegmentMultiRange(
     urlStr: String,
     headers: [String: String],
@@ -5089,6 +5384,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     fallbackDirectSession: URLSession? = nil
   ) async -> Data? {
     guard let u = URL(string: urlStr) else { return nil }
+    let directSession = fallbackDirectSession ?? session
 
     // Domestic cloud drives (115) & local LAN servers (or when proxy is disabled) are already fast on a single connection and reject 8-way Range splitting on .ts segments
     if TvLocalProxyTunnelServer.shared.isProxyActive && !isDomesticOrLocalUrl(urlStr) {
@@ -5156,48 +5452,77 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
         }
 
         if let fastData = multiResult {
-          return fastData
+          return stripDisguisedTsImageHeader(fastData)
         }
       }
     }
 
-    // Standard single-connection GET
+    // Standard single-connection GET (skip direct if this host already failed direct connection)
     var getReq = URLRequest(url: u)
     getReq.httpMethod = "GET"
-    getReq.timeoutInterval = 7.5
+    getReq.timeoutInterval = 4.8
     for (k, v) in headers where !v.isEmpty {
       getReq.setValue(v, forHTTPHeaderField: k)
     }
-    if let (d, r) = try? await session.data(for: getReq),
-       let h = r as? HTTPURLResponse,
-       (200..<300).contains(h.statusCode),
-       !d.isEmpty {
-      TvNetworkSpeedMonitor.shared.recordDownstreamBytes(d.count)
-      return d
+    let skipPrimaryDirect = (session === directSession) && isHostMarkedDirectFailed(u)
+    if !skipPrimaryDirect {
+      if let (d, r) = try? await session.data(for: getReq),
+         let h = r as? HTTPURLResponse,
+         (200..<300).contains(h.statusCode),
+         !d.isEmpty {
+        if session === directSession {
+          clearHostDirectFailed(u)
+        }
+        TvNetworkSpeedMonitor.shared.recordDownstreamBytes(d.count)
+        return stripDisguisedTsImageHeader(d)
+      }
+      if session === directSession {
+        markHostDirectFailed(u)
+      }
     }
 
     // Fallback to direct connection if proxy tunnel timed out or was rejected by the video CDN
-    if let fbSess = fallbackDirectSession, fbSess !== session {
+    if let fbSess = fallbackDirectSession, fbSess !== session, !isHostMarkedDirectFailed(u) {
       var directReq = getReq
-      directReq.timeoutInterval = 8.0
+      directReq.timeoutInterval = 4.8
       if let (d, r) = try? await fbSess.data(for: directReq),
          let h = r as? HTTPURLResponse,
          (200..<300).contains(h.statusCode),
          !d.isEmpty {
+        clearHostDirectFailed(u)
         TvNetworkSpeedMonitor.shared.recordDownstreamBytes(d.count)
-        return d
+        return stripDisguisedTsImageHeader(d)
       }
+      markHostDirectFailed(u)
+    }
+
+    // Fallback to backend server `/api/vod/proxy` when direct/proxy is blocked or SSL-reset (e.g. tsbfask.com:65 or ukzyvod3.ukubf5.com)
+    if let srvReq = buildServerProxyFallbackRequest(targetUrl: urlStr, headers: headers, timeout: 9.0),
+       let (d, r) = try? await directSession.data(for: srvReq),
+       let h = r as? HTTPURLResponse,
+       (200..<300).contains(h.statusCode),
+       !d.isEmpty {
+      TvNetworkSpeedMonitor.shared.recordDownstreamBytes(d.count)
+      return stripDisguisedTsImageHeader(d)
     }
     return nil
   }
 
-  private static func rewriteAttributeUri(in line: String, baseUrl: URL) -> String {
+  private static func rewriteAttributeUriThroughProxy(
+    in line: String,
+    baseUrl: URL,
+    localPort: UInt16,
+    activeGen: Int,
+    allowed: CharacterSet
+  ) -> String {
     guard let uriRange = line.range(of: "URI=\"") else { return line }
     let afterStart = uriRange.upperBound
     guard let endQuote = line[afterStart...].firstIndex(of: "\"") else { return line }
     let rawUri = String(line[afterStart..<endQuote])
     guard let absUri = URL(string: rawUri, relativeTo: baseUrl)?.absoluteURL.absoluteString else { return line }
-    return String(line[..<afterStart]) + absUri + String(line[endQuote...])
+    let enc = absUri.addingPercentEncoding(withAllowedCharacters: allowed) ?? absUri
+    let proxied = "http://127.0.0.1:\(localPort)/seg.ts?gen=\(activeGen)&u=\(enc)"
+    return String(line[..<afterStart]) + proxied + String(line[endQuote...])
   }
 
   private static func sliceData(_ data: Data, rangeSpec: String) -> (Data, String)? {
@@ -5949,78 +6274,52 @@ final class TvApiClient {
     headers: [String: String],
     enableAdFilter: Bool
   ) async -> String {
-    guard enableAdFilter,
-          streamUrl.lowercased().contains(".m3u8"),
-          !streamUrl.contains("/api/vod/proxy"),
-          let url = URL(string: streamUrl) else {
-      return streamUrl
-    }
-
-    do {
-      var req = URLRequest(url: url)
-      req.timeoutInterval = 5
-      for (k, v) in headers {
-        req.setValue(v, forHTTPHeaderField: k)
-      }
-      if req.value(forHTTPHeaderField: "User-Agent") == nil {
-        req.setValue(
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-          forHTTPHeaderField: "User-Agent"
-        )
-      }
-      let (data, response) = try await session.data(for: req)
-      guard let http = response as? HTTPURLResponse,
-            (200..<300).contains(http.statusCode),
-            let text = String(data: data, encoding: .utf8),
-            text.contains("#EXTM3U") else {
-        return streamUrl
-      }
-
-      if text.contains("#EXT-X-STREAM-INF") || text.contains("#EXT-X-KEY") {
-        return streamUrl
-      }
-      guard text.contains("#EXT-X-DISCONTINUITY") else {
-        return streamUrl
-      }
-
-      let cleaned = Self.stripDiscontinuityAdsAndAbsolutize(m3u8Text: text, baseUrl: url)
-      let tempFile = FileManager.default.temporaryDirectory
-        .appendingPathComponent("tv_clean_\(UUID().uuidString).m3u8")
-      try cleaned.write(to: tempFile, atomically: true, encoding: .utf8)
-      return tempFile.absoluteString
-    } catch {
-      return streamUrl
-    }
+    // AVPlayer on tvOS/iOS forbids loading HLS `.m3u8` playlists from `file://` URLs.
+    // Discontinuity ad stripping is now performed in-memory inside `TvLocalHlsProxyServer.fetchAndRewritePlaylist`
+    // and served over `http://127.0.0.1:<port>/live.m3u8`.
+    return streamUrl
   }
 
-  private static func stripDiscontinuityAdsAndAbsolutize(m3u8Text: String, baseUrl: URL) -> String {
+  static func stripDiscontinuityAdsAndAbsolutize(m3u8Text: String, baseUrl: URL) -> String {
     let lines = m3u8Text.components(separatedBy: .newlines)
     var headerLines: [String] = []
     struct Block {
       var lines: [String] = []
       var segmentCount: Int = 0
       var durationSum: Double = 0
+      var entryKeyLine: String? = nil
     }
     var blocks: [Block] = [Block()]
     var seenFirstSegmentOrDiscontinuity = false
+    var activeKeyLine: String? = nil
 
     for rawLine in lines {
       let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
       if line.isEmpty { continue }
+      let upper = line.uppercased()
 
-      if line.hasPrefix("#EXT-X-DISCONTINUITY") {
+      if upper.hasPrefix("#EXT-X-DISCONTINUITY") && !upper.hasPrefix("#EXT-X-DISCONTINUITY-SEQUENCE") {
         seenFirstSegmentOrDiscontinuity = true
-        blocks.append(Block())
+        var nextBlock = Block()
+        nextBlock.entryKeyLine = activeKeyLine
+        blocks.append(nextBlock)
         continue
       }
 
-      if !seenFirstSegmentOrDiscontinuity && line.hasPrefix("#") && !line.hasPrefix("#EXTINF") {
+      if upper.hasPrefix("#EXT-X-KEY") {
+        activeKeyLine = line
+        seenFirstSegmentOrDiscontinuity = true
+        blocks[blocks.count - 1].lines.append(line)
+        continue
+      }
+
+      if !seenFirstSegmentOrDiscontinuity && line.hasPrefix("#") && !upper.hasPrefix("#EXTINF") {
         headerLines.append(line)
         continue
       }
 
       seenFirstSegmentOrDiscontinuity = true
-      if line.hasPrefix("#EXTINF:") {
+      if upper.hasPrefix("#EXTINF:") {
         let numPart = line
           .replacingOccurrences(of: "#EXTINF:", with: "")
           .components(separatedBy: ",")
@@ -6043,13 +6342,19 @@ final class TvApiClient {
     }
 
     var out: [String] = headerLines
-    for (idx, b) in nonEmptyBlocks.enumerated() {
+    var emittedBlockCount = 0
+    for b in nonEmptyBlocks {
       let isLikelyAd = b.segmentCount <= 5 && b.durationSum <= 28.0 && nonEmptyBlocks.count >= 2
       if isLikelyAd { continue }
-      if idx > 0 {
+      if emittedBlockCount > 0 {
         out.append("#EXT-X-DISCONTINUITY")
       }
+      let firstHasKey = b.lines.first?.uppercased().hasPrefix("#EXT-X-KEY") == true
+      if !firstHasKey, let entryKey = b.entryKeyLine {
+        out.append(entryKey)
+      }
       out.append(contentsOf: b.lines)
+      emittedBlockCount += 1
     }
     if !out.contains(where: { $0.hasPrefix("#EXT-X-ENDLIST") }) {
       out.append("#EXT-X-ENDLIST")

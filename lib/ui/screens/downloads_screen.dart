@@ -2114,14 +2114,6 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
                         ),
                         onPressed: _toggleOrientation,
                       ),
-                    if (!isMobileDialog) ...[
-                      VideoDownloadSpeedBadge(
-                        player: _player,
-                        compact: true,
-                        backgroundColor: VideoPlatformTheme.bgCard,
-                      ),
-                      const SizedBox(width: 6),
-                    ],
                     if (widget.onEnterMiniPlayer != null)
                       TextButton.icon(
                         onPressed: () {
@@ -2146,24 +2138,26 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
               Expanded(
                 child: LayoutBuilder(
                   builder: (context, stageConstraints) {
-                    return Stack(
-                      fit: StackFit.expand,
-                      children: [
-                        Video(
-                          controller: _controller,
-                          width: stageConstraints.maxWidth,
-                          height: stageConstraints.maxHeight,
-                          fit: _fitMode == 'cover'
-                              ? BoxFit.cover
-                              : BoxFit.contain,
-                          fill: Colors.black,
-                        ),
-                        Positioned(
-                          top: 12,
-                          right: 12,
-                          child: VideoDownloadSpeedBadge(player: _player),
-                        ),
-                      ],
+                    return Video(
+                      controller: _controller,
+                      width: stageConstraints.maxWidth,
+                      height: stageConstraints.maxHeight,
+                      fit: _fitMode == 'cover' ? BoxFit.cover : BoxFit.contain,
+                      fill: Colors.black,
+                      controls: (state) => Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          AdaptiveVideoControls(state),
+                          Positioned(
+                            top: 12,
+                            right: 12,
+                            child: VideoDownloadSpeedBadge(
+                              player: _player,
+                              compact: true,
+                            ),
+                          ),
+                        ],
+                      ),
                     );
                   },
                 ),

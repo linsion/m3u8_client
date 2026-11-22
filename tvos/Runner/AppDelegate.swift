@@ -67,35 +67,49 @@ final class TvInteractiveWindow: UIWindow {
       }
     }
     super.sendEvent(event)
-    applyDarkFocusStyleToAllTextFields(in: self)
   }
 
   override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
     super.didUpdateFocus(in: context, with: coordinator)
-    applyDarkFocusStyleToAllTextFields(in: self)
-    coordinator.addCoordinatedAnimations({ [weak self] in
-      guard let self = self else { return }
-      self.applyDarkFocusStyleToAllTextFields(in: self)
-    }, completion: { [weak self] in
-      guard let self = self else { return }
-      self.applyDarkFocusStyleToAllTextFields(in: self)
+    let prevView = context.previouslyFocusedView
+    let nextView = context.nextFocusedView
+    applyDarkFocusStyleNearFocusedViews(prevView: prevView, nextView: nextView)
+    coordinator.addCoordinatedAnimations({ [weak self, weak prevView, weak nextView] in
+      self?.applyDarkFocusStyleNearFocusedViews(prevView: prevView, nextView: nextView)
+    }, completion: { [weak self, weak prevView, weak nextView] in
+      self?.applyDarkFocusStyleNearFocusedViews(prevView: prevView, nextView: nextView)
     })
   }
 
-  override func layoutSubviews() {
-    super.layoutSubviews()
-    applyDarkFocusStyleToAllTextFields(in: self)
+  private func applyDarkFocusStyleNearFocusedViews(prevView: UIView?, nextView: UIView?) {
+    for candidate in [prevView, nextView] {
+      guard let view = candidate else { continue }
+      var root: UIView = view
+      for _ in 0..<2 {
+        if let tf = root as? UITextField {
+          styleSingleTextField(tf)
+        }
+        guard let parent = root.superview else { break }
+        root = parent
+      }
+      applyDarkFocusStyleBounded(in: root, remainingDepth: 3)
+    }
   }
 
-  /// Ensures native tvOS UITextField / SecureField never uses a white focus platter background (which hides white text).
-  func applyDarkFocusStyleToAllTextFields(in view: UIView) {
+  private func applyDarkFocusStyleBounded(in view: UIView, remainingDepth: Int) {
     if let tf = view as? UITextField {
       styleSingleTextField(tf)
       return
     }
+    guard remainingDepth > 0 else { return }
     for sub in view.subviews {
-      applyDarkFocusStyleToAllTextFields(in: sub)
+      applyDarkFocusStyleBounded(in: sub, remainingDepth: remainingDepth - 1)
     }
+  }
+
+  /// Ensures native tvOS UITextField / SecureField never uses a white focus platter background (which hides white text).
+  func applyDarkFocusStyleToAllTextFields(in view: UIView) {
+    applyDarkFocusStyleBounded(in: view, remainingDepth: 4)
   }
 
   private func styleSingleTextField(_ tf: UITextField) {
@@ -481,6 +495,11 @@ struct TvRootView: View {
             .clipped()
             .zIndex(80)
         }
+
+        // Layer 5: Global Floating Speed Tag Overlay across all Apple TV screens & players (Movable / Hideable / Closable)
+        TvFloatingSpeedTagOverlay()
+          .environmentObject(appState)
+          .zIndex(85)
       }
 
       // Resolving Stream HUD Overlay
@@ -574,6 +593,7 @@ struct TvAppleTopNavigationBar: View {
 
   private enum TopBarFocusTarget: Hashable {
     case tab(TvMainSection)
+    case speedBadgeButton
     case themeButton
   }
 
@@ -582,8 +602,8 @@ struct TvAppleTopNavigationBar: View {
   var body: some View {
     let theme = appState.activeTheme
 
-    HStack(spacing: 18) {
-      // Brand Pill on Left
+    HStack(spacing: 16) {
+      // Left: Brand Identity Capsule (Matched 54pt height & Liquid-Glass Capsule styling)
       HStack(spacing: 10) {
         ZStack {
           Circle()
@@ -594,18 +614,19 @@ struct TvAppleTopNavigationBar: View {
                 endPoint: .bottomTrailing
               )
             )
-            .frame(width: 38, height: 38)
+            .frame(width: 36, height: 36)
           Image(systemName: "play.tv.fill")
-            .font(.system(size: 17, weight: .bold))
+            .font(.system(size: 16, weight: .bold))
             .foregroundColor(.white)
         }
         Text("流光视频")
-          .font(.system(size: 22, weight: .bold, design: .rounded))
+          .font(.system(size: 20, weight: .bold, design: .rounded))
           .foregroundColor(.white)
+          .lineLimit(1)
         Text(appState.appShortVersion)
-          .font(.system(size: 13, weight: .bold, design: .monospaced))
+          .font(.system(size: 12.5, weight: .bold, design: .monospaced))
           .foregroundColor(theme.accentHover)
-          .padding(.horizontal, 9)
+          .padding(.horizontal, 8)
           .padding(.vertical, 3)
           .background(theme.accent.opacity(0.18))
           .clipShape(Capsule(style: .continuous))
@@ -614,11 +635,19 @@ struct TvAppleTopNavigationBar: View {
               .stroke(theme.accentHover.opacity(0.45), lineWidth: 1)
           )
       }
-      .padding(.leading, 8)
+      .padding(.horizontal, 14)
+      .frame(height: 54)
+      .background(.ultraThinMaterial)
+      .clipShape(Capsule(style: .continuous))
+      .overlay(
+        Capsule(style: .continuous)
+          .stroke(Color.white.opacity(0.16), lineWidth: 1)
+      )
+      .shadow(color: .black.opacity(0.35), radius: 18, y: 6)
 
-      Spacer()
+      Spacer(minLength: 8)
 
-      // Center Floating Liquid-Glass Capsule Tab Strip
+      // Center: Floating Liquid-Glass Capsule Tab Strip (Unified 16pt icon + 17pt title + 38pt pill height)
       HStack(spacing: 8) {
         ForEach(TvMainSection.allCases) { sec in
           let isSelected = selectedSection == sec
@@ -629,17 +658,18 @@ struct TvAppleTopNavigationBar: View {
           } label: {
             HStack(spacing: 8) {
               Image(systemName: sec.iconName)
-                .font(.system(size: 17, weight: isSelected ? .bold : .medium))
+                .font(.system(size: 16, weight: isSelected ? .bold : .semibold))
               Text(sec.rawValue)
-                .font(.system(size: 19, weight: isSelected ? .bold : .medium))
+                .font(.system(size: 17, weight: isSelected ? .bold : .semibold))
+                .lineLimit(1)
             }
           }
           .buttonStyle(TvApplePillButtonStyle(isSelected: isSelected, isPrimary: isSelected, compact: true))
           .focused($focusedTarget, equals: .tab(sec))
         }
       }
-      .padding(.horizontal, 12)
-      .padding(.vertical, 8)
+      .padding(.horizontal, 10)
+      .frame(height: 54)
       .background(.ultraThinMaterial)
       .clipShape(Capsule(style: .continuous))
       .overlay(
@@ -648,24 +678,38 @@ struct TvAppleTopNavigationBar: View {
       )
       .shadow(color: .black.opacity(0.35), radius: 18, y: 6)
 
-      Spacer()
+      Spacer(minLength: 8)
 
-      // Right Quick Theme Switcher Pill
-      Button {
-        appState.cycleTheme()
-      } label: {
-        HStack(spacing: 8) {
-          Circle()
-            .fill(theme.accent)
-            .frame(width: 14, height: 14)
-            .overlay(Circle().stroke(Color.white.opacity(0.75), lineWidth: 1))
-          Text(theme.name)
-            .font(.system(size: 16, weight: .semibold))
-            .lineLimit(1)
+      // Right: Floating Liquid-Glass Utility Capsule (1:1 identical button style, height, font & container with Center Tab Strip)
+      HStack(spacing: 8) {
+        TvSpeedBadgeControlPillButton(isTopNavStyle: true)
+          .focused($focusedTarget, equals: .speedBadgeButton)
+
+        Button {
+          appState.cycleTheme()
+        } label: {
+          HStack(spacing: 8) {
+            Circle()
+              .fill(theme.accent)
+              .frame(width: 14, height: 14)
+              .overlay(Circle().stroke(Color.white.opacity(0.80), lineWidth: 1))
+            Text(theme.name)
+              .font(.system(size: 17, weight: .semibold))
+              .lineLimit(1)
+          }
         }
+        .buttonStyle(TvApplePillButtonStyle(compact: true))
+        .focused($focusedTarget, equals: .themeButton)
       }
-      .buttonStyle(TvApplePillButtonStyle(compact: true))
-      .focused($focusedTarget, equals: .themeButton)
+      .padding(.horizontal, 10)
+      .frame(height: 54)
+      .background(.ultraThinMaterial)
+      .clipShape(Capsule(style: .continuous))
+      .overlay(
+        Capsule(style: .continuous)
+          .stroke(Color.white.opacity(0.16), lineWidth: 1)
+      )
+      .shadow(color: .black.opacity(0.35), radius: 18, y: 6)
     }
     .onChange(of: focusedTarget) { newTarget in
       appState.isTopNavBarFocused = (newTarget != nil)
@@ -675,7 +719,7 @@ struct TvAppleTopNavigationBar: View {
       focusedTarget = .tab(selectedSection)
     }
     .padding(.horizontal, 48)
-    .padding(.top, 28)
+    .padding(.top, 26)
     .padding(.bottom, 10)
   }
 }
@@ -1055,17 +1099,19 @@ struct TvVodSectionView: View {
     ScrollViewReader { scrollProxy in
       ScrollView {
         VStack(alignment: .leading, spacing: 30) {
-          // 1. Floating Glass Filter & Action Bar
-          HStack(spacing: 16) {
+          // 1. Floating Glass Filter & Action Bar (Unified HStack(spacing: 8) + 16pt font across all action & category pills)
+          HStack(spacing: 14) {
             Button {
               showSourcePicker = true
             } label: {
-              HStack(spacing: 10) {
+              HStack(spacing: 8) {
                 Image(systemName: "server.rack")
+                  .font(.system(size: 15, weight: .semibold))
                 Text(appState.selectedSource?.displayName ?? "选择影视源")
+                  .font(.system(size: 16, weight: .semibold))
                   .lineLimit(1)
                 Image(systemName: "chevron.down")
-                  .font(.caption)
+                  .font(.system(size: 12, weight: .bold))
               }
             }
             .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
@@ -1074,10 +1120,13 @@ struct TvVodSectionView: View {
             Button {
               showSearchSheet = true
             } label: {
-              Label(
-                appState.searchKeyword.isEmpty ? "全网搜索" : "搜索: \(appState.searchKeyword)",
-                systemImage: "magnifyingglass"
-              )
+              HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                  .font(.system(size: 15, weight: .semibold))
+                Text(appState.searchKeyword.isEmpty ? "全网搜索" : "搜索: \(appState.searchKeyword)")
+                  .font(.system(size: 16, weight: .semibold))
+                  .lineLimit(1)
+              }
             }
             .buttonStyle(TvApplePillButtonStyle(isSelected: !appState.searchKeyword.isEmpty, compact: true))
 
@@ -1090,7 +1139,12 @@ struct TvVodSectionView: View {
                   }
                 }
               } label: {
-                Label("清除搜索", systemImage: "xmark.circle.fill")
+                HStack(spacing: 8) {
+                  Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 15, weight: .semibold))
+                  Text("清除搜索")
+                    .font(.system(size: 16, weight: .semibold))
+                }
               }
               .buttonStyle(TvApplePillButtonStyle(compact: true))
             }
@@ -1098,18 +1152,25 @@ struct TvVodSectionView: View {
             // Category Horizontal Pills (Synchronized with Expanded Category Drawer)
             ScrollViewReader { catBarProxy in
               ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 12) {
-                  Button("推荐首页") {
+                HStack(spacing: 10) {
+                  Button {
                     Task { await appState.selectCategory(nil) }
+                  } label: {
+                    Text("推荐首页")
+                      .font(.system(size: 16, weight: appState.selectedCategoryId == nil ? .bold : .medium))
                   }
                   .buttonStyle(TvApplePillButtonStyle(isSelected: appState.selectedCategoryId == nil, compact: true))
                   .id("cat_home")
 
                   ForEach(appState.categories) { cat in
-                    Button(cat.typeName) {
+                    let isCatSel = (appState.selectedCategoryId == cat.typeId)
+                    Button {
                       Task { await appState.selectCategory(cat.typeId) }
+                    } label: {
+                      Text(cat.typeName)
+                        .font(.system(size: 16, weight: isCatSel ? .bold : .medium))
                     }
-                    .buttonStyle(TvApplePillButtonStyle(isSelected: appState.selectedCategoryId == cat.typeId, compact: true))
+                    .buttonStyle(TvApplePillButtonStyle(isSelected: isCatSel, compact: true))
                     .id("cat_\(cat.typeId)")
                   }
                 }
@@ -1135,9 +1196,11 @@ struct TvVodSectionView: View {
                 }
               }
             } label: {
-              HStack(spacing: 6) {
+              HStack(spacing: 8) {
                 Image(systemName: appState.vodCategoriesExpanded ? "chevron.up.circle.fill" : "slider.horizontal.3")
-                Text(appState.vodCategoriesExpanded ? "收起" : "筛选分类 (\(appState.categories.count + 1))")
+                  .font(.system(size: 15, weight: .semibold))
+                Text(appState.vodCategoriesExpanded ? "收起分类" : "筛选分类 (\(appState.categories.count + 1))")
+                  .font(.system(size: 16, weight: .semibold))
                   .lineLimit(1)
               }
             }
@@ -1150,7 +1213,7 @@ struct TvVodSectionView: View {
             )
             .fixedSize(horizontal: true, vertical: false)
 
-            Spacer()
+            Spacer(minLength: 4)
 
             Button {
               if let src = appState.selectedSource {
@@ -1164,7 +1227,12 @@ struct TvVodSectionView: View {
                 }
               }
             } label: {
-              Image(systemName: "arrow.clockwise")
+              HStack(spacing: 6) {
+                Image(systemName: "arrow.clockwise")
+                  .font(.system(size: 15, weight: .semibold))
+                Text("刷新")
+                  .font(.system(size: 16, weight: .semibold))
+              }
             }
             .buttonStyle(TvApplePillButtonStyle(compact: true))
           }
@@ -1238,12 +1306,12 @@ struct TvVodSectionView: View {
                     if appState.vodIsScrolledDown != shouldBeScrolled {
                       appState.vodIsScrolledDown = shouldBeScrolled
                     }
-                    if focusedIdx >= visibleVodLimit - 12 && visibleVodLimit < totalCount {
-                      visibleVodLimit = min(totalCount, visibleVodLimit + 48)
+                    if focusedIdx >= visibleVodLimit - 18 && visibleVodLimit < totalCount {
+                      visibleVodLimit = min(totalCount, visibleVodLimit + 60)
                     }
-                    if focusedIdx >= totalCount - 12 {
+                    if focusedIdx >= totalCount - 18 {
                       Task {
-                        await appState.loadMoreVodIfNeeded(currentItem: item)
+                        await appState.loadMoreVodIfNeeded(currentItem: nil)
                       }
                     }
                   }
@@ -1264,19 +1332,43 @@ struct TvVodSectionView: View {
               } else if visibleVodLimit < totalCount {
                 Button("继续显示更多 (\(activeSliceCount)/\(totalCount))") {
                   visibleVodLimit = min(totalCount, visibleVodLimit + 60)
-                }
-                .buttonStyle(TvApplePillButtonStyle(compact: true))
-                .onAppear {
-                  visibleVodLimit = min(totalCount, visibleVodLimit + 60)
-                }
-              } else if appState.hasMoreVodPages && appState.searchKeyword.isEmpty {
-                Color.clear
-                  .frame(height: 20)
-                  .onAppear {
+                  if visibleVodLimit >= totalCount - 18 && appState.hasMoreVodPages && appState.searchKeyword.isEmpty {
                     Task {
                       await appState.loadMoreVodIfNeeded(currentItem: nil)
                     }
                   }
+                }
+                .buttonStyle(
+                  TvApplePillButtonStyle(
+                    compact: true,
+                    onFocusChange: { focused in
+                      guard focused else { return }
+                      visibleVodLimit = min(totalCount, visibleVodLimit + 60)
+                      if visibleVodLimit >= totalCount - 18 && appState.hasMoreVodPages && appState.searchKeyword.isEmpty {
+                        Task {
+                          await appState.loadMoreVodIfNeeded(currentItem: nil)
+                        }
+                      }
+                    }
+                  )
+                )
+              } else if appState.hasMoreVodPages && appState.searchKeyword.isEmpty {
+                Button("加载更多影片 (已加载 \(appState.vodItems.count) 部)") {
+                  Task {
+                    await appState.loadMoreVodIfNeeded(currentItem: nil)
+                  }
+                }
+                .buttonStyle(
+                  TvApplePillButtonStyle(
+                    compact: true,
+                    onFocusChange: { focused in
+                      guard focused else { return }
+                      Task {
+                        await appState.loadMoreVodIfNeeded(currentItem: nil)
+                      }
+                    }
+                  )
+                )
               } else {
                 Text("— 已加载全部 \(appState.vodItems.count) 部影片 —")
                   .font(.system(size: 16))
@@ -1788,7 +1880,6 @@ struct TvVodHeroBanner: View {
 
 /// Native Apple TV .card Poster Item (Decoupled from @EnvironmentObject so focus navigation triggers zero global rebuilds, while reacting to themeId changes!)
 struct TvVodPosterCard: View {
-  @Environment(\.isFocused) private var isFocused
   let item: TvVodItem
   let index: Int
   var themeId: String = TvThemePalette.current.id
@@ -1854,12 +1945,15 @@ struct TvVodPosterCard: View {
       }
       .frame(width: 245)
     }
-    .buttonStyle(TvApplePosterCardButtonStyle())
-    .onChange(of: isFocused) { focused in
-      if focused {
-        onFocusedAtIndex(index)
-      }
-    }
+    .buttonStyle(
+      TvApplePosterCardButtonStyle(
+        onFocusChange: { focused in
+          if focused {
+            onFocusedAtIndex(index)
+          }
+        }
+      )
+    )
   }
 }
 
@@ -1915,9 +2009,30 @@ struct TvSourcePickerSheet: View {
     case 0: return "TVBox XML"
     case 1: return "TVBox JSON"
     case 3: return "Spider JAR"
-    case 4: return "Remote Spider"
+    case 4: return "Remote"
     default: return "TVBox"
     }
+  }
+
+  private static func cleanShortHost(for src: TvVodSource) -> String {
+    let raw = src.api.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let urlHost = URL(string: raw)?.host, !urlHost.isEmpty {
+      return urlHost.count > 22 ? String(urlHost.prefix(20)) + "…" : urlHost
+    }
+    if let regex = try? NSRegularExpression(pattern: "https?://([^/:?#\\s]+)", options: [.caseInsensitive]),
+       let match = regex.firstMatch(in: raw, options: [], range: NSRange(raw.startIndex..<raw.endIndex, in: raw)),
+       let range = Range(match.range(at: 1), in: raw) {
+      let host = String(raw[range])
+      return host.count > 22 ? String(host.prefix(20)) + "…" : host
+    }
+    if raw.lowercased().hasPrefix("csp_") {
+      let clean = raw.components(separatedBy: CharacterSet(charactersIn: "?#&/ ")).first ?? raw
+      return clean.count > 18 ? String(clean.prefix(16)) + "…" : clean
+    }
+    if src.isSpiderSource {
+      return "内置爬虫源"
+    }
+    return "标准接口"
   }
 
   private static func latencyGradeInfo(ms: Int?, isTesting: Bool) -> (label: String, grade: String, color: Color, bars: Int) {
@@ -2047,7 +2162,10 @@ struct TvSourcePickerSheet: View {
         .focusSection()
 
         ScrollView {
-          LazyVGrid(columns: [GridItem(.adaptive(minimum: 340, maximum: 420), spacing: 14)], spacing: 14) {
+          LazyVGrid(
+            columns: Array(repeating: GridItem(.flexible(minimum: 320, maximum: 540), spacing: 14), count: 3),
+            spacing: 14
+          ) {
             ForEach(filteredSources) { src in
               let isSelected = appState.selectedSource?.id == src.id
               let isPinned = appState.pinnedSourceIds.contains(src.id)
@@ -2055,12 +2173,12 @@ struct TvSourcePickerSheet: View {
               let isTesting = appState.testingSourceIds.contains(src.id)
               let latInfo = Self.latencyGradeInfo(ms: ms, isTesting: isTesting)
               let proto = Self.protocolTag(for: src)
-              let host = URL(string: src.api)?.host ?? (src.isSpiderSource ? src.api : "cms-api")
+              let host = Self.cleanShortHost(for: src)
               Button {
                 isPresented = false
                 Task { await appState.selectSource(src) }
               } label: {
-                HStack(spacing: 12) {
+                HStack(spacing: 10) {
                   ZStack {
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                       .fill(
@@ -2068,20 +2186,20 @@ struct TvSourcePickerSheet: View {
                           ? theme.accent
                           : (src.isSpiderSource ? Color.indigo.opacity(0.28) : theme.accent.opacity(0.22))
                       )
-                      .frame(width: 42, height: 42)
+                      .frame(width: 40, height: 40)
                     if isSelected {
                       Image(systemName: "play.fill")
-                        .font(.system(size: 17, weight: .bold))
+                        .font(.system(size: 16, weight: .bold))
                         .foregroundColor(.white)
                     } else {
                       Text(String(src.displayName.prefix(1)))
-                        .font(.system(size: 17, weight: .heavy))
+                        .font(.system(size: 16, weight: .heavy))
                         .foregroundColor(src.isSpiderSource ? Color(red: 0.55, green: 0.62, blue: 1.0) : theme.accentHover)
                     }
                   }
 
                   VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 6) {
+                    HStack(spacing: 5) {
                       if isPinned {
                         Image(systemName: "pin.fill")
                           .font(.system(size: 11))
@@ -2091,6 +2209,7 @@ struct TvSourcePickerSheet: View {
                         .font(.system(size: 15, weight: .bold))
                         .foregroundColor(.white)
                         .lineLimit(1)
+                        .truncationMode(.tail)
                       if isSelected {
                         Text("当前")
                           .font(.system(size: 10, weight: .bold))
@@ -2099,6 +2218,7 @@ struct TvSourcePickerSheet: View {
                           .padding(.vertical, 1)
                           .background(theme.accent.opacity(0.22))
                           .clipShape(Capsule())
+                          .fixedSize()
                       }
                     }
                     HStack(spacing: 6) {
@@ -2109,14 +2229,17 @@ struct TvSourcePickerSheet: View {
                         .padding(.vertical, 2)
                         .background((src.isSpiderSource ? Color.indigo : theme.accent).opacity(0.18))
                         .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                        .fixedSize()
                       Text(host)
                         .font(.system(size: 11, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.5))
+                        .foregroundColor(.white.opacity(0.52))
                         .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: 155, alignment: .leading)
                     }
                   }
-
-                  Spacer()
+                  .frame(maxWidth: .infinity, alignment: .leading)
+                  .clipped()
 
                   // Latency & Signal Bars Badge
                   HStack(spacing: 6) {
@@ -2129,14 +2252,17 @@ struct TvSourcePickerSheet: View {
                     }
                     VStack(alignment: .trailing, spacing: 1) {
                       Text(latInfo.label)
-                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                        .font(.system(size: 11.5, weight: .bold, design: .monospaced))
                         .foregroundColor(latInfo.color)
+                        .lineLimit(1)
                       Text(latInfo.grade)
                         .font(.system(size: 9.5, weight: .semibold))
                         .foregroundColor(latInfo.color.opacity(0.85))
+                        .lineLimit(1)
                     }
                   }
-                  .padding(.horizontal, 9)
+                  .fixedSize()
+                  .padding(.horizontal, 8)
                   .padding(.vertical, 5)
                   .background(latInfo.color.opacity(0.12))
                   .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -2145,8 +2271,10 @@ struct TvSourcePickerSheet: View {
                       .stroke(latInfo.color.opacity(0.38), lineWidth: 1)
                   )
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .frame(maxWidth: .infinity, minHeight: 72, maxHeight: 72, alignment: .leading)
+                .clipped()
               }
               .buttonStyle(TvAppleSurfaceButtonStyle(isSelected: isSelected, cornerRadius: 12))
               .contextMenu {
@@ -2169,11 +2297,18 @@ struct TvSourcePickerSheet: View {
               }
             }
           }
-          .padding(4)
+          .padding(6)
         }
         .focusSection()
       }
-      .padding(36)
+      .padding(32)
+      .frame(
+        width: min(UIScreen.main.bounds.width - 100, 1640),
+        height: min(UIScreen.main.bounds.height - 90, 900)
+      )
+      .background(.regularMaterial)
+      .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+      .clipped()
     }
     .withTvLanQuickInputOverlay(appState)
   }
@@ -2282,6 +2417,18 @@ struct TvVodDetailSheetView: View {
   @State private var isSearchingAlternatives = false
   @FocusState private var focusedDetailTarget: String?
 
+  // 16:9 Inline Video Preview Window State (Click preview window to enter fullscreen)
+  @State private var previewPlayer = AVPlayer()
+  @State private var previewGroupIndex = 0
+  @State private var previewEpisodeIndex = 0
+  @State private var isPreviewLoading = false
+  @State private var isPreviewPlaying = false
+  @State private var previewPositionSec: Double = 0
+  @State private var previewDurationSec: Double = 0
+  @State private var previewResolvedInfo: (finalStream: String, backupProxyUrl: String, headers: [String: String], viaBadge: String, resumeSec: Double)? = nil
+  @State private var previewTimeObserver: Any? = nil
+  @State private var previewLoadTask: Task<Void, Never>? = nil
+
   private let chunkSize = 40
   private let episodeColumns = [
     GridItem(.adaptive(minimum: 155, maximum: 195), spacing: 10)
@@ -2308,14 +2455,28 @@ struct TvVodDetailSheetView: View {
         ScrollView {
           VStack(alignment: .leading, spacing: 30) {
             if isLoading {
-              VStack(spacing: 22) {
+              VStack(spacing: 24) {
                 ProgressView()
                   .scaleEffect(1.6)
                 Text("正在加载影片详情与高清片源...")
                   .font(.title3)
                   .foregroundColor(.white.opacity(0.75))
+                Button {
+                  appState.selectedDetailItem = nil
+                } label: {
+                  Label("返回列表", systemImage: "xmark")
+                }
+                .buttonStyle(TvApplePillButtonStyle(compact: true))
+                .focused($focusedDetailTarget, equals: "detail_loading_back")
               }
               .frame(maxWidth: .infinity, minHeight: 620)
+              .onAppear {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                  if isLoading {
+                    focusedDetailTarget = "detail_loading_back"
+                  }
+                }
+              }
             } else if let d = detail {
               let resumeInfo = appState.lastWatchedEpisode(for: d)
 
@@ -2423,28 +2584,21 @@ struct TvVodDetailSheetView: View {
                   // 3. 网易爆米花 Primary Action Bar
                   HStack(spacing: 16) {
                     if !d.playGroups.isEmpty {
-                      let targetGroupIdx = resumeInfo?.groupIndex ?? min(selectedGroupIndex, max(0, d.playGroups.count - 1))
-                      let targetEpIdx = resumeInfo?.episodeIndex ?? 0
+                      let targetGroupIdx = min(max(0, previewGroupIndex), d.playGroups.count - 1)
                       let targetGroup = d.playGroups[targetGroupIdx]
+                      let targetEpIdx = min(max(0, previewEpisodeIndex), max(0, targetGroup.episodes.count - 1))
                       if targetEpIdx < targetGroup.episodes.count {
                         let targetEp = targetGroup.episodes[targetEpIdx]
-                        let playLabel = resumeInfo != nil
-                          ? "继续播放 \(targetEp.title) (\(formatClock(resumeInfo!.savedSec)))"
-                          : "立即播放 \(targetEp.title)"
+                        let currentSec = previewPositionSec > 5 ? previewPositionSec : (resumeInfo?.savedSec ?? 0)
+                        let playLabel = currentSec > 5
+                          ? "全屏播放 \(targetEp.title) (\(formatClock(currentSec)))"
+                          : "全屏播放 \(targetEp.title)"
 
                         Button {
-                          // Keep appState.selectedDetailItem intact so pressing Back in the video player returns to this Detail Page!
-                          Task {
-                            await appState.startEpisodePlayback(
-                              source: currentSource,
-                              detail: d,
-                              groupIndex: targetGroupIdx,
-                              episodeIndex: targetEpIdx
-                            )
-                          }
+                          enterFullscreenFromPreview(source: currentSource, detail: d)
                         } label: {
                           HStack(spacing: 10) {
-                            Image(systemName: "play.fill")
+                            Image(systemName: "arrow.up.left.and.arrow.down.right")
                             Text(playLabel)
                           }
                           .padding(.horizontal, 6)
@@ -2502,15 +2656,8 @@ struct TvVodDetailSheetView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-                // Right Floating 3D Poster Card
-                TvRemoteImage(rawUrl: posterUrl, placeholderIcon: "film", contentMode: .fill)
-                  .frame(width: 248, height: 356)
-                  .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-                  .overlay(
-                    RoundedRectangle(cornerRadius: 24, style: .continuous)
-                      .stroke(Color.white.opacity(0.24), lineWidth: 1.5)
-                  )
-                  .shadow(color: .black.opacity(0.65), radius: 28, y: 14)
+                // Right 16:9 Live Video Preview Window (Click window to enter fullscreen playback)
+                vodDetailVideoPreviewCard(source: currentSource, detail: d, posterUrl: posterUrl)
               }
               .id("detail_top_anchor")
 
@@ -2655,7 +2802,8 @@ struct TvVodDetailSheetView: View {
                   LazyVGrid(columns: episodeColumns, spacing: 10) {
                     ForEach(Array(visibleEpisodes.enumerated()), id: \.element.id) { sliceIdx, ep in
                       let savedSec = appState.savedPosition(vodId: d.vodId, episodeTitle: ep.title)
-                      let isLastWatched = resumeInfo?.episodeTitle == ep.title && resumeInfo?.groupIndex == safeGroupIdx
+                      let isActivePreviewEp = (safeGroupIdx == previewGroupIndex && ep.index == previewEpisodeIndex)
+                      let isLastWatched = isActivePreviewEp || (resumeInfo?.episodeTitle == ep.title && resumeInfo?.groupIndex == safeGroupIdx)
 
                       TvFilmlyEpisodeCard(
                         episode: ep,
@@ -2674,15 +2822,17 @@ struct TvVodDetailSheetView: View {
                               episode: ep
                             )
                           }
+                        } else if isActivePreviewEp {
+                          // Already playing in the 16:9 preview window -> enter fullscreen playback
+                          enterFullscreenFromPreview(source: currentSource, detail: d)
                         } else {
-                          Task {
-                            await appState.startEpisodePlayback(
-                              source: currentSource,
-                              detail: d,
-                              groupIndex: safeGroupIdx,
-                              episodeIndex: ep.index
-                            )
-                          }
+                          // Switch the 16:9 detail video preview window to this episode
+                          startPreviewPlayback(
+                            source: currentSource,
+                            detail: d,
+                            groupIndex: safeGroupIdx,
+                            episodeIndex: ep.index
+                          )
                         }
                       }
                     }
@@ -2721,10 +2871,41 @@ struct TvVodDetailSheetView: View {
     }
     .onChange(of: appState.activePlayback == nil) { isPlayerClosed in
       if isPlayerClosed {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-          focusedDetailTarget = "detail_primary_play"
+        if let d = detail {
+          let currentSource = activeSource ?? item.source
+          if let resume = appState.lastWatchedEpisode(for: d) {
+            selectedGroupIndex = resume.groupIndex
+            selectedChunkIndex = resume.episodeIndex / chunkSize
+            if resume.groupIndex != previewGroupIndex || resume.episodeIndex != previewEpisodeIndex || previewPlayer.currentItem == nil {
+              startPreviewPlayback(
+                source: currentSource,
+                detail: d,
+                groupIndex: resume.groupIndex,
+                episodeIndex: resume.episodeIndex
+              )
+            } else {
+              let saved = resume.savedSec
+              if saved > 5 && abs(saved - previewPositionSec) > 3 {
+                previewPlayer.seek(to: CMTime(seconds: saved, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+              }
+              previewPlayer.play()
+              isPreviewPlaying = true
+            }
+          } else {
+            previewPlayer.play()
+            isPreviewPlaying = true
+          }
         }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+          focusedDetailTarget = "detail_preview_window"
+        }
+      } else {
+        previewPlayer.pause()
+        isPreviewPlaying = false
       }
+    }
+    .onDisappear {
+      cleanupPreviewPlayer()
     }
     .task(id: item.id) {
       appState.detailShowSourceShelf = false
@@ -2733,11 +2914,337 @@ struct TvVodDetailSheetView: View {
       activeSource = item.source
       await loadDetail(for: item)
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-        focusedDetailTarget = "detail_primary_play"
+        focusedDetailTarget = "detail_preview_window"
       }
       if let d = detail, d.playGroups.isEmpty {
         await searchAlternativeSources(title: d.vodName)
       }
+    }
+  }
+
+  @ViewBuilder
+  private func vodDetailVideoPreviewCard(source: TvVodSource, detail d: TvVodDetail, posterUrl: String) -> some View {
+    let safeGroupIdx = min(max(0, previewGroupIndex), max(0, d.playGroups.count - 1))
+    let group: TvPlayGroup? = d.playGroups.isEmpty ? nil : d.playGroups[safeGroupIdx]
+    let safeEpIdx = min(max(0, previewEpisodeIndex), max(0, (group?.episodes.count ?? 1) - 1))
+    let previewEp: TvEpisode? = (group != nil && safeEpIdx < group!.episodes.count) ? group!.episodes[safeEpIdx] : nil
+    let epTitle = previewEp?.title ?? d.vodRemarks
+    let groupName = group?.name ?? source.displayName
+
+    Button {
+      enterFullscreenFromPreview(source: source, detail: d)
+    } label: {
+      ZStack {
+        Color.black
+
+        // Backdrop poster while preview stream is resolving
+        if !isPreviewPlaying || isPreviewLoading {
+          TvRemoteImage(rawUrl: posterUrl, placeholderIcon: "film", contentMode: .fill)
+            .frame(width: 560, height: 315)
+            .clipped()
+            .overlay(Color.black.opacity(0.45))
+        }
+
+        // Live 16:9 AVPlayer video preview layer
+        TvRawAVPlayerLayerView(player: previewPlayer, videoGravity: .resizeAspect)
+          .frame(width: 560, height: 315)
+          .opacity(isPreviewPlaying ? 1.0 : 0.01)
+
+        // Subtle top & bottom gradient scrims for badges
+        VStack(spacing: 0) {
+          LinearGradient(
+            colors: [Color.black.opacity(0.72), Color.clear],
+            startPoint: .top,
+            endPoint: .bottom
+          )
+          .frame(height: 64)
+          Spacer()
+          LinearGradient(
+            colors: [Color.clear, Color.black.opacity(0.84)],
+            startPoint: .top,
+            endPoint: .bottom
+          )
+          .frame(height: 82)
+        }
+
+        // Center loading / play indicator
+        if isPreviewLoading {
+          VStack(spacing: 10) {
+            ProgressView()
+              .scaleEffect(1.2)
+            Text("正在加载预览画面...")
+              .font(.system(size: 13, weight: .semibold))
+              .foregroundColor(.white.opacity(0.9))
+          }
+          .padding(.horizontal, 18)
+          .padding(.vertical, 12)
+          .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+              .fill(Color.black.opacity(0.68))
+          )
+        } else if !isPreviewPlaying {
+          Image(systemName: "play.circle.fill")
+            .font(.system(size: 56))
+            .foregroundColor(.white.opacity(0.88))
+            .shadow(color: .black.opacity(0.6), radius: 12)
+        }
+
+        // Top & Bottom Overlay Badges
+        VStack {
+          HStack(spacing: 8) {
+            HStack(spacing: 6) {
+              Circle()
+                .fill(isPreviewPlaying ? Color.green : appState.activeTheme.accentHover)
+                .frame(width: 8, height: 8)
+              Text(isPreviewPlaying ? "正在预览 · \(epTitle)" : "视频窗口 · \(epTitle)")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundColor(.white)
+                .lineLimit(1)
+            }
+            .padding(.horizontal, 11)
+            .padding(.vertical, 5)
+            .background(Capsule().fill(Color.black.opacity(0.68)))
+            .overlay(Capsule().stroke(Color.white.opacity(0.18), lineWidth: 0.8))
+
+            Spacer()
+
+            Text(groupName)
+              .font(.system(size: 12, weight: .semibold))
+              .foregroundColor(appState.activeTheme.accentHover)
+              .padding(.horizontal, 10)
+              .padding(.vertical, 4)
+              .background(Capsule().fill(Color.black.opacity(0.68)))
+          }
+
+          Spacer()
+
+          HStack(spacing: 10) {
+            if previewPositionSec > 1 {
+              Text(
+                previewDurationSec > 1
+                  ? "\(formatClock(previewPositionSec)) / \(formatClock(previewDurationSec))"
+                  : formatClock(previewPositionSec)
+              )
+              .font(.system(size: 13, weight: .bold, design: .monospaced))
+              .foregroundColor(.white.opacity(0.92))
+              .padding(.horizontal, 10)
+              .padding(.vertical, 4)
+              .background(Capsule().fill(Color.black.opacity(0.62)))
+            }
+
+            Spacer()
+
+            HStack(spacing: 6) {
+              Image(systemName: "arrow.up.left.and.arrow.down.right")
+                .font(.system(size: 12, weight: .bold))
+              Text("点击窗口全屏播放")
+                .font(.system(size: 13, weight: .bold))
+            }
+            .foregroundColor(.black)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(Capsule().fill(appState.activeTheme.accentHover))
+          }
+        }
+        .padding(14)
+      }
+      .frame(width: 560, height: 315)
+      .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+      .overlay(
+        RoundedRectangle(cornerRadius: 22, style: .continuous)
+          .stroke(
+            focusedDetailTarget == "detail_preview_window"
+              ? appState.activeTheme.accentHover
+              : Color.white.opacity(0.24),
+            lineWidth: focusedDetailTarget == "detail_preview_window" ? 3 : 1.5
+          )
+      )
+      .shadow(color: .black.opacity(0.68), radius: 26, y: 12)
+    }
+    .buttonStyle(TvAppleSurfaceButtonStyle(isSelected: focusedDetailTarget == "detail_preview_window", cornerRadius: 22))
+    .focused($focusedDetailTarget, equals: "detail_preview_window")
+  }
+
+  private func setupPreviewTimeObserverIfNeeded() {
+    guard previewTimeObserver == nil else { return }
+    let interval = CMTime(seconds: 0.5, preferredTimescale: 600)
+    previewTimeObserver = previewPlayer.addPeriodicTimeObserver(forInterval: interval, queue: .main) { time in
+      let sec = time.seconds
+      if sec.isFinite && sec >= 0 {
+        previewPositionSec = sec
+      }
+      if let item = previewPlayer.currentItem {
+        let dur = item.duration.seconds
+        if dur.isFinite && dur > 0 {
+          previewDurationSec = dur
+        }
+        if previewPlayer.timeControlStatus == .playing && !isPreviewPlaying {
+          isPreviewPlaying = true
+          isPreviewLoading = false
+        }
+        // Sample network download speed during detail-page preview playback
+        let proxySpeed = TvNetworkSpeedMonitor.shared.recentDownstreamBytesPerSecond
+        var logSpeed: Double = 0
+        if let evt = item.accessLog()?.events.last {
+          if evt.observedBitrate > 0 && evt.observedBitrate.isFinite {
+            logSpeed = evt.observedBitrate / 8.0
+          } else if evt.indicatedBitrate > 0 && evt.indicatedBitrate.isFinite {
+            logSpeed = evt.indicatedBitrate / 8.0
+          }
+        }
+        let measured = max(proxySpeed, logSpeed)
+        if measured > 0 {
+          appState.latestMeasuredSpeedBytesPerSec = measured
+        }
+      }
+      if sec.isFinite && sec > 3,
+         let d = detail,
+         previewGroupIndex >= 0, previewGroupIndex < d.playGroups.count {
+        let grp = d.playGroups[previewGroupIndex]
+        if previewEpisodeIndex >= 0, previewEpisodeIndex < grp.episodes.count {
+          let ep = grp.episodes[previewEpisodeIndex]
+          let currentSource = activeSource ?? item.source
+          appState.recordPlaybackProgress(
+            source: currentSource,
+            detail: d,
+            groupName: grp.name,
+            episodeTitle: ep.title,
+            position: sec,
+            duration: previewDurationSec
+          )
+        }
+      }
+    }
+  }
+
+  private func startPreviewPlayback(
+    source: TvVodSource,
+    detail d: TvVodDetail,
+    groupIndex: Int,
+    episodeIndex: Int
+  ) {
+    guard !d.playGroups.isEmpty else { return }
+    let safeGroup = min(max(0, groupIndex), d.playGroups.count - 1)
+    let group = d.playGroups[safeGroup]
+    guard !group.episodes.isEmpty else { return }
+    let safeEp = min(max(0, episodeIndex), group.episodes.count - 1)
+
+    previewLoadTask?.cancel()
+    previewPlayer.pause()
+    previewGroupIndex = safeGroup
+    previewEpisodeIndex = safeEp
+    selectedGroupIndex = safeGroup
+    selectedChunkIndex = safeEp / chunkSize
+    isPreviewLoading = true
+    isPreviewPlaying = false
+    previewResolvedInfo = nil
+
+    setupPreviewTimeObserverIfNeeded()
+
+    previewLoadTask = Task {
+      guard let info = await appState.resolveEpisodePlaybackInfo(
+        source: source,
+        detail: d,
+        groupIndex: safeGroup,
+        episodeIndex: safeEp
+      ) else {
+        await MainActor.run {
+          isPreviewLoading = false
+        }
+        return
+      }
+      if Task.isCancelled { return }
+      guard let url = URL(string: info.finalStream) else {
+        await MainActor.run {
+          isPreviewLoading = false
+        }
+        return
+      }
+
+      await MainActor.run {
+        if Task.isCancelled || appState.activePlayback != nil { return }
+        previewResolvedInfo = info
+        let asset: AVURLAsset
+        if info.headers.isEmpty || info.finalStream.contains("127.0.0.1:") {
+          asset = AVURLAsset(url: url)
+        } else {
+          asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": info.headers])
+        }
+        let playerItem = AVPlayerItem(asset: asset)
+        playerItem.preferredForwardBufferDuration = 10
+        previewPlayer.replaceCurrentItem(with: playerItem)
+        if info.resumeSec > 5 {
+          previewPositionSec = info.resumeSec
+          previewPlayer.seek(
+            to: CMTime(seconds: info.resumeSec, preferredTimescale: 600),
+            toleranceBefore: .zero,
+            toleranceAfter: .zero
+          )
+        } else {
+          previewPositionSec = 0
+        }
+        previewPlayer.play()
+        isPreviewLoading = false
+        isPreviewPlaying = true
+      }
+    }
+  }
+
+  private func enterFullscreenFromPreview(source: TvVodSource, detail d: TvVodDetail) {
+    guard !d.playGroups.isEmpty else { return }
+    let safeGroup = min(max(0, previewGroupIndex), d.playGroups.count - 1)
+    let group = d.playGroups[safeGroup]
+    guard !group.episodes.isEmpty else { return }
+    let safeEp = min(max(0, previewEpisodeIndex), group.episodes.count - 1)
+    let ep = group.episodes[safeEp]
+
+    previewLoadTask?.cancel()
+    let currentSec = previewPlayer.currentTime().seconds
+    if currentSec.isFinite && currentSec > 3 {
+      previewPositionSec = currentSec
+      appState.recordPlaybackProgress(
+        source: source,
+        detail: d,
+        groupName: group.name,
+        episodeTitle: ep.title,
+        position: currentSec,
+        duration: previewDurationSec,
+        force: true
+      )
+    }
+    previewPlayer.pause()
+    isPreviewPlaying = false
+
+    var preResolved = previewResolvedInfo
+    if var info = preResolved, previewPositionSec > 5 {
+      info.resumeSec = previewPositionSec
+      preResolved = info
+    }
+
+    Task {
+      await appState.startEpisodePlayback(
+        source: source,
+        detail: d,
+        groupIndex: safeGroup,
+        episodeIndex: safeEp,
+        preResolvedInfo: preResolved
+      )
+    }
+  }
+
+  private func cleanupPreviewPlayer() {
+    previewLoadTask?.cancel()
+    previewLoadTask = nil
+    previewPlayer.pause()
+    previewPlayer.replaceCurrentItem(with: nil)
+    if let token = previewTimeObserver {
+      previewPlayer.removeTimeObserver(token)
+      previewTimeObserver = nil
+    }
+    isPreviewPlaying = false
+    isPreviewLoading = false
+    if appState.activePlayback == nil {
+      appState.latestMeasuredSpeedBytesPerSec = 0
     }
   }
 
@@ -2746,9 +3253,28 @@ struct TvVodDetailSheetView: View {
     defer { isLoading = false }
     do {
       detail = try await appState.api.fetchVodDetail(source: target.source, vodId: target.vodId)
-      if let d = detail, let resume = appState.lastWatchedEpisode(for: d) {
-        selectedGroupIndex = resume.groupIndex
-        selectedChunkIndex = resume.episodeIndex / chunkSize
+      if let d = detail {
+        let initGroup: Int
+        let initEp: Int
+        if let resume = appState.lastWatchedEpisode(for: d) {
+          initGroup = resume.groupIndex
+          initEp = resume.episodeIndex
+        } else {
+          initGroup = 0
+          initEp = 0
+        }
+        selectedGroupIndex = initGroup
+        selectedChunkIndex = initEp / chunkSize
+        previewGroupIndex = initGroup
+        previewEpisodeIndex = initEp
+        if !d.playGroups.isEmpty && appState.activePlayback == nil {
+          startPreviewPlayback(
+            source: target.source,
+            detail: d,
+            groupIndex: initGroup,
+            episodeIndex: initEp
+          )
+        }
       } else {
         selectedGroupIndex = 0
         selectedChunkIndex = 0
@@ -2791,7 +3317,6 @@ struct TvVodDetailSheetView: View {
 
 /// Sleek Compact Episode Link Chip with Progress Bar & Status Indicator (Decoupled from @EnvironmentObject)
 struct TvFilmlyEpisodeCard: View {
-  @Environment(\.isFocused) private var isFocused
   let episode: TvEpisode
   let sliceIndex: Int
   let groupName: String
@@ -2848,15 +3373,20 @@ struct TvFilmlyEpisodeCard: View {
       .padding(.vertical, 10)
       .frame(maxWidth: .infinity, alignment: .leading)
     }
-    .buttonStyle(TvAppleSurfaceButtonStyle(isSelected: isLastWatched || savedSeconds > 5, cornerRadius: 10))
-    .onChange(of: isFocused) { focused in
-      if focused, let appState = TvAppState.shared {
-        let shouldBeScrolled = (sliceIndex >= 10)
-        if appState.detailIsScrolledDown != shouldBeScrolled {
-          appState.detailIsScrolledDown = shouldBeScrolled
+    .buttonStyle(
+      TvAppleSurfaceButtonStyle(
+        isSelected: isLastWatched || savedSeconds > 5,
+        cornerRadius: 10,
+        onFocusChange: { focused in
+          if focused, let appState = TvAppState.shared {
+            let shouldBeScrolled = (sliceIndex >= 10)
+            if appState.detailIsScrolledDown != shouldBeScrolled {
+              appState.detailIsScrolledDown = shouldBeScrolled
+            }
+          }
         }
-      }
-    }
+      )
+    )
   }
 }
 
@@ -3304,6 +3834,16 @@ struct TvLiveSectionView: View {
         .padding(.vertical, 16)
       }
 
+      if liveController.activeChannel != nil {
+        TvVideoDownloadSpeedBadge(
+          player: liveController.player,
+          isBuffering: liveController.isBuffering,
+          compact: true
+        )
+        .frame(width: 0, height: 0)
+        .opacity(0)
+      }
+
       if appState.showProxyStatsOverlay {
         VStack {
           HStack {
@@ -3551,13 +4091,6 @@ struct TvLiveSectionView: View {
                 .clipShape(Capsule())
               }
               Spacer()
-              if liveController.activeChannel != nil {
-                TvVideoDownloadSpeedBadge(
-                  player: liveController.player,
-                  isBuffering: liveController.isBuffering,
-                  compact: true
-                )
-              }
             }
             Spacer()
             if isVideoFocused {
@@ -3623,14 +4156,8 @@ struct TvLiveSectionView: View {
           }
           .frame(maxWidth: .infinity, alignment: .leading)
 
-          // Right: Real-Time Speed Badge + 4 Permanent, Fixed-Size Action Buttons (Never Inserted/Removed Dynamically!)
+          // Right: 4 Permanent, Fixed-Size Action Buttons (Never Inserted/Removed Dynamically!)
           HStack(spacing: 10) {
-            TvVideoDownloadSpeedBadge(
-              player: liveController.player,
-              isBuffering: liveController.isBuffering,
-              compact: true
-            )
-
             Button {
               enterFullscreenMode()
             } label: {
@@ -3728,12 +4255,6 @@ struct TvLiveSectionView: View {
                   .font(.system(size: 13, weight: .medium))
                   .foregroundColor(.white.opacity(0.72))
               }
-
-              TvVideoDownloadSpeedBadge(
-                player: liveController.player,
-                isBuffering: liveController.isBuffering,
-                compact: true
-              )
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 12)
@@ -3908,12 +4429,6 @@ struct TvLiveSectionView: View {
             }
             .buttonStyle(TvApplePillButtonStyle(isDestructive: true, compact: true))
             .fixedSize(horizontal: true, vertical: false)
-
-            TvVideoDownloadSpeedBadge(
-              player: liveController.player,
-              isBuffering: liveController.isBuffering,
-              compact: true
-            )
           }
           .padding(.horizontal, 24)
           .padding(.vertical, 16)
@@ -4147,7 +4662,6 @@ struct TvLiveGuideDrawerView: View {
 
 /// Pure, Decoupled Live Channel Row (No @EnvironmentObject observation — 0ms focus navigation in 1,500+ channel lists)
 struct TvLiveChannelRowView: View {
-  @Environment(\.isFocused) private var isFocused
   let index: Int
   let channel: TvLiveChannel
   let isCurrent: Bool
@@ -4202,12 +4716,17 @@ struct TvLiveChannelRowView: View {
       .padding(.horizontal, 14)
       .padding(.vertical, 10)
     }
-    .buttonStyle(TvAppleSurfaceButtonStyle(isSelected: isCurrent, cornerRadius: 15))
-    .onChange(of: isFocused) { focused in
-      if focused {
-        onFocusedAtIndex(index)
-      }
-    }
+    .buttonStyle(
+      TvAppleSurfaceButtonStyle(
+        isSelected: isCurrent,
+        cornerRadius: 15,
+        onFocusChange: { focused in
+          if focused {
+            onFocusedAtIndex(index)
+          }
+        }
+      )
+    )
     .contextMenu {
       Button(action: onFullscreen) {
         Label("全屏观看", systemImage: "arrow.up.left.and.arrow.down.right")
@@ -4804,7 +5323,28 @@ struct TvTelegramDialogsSidebarView: View {
                 .padding(.horizontal, 14)
                 .padding(.vertical, 11)
               }
-              .buttonStyle(TvAppleSurfaceButtonStyle(isSelected: isSelected, cornerRadius: 16))
+              .buttonStyle(
+                TvAppleSurfaceButtonStyle(
+                  isSelected: isSelected,
+                  cornerRadius: 16,
+                  onFocusChange: { focused in
+                    guard focused else { return }
+                    let chats = appState.filteredTelegramChats
+                    if let idx = chats.firstIndex(where: { $0.peer == chat.peer }),
+                       idx >= max(0, chats.count - 4),
+                       !appState.nextTelegramChatCursor.isEmpty,
+                       !appState.isLoadingTelegram {
+                      Task {
+                        await appState.loadTelegramChats(
+                          accountId: appState.activeTelegramAccountId,
+                          folder: appState.selectedTelegramFolderKey,
+                          loadMore: true
+                        )
+                      }
+                    }
+                  }
+                )
+              )
               .contextMenu {
                 if chat.unread > 0 {
                   Button {
@@ -4839,24 +5379,31 @@ struct TvTelegramDialogsSidebarView: View {
             if !appState.nextTelegramChatCursor.isEmpty {
               HStack(spacing: 10) {
                 Spacer()
-                ProgressView()
-                Text("正在加载更多会话...")
-                  .font(.caption)
-                  .foregroundColor(TvTelegramPalette.textMuted)
+                Button {
+                  if !appState.isLoadingTelegram {
+                    Task {
+                      await appState.loadTelegramChats(
+                        accountId: appState.activeTelegramAccountId,
+                        folder: appState.selectedTelegramFolderKey,
+                        loadMore: true
+                      )
+                    }
+                  }
+                } label: {
+                  HStack(spacing: 8) {
+                    if appState.isLoadingTelegram {
+                      ProgressView()
+                    } else {
+                      Image(systemName: "arrow.down.circle")
+                    }
+                    Text(appState.isLoadingTelegram ? "正在加载更多会话..." : "加载更多会话")
+                      .font(.caption)
+                  }
+                }
+                .buttonStyle(TvApplePillButtonStyle(compact: true))
                 Spacer()
               }
               .padding(.vertical, 12)
-              .onAppear {
-                if !appState.isLoadingTelegram {
-                  Task {
-                    await appState.loadTelegramChats(
-                      accountId: appState.activeTelegramAccountId,
-                      folder: appState.selectedTelegramFolderKey,
-                      loadMore: true
-                    )
-                  }
-                }
-              }
             }
           }
           .padding(.horizontal, 10)
@@ -7744,6 +8291,10 @@ struct TvMediaLibrarySectionView: View {
       TvMusicPlaylistManagerSheet()
         .environmentObject(appState)
     }
+    .sheet(isPresented: $appState.showMusicSmartAiSheet) {
+      TvMusicSmartAiPlaylistSheet()
+        .environmentObject(appState)
+    }
     .sheet(item: $appState.activeArchiveMusicBrowserEntry) { archEntry in
       TvArchiveMusicBrowserSheet(archiveEntry: archEntry)
         .environmentObject(appState)
@@ -8166,6 +8717,30 @@ struct TvMediaLibrarySectionView: View {
         appState.showMusicFolderPickerSheet = true
       } label: {
         Label("自选文件夹/压缩包随机播放", systemImage: "folder.badge.plus")
+          .font(.system(size: 13, weight: .bold))
+          .foregroundColor(theme.accentHover)
+      }
+      .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+      Button {
+        let mount = appState.activeStorageMount
+        let curPath = appState.fileListing.path.isEmpty
+          ? (mount.kind == .cloud115 ? "0" : (mount.kind == .server ? "" : mount.rootPath))
+          : appState.fileListing.path
+        let dirTitle = (curPath as NSString).lastPathComponent
+        let curItem = TvSavedMusicFolderItem(
+          mountId: mount.id,
+          mountName: mount.name,
+          sourceKind: mount.kind,
+          path: curPath,
+          title: (dirTitle.isEmpty || dirTitle == "/" || dirTitle == "0") ? mount.name : dirTitle,
+          isArchive: false,
+          size: 0,
+          pickcode115: ""
+        )
+        appState.openMusicSmartAiSheet(tab: 1, sources: [curItem])
+      } label: {
+        Label("AI 智能生成歌单", systemImage: "sparkles")
           .font(.system(size: 13, weight: .bold))
           .foregroundColor(theme.accentHover)
       }
@@ -11224,7 +11799,45 @@ struct TvSettingsSectionView: View {
 
     HStack(alignment: .top, spacing: 28) {
       // Left Navigation Rail
-      VStack(alignment: .leading, spacing: 16) {
+      VStack(alignment: .leading, spacing: 14) {
+        // Dedicated Apple TV Back Navigation Card
+        Button {
+          appState.navigateBackToPreviousSection()
+        } label: {
+          HStack(spacing: 14) {
+            ZStack {
+              Circle()
+                .fill(
+                  LinearGradient(
+                    colors: [theme.accentHover, theme.accent],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                  )
+                )
+                .frame(width: 42, height: 42)
+              Image(systemName: "chevron.backward")
+                .font(.system(size: 18, weight: .heavy))
+                .foregroundColor(.white)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+              Text("返回 \(appState.lastPrimarySection.rawValue)")
+                .font(.system(size: 17, weight: .heavy, design: .rounded))
+                .foregroundColor(.white)
+              Text("按遥控器 Menu / 返回键也可退出设置")
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundColor(.white.opacity(0.65))
+                .lineLimit(1)
+            }
+            Spacer()
+            Image(systemName: "arrow.uturn.backward.circle.fill")
+              .font(.system(size: 22))
+              .foregroundColor(theme.accentHover)
+          }
+          .padding(.horizontal, 16)
+          .padding(.vertical, 12)
+        }
+        .buttonStyle(TvAppleSurfaceButtonStyle(isSelected: false, cornerRadius: 16))
+
         // System Header Summary Card
         VStack(alignment: .leading, spacing: 10) {
           HStack(spacing: 12) {
@@ -11252,12 +11865,6 @@ struct TvSettingsSectionView: View {
                 .foregroundColor(theme.accentHover)
             }
             Spacer()
-            Button {
-              appState.navigateBackToPreviousSection()
-            } label: {
-              Label("返回 \(appState.lastPrimarySection.rawValue)", systemImage: "arrow.uturn.backward")
-            }
-            .buttonStyle(TvApplePillButtonStyle(compact: true))
           }
 
           HStack(spacing: 8) {
@@ -11819,20 +12426,26 @@ struct TvSettingsSectionView: View {
           .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
         }
 
-        HStack(spacing: 10) {
-          ForEach(["openai", "gemini", "deepseek", "custom"], id: \.self) { prov in
-            let isSel = (aiProviderDraft.lowercased() == prov)
-            Button(prov.uppercased()) {
-              aiProviderDraft = prov
+        let activePreset = TvAppState.aiProviderPreset(for: aiProviderDraft)
+
+        ScrollView(.horizontal, showsIndicators: false) {
+          HStack(spacing: 10) {
+            ForEach(TvAppState.aiProviderPresets, id: \.id) { preset in
+              let isSel = (aiProviderDraft.lowercased() == preset.id)
+              Button(preset.label) {
+                aiProviderDraft = preset.id
+              }
+              .buttonStyle(TvApplePillButtonStyle(isSelected: isSel, isPrimary: isSel, compact: true))
             }
-            .buttonStyle(TvApplePillButtonStyle(isSelected: isSel, isPrimary: isSel, compact: true))
           }
-          Spacer()
-          TextField("API Key (sk-... / AIza...)", text: $aiApiKeyDraft)
-            .frame(width: 340)
+        }
+
+        HStack(spacing: 10) {
+          TextField("API Key (\(activePreset.keyPlaceholder))", text: $aiApiKeyDraft)
+            .frame(maxWidth: .infinity)
           TvQrInputTriggerButton(
-            prompt: "输入 AI API Key",
-            placeholder: "sk-... 或 Gemini API Key",
+            prompt: "输入 \(activePreset.label) API Key",
+            placeholder: activePreset.keyPlaceholder,
             labelText: "扫码填Key"
           ) { text in
             aiApiKeyDraft = text
@@ -11846,9 +12459,23 @@ struct TvSettingsSectionView: View {
         }
 
         HStack(spacing: 12) {
-          TextField("自定义 Base URL (可选，如 https://api.openai.com/v1)", text: $aiBaseUrlDraft)
-          TextField("模型名称 (可选，如 gpt-4o-mini / gemini-2.0-flash)", text: $aiModelDraft)
-            .frame(width: 340)
+          TextField("接入点 Base URL (可选，默认 \(activePreset.defaultBaseUrl))", text: $aiBaseUrlDraft)
+          TvQrInputTriggerButton(
+            prompt: "输入 AI 接口地址 Base URL",
+            placeholder: activePreset.defaultBaseUrl,
+            labelText: "扫码填接入点"
+          ) { text in
+            aiBaseUrlDraft = text
+          }
+          TextField("模型名称 (可选，默认 \(activePreset.defaultModel))", text: $aiModelDraft)
+            .frame(width: 320)
+          TvQrInputTriggerButton(
+            prompt: "输入 AI 模型名称",
+            placeholder: activePreset.defaultModel,
+            labelText: "扫码填模型"
+          ) { text in
+            aiModelDraft = text
+          }
         }
       }
       .padding(20)
@@ -12280,60 +12907,86 @@ struct TvCloudMusicBottomDockBar: View {
 
           Spacer()
 
-          Text("\(Self.formatTime(appState.cloudMusicPosition)) / \(Self.formatTime(appState.cloudMusicDuration))")
-            .font(.system(size: 13, weight: .semibold, design: .monospaced))
-            .foregroundColor(.white.opacity(0.78))
-
-          Button {
-            appState.stepCloudMusicTrack(delta: -1)
-          } label: {
-            Image(systemName: "backward.fill")
-          }
-          .buttonStyle(TvApplePillButtonStyle(compact: true))
-
-          Button {
-            appState.toggleCloudMusicPlayPause()
-          } label: {
-            if appState.isCloudMusicLoading {
-              ProgressView()
-            } else {
-              Image(systemName: appState.isCloudMusicPlaying ? "pause.fill" : "play.fill")
+          // Zone 2 (Center): Core Transport Capsule
+          HStack(spacing: 10) {
+            Button {
+              appState.cycleCloudMusicPlayMode()
+            } label: {
+              Label(appState.cloudMusicPlayModeLabel, systemImage: appState.cloudMusicPlayModeIcon)
             }
-          }
-          .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+            .buttonStyle(TvApplePillButtonStyle(compact: true))
 
-          Button {
-            appState.stepCloudMusicTrack(delta: 1)
-          } label: {
-            Image(systemName: "forward.fill")
-          }
-          .buttonStyle(TvApplePillButtonStyle(compact: true))
-
-          Button {
-            appState.cycleCloudMusicPlayMode()
-          } label: {
-            Label(appState.cloudMusicPlayModeLabel, systemImage: appState.cloudMusicPlayModeIcon)
-          }
-          .buttonStyle(TvApplePillButtonStyle(compact: true))
-
-          Button {
-            if appState.selectedSection == .mediaLibrary {
-              appState.showCloudMusicFullscreen = true
-            } else {
-              appState.selectedSection = .music
+            Button {
+              appState.stepCloudMusicTrack(delta: -1)
+            } label: {
+              Image(systemName: "backward.fill")
             }
-          } label: {
-            Label("黑胶歌词厅 (\(appState.cloudMusicCurrentIndex + 1)/\(appState.cloudMusicQueue.count))", systemImage: "opticaldisc.fill")
-              .foregroundColor(theme.accentHover)
-          }
-          .buttonStyle(TvApplePillButtonStyle(compact: true))
+            .buttonStyle(TvApplePillButtonStyle(compact: true))
 
-          Button {
-            appState.stopCloudMusicPlayer()
-          } label: {
-            Image(systemName: "xmark")
+            Button {
+              appState.toggleCloudMusicPlayPause()
+            } label: {
+              if appState.isCloudMusicLoading {
+                ProgressView()
+              } else {
+                Image(systemName: appState.isCloudMusicPlaying ? "pause.fill" : "play.fill")
+              }
+            }
+            .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+
+            Button {
+              appState.stepCloudMusicTrack(delta: 1)
+            } label: {
+              Image(systemName: "forward.fill")
+            }
+            .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+            Button {
+              appState.cycleCloudMusicSpeed()
+            } label: {
+              Text(String(format: "%.2gx", appState.cloudMusicSpeed))
+            }
+            .buttonStyle(TvApplePillButtonStyle(compact: true))
           }
-          .buttonStyle(TvApplePillButtonStyle(isDestructive: true, compact: true))
+
+          Spacer()
+
+          // Zone 3 (Right): Time + Volume Adjustment + Lyrics Hall + Close
+          HStack(spacing: 10) {
+            Text("\(Self.formatTime(appState.cloudMusicPosition)) / \(Self.formatTime(appState.cloudMusicDuration))")
+              .font(.system(size: 13, weight: .semibold, design: .monospaced))
+              .foregroundColor(.white.opacity(0.78))
+
+            Button {
+              appState.toggleCloudMusicMute()
+            } label: {
+              Image(
+                systemName: appState.cloudMusicIsMuted || appState.cloudMusicVolume <= 0.01
+                  ? "speaker.slash.fill"
+                  : "speaker.wave.2.fill"
+              )
+            }
+            .buttonStyle(TvApplePillButtonStyle(isSelected: appState.cloudMusicIsMuted, compact: true))
+
+            Button {
+              if appState.selectedSection == .mediaLibrary {
+                appState.showCloudMusicFullscreen = true
+              } else {
+                appState.selectedSection = .music
+              }
+            } label: {
+              Label("黑胶歌词厅 (\(appState.cloudMusicCurrentIndex + 1)/\(appState.cloudMusicQueue.count))", systemImage: "opticaldisc.fill")
+                .foregroundColor(theme.accentHover)
+            }
+            .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+            Button {
+              appState.stopCloudMusicPlayer()
+            } label: {
+              Image(systemName: "xmark")
+            }
+            .buttonStyle(TvApplePillButtonStyle(isDestructive: true, compact: true))
+          }
         }
 
         GeometryReader { geo in
@@ -12556,6 +13209,22 @@ struct TvCloudMusicFullscreenHallView: View {
               .buttonStyle(TvApplePillButtonStyle(compact: true))
               .fixedSize(horizontal: true, vertical: false)
 
+              Button {
+                appState.openMusicSmartAiSheet(tab: 1)
+              } label: {
+                Label("AI 智能分类建表", systemImage: "sparkles")
+              }
+              .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+              .fixedSize(horizontal: true, vertical: false)
+
+              Button {
+                appState.openMusicSmartAiSheet(tab: 0)
+              } label: {
+                Label("搜人名/关键词建表", systemImage: "person.text.rectangle.fill")
+              }
+              .buttonStyle(TvApplePillButtonStyle(compact: true))
+              .fixedSize(horizontal: true, vertical: false)
+
               if !appState.cloudMusicQueue.isEmpty {
                 Button {
                   _ = appState.saveCurrentCloudMusicQueueAsPlaylist(name: "")
@@ -12596,21 +13265,6 @@ struct TvCloudMusicFullscreenHallView: View {
                 .fixedSize(horizontal: true, vertical: false)
 
               Spacer(minLength: 8)
-
-              HStack(spacing: 6) {
-                Circle()
-                  .fill(appState.isCloudMusicPlaying ? Color.green : Color.gray)
-                  .frame(width: 8, height: 8)
-                Text(currentSpeedText)
-                  .font(.system(size: 13, weight: .bold, design: .monospaced))
-                  .foregroundColor(.white)
-                  .lineLimit(1)
-              }
-              .padding(.horizontal, 11)
-              .padding(.vertical, 5)
-              .background(Color.white.opacity(0.08))
-              .clipShape(Capsule())
-              .fixedSize(horizontal: true, vertical: false)
 
               if !isStandaloneSection {
                 Button {
@@ -12791,6 +13445,39 @@ struct TvCloudMusicFullscreenHallView: View {
 
                 Spacer()
 
+                // Right Zone: Always-Visible Volume Adjustment + Queue Switcher + Stop
+                HStack(spacing: 10) {
+                  Button {
+                    appState.toggleCloudMusicMute()
+                  } label: {
+                    Image(
+                      systemName: appState.cloudMusicIsMuted || appState.cloudMusicVolume <= 0.01
+                        ? "speaker.slash.fill"
+                        : "speaker.wave.2.fill"
+                    )
+                  }
+                  .buttonStyle(TvApplePillButtonStyle(isSelected: appState.cloudMusicIsMuted, compact: true))
+
+                  Button {
+                    appState.stepCloudMusicVolume(delta: -0.1)
+                  } label: {
+                    Image(systemName: "minus")
+                  }
+                  .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+                  Text("\(appState.cloudMusicIsMuted ? 0 : Int(round(appState.cloudMusicVolume * 100)))%")
+                    .font(.system(size: 13, weight: .bold, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.85))
+                    .frame(width: 44)
+
+                  Button {
+                    appState.stepCloudMusicVolume(delta: 0.1)
+                  } label: {
+                    Image(systemName: "plus")
+                  }
+                  .buttonStyle(TvApplePillButtonStyle(compact: true))
+                }
+
                 Button {
                   rightPaneTab = (rightPaneTab == 0) ? 1 : 0
                 } label: {
@@ -12835,6 +13522,10 @@ struct TvCloudMusicFullscreenHallView: View {
     }
     .sheet(isPresented: $appState.showMusicPlaylistManagerSheet) {
       TvMusicPlaylistManagerSheet()
+        .environmentObject(appState)
+    }
+    .sheet(isPresented: $appState.showMusicSmartAiSheet) {
+      TvMusicSmartAiPlaylistSheet()
         .environmentObject(appState)
     }
     .sheet(item: $appState.activeArchiveMusicBrowserEntry) { archEntry in
@@ -12986,6 +13677,22 @@ struct TvCloudMusicFullscreenHallView: View {
         }
         .buttonStyle(TvApplePillButtonStyle(isPrimary: true))
         .focused($initialFocus, equals: "music_play_pause")
+
+        Button {
+          appState.openMusicSmartAiSheet(tab: 1)
+        } label: {
+          Label("AI 智能分析自动分类建表", systemImage: "sparkles")
+            .font(.system(size: 18, weight: .bold))
+        }
+        .buttonStyle(TvApplePillButtonStyle(isPrimary: true))
+
+        Button {
+          appState.openMusicSmartAiSheet(tab: 0)
+        } label: {
+          Label("按人名 / 关键词搜歌建表", systemImage: "person.text.rectangle.fill")
+            .font(.system(size: 18, weight: .bold))
+        }
+        .buttonStyle(TvApplePillButtonStyle())
 
         if !appState.savedMusicPlaylists.isEmpty {
           Button {
@@ -13368,6 +14075,26 @@ struct TvMusicPlaylistManagerSheet: View {
             .clipShape(Capsule())
 
           Spacer()
+
+          Button {
+            appState.showMusicPlaylistManagerSheet = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+              appState.openMusicSmartAiSheet(tab: 1)
+            }
+          } label: {
+            Label("AI 智能分类建表", systemImage: "sparkles")
+          }
+          .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+
+          Button {
+            appState.showMusicPlaylistManagerSheet = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+              appState.openMusicSmartAiSheet(tab: 0)
+            }
+          } label: {
+            Label("按人名/关键词建表", systemImage: "person.text.rectangle.fill")
+          }
+          .buttonStyle(TvApplePillButtonStyle(compact: true))
 
           Button("关闭窗口") {
             appState.showMusicPlaylistManagerSheet = false
@@ -13770,7 +14497,11 @@ struct TvMusicFolderPickerSheet: View {
           Spacer()
 
           Button {
-            showKeywordPlaylistSheet = true
+            let targets = effectiveTargetSources()
+            appState.showMusicFolderPickerSheet = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+              appState.openMusicSmartAiSheet(tab: 0, sources: targets)
+            }
           } label: {
             Label("查找人名/关键词新建列表", systemImage: "person.text.rectangle.fill")
           }
@@ -13778,18 +14509,14 @@ struct TvMusicFolderPickerSheet: View {
 
           Button {
             let targets = effectiveTargetSources()
-            guard !targets.isEmpty else { return }
             appState.showMusicFolderPickerSheet = false
-            Task {
-              _ = await appState.aiCategorizeMusicDirectoryAndCreatePlaylists(
-                sources: targets,
-                includeSubfolders: includeSubfolders
-              )
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+              appState.openMusicSmartAiSheet(tab: 1, sources: targets)
             }
           } label: {
             Label("AI 分析自动生成列表", systemImage: "sparkles")
           }
-          .buttonStyle(TvApplePillButtonStyle(compact: true))
+          .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
 
           Button {
             let targets = effectiveTargetSources()
@@ -14284,6 +15011,767 @@ struct TvArchiveMusicBrowserSheet: View {
         self.errorText = error.localizedDescription
         self.isLoading = false
       }
+    }
+  }
+}
+
+// MARK: - Interactive Music Smart Search & AI Playlist Generator Sheet (按人名/关键词搜歌建表 & AI 智能分析目录分类建表)
+
+struct TvMusicAiCategoryDraft: Identifiable {
+  let id: String = UUID().uuidString
+  var name: String
+  var description: String
+  var tracks: [TvFileEntry]
+  var selected: Bool = true
+}
+
+struct TvMusicSmartAiPlaylistSheet: View {
+  @EnvironmentObject var appState: TvAppState
+  @State private var activeTab: Int = 1 // 0: 按人名/关键词搜歌建表, 1: AI 智能分析目录分类建表
+  @State private var targetSources: [TvSavedMusicFolderItem] = []
+  @State private var includeSubfolders: Bool = true
+
+  // Tab 0: Keyword / Artist search state
+  @State private var keywordQuery: String = ""
+  @State private var customPlaylistName: String = ""
+  @State private var isScanningKeyword: Bool = false
+  @State private var matchedTracks: [TvFileEntry] = []
+  @State private var hasSearchedKeyword: Bool = false
+
+  // Tab 1: AI categorization state
+  @State private var selectedDimension: String = "auto"
+  @State private var customAiPrompt: String = ""
+  @State private var isAnalyzingAi: Bool = false
+  @State private var aiProgressText: String = ""
+  @State private var aiDrafts: [TvMusicAiCategoryDraft] = []
+  @State private var showAiKeyEditor: Bool = false
+  @State private var aiProviderDraft: String = "openai"
+  @State private var aiKeyDraft: String = ""
+  @State private var aiBaseUrlDraft: String = ""
+  @State private var aiModelDraft: String = ""
+
+  private let aiDimensions: [(id: String, label: String, icon: String)] = [
+    ("auto", "AI 综合智能归类", "sparkles"),
+    ("artist", "按歌手 / 艺术家", "person.2.fill"),
+    ("genre", "按曲风 / 流派", "guitars.fill"),
+    ("mood", "按心情 / 场景", "moon.stars.fill"),
+    ("language", "按语种 / 地区", "globe.asia.australia.fill"),
+    ("era", "按年代 / 时期", "clock.arrow.circlepath"),
+  ]
+
+  var body: some View {
+    let theme = appState.activeTheme
+
+    ZStack {
+      TvAmbientBackdropView(imageUrl: appState.ambientBackdropUrl)
+
+      VStack(alignment: .leading, spacing: 14) {
+        // 1. Header Bar & Tab Switcher
+        HStack(spacing: 14) {
+          Label("音乐 AI 智能歌单与搜歌建表工作台", systemImage: "sparkles")
+            .font(.system(size: 24, weight: .heavy))
+            .foregroundColor(theme.accentHover)
+
+          HStack(spacing: 10) {
+            Button {
+              activeTab = 1
+            } label: {
+              Label("AI 智能分析目录自动分类建表", systemImage: "sparkles")
+            }
+            .buttonStyle(TvApplePillButtonStyle(isSelected: activeTab == 1, isPrimary: activeTab == 1, compact: true))
+
+            Button {
+              activeTab = 0
+            } label: {
+              Label("按人名 / 关键词搜歌新建列表", systemImage: "person.text.rectangle.fill")
+            }
+            .buttonStyle(TvApplePillButtonStyle(isSelected: activeTab == 0, isPrimary: activeTab == 0, compact: true))
+          }
+
+          Spacer()
+
+          Button {
+            includeSubfolders.toggle()
+          } label: {
+            Label(
+              "递归子目录与压缩包",
+              systemImage: includeSubfolders ? "checkmark.square.fill" : "square"
+            )
+          }
+          .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+          Button("关闭") {
+            appState.showMusicSmartAiSheet = false
+          }
+          .buttonStyle(TvApplePillButtonStyle(compact: true))
+        }
+        .focusSection()
+
+        // 2. Target Music Directories Strip
+        targetDirectoriesCard(theme: theme)
+          .focusSection()
+
+        // 3. Active Tab Content
+        if activeTab == 0 {
+          keywordSearchTabContent(theme: theme)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+          aiCategorizeTabContent(theme: theme)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+      }
+      .padding(28)
+      .frame(
+        width: min(UIScreen.main.bounds.width - 100, 1620),
+        height: min(UIScreen.main.bounds.height - 80, 920)
+      )
+      .background(.regularMaterial)
+      .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+      .clipped()
+    }
+    .withTvLanQuickInputOverlay(appState)
+    .onAppear {
+      activeTab = appState.musicSmartAiInitialTab
+      aiProviderDraft = appState.aiProvider
+      aiKeyDraft = appState.aiApiKey
+      aiBaseUrlDraft = appState.aiBaseUrl
+      aiModelDraft = appState.aiModel
+      bootstrapInitialSources()
+    }
+  }
+
+  private func bootstrapInitialSources() {
+    if !appState.musicSmartAiInitialSources.isEmpty {
+      targetSources = appState.musicSmartAiInitialSources
+      return
+    }
+    if !appState.savedMusicFolders.isEmpty {
+      targetSources = appState.savedMusicFolders
+      return
+    }
+    let mount = appState.activeStorageMount
+    let rawPath = appState.fileListing.path.isEmpty
+      ? (mount.kind == .cloud115 ? "0" : (mount.kind == .server ? "" : mount.rootPath))
+      : appState.fileListing.path
+    let dirTitle = (rawPath as NSString).lastPathComponent
+    targetSources = [
+      TvSavedMusicFolderItem(
+        mountId: mount.id,
+        mountName: mount.name,
+        sourceKind: mount.kind,
+        path: rawPath,
+        title: (dirTitle.isEmpty || dirTitle == "/" || dirTitle == "0") ? mount.name : dirTitle,
+        isArchive: false,
+        size: 0,
+        pickcode115: ""
+      )
+    ]
+  }
+
+  @ViewBuilder
+  private func targetDirectoriesCard(theme: TvThemePalette) -> some View {
+    HStack(spacing: 10) {
+      Label("扫描目标目录 (\(targetSources.count))：", systemImage: "folder.fill.badge.gearshape")
+        .font(.system(size: 13, weight: .bold))
+        .foregroundColor(theme.accentHover)
+        .fixedSize()
+
+      ScrollView(.horizontal, showsIndicators: false) {
+        HStack(spacing: 8) {
+          ForEach(targetSources) { item in
+            Button {
+              if targetSources.count > 1 {
+                targetSources.removeAll { $0.id == item.id }
+              }
+            } label: {
+              HStack(spacing: 5) {
+                Image(systemName: item.isArchive ? "doc.zipper" : "folder.fill")
+                  .font(.system(size: 12))
+                Text("\(item.mountName): \(item.title)")
+                  .font(.system(size: 12.5, weight: .semibold))
+                  .lineLimit(1)
+                if targetSources.count > 1 {
+                  Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.6))
+                }
+              }
+            }
+            .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+          }
+
+          ForEach(appState.savedMusicFolders) { fav in
+            if !targetSources.contains(where: { $0.id == fav.id }) {
+              Button {
+                targetSources.append(fav)
+              } label: {
+                Label("+ \(fav.mountName): \(fav.title)", systemImage: "star.fill")
+              }
+              .buttonStyle(TvApplePillButtonStyle(compact: true))
+            }
+          }
+        }
+      }
+
+      Spacer()
+
+      if !appState.cloudMusicQueue.isEmpty {
+        Text("亦可直接分析当前播放队列 (\(appState.cloudMusicQueue.count)首)")
+          .font(.system(size: 12, weight: .semibold))
+          .foregroundColor(.white.opacity(0.65))
+      }
+
+      Button {
+        appState.showMusicSmartAiSheet = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+          appState.showMusicFolderPickerSheet = true
+        }
+      } label: {
+        Label("浏览/增选目录", systemImage: "folder.badge.plus")
+      }
+      .buttonStyle(TvApplePillButtonStyle(compact: true))
+    }
+    .padding(.horizontal, 16)
+    .padding(.vertical, 10)
+    .background(Color.black.opacity(0.26))
+    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+  }
+
+  @ViewBuilder
+  private func keywordSearchTabContent(theme: TvThemePalette) -> some View {
+    VStack(alignment: .leading, spacing: 14) {
+      HStack(spacing: 12) {
+        TextField("输入歌手人名或歌曲关键词（支持多个，如：周杰伦, 陈奕迅, 粤语）...", text: $keywordQuery)
+          .frame(maxWidth: .infinity)
+
+        TvQrInputTriggerButton(
+          prompt: "查找歌手人名或关键词",
+          placeholder: "如：周杰伦 / 陈奕迅 / 邓紫棋",
+          labelText: "扫码输入"
+        ) { text in
+          keywordQuery = text
+        }
+
+        TextField("新歌单名称（可选，留空自动按关键词命名）...", text: $customPlaylistName)
+          .frame(width: 340)
+
+        TvQrInputTriggerButton(
+          prompt: "新播放列表名称",
+          placeholder: "如：周杰伦无损精选",
+          labelText: "扫码命名"
+        ) { text in
+          customPlaylistName = text
+        }
+      }
+      .focusSection()
+
+      HStack(spacing: 14) {
+        Button {
+          Task { await runKeywordPreviewSearch() }
+        } label: {
+          Label(isScanningKeyword ? "正在递归扫描目录与压缩包..." : "扫描目录并预览匹配歌曲", systemImage: "magnifyingglass")
+        }
+        .buttonStyle(TvApplePillButtonStyle(compact: true))
+        .disabled(isScanningKeyword)
+
+        Button {
+          Task { await runKeywordDirectCreatePlaylist() }
+        } label: {
+          Label("直接检索并新建歌单播放", systemImage: "play.circle.fill")
+        }
+        .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+        .disabled(isScanningKeyword)
+
+        if !matchedTracks.isEmpty {
+          Button {
+            createPlaylistFromMatchedTracks(playImmediately: true)
+          } label: {
+            Label("将当前匹配的 \(matchedTracks.count) 首歌存为新歌单并播放", systemImage: "plus.rectangle.on.folder.fill")
+          }
+          .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+        }
+
+        Spacer()
+      }
+      .focusSection()
+
+      // Results list
+      Group {
+        if isScanningKeyword {
+          VStack(spacing: 14) {
+            ProgressView()
+              .scaleEffect(1.3)
+            Text("正在扫描所选目录及 .zip / .tar 压缩包内的音乐文件...")
+              .font(.system(size: 16))
+              .foregroundColor(.white.opacity(0.75))
+          }
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if matchedTracks.isEmpty {
+          VStack(spacing: 12) {
+            Image(systemName: "person.text.rectangle")
+              .font(.system(size: 44))
+              .foregroundColor(.white.opacity(0.3))
+            Text(
+              hasSearchedKeyword
+                ? "未在所选目录中找到匹配「\(keywordQuery)」的音频曲目"
+                : "输入歌手人名（如：周杰伦、王菲、Taylor Swift）或关键词，自动从多级文件夹及压缩包中提取专属歌单"
+            )
+            .font(.system(size: 16, weight: .semibold))
+            .foregroundColor(.white.opacity(0.72))
+            .multilineTextAlignment(.center)
+          }
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+          ScrollView {
+            LazyVStack(spacing: 8) {
+              ForEach(Array(matchedTracks.enumerated()), id: \.element.id) { idx, track in
+                let meta = TvAppState.parseCloudTrackMetadata(track, fallbackArtist: appState.mountDisplayName(for: track))
+                HStack(spacing: 12) {
+                  Text(String(format: "%02d", idx + 1))
+                    .font(.system(size: 13, weight: .bold, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.55))
+                    .frame(width: 36)
+                  Image(systemName: "music.note")
+                    .foregroundColor(theme.accentHover)
+                  VStack(alignment: .leading, spacing: 2) {
+                    Text(meta.title)
+                      .font(.system(size: 16, weight: .bold))
+                      .foregroundColor(.white)
+                      .lineLimit(1)
+                    Text("\(meta.artist) · \(track.path) · \(track.formattedSize)")
+                      .font(.system(size: 12))
+                      .foregroundColor(.white.opacity(0.62))
+                      .lineLimit(1)
+                  }
+                  Spacer()
+                  Text(meta.qualityTag)
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(theme.accentHover)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color.white.opacity(0.08))
+                    .clipShape(Capsule())
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(Color.white.opacity(0.05))
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+              }
+            }
+            .padding(6)
+          }
+          .focusSection()
+        }
+      }
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
+      .padding(12)
+      .background(Color.black.opacity(0.28))
+      .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+  }
+
+  @ViewBuilder
+  private func aiCategorizeTabContent(theme: TvThemePalette) -> some View {
+    let activePreset = TvAppState.aiProviderPreset(for: aiProviderDraft)
+    VStack(alignment: .leading, spacing: 12) {
+      // Row 1: AI Engine Status & Inline Multi-Provider / Endpoint Config
+      HStack(spacing: 10) {
+        let hasKey = !appState.aiApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        HStack(spacing: 6) {
+          Image(systemName: hasKey ? "checkmark.seal.fill" : "cpu.fill")
+            .foregroundColor(hasKey ? .green : .orange)
+          Text(
+            hasKey
+              ? "AI 接口已就绪：\(appState.effectiveAiProviderLabel) · \(appState.effectiveAiModel) (\(appState.effectiveAiBaseUrl))"
+              : "未配置 AI API Key（已启用本地智能规则引擎兜底，点击右侧可选择 OpenAI / DeepSeek / 通义千问 / Gemini / Claude 接入点）"
+          )
+          .font(.system(size: 12.5, weight: .bold))
+          .foregroundColor(.white.opacity(0.9))
+          .lineLimit(1)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background((hasKey ? Color.green : Color.orange).opacity(0.16))
+        .clipShape(Capsule())
+
+        Button {
+          aiProviderDraft = appState.aiProvider
+          aiKeyDraft = appState.aiApiKey
+          aiBaseUrlDraft = appState.aiBaseUrl
+          aiModelDraft = appState.aiModel
+          showAiKeyEditor.toggle()
+        } label: {
+          Label(
+            showAiKeyEditor ? "收起供应商与接入点配置" : "设置 AI 供应商 / 接入点 / Key",
+            systemImage: showAiKeyEditor ? "chevron.up.circle.fill" : "slider.horizontal.3"
+          )
+        }
+        .buttonStyle(TvApplePillButtonStyle(isSelected: showAiKeyEditor, compact: true))
+
+        Spacer()
+      }
+      .focusSection()
+
+      if showAiKeyEditor {
+        VStack(alignment: .leading, spacing: 10) {
+          // 1. Multi-Provider Endpoint Selector Pills
+          ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 10) {
+              Text("供应商接入点：")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundColor(.white.opacity(0.78))
+
+              ForEach(TvAppState.aiProviderPresets, id: \.id) { preset in
+                let isSel = (aiProviderDraft.lowercased() == preset.id)
+                Button {
+                  aiProviderDraft = preset.id
+                } label: {
+                  Text(preset.label)
+                }
+                .buttonStyle(TvApplePillButtonStyle(isSelected: isSel, isPrimary: isSel, compact: true))
+              }
+            }
+          }
+          .focusSection()
+
+          // 2. API Key + Base URL Endpoint + Model Name + QR Scan Input & Save
+          HStack(spacing: 10) {
+            TextField(
+              "AI API Key (\(activePreset.keyPlaceholder))",
+              text: $aiKeyDraft
+            )
+            .frame(maxWidth: .infinity)
+
+            TvQrInputTriggerButton(
+              prompt: "配置 \(activePreset.label) API Key",
+              placeholder: "粘贴 \(activePreset.keyPlaceholder) API Key",
+              labelText: "扫码填 Key"
+            ) { text in
+              aiKeyDraft = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+
+            TextField(
+              "接入点 Base URL (留空默认 \(activePreset.defaultBaseUrl))",
+              text: $aiBaseUrlDraft
+            )
+            .frame(maxWidth: .infinity)
+
+            TvQrInputTriggerButton(
+              prompt: "自定义 AI 接入点 Base URL",
+              placeholder: activePreset.defaultBaseUrl,
+              labelText: "扫码填接入点"
+            ) { text in
+              aiBaseUrlDraft = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+          }
+          .focusSection()
+
+          HStack(spacing: 10) {
+            TextField(
+              "AI 模型名称 (可选，留空默认 \(activePreset.defaultModel))",
+              text: $aiModelDraft
+            )
+            .frame(maxWidth: .infinity)
+
+            TvQrInputTriggerButton(
+              prompt: "输入 AI 模型名称",
+              placeholder: activePreset.defaultModel,
+              labelText: "扫码填模型"
+            ) { text in
+              aiModelDraft = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+
+            if !aiBaseUrlDraft.isEmpty || !aiModelDraft.isEmpty {
+              Button {
+                aiBaseUrlDraft = ""
+                aiModelDraft = ""
+              } label: {
+                Label("恢复官方默认接入点与模型", systemImage: "arrow.counterclockwise")
+              }
+              .buttonStyle(TvApplePillButtonStyle(compact: true))
+            }
+
+            Button {
+              appState.saveAiConfig(
+                provider: aiProviderDraft,
+                apiKey: aiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines),
+                baseUrl: aiBaseUrlDraft.trimmingCharacters(in: .whitespacesAndNewlines),
+                model: aiModelDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+              )
+              showAiKeyEditor = false
+            } label: {
+              Label("保存 AI 供应商与接入点配置", systemImage: "checkmark.circle.fill")
+            }
+            .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+          }
+          .focusSection()
+        }
+        .padding(12)
+        .background(Color.white.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+      }
+
+      // Row 2: Classification Dimension Chips
+      ScrollView(.horizontal, showsIndicators: false) {
+        HStack(spacing: 10) {
+          Text("分类维度：")
+            .font(.system(size: 13, weight: .bold))
+            .foregroundColor(.white.opacity(0.75))
+
+          ForEach(aiDimensions, id: \.id) { dim in
+            let isSel = (selectedDimension == dim.id)
+            Button {
+              selectedDimension = dim.id
+            } label: {
+              Label(dim.label, systemImage: dim.icon)
+            }
+            .buttonStyle(TvApplePillButtonStyle(isSelected: isSel, isPrimary: isSel, compact: true))
+          }
+        }
+      }
+      .focusSection()
+
+      // Row 3: Custom Prompt & Action Buttons
+      HStack(spacing: 12) {
+        TextField("补充 AI 分类要求（可选，如：分为周杰伦、粤语经典、欧美流行、纯音乐）...", text: $customAiPrompt)
+          .frame(maxWidth: .infinity)
+
+        TvQrInputTriggerButton(
+          prompt: "补充 AI 歌单分类要求",
+          placeholder: "如：按粤语经典、周杰伦、深夜安静分类",
+          labelText: "扫码输入要求"
+        ) { text in
+          customAiPrompt = text
+        }
+
+        Button {
+          Task { await runAiAnalyze(createImmediately: false) }
+        } label: {
+          Label(isAnalyzingAi ? "AI 分析中..." : "AI 分析目录并预览分类", systemImage: "sparkles")
+        }
+        .buttonStyle(TvApplePillButtonStyle(compact: true))
+        .disabled(isAnalyzingAi)
+
+        Button {
+          Task { await runAiAnalyze(createImmediately: true) }
+        } label: {
+          Label("AI 分析并直接生成歌单", systemImage: "bolt.fill")
+        }
+        .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+        .disabled(isAnalyzingAi)
+      }
+      .focusSection()
+
+      // Row 4: AI Category Preview Cards & Batch Creation
+      Group {
+        if isAnalyzingAi {
+          VStack(spacing: 14) {
+            ProgressView()
+              .scaleEffect(1.3)
+            Text(aiProgressText.isEmpty ? "正在扫描音乐目录并调用 AI 进行智能曲库分类..." : aiProgressText)
+              .font(.system(size: 16, weight: .semibold))
+              .foregroundColor(.white.opacity(0.8))
+          }
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if aiDrafts.isEmpty {
+          VStack(spacing: 12) {
+            Image(systemName: "wand.and.stars")
+              .font(.system(size: 46))
+              .foregroundColor(theme.accentHover.opacity(0.45))
+            Text("点击上方「AI 分析目录并预览分类」或「AI 分析并直接生成歌单」")
+              .font(.system(size: 17, weight: .bold))
+              .foregroundColor(.white.opacity(0.85))
+            Text("自动递归扫描所选目录（含 .zip/.tar 无损音乐压缩包），支持 AI 大模型或本地曲库引擎按歌手、曲风、语种、心情智能生成多个精选歌单")
+              .font(.system(size: 14))
+              .foregroundColor(.white.opacity(0.6))
+              .multilineTextAlignment(.center)
+              .padding(.horizontal, 60)
+          }
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+          let selectedCount = aiDrafts.filter { $0.selected }.count
+          VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+              Text("AI 已规划 \(aiDrafts.count) 个分类歌单（已勾选 \(selectedCount) 个）：")
+                .font(.system(size: 14, weight: .bold))
+                .foregroundColor(theme.accentHover)
+
+              Button("全选") {
+                for idx in aiDrafts.indices { aiDrafts[idx].selected = true }
+              }
+              .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+              Spacer()
+
+              Button {
+                let chosen = aiDrafts.filter { $0.selected }.map { (name: $0.name, description: $0.description, tracks: $0.tracks) }
+                guard !chosen.isEmpty else { return }
+                _ = appState.createPlaylistsFromAiDrafts(chosen, sources: targetSources, playFirst: true)
+                appState.showMusicSmartAiSheet = false
+              } label: {
+                Label("一键创建所选 \(selectedCount) 个分类歌单并播放", systemImage: "checkmark.circle.fill")
+              }
+              .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+              .disabled(selectedCount == 0)
+            }
+            .focusSection()
+
+            ScrollView {
+              LazyVGrid(
+                columns: Array(repeating: GridItem(.flexible(minimum: 340, maximum: 520), spacing: 12), count: 3),
+                spacing: 12
+              ) {
+                ForEach(Array(aiDrafts.enumerated()), id: \.element.id) { idx, draft in
+                  let sampleNames = draft.tracks.prefix(4).map {
+                    TvAppState.parseCloudTrackMetadata($0, fallbackArtist: "").title
+                  }.joined(separator: " / ")
+                  Button {
+                    aiDrafts[idx].selected.toggle()
+                  } label: {
+                    VStack(alignment: .leading, spacing: 6) {
+                      HStack(spacing: 8) {
+                        Image(systemName: draft.selected ? "checkmark.circle.fill" : "circle")
+                          .font(.system(size: 18, weight: .bold))
+                          .foregroundColor(draft.selected ? theme.accentHover : .white.opacity(0.4))
+                        Text(draft.name)
+                          .font(.system(size: 16, weight: .heavy))
+                          .foregroundColor(.white)
+                          .lineLimit(1)
+                        Spacer()
+                        Text("\(draft.tracks.count) 首")
+                          .font(.system(size: 12, weight: .bold))
+                          .foregroundColor(theme.accentHover)
+                          .padding(.horizontal, 8)
+                          .padding(.vertical, 2)
+                          .background(theme.accent.opacity(0.2))
+                          .clipShape(Capsule())
+                      }
+                      Text(draft.description)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.75))
+                        .lineLimit(1)
+                      Text("包含：\(sampleNames)")
+                        .font(.system(size: 11.5))
+                        .foregroundColor(.white.opacity(0.55))
+                        .lineLimit(2)
+                    }
+                    .padding(14)
+                    .frame(maxWidth: .infinity, minHeight: 96, maxHeight: 96, alignment: .topLeading)
+                    .clipped()
+                  }
+                  .buttonStyle(TvAppleSurfaceButtonStyle(isSelected: draft.selected, cornerRadius: 14))
+                }
+              }
+              .padding(4)
+            }
+            .focusSection()
+          }
+        }
+      }
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
+      .padding(12)
+      .background(Color.black.opacity(0.28))
+      .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+  }
+
+  private func collectAllAudioTracks() async -> [TvFileEntry] {
+    if !targetSources.isEmpty {
+      let scanned = await appState.collectMusicTracksFromSources(
+        sources: targetSources,
+        includeSubfolders: includeSubfolders
+      )
+      if !scanned.isEmpty {
+        return scanned
+      }
+    }
+    return appState.cloudMusicQueue
+  }
+
+  private func runKeywordPreviewSearch() async {
+    let rawKw = keywordQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !rawKw.isEmpty else {
+      appState.showToast("请输入歌手人名或歌曲关键词")
+      return
+    }
+    isScanningKeyword = true
+    hasSearchedKeyword = true
+    let allTracks = await collectAllAudioTracks()
+    let keywords = rawKw
+      .replacingOccurrences(of: "，", with: ",")
+      .replacingOccurrences(of: "、", with: ",")
+      .replacingOccurrences(of: "/", with: ",")
+      .split(separator: ",")
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+      .filter { !$0.isEmpty }
+    let matched = allTracks.filter { track in
+      let meta = TvAppState.parseCloudTrackMetadata(track, fallbackArtist: "")
+      let haystack = "\(track.name) \(track.path) \(track.archiveInnerPath) \(meta.title) \(meta.artist)".lowercased()
+      return keywords.contains { haystack.contains($0) }
+    }
+    matchedTracks = matched
+    isScanningKeyword = false
+  }
+
+  private func runKeywordDirectCreatePlaylist() async {
+    let rawKw = keywordQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !rawKw.isEmpty else {
+      appState.showToast("请输入歌手人名或歌曲关键词")
+      return
+    }
+    isScanningKeyword = true
+    let created = await appState.searchMusicDirectoryAndCreatePlaylist(
+      sources: targetSources,
+      keyword: rawKw,
+      playlistName: customPlaylistName,
+      includeSubfolders: includeSubfolders,
+      playImmediately: true
+    )
+    isScanningKeyword = false
+    if created != nil {
+      appState.showMusicSmartAiSheet = false
+    }
+  }
+
+  private func createPlaylistFromMatchedTracks(playImmediately: Bool) {
+    guard !matchedTracks.isEmpty else { return }
+    let rawKw = keywordQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+    let title = customPlaylistName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      ? "「\(rawKw)」精选 (\(matchedTracks.count)首)"
+      : customPlaylistName.trimmingCharacters(in: .whitespacesAndNewlines)
+    _ = appState.createPlaylistsFromAiDrafts(
+      [(name: title, description: "关键词匹配：\(rawKw)", tracks: matchedTracks)],
+      sources: targetSources,
+      playFirst: playImmediately
+    )
+    appState.showMusicSmartAiSheet = false
+  }
+
+  private func runAiAnalyze(createImmediately: Bool) async {
+    isAnalyzingAi = true
+    aiProgressText = "正在递归扫描目录与压缩包曲目..."
+    let tracks = await collectAllAudioTracks()
+    guard !tracks.isEmpty else {
+      isAnalyzingAi = false
+      appState.showToast("未在目标目录中发现音频曲目，请先选择包含音乐的目录")
+      return
+    }
+    aiProgressText = "已扫描到 \(tracks.count) 首歌曲，正在进行 AI 智能归类..."
+    let results = await appState.analyzeTracksWithAiOrHeuristic(
+      tracks: tracks,
+      dimension: selectedDimension,
+      customInstruction: customAiPrompt
+    )
+    let drafts = results.map {
+      TvMusicAiCategoryDraft(name: $0.name, description: $0.description, tracks: $0.tracks, selected: true)
+    }
+    aiDrafts = drafts
+    isAnalyzingAi = false
+
+    if createImmediately && !drafts.isEmpty {
+      let chosen = drafts.map { (name: $0.name, description: $0.description, tracks: $0.tracks) }
+      _ = appState.createPlaylistsFromAiDrafts(chosen, sources: targetSources, playFirst: true)
+      appState.showMusicSmartAiSheet = false
     }
   }
 }

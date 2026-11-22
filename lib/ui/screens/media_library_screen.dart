@@ -4842,11 +4842,6 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
                         ),
                       ),
                     ),
-                    VideoDownloadSpeedBadge(
-                      player: _player,
-                      compact: true,
-                      backgroundColor: VideoPlatformTheme.bgCard,
-                    ),
                     const SizedBox(width: 4),
                     PlayerVolumeControl(
                       player: _player,
@@ -4885,26 +4880,28 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
               Expanded(
                 child: LayoutBuilder(
                   builder: (context, stageConstraints) {
-                    return Stack(
-                      fit: StackFit.expand,
-                      children: [
-                        Video(
-                          controller: _controller,
-                          width: stageConstraints.maxWidth,
-                          height: stageConstraints.maxHeight,
-                          fit: _fitMode == 'cover'
-                              ? BoxFit.cover
-                              : BoxFit.contain,
-                          fill: Colors.black,
-                          pauseUponEnteringBackgroundMode: false,
-                          resumeUponEnteringForegroundMode: true,
-                        ),
-                        Positioned(
-                          top: 12,
-                          right: 12,
-                          child: VideoDownloadSpeedBadge(player: _player),
-                        ),
-                      ],
+                    return Video(
+                      controller: _controller,
+                      width: stageConstraints.maxWidth,
+                      height: stageConstraints.maxHeight,
+                      fit: _fitMode == 'cover' ? BoxFit.cover : BoxFit.contain,
+                      fill: Colors.black,
+                      pauseUponEnteringBackgroundMode: false,
+                      resumeUponEnteringForegroundMode: true,
+                      controls: (state) => Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          AdaptiveVideoControls(state),
+                          Positioned(
+                            top: 12,
+                            right: 12,
+                            child: VideoDownloadSpeedBadge(
+                              player: _player,
+                              compact: true,
+                            ),
+                          ),
+                        ],
+                      ),
                     );
                   },
                 ),

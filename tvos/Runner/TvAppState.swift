@@ -9,9 +9,15 @@ import UIKit
 @MainActor
 final class TvAppState: ObservableObject {
   static weak var shared: TvAppState? = nil
-  @Published var serverUrl: String
-  @Published var authSecret: String
-  @Published var enableAdFilter: Bool
+  @Published var serverUrl: String {
+    didSet { UserDefaults.standard.set(serverUrl, forKey: "tv_server_url") }
+  }
+  @Published var authSecret: String {
+    didSet { UserDefaults.standard.set(authSecret, forKey: "tv_auth_secret") }
+  }
+  @Published var enableAdFilter: Bool {
+    didSet { UserDefaults.standard.set(enableAdFilter, forKey: "tv_ad_filter") }
+  }
   @Published var preferDirectPlayback: Bool
   @Published var skipIntroSeconds: Int
   @Published var skipOutroSeconds: Int
@@ -377,6 +383,15 @@ final class TvAppState: ObservableObject {
   @Published var scanningMusicStatusText: String = ""
   @Published var activeArchiveMusicBrowserEntry: TvFileEntry? = nil
   @Published var showMusicFolderPickerSheet: Bool = false
+  @Published var showMusicSmartAiSheet: Bool = false
+  @Published var musicSmartAiInitialTab: Int = 1
+  @Published var musicSmartAiInitialSources: [TvSavedMusicFolderItem] = []
+  @Published var cloudMusicVolume: Float = 1.0
+  @Published var cloudMusicIsMuted: Bool = false
+  @Published var speedBadgeCornerPreset: Int = 0 // 0: 右上, 1: 左上, 2: 右下, 3: 左下
+  @Published var speedBadgeIsHidden: Bool = false
+  @Published var speedBadgeIsClosed: Bool = false
+  var latestMeasuredSpeedBytesPerSec: Double = 0.0
   var musicFolderPickerBackHandler: (() -> Bool)? = nil
   private var cloudMusicPlayer: AVPlayer? = nil
   private var cloudMusicTimeObserver: Any? = nil
@@ -425,6 +440,8 @@ final class TvAppState: ObservableObject {
 
   private let defaults = UserDefaults.standard
   private var localProgress: [String: Double] = [:]
+  private var lastHistoryPersistAt: Date = .distantPast
+  private var lastHistoryPersistKey: String = ""
   private var toastTask: Task<Void, Never>? = nil
   private var audioPlayer: AVPlayer? = nil
   private var audioTimeObserver: Any? = nil
@@ -989,8 +1006,59 @@ final class TvAppState: ObservableObject {
     showToast(enabled ? "✓ 已开启观看历史记录" : "🕵️ 已关闭观看历史记录（无痕观看模式）")
   }
 
+  static let aiProviderPresets: [(id: String, label: String, defaultBaseUrl: String, defaultModel: String, keyPlaceholder: String)] = [
+    ("openai", "OpenAI / 兼容接口", "https://api.openai.com/v1", "gpt-4o-mini", "sk-..."),
+    ("deepseek", "DeepSeek 官方", "https://api.deepseek.com/v1", "deepseek-chat", "sk-..."),
+    ("qwen", "阿里云通义千问", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus", "sk-..."),
+    ("gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta", "gemini-2.0-flash", "AIzaSy..."),
+    ("claude", "Anthropic Claude", "https://api.anthropic.com/v1", "claude-3-5-haiku-latest", "sk-ant-..."),
+    ("siliconflow", "硅基流动 SiliconFlow", "https://api.siliconflow.cn/v1", "deepseek-ai/DeepSeek-V3", "sk-...")
+  ]
+
+  static func aiProviderPreset(for rawId: String) -> (id: String, label: String, defaultBaseUrl: String, defaultModel: String, keyPlaceholder: String) {
+    let lower = rawId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if let match = aiProviderPresets.first(where: { $0.id == lower }) {
+      return match
+    }
+    return aiProviderPresets[0]
+  }
+
+  var effectiveAiProvider: String {
+    let key = aiApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    let raw = aiProvider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if raw == "gemini" || key.hasPrefix("AIza") {
+      return "gemini"
+    }
+    if raw == "claude" || key.hasPrefix("sk-ant-") {
+      return "claude"
+    }
+    return raw.isEmpty ? "openai" : raw
+  }
+
+  var effectiveAiProviderLabel: String {
+    Self.aiProviderPreset(for: effectiveAiProvider).label
+  }
+
+  var effectiveAiBaseUrl: String {
+    let custom = aiBaseUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+      .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    if !custom.isEmpty {
+      return custom
+    }
+    return Self.aiProviderPreset(for: effectiveAiProvider).defaultBaseUrl
+  }
+
+  var effectiveAiModel: String {
+    let custom = aiModel.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !custom.isEmpty {
+      return custom
+    }
+    return Self.aiProviderPreset(for: effectiveAiProvider).defaultModel
+  }
+
   func saveAiConfig(provider: String, apiKey: String, baseUrl: String, model: String) {
-    self.aiProvider = provider.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "openai" : provider.trimmingCharacters(in: .whitespacesAndNewlines)
+    let cleanProv = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    self.aiProvider = cleanProv.isEmpty ? "openai" : cleanProv
     self.aiApiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
     self.aiBaseUrl = baseUrl.trimmingCharacters(in: .whitespacesAndNewlines)
     self.aiModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -998,7 +1066,7 @@ final class TvAppState: ObservableObject {
     defaults.set(self.aiApiKey, forKey: "tv_ai_api_key_v1")
     defaults.set(self.aiBaseUrl, forKey: "tv_ai_base_url_v1")
     defaults.set(self.aiModel, forKey: "tv_ai_model_v1")
-    showToast("✓ AI 智能音乐分类配置已保存")
+    showToast("✓ AI 配置已保存（\(effectiveAiProviderLabel) · \(effectiveAiModel)）")
   }
 
   func togglePinSource(_ sourceId: String) {
@@ -1291,6 +1359,23 @@ final class TvAppState: ObservableObject {
         self.totalPages = max(1, res.pageCount)
         self.hasMoreVodPages = !res.items.isEmpty && (res.pageCount > 1 || res.items.count >= 12 || !self.categories.isEmpty)
         self.statusBanner = res.items.isEmpty ? "当前分类下暂无影片数据，可尝试切换分类或影视源" : nil
+        // Standard CMS sites return 20 items per page (only ~3 rows on a 6-column Apple TV grid).
+        // Automatically prefetch page 2 on initial load so the screen is filled with ~40 posters (~7 rows).
+        if !self.vodItems.isEmpty && self.vodItems.count < 36 && self.hasMoreVodPages {
+          let activeCategory = self.selectedCategoryId
+          if let page2 = try? await api.fetchVodList(source: source, page: 2, typeId: activeCategory) {
+            let existingIds = Set(self.vodItems.map { $0.id })
+            let moreItems = page2.items.filter { !existingIds.contains($0.id) }
+            if !moreItems.isEmpty {
+              self.vodItems.append(contentsOf: moreItems)
+              self.currentPage = 2
+              self.totalPages = max(2, page2.pageCount)
+              self.hasMoreVodPages = 2 < self.totalPages || moreItems.count >= 12
+            } else if activeCategory == nil && !self.categories.isEmpty {
+              await loadMoreFromFallbackCategories(source: source)
+            }
+          }
+        }
       } else {
         let existingIds = Set(self.vodItems.map { $0.id })
         let newItems = res.items.filter { !existingIds.contains($0.id) }
@@ -1347,7 +1432,7 @@ final class TvAppState: ObservableObject {
     }
 
     if let item = currentItem {
-      let thresholdIdx = max(0, vodItems.count - 12)
+      let thresholdIdx = max(0, vodItems.count - 18)
       guard let idx = vodItems.firstIndex(where: { $0.id == item.id }),
             idx >= thresholdIdx else {
         return
@@ -1451,12 +1536,19 @@ final class TvAppState: ObservableObject {
     groupName: String,
     episodeTitle: String,
     position: Double,
-    duration: Double
+    duration: Double,
+    force: Bool = false
   ) {
     guard watchHistoryEnabled else { return }
     guard let detail = detail, position > 3 else { return }
     let key = progressKey(vodId: detail.vodId, episodeTitle: episodeTitle)
     localProgress[key] = position
+
+    let now = Date()
+    let shouldPersist = force || key != lastHistoryPersistKey || now.timeIntervalSince(lastHistoryPersistAt) >= 12.0
+    guard shouldPersist else { return }
+    lastHistoryPersistAt = now
+    lastHistoryPersistKey = key
     defaults.set(localProgress, forKey: "tv_watch_progress")
 
     let srcKey = source?.librarySourceKey ?? "default"
@@ -1472,7 +1564,7 @@ final class TvAppState: ObservableObject {
       line: groupName,
       position: position,
       duration: max(duration, position),
-      updated: Int64(Date().timeIntervalSince1970)
+      updated: Int64(now.timeIntervalSince1970)
     )
     if let idx = history.firstIndex(where: { $0.id == item.id }) {
       history[idx] = item
@@ -1484,19 +1576,16 @@ final class TvAppState: ObservableObject {
     }
   }
 
-  func startEpisodePlayback(
+  func resolveEpisodePlaybackInfo(
     source: TvVodSource,
     detail: TvVodDetail,
     groupIndex: Int,
     episodeIndex: Int
-  ) async {
-    guard groupIndex >= 0, groupIndex < detail.playGroups.count else { return }
+  ) async -> (finalStream: String, backupProxyUrl: String, headers: [String: String], viaBadge: String, resumeSec: Double)? {
+    guard groupIndex >= 0, groupIndex < detail.playGroups.count else { return nil }
     let group = detail.playGroups[groupIndex]
-    guard episodeIndex >= 0, episodeIndex < group.episodes.count else { return }
+    guard episodeIndex >= 0, episodeIndex < group.episodes.count else { return nil }
     let ep = group.episodes[episodeIndex]
-
-    isResolvingPlay = true
-    defer { isResolvingPlay = false }
 
     activateScenarioProxyTunnel(for: .vodStream)
     let effRoute = resolveEffectiveRoute(for: .vodStream)
@@ -1513,11 +1602,12 @@ final class TvAppState: ObservableObject {
       enableAdFilter: enableAdFilter
     )
     var mergedHeaders = resolved.headers
-    if mergedHeaders["Cookie"] == nil && !api.cookieHeaderValue.isEmpty {
+    if finalStream.contains("/api/vod/proxy") && mergedHeaders["Cookie"] == nil && !api.cookieHeaderValue.isEmpty {
       mergedHeaders["Cookie"] = api.cookieHeaderValue
     }
-    if effRoute == .proxyNode && !finalStream.contains("127.0.0.1:") {
-      if finalStream.lowercased().contains(".m3u8") {
+    let isHlsCandidate = finalStream.lowercased().contains(".m3u8") || finalStream.contains("/api/vod/proxy")
+    if !finalStream.contains("127.0.0.1:") && !TvLocalHlsProxyServer.isDomesticOrLocalUrl(finalStream) {
+      if isHlsCandidate {
         if let proxiedHls = await TvLocalHlsProxyServer.shared.prepareProxyPlaylistUrl(
           gatewayUrl: finalStream,
           resolvedUrl: finalStream,
@@ -1525,7 +1615,7 @@ final class TvAppState: ObservableObject {
         ) {
           finalStream = proxiedHls
         }
-      } else if finalStream.hasPrefix("http") {
+      } else if effRoute == .proxyNode && finalStream.hasPrefix("http") {
         finalStream = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
           remoteUrl: finalStream,
           headers: mergedHeaders
@@ -1538,16 +1628,45 @@ final class TvAppState: ObservableObject {
     let viaBadge = (effRoute == .proxyNode)
       ? "代理: \(resolveNode(for: .vodStream)?.displayTitle ?? resolved.parseVia)"
       : resolved.parseVia
+    return (finalStream, resolved.serverProxyUrl, mergedHeaders, viaBadge, resumeSec)
+  }
+
+  func startEpisodePlayback(
+    source: TvVodSource,
+    detail: TvVodDetail,
+    groupIndex: Int,
+    episodeIndex: Int,
+    preResolvedInfo: (finalStream: String, backupProxyUrl: String, headers: [String: String], viaBadge: String, resumeSec: Double)? = nil
+  ) async {
+    guard groupIndex >= 0, groupIndex < detail.playGroups.count else { return }
+    let group = detail.playGroups[groupIndex]
+    guard episodeIndex >= 0, episodeIndex < group.episodes.count else { return }
+    let ep = group.episodes[episodeIndex]
+
+    let info: (finalStream: String, backupProxyUrl: String, headers: [String: String], viaBadge: String, resumeSec: Double)
+    if let pre = preResolvedInfo, !pre.finalStream.isEmpty {
+      info = pre
+    } else {
+      isResolvingPlay = true
+      defer { isResolvingPlay = false }
+      guard let resolvedInfo = await resolveEpisodePlaybackInfo(
+        source: source,
+        detail: detail,
+        groupIndex: groupIndex,
+        episodeIndex: episodeIndex
+      ) else { return }
+      info = resolvedInfo
+    }
 
     self.playerControlsVisible = true
     self.playerShowEpisodeDrawer = false
     self.activePlayback = TvPlaybackRequest(
       title: detail.vodName,
-      subtitle: "\(group.name) · \(ep.title) (\(viaBadge))",
-      streamUrl: finalStream,
-      backupProxyUrl: resolved.serverProxyUrl,
-      headers: mergedHeaders,
-      resumeSeconds: resumeSec,
+      subtitle: "\(group.name) · \(ep.title) (\(info.viaBadge))",
+      streamUrl: info.finalStream,
+      backupProxyUrl: info.backupProxyUrl,
+      headers: info.headers,
+      resumeSeconds: info.resumeSec,
       isLive: false,
       vodSource: source,
       vodDetail: detail,
@@ -4647,6 +4766,171 @@ final class TvAppState: ObservableObject {
     return pl
   }
 
+  func openMusicSmartAiSheet(tab: Int = 1, sources: [TvSavedMusicFolderItem] = []) {
+    musicSmartAiInitialTab = tab
+    if !sources.isEmpty {
+      musicSmartAiInitialSources = sources
+    } else if !currentMusicQueueSources.isEmpty {
+      musicSmartAiInitialSources = currentMusicQueueSources
+    } else if !savedMusicFolders.isEmpty {
+      musicSmartAiInitialSources = savedMusicFolders
+    } else if let m = storageMounts.first {
+      musicSmartAiInitialSources = [
+        TvSavedMusicFolderItem(
+          mountId: m.id,
+          mountName: m.name,
+          sourceKind: m.kind,
+          path: m.rootPath,
+          title: m.name,
+          isArchive: false,
+          size: 0,
+          pickcode115: ""
+        )
+      ]
+    }
+    if showMusicFolderPickerSheet {
+      showMusicFolderPickerSheet = false
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+        self.showMusicSmartAiSheet = true
+      }
+    } else if showMusicPlaylistManagerSheet {
+      showMusicPlaylistManagerSheet = false
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+        self.showMusicSmartAiSheet = true
+      }
+    } else {
+      showMusicSmartAiSheet = true
+    }
+  }
+
+  func analyzeTracksWithAiOrHeuristic(
+    tracks: [TvFileEntry],
+    dimension: String = "auto",
+    customInstruction: String = ""
+  ) async -> [(name: String, description: String, tracks: [TvFileEntry])] {
+    guard !tracks.isEmpty else { return [] }
+    var groupedIndices: [String: [Int]] = [:]
+
+    let apiKey = aiApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !apiKey.isEmpty {
+      let dimInstruction: String = {
+        switch dimension {
+        case "artist": return "按歌手 / 艺术家归类，将同一歌手或相关乐队的歌曲归入同一播放列表"
+        case "genre": return "按音乐曲风 / 流派（如流行、摇滚、电子、民谣、古典、R&B、说唱等）归类"
+        case "mood": return "按心情 / 聆听场景（如开车兜风、深夜放松、运动燃曲、工作专注、怀旧伤感等）归类"
+        case "language": return "按语种 / 地区（如国语流行、粤语经典、欧美金曲、日韩音乐、纯音乐等）归类"
+        case "era": return "按年代 / 时期（如80/90怀旧金曲、00年代华语巅峰、近年热歌等）归类"
+        default: return "综合分析歌手、曲风、语种、心情与目录特征，自动划分为 2 到 8 个主题鲜明的精品播放列表"
+        }
+      }()
+      let extraRule = customInstruction.trimmingCharacters(in: .whitespacesAndNewlines)
+      let sampleTracks = Array(tracks.prefix(160))
+      var lines: [String] = []
+      for (i, t) in sampleTracks.enumerated() {
+        let meta = Self.parseCloudTrackMetadata(t)
+        let label = meta.artist.isEmpty ? meta.title : "\(meta.artist) - \(meta.title)"
+        lines.append("\(i): \(label)")
+      }
+      let prompt = """
+      请将以下音乐曲目按【\(dimInstruction)】智能归类为 2 到 8 个精选播放列表。
+      \(extraRule.isEmpty ? "" : "用户附加要求：\(extraRule)")
+      只返回严格合法的 JSON 对象，格式如下：
+      {"playlists":[{"name":"列表名称","indices":[0,1,2]}]}
+      曲目清单：
+      \(lines.joined(separator: "\n"))
+      """
+
+      if let llmGroups = await requestAiPlaylistGrouping(prompt: prompt, maxIndex: sampleTracks.count - 1) {
+        groupedIndices = llmGroups
+      }
+    }
+
+    if groupedIndices.isEmpty {
+      var byArtist: [String: [Int]] = [:]
+      var losslessIndices: [Int] = []
+      var folderGroups: [String: [Int]] = [:]
+      for (i, t) in tracks.enumerated() {
+        let meta = Self.parseCloudTrackMetadata(t)
+        let ext = t.normalizedExt
+        if [".flac", ".ape", ".wav", ".alac", ".dsf", ".dff"].contains(ext) {
+          losslessIndices.append(i)
+        }
+        let artist = meta.artist.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !artist.isEmpty && artist != "未知歌手" && !artist.contains("115") && !artist.contains("AList") {
+          byArtist[artist, default: []].append(i)
+        }
+        let parentDir = ((t.path as NSString).deletingLastPathComponent as NSString).lastPathComponent
+        if !parentDir.isEmpty && parentDir != "/" && parentDir != "0" {
+          folderGroups[parentDir, default: []].append(i)
+        }
+      }
+      let topArtists = byArtist.sorted { $0.value.count > $1.value.count }.prefix(6)
+      for (artist, idxs) in topArtists where idxs.count >= 2 {
+        groupedIndices["🎤 \(artist) 精选"] = idxs
+      }
+      if groupedIndices.isEmpty {
+        for (folder, idxs) in folderGroups.sorted(by: { $0.value.count > $1.value.count }).prefix(6) where idxs.count >= 2 {
+          groupedIndices["📂 \(folder) 精选"] = idxs
+        }
+      }
+      if !losslessIndices.isEmpty && losslessIndices.count < tracks.count {
+        groupedIndices["💎 Hi-Res 无损臻选"] = losslessIndices
+      }
+      if groupedIndices.isEmpty {
+        groupedIndices["🎵 智能精选合集"] = Array(tracks.indices)
+      }
+    }
+
+    var drafts: [(name: String, description: String, tracks: [TvFileEntry])] = []
+    for entry in groupedIndices.sorted(by: { $0.value.count > $1.value.count }) {
+      let validTracks = entry.value.compactMap { idx -> TvFileEntry? in
+        (idx >= 0 && idx < tracks.count) ? tracks[idx] : nil
+      }
+      guard !validTracks.isEmpty else { continue }
+      let previewNames = validTracks.prefix(5).map { Self.parseCloudTrackMetadata($0).title }.joined(separator: "、")
+      let desc = "包含：\(previewNames)\(validTracks.count > 5 ? " 等共 \(validTracks.count) 首" : "")"
+      drafts.append((name: entry.key, description: desc, tracks: validTracks))
+    }
+    return drafts
+  }
+
+  @discardableResult
+  func createPlaylistsFromAiDrafts(
+    _ drafts: [(name: String, description: String, tracks: [TvFileEntry])],
+    sources: [TvSavedMusicFolderItem],
+    playFirst: Bool = true
+  ) -> [TvSavedMusicPlaylist] {
+    var created: [TvSavedMusicPlaylist] = []
+    let baseMs = Int64(Date().timeIntervalSince1970 * 1000)
+    for (offset, draft) in drafts.enumerated() where !draft.tracks.isEmpty {
+      let pl = TvSavedMusicPlaylist(
+        id: "pl_ai_\(baseMs + Int64(offset))",
+        name: draft.name,
+        tracks: draft.tracks,
+        sources: sources,
+        currentIndex: 0,
+        updatedEpochMs: baseMs + Int64(offset)
+      )
+      savedMusicPlaylists.append(pl)
+      created.append(pl)
+    }
+    if let first = created.first {
+      activeMusicPlaylistId = first.id
+      if playFirst {
+        cloudMusicQueue = first.tracks
+        cloudMusicCurrentIndex = 0
+        currentMusicQueueSources = sources
+        persistDefaultMusicQueueAndPlaylists()
+        openCurrentCloudMusicTrack()
+        showToast("✨ 已创建 \(created.count) 个 AI 分类歌单并开始播放「\(first.name)」")
+      } else {
+        persistDefaultMusicQueueAndPlaylists()
+        showToast("✨ 已成功创建 \(created.count) 个 AI 分类歌单")
+      }
+    }
+    return created
+  }
+
   /// Uses AI (or smart local artist/style heuristic fallback) to categorize tracks in the selected directory and batch-create playlists.
   func aiCategorizeMusicDirectoryAndCreatePlaylists(
     sources: [TvSavedMusicFolderItem],
@@ -4752,38 +5036,53 @@ final class TvAppState: ObservableObject {
   }
 
   private func requestAiPlaylistGrouping(prompt: String, maxIndex: Int) async -> [String: [Int]]? {
-    let provider = aiProvider.lowercased()
     let key = aiApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !key.isEmpty else { return nil }
+    let provider = effectiveAiProvider
+    let base = effectiveAiBaseUrl
+    let modelName = effectiveAiModel
+    let systemPrompt = "You are a music librarian that returns only JSON."
 
     let endpoint: String
-    let modelName: String
     if provider == "gemini" {
-      let m = aiModel.isEmpty ? "gemini-2.0-flash" : aiModel
-      let base = aiBaseUrl.isEmpty ? "https://generativelanguage.googleapis.com/v1beta" : aiBaseUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-      endpoint = "\(base)/models/\(m):generateContent?key=\(key)"
-      modelName = m
-    } else if provider == "deepseek" {
-      let base = aiBaseUrl.isEmpty ? "https://api.deepseek.com/v1" : aiBaseUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-      endpoint = "\(base)/chat/completions"
-      modelName = aiModel.isEmpty ? "deepseek-chat" : aiModel
+      let cleanBase = base.contains("generativelanguage.googleapis.com")
+        ? base
+        : "https://generativelanguage.googleapis.com/v1beta"
+      let encodedKey = key.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? key
+      endpoint = "\(cleanBase)/models/\(modelName):generateContent?key=\(encodedKey)"
+    } else if provider == "claude" {
+      endpoint = base.hasSuffix("/messages") ? base : "\(base)/messages"
     } else {
-      let base = aiBaseUrl.isEmpty ? "https://api.openai.com/v1" : aiBaseUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-      endpoint = "\(base)/chat/completions"
-      modelName = aiModel.isEmpty ? "gpt-4o-mini" : aiModel
+      endpoint = base.hasSuffix("/chat/completions") ? base : "\(base)/chat/completions"
     }
 
     guard let url = URL(string: endpoint) else { return nil }
     var req = URLRequest(url: url)
     req.httpMethod = "POST"
-    req.timeoutInterval = 25
+    req.timeoutInterval = 30
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
     let bodyObj: [String: Any]
     if provider == "gemini" {
       bodyObj = [
         "contents": [
-          ["parts": [["text": prompt]]]
+          ["parts": [["text": "\(systemPrompt)\n\n\(prompt)"]]]
+        ],
+        "generationConfig": [
+          "temperature": 0.2,
+          "responseMimeType": "application/json"
+        ]
+      ]
+    } else if provider == "claude" {
+      req.setValue(key, forHTTPHeaderField: "x-api-key")
+      req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+      bodyObj = [
+        "model": modelName,
+        "max_tokens": 4096,
+        "temperature": 0.2,
+        "system": systemPrompt,
+        "messages": [
+          ["role": "user", "content": prompt]
         ]
       ]
     } else {
@@ -4791,7 +5090,7 @@ final class TvAppState: ObservableObject {
       bodyObj = [
         "model": modelName,
         "messages": [
-          ["role": "system", "content": "You are a music librarian that returns only JSON."],
+          ["role": "system", "content": systemPrompt],
           ["role": "user", "content": prompt]
         ],
         "temperature": 0.2
@@ -4813,6 +5112,15 @@ final class TvAppState: ObservableObject {
          let parts = content["parts"] as? [[String: Any]],
          let txt = parts.first?["text"] as? String {
         textContent = txt
+      }
+    } else if provider == "claude" {
+      if let contentList = root["content"] as? [[String: Any]] {
+        for block in contentList {
+          if let txt = block["text"] as? String, !txt.isEmpty {
+            textContent = txt
+            break
+          }
+        }
       }
     } else {
       if let choices = root["choices"] as? [[String: Any]],
@@ -5043,6 +5351,8 @@ final class TvAppState: ObservableObject {
     player.automaticallyWaitsToMinimizeStalling = true
     self.cloudMusicPlayer = player
 
+    let isLocalProxyStream = url.host == "127.0.0.1" || url.host == "localhost"
+    var lastReportedAccessLogBytes: Int64 = 0
     cloudMusicTimeObserver = player.addPeriodicTimeObserver(
       forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
       queue: .main
@@ -5051,8 +5361,28 @@ final class TvAppState: ObservableObject {
       let durSec = player.currentItem.map { CMTimeGetSeconds($0.duration) } ?? 0
       let itemStatus = player.currentItem?.status ?? .unknown
       let itemErr = player.currentItem?.error
+      let accessLogBytes: Int64 = {
+        guard !isLocalProxyStream,
+              let events = player.currentItem?.accessLog()?.events else { return 0 }
+        return events.reduce(Int64(0)) { $0 + max(0, $1.numberOfBytesTransferred) }
+      }()
       Task { @MainActor [weak self] in
         guard let self = self, seq == self.cloudMusicOpenSeq else { return }
+        if !isLocalProxyStream && track.sourceKind != .localCache {
+          if accessLogBytes > lastReportedAccessLogBytes {
+            let delta = Int(min(Int64(50_000_000), accessLogBytes - lastReportedAccessLogBytes))
+            lastReportedAccessLogBytes = accessLogBytes
+            TvNetworkSpeedMonitor.shared.recordDownstreamBytes(delta)
+          } else if self.isCloudMusicPlaying && sec > 0.05 && TvNetworkSpeedMonitor.shared.recentDownstreamBytesPerSecond < 1024 {
+            let estPerTick: Int = {
+              if track.size > 0 && durSec.isFinite && durSec > 1 {
+                return max(4096, min(128_000, Int(Double(track.size) / durSec * 0.25)))
+              }
+              return 10_240
+            }()
+            TvNetworkSpeedMonitor.shared.recordDownstreamBytes(estPerTick)
+          }
+        }
         if itemStatus == .failed {
           if !self.cloudMusicRetriedWithProxy && track.sourceKind != .localCache {
             self.cloudMusicRetriedWithProxy = true
@@ -5491,6 +5821,22 @@ final class TvAppState: ObservableObject {
     if isCloudMusicPlaying {
       cloudMusicPlayer?.rate = cloudMusicSpeed
     }
+  }
+
+  func toggleCloudMusicMute() {
+    cloudMusicIsMuted.toggle()
+    cloudMusicPlayer?.isMuted = cloudMusicIsMuted
+  }
+
+  func stepCloudMusicVolume(delta: Float) {
+    cloudMusicIsMuted = false
+    cloudMusicVolume = min(max(0.0, cloudMusicVolume + delta), 1.0)
+    cloudMusicPlayer?.isMuted = (cloudMusicVolume <= 0.01)
+    cloudMusicPlayer?.volume = cloudMusicVolume
+  }
+
+  func cycleSpeedBadgeCorner() {
+    speedBadgeCornerPreset = (speedBadgeCornerPreset + 1) % 4
   }
 
   private func cleanupCloudMusicPlayerInstance() {

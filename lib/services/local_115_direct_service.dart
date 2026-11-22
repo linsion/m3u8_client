@@ -11,6 +11,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/models.dart';
 import 'api_client.dart';
 import 'cloud115_upload_protocol.dart';
+import 'proxy_routing_service.dart';
 
 /// 1:1 port of `github.com/deadblue/elevengo/internal/crypto/m115`
 /// Used to encrypt/decrypt `https://proapi.115.com/app/chrome/downurl` payloads.
@@ -985,6 +986,7 @@ class Local115DirectService extends ChangeNotifier {
       final prefix = BytesBuilder(copy: false);
       await for (final chunk in response.timeout(const Duration(seconds: 10))) {
         final count = min(chunk.length, 64 - prefix.length);
+        LocalProxyTunnelBridge.recordDownstreamBytes(count);
         prefix.add(chunk.sublist(0, count));
         if (prefix.length >= 64) break;
       }
@@ -1596,7 +1598,9 @@ class Local115DirectService extends ChangeNotifier {
             return null;
           }
           final remaining = bytesToRead - builder.length;
-          builder.add(chunk.length <= remaining ? chunk : chunk.sublist(0, remaining));
+          final slice = chunk.length <= remaining ? chunk : chunk.sublist(0, remaining);
+          LocalProxyTunnelBridge.recordDownstreamBytes(slice.length);
+          builder.add(slice);
           if (builder.length == bytesToRead) break;
         }
         final rawBytes = builder.takeBytes();
@@ -1797,7 +1801,10 @@ class Local115DirectService extends ChangeNotifier {
       await upstream.drain<void>();
       await downstream.close();
     } else {
-      await upstream.pipe(downstream);
+      await upstream.map((chunk) {
+        LocalProxyTunnelBridge.recordDownstreamBytes(chunk.length);
+        return chunk;
+      }).pipe(downstream);
     }
   }
 
@@ -1821,6 +1828,7 @@ class Local115DirectService extends ChangeNotifier {
         continue;
       }
       final count = min(length, chunk.length - skip);
+      LocalProxyTunnelBridge.recordDownstreamBytes(count);
       downstream.add(chunk.sublist(skip, skip + count));
       await downstream.flush();
       length -= count;
@@ -1843,6 +1851,7 @@ class Local115DirectService extends ChangeNotifier {
     }
     final bytes = BytesBuilder(copy: false);
     await for (final chunk in upstream.timeout(const Duration(seconds: 15))) {
+      LocalProxyTunnelBridge.recordDownstreamBytes(chunk.length);
       bytes.add(chunk);
     }
     final playlist = utf8.decode(bytes.takeBytes(), allowMalformed: true).trim();

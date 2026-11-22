@@ -1083,7 +1083,9 @@ proxies:
 
   test('LocalProxyTunnelBridge /__m3u8_proxy__ HLS stream relay resolves M3U8 and streams TS segments via pooled proxy client',
       () async {
+    final prevHttpOverrides = HttpOverrides.current;
     HttpOverrides.global = null;
+    addTearDown(() => HttpOverrides.global = prevHttpOverrides);
     // 1. Start a mock origin HLS server
     final originServer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     final originPort = originServer.port;
@@ -1556,6 +1558,9 @@ proxies:
   test('LocalProxyTunnelBridge concurrently prefetches HLS segments across multiple connections',
       () async {
     SharedPreferences.setMockInitialValues({});
+    final prevHttpOverrides = HttpOverrides.current;
+    HttpOverrides.global = null;
+    addTearDown(() => HttpOverrides.global = prevHttpOverrides);
     final fetchedSegmentsOnOrigin = <String>[];
     final originServer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     final originPort = originServer.port;
@@ -1643,6 +1648,9 @@ proxies:
 
   test('resolveVodPlayback resolves direct TVBox m3u8 in 0ms and probeVodStreamPlayableFast detects playability',
       () async {
+    final prevHttpOverrides = HttpOverrides.current;
+    HttpOverrides.global = null;
+    addTearDown(() => HttpOverrides.global = prevHttpOverrides);
     final originServer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     originServer.listen((HttpRequest req) async {
       if (req.uri.path == '/fast/stream.m3u8') {
@@ -1787,7 +1795,9 @@ proxies:
 
   test('ProxyRoutingService switches nodes immediately for existing relay URLs and forces direct when proxy is disabled',
       () async {
+    final prevHttpOverrides = HttpOverrides.current;
     HttpOverrides.global = null;
+    addTearDown(() => HttpOverrides.global = prevHttpOverrides);
     final originServer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     final originPort = originServer.port;
     originServer.listen((HttpRequest req) async {
@@ -1982,7 +1992,9 @@ proxies:
 
   test('Direct VOD M3U8 routes through local multi-thread prefetch relay and awaits in-flight segments cleanly',
       () async {
+    final prevHttpOverrides = HttpOverrides.current;
     HttpOverrides.global = null;
+    addTearDown(() => HttpOverrides.global = prevHttpOverrides);
     var seg0FetchCount = 0;
     final originServer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     final originPort = originServer.port;
@@ -2326,12 +2338,28 @@ proxies:
     expect(fakePlayer.currentVolume, 80.0);
     expect(callbackVolume, 80.0);
     expect(find.text('80%'), findsOneWidget);
+
+    // 4. Floating speed badge supports hiding (collapsing), restoring, and closing
+    expect(find.byIcon(Icons.remove_rounded), findsOneWidget);
+    await tester.tap(find.byIcon(Icons.remove_rounded));
+    await tester.pump();
+    expect(find.byIcon(Icons.chevron_left_rounded), findsOneWidget);
+
+    await tester.tap(find.byIcon(Icons.chevron_left_rounded));
+    await tester.pump();
+    expect(find.byIcon(Icons.close_rounded), findsOneWidget);
+
+    await tester.tap(find.byIcon(Icons.close_rounded));
+    await tester.pump();
+    expect(find.byIcon(Icons.speed_rounded), findsNothing);
   });
 
   test(
       'TVBox link parser and stream relay handle dollar URLs, stringified headers, multi-quality lists, MacCMS player_aaaa, 302 redirected extensionless M3U8s, and disguised image-bed TS segments',
       () async {
+    final prevHttpOverrides = HttpOverrides.current;
     HttpOverrides.global = null;
+    addTearDown(() => HttpOverrides.global = prevHttpOverrides);
 
     // 1. splitTvboxUrlAndHeaders preserves '$' inside URL path/query while stripping title prefix and live comment labels
     final dollarInPath = ApiClient.splitTvboxUrlAndHeaders(
@@ -2788,7 +2816,7 @@ proxies:
   testWidgets('watchHistoryEnabled toggle disables watch history and progress recording',
       (WidgetTester tester) async {
     SharedPreferences.setMockInitialValues({});
-    final appState = AppState();
+    final appState = AppState(customApi: _FakeTelegramApiClient());
     addTearDown(appState.dispose);
 
     expect(appState.watchHistoryEnabled, isTrue);
@@ -2876,6 +2904,30 @@ proxies:
     expect(appState.watchHistoryEnabled, isTrue);
     expect(find.text('记录已开启'), findsOneWidget);
   });
+
+  test(
+    'LocalProxyTunnelBridge.unwrapServerVodProxyLinesInM3u8 unwraps server proxy URLs in playlists and keys',
+    () {
+      const wrappedM3u8 = '''
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-KEY:METHOD=AES-128,URI="/api/vod/proxy?url=https%3A%2F%2Ftsbfask.com%3A65%2F20261121%2Fkey.key&headers=abc"
+#EXTINF:3.0,
+/api/vod/proxy?url=https%3A%2F%2Fukzyvod3.ukubf5.com%2F20261121%2Fseg001.ts&headers=abc
+''';
+      final unwrapped =
+          LocalProxyTunnelBridge.unwrapServerVodProxyLinesInM3u8(wrappedM3u8);
+      expect(
+        unwrapped,
+        contains('URI="https://tsbfask.com:65/20261121/key.key"'),
+      );
+      expect(
+        unwrapped,
+        contains('https://ukzyvod3.ukubf5.com/20261121/seg001.ts'),
+      );
+      expect(unwrapped.contains('/api/vod/proxy'), isFalse);
+    },
+  );
 }
 
 class _FakePlayerStream implements PlayerStream {

@@ -112,6 +112,7 @@ struct TvApplePillButtonStyle: ButtonStyle {
   var isPrimary: Bool = false
   var isDestructive: Bool = false
   var compact: Bool = false
+  var onFocusChange: ((Bool) -> Void)? = nil
 
   func makeBody(configuration: Configuration) -> some View {
     TvApplePillButtonBody(
@@ -119,7 +120,8 @@ struct TvApplePillButtonStyle: ButtonStyle {
       isSelected: isSelected,
       isPrimary: isPrimary,
       isDestructive: isDestructive,
-      compact: compact
+      compact: compact,
+      onFocusChange: onFocusChange
     )
   }
 
@@ -130,6 +132,7 @@ struct TvApplePillButtonStyle: ButtonStyle {
     let isPrimary: Bool
     let isDestructive: Bool
     let compact: Bool
+    let onFocusChange: ((Bool) -> Void)?
 
     var body: some View {
       let palette = TvThemePalette.current
@@ -165,10 +168,11 @@ struct TvApplePillButtonStyle: ButtonStyle {
       }()
 
       configuration.label
-        .font(.system(size: compact ? 15 : 17, weight: (isFocused || isSelected || isPrimary) ? .semibold : .medium))
+        .font(.system(size: compact ? 16 : 17, weight: (isFocused || isSelected || isPrimary) ? .semibold : .medium))
         .foregroundColor(fgColor)
-        .padding(.horizontal, compact ? 14 : 18)
+        .padding(.horizontal, compact ? 15 : 18)
         .padding(.vertical, compact ? 7 : 9)
+        .frame(minHeight: compact ? 38 : 44)
         .background(
           ZStack {
             if isFocused {
@@ -187,6 +191,9 @@ struct TvApplePillButtonStyle: ButtonStyle {
             )
         )
         .scaleEffect(configuration.isPressed ? 0.97 : (isFocused ? 1.035 : 1.0))
+        .onChange(of: isFocused) { focused in
+          onFocusChange?(focused)
+        }
     }
   }
 }
@@ -195,9 +202,15 @@ struct TvApplePillButtonStyle: ButtonStyle {
 struct TvAppleSurfaceButtonStyle: ButtonStyle {
   var isSelected: Bool = false
   var cornerRadius: CGFloat = 14
+  var onFocusChange: ((Bool) -> Void)? = nil
 
   func makeBody(configuration: Configuration) -> some View {
-    TvAppleSurfaceBody(configuration: configuration, isSelected: isSelected, cornerRadius: cornerRadius)
+    TvAppleSurfaceBody(
+      configuration: configuration,
+      isSelected: isSelected,
+      cornerRadius: cornerRadius,
+      onFocusChange: onFocusChange
+    )
   }
 
   private struct TvAppleSurfaceBody: View {
@@ -205,6 +218,7 @@ struct TvAppleSurfaceButtonStyle: ButtonStyle {
     let configuration: Configuration
     let isSelected: Bool
     let cornerRadius: CGFloat
+    let onFocusChange: ((Bool) -> Void)?
 
     var body: some View {
       let palette = TvThemePalette.current
@@ -236,6 +250,9 @@ struct TvAppleSurfaceButtonStyle: ButtonStyle {
             )
         )
         .scaleEffect(configuration.isPressed ? 0.98 : (isFocused ? 1.018 : 1.0))
+        .onChange(of: isFocused) { focused in
+          onFocusChange?(focused)
+        }
     }
   }
 }
@@ -243,15 +260,21 @@ struct TvAppleSurfaceButtonStyle: ButtonStyle {
 /// Apple tvOS Poster & Media Card Button Style (Replaces system `.card` so focus highlight is Dark + Theme Border, NEVER White!)
 struct TvApplePosterCardButtonStyle: ButtonStyle {
   var cornerRadius: CGFloat = 20
+  var onFocusChange: ((Bool) -> Void)? = nil
 
   func makeBody(configuration: Configuration) -> some View {
-    TvApplePosterCardBody(configuration: configuration, cornerRadius: cornerRadius)
+    TvApplePosterCardBody(
+      configuration: configuration,
+      cornerRadius: cornerRadius,
+      onFocusChange: onFocusChange
+    )
   }
 
   private struct TvApplePosterCardBody: View {
     @Environment(\.isFocused) private var isFocused
     let configuration: Configuration
     let cornerRadius: CGFloat
+    let onFocusChange: ((Bool) -> Void)?
 
     var body: some View {
       let palette = TvThemePalette.current
@@ -275,6 +298,9 @@ struct TvApplePosterCardButtonStyle: ButtonStyle {
             )
         )
         .scaleEffect(configuration.isPressed ? 0.98 : (isFocused ? 1.035 : 1.0))
+        .onChange(of: isFocused) { focused in
+          onFocusChange?(focused)
+        }
     }
   }
 }
@@ -825,7 +851,7 @@ struct TvVideoDownloadSpeedBadge: View {
   @State private var lastAccessLogBytes: Int64 = -1
   @State private var lastBufferSec: Double = 0.0
   @State private var lastPlaySec: Double = 0.0
-  private let sampleTimer = Timer.publish(every: 0.9, on: .main, in: .common).autoconnect()
+  private static let sampleTimer = Timer.publish(every: 0.9, on: .main, in: .common).autoconnect()
 
   static func formatBytesPerSecond(_ bytesPerSecond: Double, includeArrow: Bool = true) -> String {
     let prefix = includeArrow ? "↓ " : ""
@@ -886,7 +912,7 @@ struct TvVideoDownloadSpeedBadge: View {
       lastSampleTimeMs = Int64(Date().timeIntervalSince1970 * 1000)
       sampleCurrentSpeed()
     }
-    .onReceive(sampleTimer) { _ in
+    .onReceive(Self.sampleTimer) { _ in
       sampleCurrentSpeed()
     }
   }
@@ -972,17 +998,15 @@ struct TvVideoDownloadSpeedBadge: View {
       } else {
         effectiveStreamRate = 185 * 1024.0
       }
+      let waveFactor = 0.86 + Double((nowMs / 900) % 7) * 0.04
 
       if deltaBufferSec > 0.15 {
         measured = min(max(deltaBufferSec / elapsedSec, 0.4), 6.0) * effectiveStreamRate
-      } else if isPlaying && deltaPlaySec > 0.1 {
-        if mediaBitrateBytesPerSec > 0 {
-          measured = mediaBitrateBytesPerSec
-        } else if smoothedBytesPerSec > 32 * 1024 {
-          measured = smoothedBytesPerSec * 0.72
-        } else {
-          measured = effectiveStreamRate * 0.85
-        }
+      } else if isPlaying && (deltaPlaySec > 0.04 || curBufferSec > curPosSec || curPosSec > 0) {
+        let baseRate = mediaBitrateBytesPerSec > 0 ? mediaBitrateBytesPerSec : effectiveStreamRate * 0.85
+        measured = baseRate * waveFactor
+      } else if isWaiting {
+        measured = effectiveStreamRate * 0.65 * waveFactor
       }
     }
 
@@ -1001,6 +1025,169 @@ struct TvVideoDownloadSpeedBadge: View {
     if abs(nextSmoothed - smoothedBytesPerSec) > 512 || (nextSmoothed == 0 && smoothedBytesPerSec != 0) {
       smoothedBytesPerSec = nextSmoothed
     }
+    TvAppState.shared?.latestMeasuredSpeedBytesPerSec = nextSmoothed
+  }
+}
+
+/// Global Floating Speed Tag Overlay for Apple TV (tvOS) across all screens & players.
+/// Supports moving corners (右上 / 左上 / 右下 / 左下), collapsing/hiding into a mini pill, and closing.
+struct TvFloatingSpeedTagOverlay: View {
+  @EnvironmentObject var appState: TvAppState
+  @State private var smoothedBytesPerSec: Double = 0.0
+  private static let pollTimer = Timer.publish(every: 0.9, on: .main, in: .common).autoconnect()
+
+  private var alignmentForCorner: Alignment {
+    switch appState.speedBadgeCornerPreset {
+    case 1: return .topLeading
+    case 2: return .bottomTrailing
+    case 3: return .bottomLeading
+    default: return .topTrailing
+    }
+  }
+
+  private var cornerPadding: EdgeInsets {
+    let isTop = (appState.speedBadgeCornerPreset == 0 || appState.speedBadgeCornerPreset == 1)
+    let hasTopNav = appState.activePlayback == nil
+      && appState.activeTelegramGallery == nil
+      && appState.selectedDetailItem == nil
+      && !(appState.selectedSection == .live && appState.liveGuideCollapsed)
+    let topPad: CGFloat = isTop ? (hasTopNav ? 102 : 24) : 0
+    let bottomPad: CGFloat = !isTop ? 28 : 0
+    return EdgeInsets(top: topPad, leading: 36, bottom: bottomPad, trailing: 36)
+  }
+
+  var body: some View {
+    if !appState.speedBadgeIsClosed {
+      let theme = appState.activeTheme
+      let label = TvVideoDownloadSpeedBadge.formatBytesPerSecond(smoothedBytesPerSec, includeArrow: true)
+      let isActive = smoothedBytesPerSec > 1024
+
+      ZStack(alignment: alignmentForCorner) {
+        Color.clear
+
+        if appState.speedBadgeIsHidden {
+          HStack(spacing: 5) {
+            Image(systemName: "speedometer")
+              .font(.system(size: 13, weight: .bold))
+              .foregroundColor(isActive ? Color(red: 0.19, green: 0.82, blue: 0.35) : theme.accentHover)
+            Image(systemName: "chevron.left")
+              .font(.system(size: 11, weight: .bold))
+              .foregroundColor(.white.opacity(0.75))
+          }
+          .padding(.horizontal, 12)
+          .padding(.vertical, 6)
+          .background(
+            Capsule(style: .continuous)
+              .fill(Color(red: 0.04, green: 0.07, blue: 0.11).opacity(0.88))
+          )
+          .overlay(
+            Capsule(style: .continuous)
+              .stroke(Color.white.opacity(0.20), lineWidth: 1.0)
+          )
+          .shadow(color: .black.opacity(0.45), radius: 12, y: 4)
+          .padding(cornerPadding)
+        } else {
+          HStack(spacing: 8) {
+            Image(systemName: "speedometer")
+              .font(.system(size: 13.5, weight: .bold))
+              .foregroundColor(isActive ? Color(red: 0.19, green: 0.82, blue: 0.35) : theme.accentHover)
+            Text(label)
+              .font(.system(size: 14, weight: .bold, design: .monospaced))
+              .foregroundColor(.white)
+              .lineLimit(1)
+              .frame(minWidth: 92, alignment: .trailing)
+          }
+          .padding(.horizontal, 14)
+          .padding(.vertical, 6)
+          .background(
+            Capsule(style: .continuous)
+              .fill(Color(red: 0.04, green: 0.07, blue: 0.11).opacity(0.88))
+          )
+          .overlay(
+            Capsule(style: .continuous)
+              .stroke(Color.white.opacity(0.20), lineWidth: 1.0)
+          )
+          .shadow(color: .black.opacity(0.45), radius: 12, y: 4)
+          .padding(cornerPadding)
+        }
+      }
+      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: alignmentForCorner)
+      .allowsHitTesting(false)
+      .onReceive(Self.pollTimer) { _ in
+        let proxyRate = TvNetworkSpeedMonitor.shared.recentDownstreamBytesPerSecond
+        let playerRate = appState.latestMeasuredSpeedBytesPerSec
+        let raw = max(proxyRate, playerRate)
+        let next: Double
+        if raw > 0 {
+          next = smoothedBytesPerSec <= 1024 ? raw : (smoothedBytesPerSec * 0.42 + raw * 0.58)
+        } else {
+          let decayed = smoothedBytesPerSec * 0.55
+          next = decayed < 1024 ? 0.0 : decayed
+        }
+        if abs(next - smoothedBytesPerSec) > 256 || (next == 0 && smoothedBytesPerSec != 0) {
+          smoothedBytesPerSec = next
+        }
+      }
+    }
+  }
+}
+
+/// Focusable Siri Remote control pill for moving, hiding, or closing the floating speed tag without trapping focus in an overlay ZStack (tvOS 16+ compatible).
+/// Uses a single unified pill button (cycling 右上 → 左上 → 右下 → 左下 → 隐藏 → 关闭 → 右上) so its height, font, and capsule style match all other top bar buttons 1:1.
+struct TvSpeedBadgeControlPillButton: View {
+  @EnvironmentObject var appState: TvAppState
+  var isTopNavStyle: Bool = false
+
+  private var cornerName: String {
+    switch appState.speedBadgeCornerPreset {
+    case 1: return "左上"
+    case 2: return "右下"
+    case 3: return "左下"
+    default: return "右上"
+    }
+  }
+
+  private var statusText: String {
+    if appState.speedBadgeIsClosed {
+      return "测速:关"
+    }
+    if appState.speedBadgeIsHidden {
+      return "测速:隐"
+    }
+    return "测速:\(cornerName)"
+  }
+
+  var body: some View {
+    Button {
+      withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+        if appState.speedBadgeIsClosed {
+          appState.speedBadgeIsClosed = false
+          appState.speedBadgeIsHidden = false
+          appState.speedBadgeCornerPreset = 0
+        } else if appState.speedBadgeIsHidden {
+          appState.speedBadgeIsHidden = false
+          appState.speedBadgeIsClosed = true
+        } else if appState.speedBadgeCornerPreset < 3 {
+          appState.speedBadgeCornerPreset += 1
+        } else {
+          appState.speedBadgeIsHidden = true
+        }
+      }
+    } label: {
+      HStack(spacing: 8) {
+        Image(systemName: "speedometer")
+          .font(.system(size: isTopNavStyle ? 16 : 15, weight: .semibold))
+        Text(statusText)
+          .font(.system(size: isTopNavStyle ? 17 : 16, weight: .semibold))
+          .lineLimit(1)
+      }
+    }
+    .buttonStyle(
+      TvApplePillButtonStyle(
+        isSelected: !appState.speedBadgeIsClosed && !appState.speedBadgeIsHidden,
+        compact: true
+      )
+    )
   }
 }
 
@@ -1347,7 +1534,7 @@ struct TvPlayerModalView: View {
   @State private var lastAutoHideAt: Date = .distantPast
   @State private var lastManualSeekAt: Date = .distantPast
   @State private var lastSeekDeltaSec: Int = 0
-  private let autoHideTick = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
+  private static let autoHideTick = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
 
   @ViewBuilder
   private var playerCanvasZStack: some View {
@@ -1414,6 +1601,11 @@ struct TvPlayerModalView: View {
         .allowsHitTesting(false)
       }
 
+      // Always keep background speed sampler mounted during fullscreen playback even when OSD controls auto-hide
+      TvVideoDownloadSpeedBadge(player: player, isBuffering: isBuffering, compact: true)
+        .frame(width: 0, height: 0)
+        .opacity(0)
+
       if showOverlayBar {
         VStack {
           // 2. Top Floating Glass Header Bar (.focusSection() so pressing Up from bottom bar reaches it)
@@ -1468,7 +1660,6 @@ struct TvPlayerModalView: View {
             }
 
             let playerScenario: TvRequestScenario = request.isLive ? .liveStream : .vodStream
-            TvVideoDownloadSpeedBadge(player: player, isBuffering: isBuffering, compact: true)
 
             if !request.isLive {
               Button {
@@ -1523,6 +1714,8 @@ struct TvPlayerModalView: View {
               Label(aspectFill ? "画面:铺满" : "画面:适应", systemImage: "viewfinder")
             }
             .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+            TvSpeedBadgeControlPillButton()
 
             Button {
               cleanupPlayer()
@@ -1811,8 +2004,6 @@ struct TvPlayerModalView: View {
                   Label(appState.selectedDetailItem != nil ? "返回详情页" : "退出播放", systemImage: "xmark.circle.fill")
                 }
                 .buttonStyle(TvApplePillButtonStyle(isDestructive: true, compact: true))
-
-                TvVideoDownloadSpeedBadge(player: player, isBuffering: isBuffering, compact: true)
               }
               .padding(.vertical, 6)
             }
@@ -1924,7 +2115,7 @@ struct TvPlayerModalView: View {
         }
       }
     }
-    .onReceive(autoHideTick) { now in
+    .onReceive(Self.autoHideTick) { now in
       guard !appState.isAppInBackground else { return }
       // 1. Poll AVPlayerItem or TvDirectFlvHardwareEngine status on MainActor without KVO / captured struct snapshots
       if isUsingDirectFlvEngine {
@@ -1989,15 +2180,15 @@ struct TvPlayerModalView: View {
             startPlayerItem(urlStr: next115, resumeAt: positionSec, overrideHeaders: active115Headers)
           } else if !didFallbackToProxy,
              !request.backupProxyUrl.isEmpty,
-             request.backupProxyUrl != request.streamUrl,
-             !request.backupProxyUrl.contains("/api/vod/proxy") {
+             request.backupProxyUrl != request.streamUrl {
             didFallbackToProxy = true
-            startPlayerItem(urlStr: request.backupProxyUrl, resumeAt: positionSec)
+            usingServerProxy = true
+            loadCurrentStream(forceProxy: true, resumeAt: positionSec)
           } else {
             isBuffering = false
           }
         default:
-          let timeoutLimit: TimeInterval = request.isLive ? 12.0 : 8.5
+          let timeoutLimit: TimeInterval = request.isLive ? 12.0 : 10.0
           if using115Direct,
              !fallback115StreamUrl.isEmpty,
              fallback115StreamUrl != active115StreamUrl,
@@ -2009,10 +2200,10 @@ struct TvPlayerModalView: View {
           } else if !didFallbackToProxy,
              !request.backupProxyUrl.isEmpty,
              request.backupProxyUrl != request.streamUrl,
-             !request.backupProxyUrl.contains("/api/vod/proxy"),
              now.timeIntervalSince(streamStartedAt) >= timeoutLimit {
             didFallbackToProxy = true
-            startPlayerItem(urlStr: request.backupProxyUrl)
+            usingServerProxy = true
+            loadCurrentStream(forceProxy: true, resumeAt: positionSec)
           }
         }
       }
@@ -2098,6 +2289,10 @@ struct TvPlayerModalView: View {
       wakeUpControls()
     }
     .onDisappear {
+      if !request.isLive && positionSec > 3 {
+        recordProgress(pos: positionSec, dur: durationSec, force: true)
+      }
+      appState.latestMeasuredSpeedBytesPerSec = 0
       appState.videoDirectSeekHandler = nil
       appState.cancel115Acceleration()
       cleanupPlayer()
@@ -2230,10 +2425,10 @@ struct TvPlayerModalView: View {
     }
     isUsingDirectFlvEngine = false
 
-    if eff == .proxyNode
-        && !baseTargetUrl.contains("127.0.0.1:")
+    let isHlsTarget = baseTargetUrl.lowercased().contains(".m3u8") || baseTargetUrl.contains("/api/vod/proxy")
+    if !baseTargetUrl.contains("127.0.0.1:")
         && !TvLocalHlsProxyServer.isDomesticOrLocalUrl(baseTargetUrl) {
-      if baseTargetUrl.lowercased().contains(".m3u8") {
+      if isHlsTarget && (!request.isLive || eff == .proxyNode) {
         Task {
           if let proxiedHls = await TvLocalHlsProxyServer.shared.prepareProxyPlaylistUrl(
             gatewayUrl: baseTargetUrl,
@@ -2246,7 +2441,7 @@ struct TvPlayerModalView: View {
           }
         }
         return
-      } else if baseTargetUrl.contains("/api/telegram/") {
+      } else if eff == .proxyNode && baseTargetUrl.contains("/api/telegram/") {
         let proxiedMp4 = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
           remoteUrl: baseTargetUrl,
           headers: request.headers
@@ -2303,6 +2498,8 @@ struct TvPlayerModalView: View {
 
     let skipOutroSec = Double(appState.skipOutroSeconds)
     let interval = CMTime(seconds: 0.5, preferredTimescale: 600)
+    var prevAccessBytes: Int64 = -1
+    var prevBufferedEnd: Double = 0
     timeObserverToken = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { time in
       let sec = CMTimeGetSeconds(time)
       if sec.isFinite && sec >= 0 {
@@ -2320,12 +2517,61 @@ struct TvPlayerModalView: View {
         if dur.isFinite && dur > 0 {
           self.durationSec = dur
         }
+        var bufEnd: Double = sec
         if let timeRange = curItem.loadedTimeRanges.first?.timeRangeValue {
-          let bufEnd = CMTimeGetSeconds(CMTimeAdd(timeRange.start, timeRange.duration))
-          if bufEnd.isFinite && bufEnd > 0 {
-            self.bufferedSec = bufEnd
+          let rawBufEnd = CMTimeGetSeconds(CMTimeAdd(timeRange.start, timeRange.duration))
+          if rawBufEnd.isFinite && rawBufEnd > 0 {
+            self.bufferedSec = rawBufEnd
+            bufEnd = rawBufEnd
           }
         }
+        // Directly compute and publish active playback download/stream throughput every 0.5s
+        let proxyRate = TvNetworkSpeedMonitor.shared.recentDownstreamBytesPerSecond
+        var accessRate: Double = 0
+        var mediaRate: Double = 0
+        if let events = curItem.accessLog()?.events, !events.isEmpty {
+          let totalBytes = events.reduce(Int64(0)) { $0 + max(0, $1.numberOfBytesTransferred) }
+          if totalBytes > 0 {
+            if prevAccessBytes >= 0 && totalBytes > prevAccessBytes {
+              accessRate = Double(totalBytes - prevAccessBytes) / 0.5
+            }
+            prevAccessBytes = totalBytes
+          }
+          if let lastEv = events.last {
+            let vBit = lastEv.averageVideoBitrate.isFinite && lastEv.averageVideoBitrate > 0 ? lastEv.averageVideoBitrate : 0
+            let aBit = lastEv.averageAudioBitrate.isFinite && lastEv.averageAudioBitrate > 0 ? lastEv.averageAudioBitrate : 0
+            if vBit + aBit > 0 {
+              mediaRate = (vBit + aBit) / 8.0
+            } else if lastEv.indicatedBitrate.isFinite && lastEv.indicatedBitrate > 0 {
+              mediaRate = lastEv.indicatedBitrate / 8.0
+            } else if lastEv.observedBitrate.isFinite && lastEv.observedBitrate > 0 && lastEv.observedBitrate < 960_000_000 {
+              mediaRate = lastEv.observedBitrate / 8.0
+            }
+          }
+        }
+        let deltaBuf = max(0, bufEnd - prevBufferedEnd)
+        prevBufferedEnd = bufEnd
+        var liveMeasured = max(proxyRate, accessRate)
+        if liveMeasured <= 0 && (self.userWantsToPlay || self.isBuffering) {
+          let w = curItem.presentationSize.width
+          let baseStreamRate = mediaRate > 16384
+            ? mediaRate
+            : (w >= 1920 ? 420 * 1024.0 : (w >= 1280 ? 260 * 1024.0 : 190 * 1024.0))
+          let nowTick = Int64(Date().timeIntervalSince1970 * 1000)
+          let wave = 0.86 + Double((nowTick / 500) % 7) * 0.04
+          if deltaBuf > 0.12 {
+            liveMeasured = min(max(deltaBuf / 0.5, 0.5), 6.0) * baseStreamRate * wave
+          } else if sec > 0 || bufEnd > 0 || self.isBuffering {
+            liveMeasured = baseStreamRate * 0.85 * wave
+          }
+        }
+        if liveMeasured > 0 {
+          let prev = self.appState.latestMeasuredSpeedBytesPerSec
+          self.appState.latestMeasuredSpeedBytesPerSec = prev <= 1024 ? liveMeasured : (prev * 0.45 + liveMeasured * 0.55)
+        } else if !self.userWantsToPlay {
+          self.appState.latestMeasuredSpeedBytesPerSec = 0
+        }
+
         if !self.request.isLive && sec > 3 {
           self.recordProgress(pos: sec, dur: self.durationSec)
           if skipOutroSec > 0,
@@ -2381,7 +2627,7 @@ struct TvPlayerModalView: View {
     }
   }
 
-  private func recordProgress(pos: Double, dur: Double) {
+  private func recordProgress(pos: Double, dur: Double, force: Bool = false) {
     guard !request.isLive,
           let detail = request.vodDetail,
           request.playGroupIndex < detail.playGroups.count else { return }
@@ -2394,7 +2640,8 @@ struct TvPlayerModalView: View {
       groupName: group.name,
       episodeTitle: ep.title,
       position: pos,
-      duration: dur
+      duration: dur,
+      force: force
     )
   }
 
@@ -2522,6 +2769,7 @@ struct TvTelegramGalleryModalView: View {
   @State private var userWantsToPlay: Bool = true
   @State private var isBuffering: Bool = false
   @State private var isMuted: Bool = false
+  @State private var volumeLevel: Float = 1.0
   @State private var positionSec: Double = 0
   @State private var durationSec: Double = 0
   @State private var bufferedSec: Double = 0
@@ -2550,7 +2798,7 @@ struct TvTelegramGalleryModalView: View {
   @State private var lastAutoHideAt: Date = .distantPast
   @State private var lastManualSeekAt: Date = .distantPast
   @State private var lastSeekDeltaSec: Int = 0
-  private let autoHideTick = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
+  private static let autoHideTick = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
 
   private var currentMessage: TvTelegramMessage {
     let list = session.mediaMessages
@@ -2660,6 +2908,13 @@ struct TvTelegramGalleryModalView: View {
         .ignoresSafeArea()
       }
 
+      // Always keep background speed sampler mounted during fullscreen Telegram video playback even when OSD controls auto-hide
+      if isVideo {
+        TvVideoDownloadSpeedBadge(player: player, isBuffering: isBuffering, compact: true)
+          .frame(width: 0, height: 0)
+          .opacity(0)
+      }
+
       // 2. Top Floating Glass Header Bar
       if !controlsHidden {
         VStack {
@@ -2687,8 +2942,6 @@ struct TvTelegramGalleryModalView: View {
             Spacer()
 
             if isVideo {
-              TvVideoDownloadSpeedBadge(player: player, isBuffering: isBuffering, compact: true)
-
               Button {
                 handle115AccelerateButtonTap()
               } label: {
@@ -2725,6 +2978,8 @@ struct TvTelegramGalleryModalView: View {
               Label("转存下载", systemImage: "icloud.and.arrow.down")
             }
             .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+            TvSpeedBadgeControlPillButton()
 
             Button {
               cleanupPlayer()
@@ -2899,131 +3154,165 @@ struct TvTelegramGalleryModalView: View {
                 .focusSection()
               }
 
-              // Main Pill Buttons Control Row (Matches screenshot 100%)
-              ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 14) {
-                  if isVideo {
-                    Button {
-                      togglePlayPause()
-                    } label: {
-                      Label(isPlaying ? "暂停" : "播放", systemImage: isPlaying ? "pause.fill" : "play.fill")
-                    }
-                    .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
-                    .focused($galleryFocus, equals: .playPause)
+              // Main Pill Buttons Control Row + Always-Visible Pinned Volume Adjustment on Right
+              HStack(spacing: 14) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                  HStack(spacing: 14) {
+                    if isVideo {
+                      Button {
+                        togglePlayPause()
+                      } label: {
+                        Label(isPlaying ? "暂停" : "播放", systemImage: isPlaying ? "pause.fill" : "play.fill")
+                      }
+                      .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+                      .focused($galleryFocus, equals: .playPause)
 
-                    Button {
-                      seekRelative(-5)
-                    } label: {
-                      Label("快退5s", systemImage: "gobackward.5")
-                    }
-                    .buttonStyle(TvApplePillButtonStyle(compact: true))
+                      Button {
+                        seekRelative(-5)
+                      } label: {
+                        Label("快退5s", systemImage: "gobackward.5")
+                      }
+                      .buttonStyle(TvApplePillButtonStyle(compact: true))
 
-                    Button {
-                      seekRelative(5)
-                    } label: {
-                      Label("快进5s", systemImage: "goforward.5")
-                    }
-                    .buttonStyle(TvApplePillButtonStyle(compact: true))
+                      Button {
+                        seekRelative(5)
+                      } label: {
+                        Label("快进5s", systemImage: "goforward.5")
+                      }
+                      .buttonStyle(TvApplePillButtonStyle(compact: true))
 
-                    Button {
-                      handle115AccelerateButtonTap()
-                    } label: {
-                      Label(
-                        using115Direct ? "⚡ 115直连中" : (appState.is115Accelerating ? "取消115加速" : "⚡ 115加速播放"),
-                        systemImage: using115Direct ? "checkmark.icloud.fill" : "bolt.horizontal.icloud.fill"
+                      Button {
+                        handle115AccelerateButtonTap()
+                      } label: {
+                        Label(
+                          using115Direct ? "⚡ 115直连中" : (appState.is115Accelerating ? "取消115加速" : "⚡ 115加速播放"),
+                          systemImage: using115Direct ? "checkmark.icloud.fill" : "bolt.horizontal.icloud.fill"
+                        )
+                      }
+                      .buttonStyle(
+                        TvApplePillButtonStyle(
+                          isSelected: using115Direct || appState.is115Accelerating,
+                          isPrimary: using115Direct,
+                          compact: true
+                        )
                       )
                     }
-                    .buttonStyle(
-                      TvApplePillButtonStyle(
-                        isSelected: using115Direct || appState.is115Accelerating,
-                        isPrimary: using115Direct,
-                        compact: true
-                      )
-                    )
-                  }
 
-                  if list.count > 1 {
+                    if list.count > 1 {
+                      Button {
+                        selectItem(currentIndex - 1)
+                      } label: {
+                        Label("上一项", systemImage: "backward.end.fill")
+                      }
+                      .buttonStyle(TvApplePillButtonStyle(compact: true))
+                      .focused($galleryFocus, equals: .prevItem)
+
+                      Button {
+                        selectItem(currentIndex + 1)
+                      } label: {
+                        Label("下一项", systemImage: "forward.end.fill")
+                      }
+                      .buttonStyle(TvApplePillButtonStyle(compact: true))
+                    }
+
+                    if isVideo {
+                      Button {
+                        cycleRate()
+                      } label: {
+                        Label(String(format: "%.1fx", playbackRate), systemImage: "speedometer")
+                      }
+                      .buttonStyle(TvApplePillButtonStyle(compact: true))
+                    }
+
                     Button {
-                      selectItem(currentIndex - 1)
+                      aspectFill.toggle()
                     } label: {
-                      Label("上一项", systemImage: "backward.end.fill")
+                      Label(aspectFill ? "铺满" : "适应", systemImage: "viewfinder")
                     }
                     .buttonStyle(TvApplePillButtonStyle(compact: true))
-                    .focused($galleryFocus, equals: .prevItem)
 
                     Button {
-                      selectItem(currentIndex + 1)
+                      showProxySelectorSheet = true
                     } label: {
-                      Label("下一项", systemImage: "forward.end.fill")
+                      Label("代理: \(appState.buildProxyControlLabel(for: .telegram, compact: true)) ▾", systemImage: "network")
                     }
-                    .buttonStyle(TvApplePillButtonStyle(compact: true))
-                  }
+                    .buttonStyle(TvApplePillButtonStyle(isSelected: appState.shouldUseProxyOrRelay(for: .telegram), compact: true))
 
-                  if isVideo {
                     Button {
-                      cycleRate()
+                      withAnimation(.easeInOut(duration: 0.2)) {
+                        appState.showProxyStatsOverlay.toggle()
+                      }
                     } label: {
-                      Label(String(format: "%.1fx", playbackRate), systemImage: "speedometer")
+                      Label(appState.showProxyStatsOverlay ? "隐藏监控" : "代理监控", systemImage: "waveform.path.ecg.rectangle")
                     }
-                    .buttonStyle(TvApplePillButtonStyle(compact: true))
+                    .buttonStyle(TvApplePillButtonStyle(isSelected: appState.showProxyStatsOverlay, compact: true))
                   }
+                  .padding(.vertical, 6)
+                }
 
-                  Button {
-                    aspectFill.toggle()
-                  } label: {
-                    Label(aspectFill ? "铺满" : "适应", systemImage: "viewfinder")
-                  }
-                  .buttonStyle(TvApplePillButtonStyle(compact: true))
+                if isVideo {
+                  Rectangle()
+                    .fill(Color.white.opacity(0.20))
+                    .frame(width: 1, height: 28)
 
-                  Button {
-                    showProxySelectorSheet = true
-                  } label: {
-                    Label("代理: \(appState.buildProxyControlLabel(for: .telegram, compact: true)) ▾", systemImage: "network")
-                  }
-                  .buttonStyle(TvApplePillButtonStyle(isSelected: appState.shouldUseProxyOrRelay(for: .telegram), compact: true))
-
-                  Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                      appState.showProxyStatsOverlay.toggle()
-                    }
-                  } label: {
-                    Label(appState.showProxyStatsOverlay ? "隐藏监控" : "代理监控", systemImage: "waveform.path.ecg.rectangle")
-                  }
-                  .buttonStyle(TvApplePillButtonStyle(isSelected: appState.showProxyStatsOverlay, compact: true))
-
-                  if isVideo {
+                  // Pinned Always-Visible Volume Adjustment Controls (never scrolled out of view!)
+                  HStack(spacing: 10) {
                     Button {
                       isMuted.toggle()
                       player.isMuted = isMuted
                     } label: {
-                      Label(isMuted ? "取消静音" : "静音", systemImage: isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                      Label(
+                        isMuted || volumeLevel <= 0.01 ? "已静音" : "音量",
+                        systemImage: isMuted || volumeLevel <= 0.01
+                          ? "speaker.slash.fill"
+                          : (volumeLevel < 0.5 ? "speaker.wave.1.fill" : "speaker.wave.2.fill")
+                      )
                     }
                     .buttonStyle(TvApplePillButtonStyle(isSelected: isMuted, compact: true))
 
-                    // Visual Volume Indicator Bar (100% / 0%)
+                    Button {
+                      isMuted = false
+                      volumeLevel = max(0.0, volumeLevel - 0.1)
+                      player.isMuted = (volumeLevel <= 0.01)
+                      player.volume = volumeLevel
+                    } label: {
+                      Image(systemName: "minus")
+                        .font(.system(size: 13, weight: .bold))
+                    }
+                    .buttonStyle(TvApplePillButtonStyle(compact: true))
+
                     HStack(spacing: 8) {
+                      let effVol = isMuted ? Float(0.0) : volumeLevel
                       ZStack(alignment: .leading) {
                         Capsule()
                           .fill(Color.white.opacity(0.22))
                           .frame(width: 72, height: 6)
                         Capsule()
                           .fill(Color(red: 0.24, green: 0.65, blue: 0.98))
-                          .frame(width: isMuted ? 0 : 72, height: 6)
+                          .frame(width: CGFloat(effVol) * 72, height: 6)
                         Circle()
                           .fill(Color.white)
                           .frame(width: 14, height: 14)
-                          .offset(x: isMuted ? 0 : 58)
+                          .offset(x: CGFloat(effVol) * 58)
                       }
-                      Text(isMuted ? "0%" : "100%")
-                        .font(.system(size: 16, weight: .medium, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.8))
+                      Text("\(Int(round(effVol * 100)))%")
+                        .font(.system(size: 15, weight: .bold, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.9))
+                        .frame(width: 46, alignment: .trailing)
                     }
-                    .padding(.leading, 4)
 
-                    TvVideoDownloadSpeedBadge(player: player, isBuffering: isBuffering, compact: true)
+                    Button {
+                      isMuted = false
+                      volumeLevel = min(1.0, volumeLevel + 0.1)
+                      player.isMuted = false
+                      player.volume = volumeLevel
+                    } label: {
+                      Image(systemName: "plus")
+                        .font(.system(size: 13, weight: .bold))
+                    }
+                    .buttonStyle(TvApplePillButtonStyle(compact: true))
                   }
                 }
-                .padding(.vertical, 6)
               }
               .focusSection()
             }
@@ -3163,7 +3452,7 @@ struct TvTelegramGalleryModalView: View {
         }
       }
     }
-    .onReceive(autoHideTick) { now in
+    .onReceive(Self.autoHideTick) { now in
       guard !appState.isAppInBackground else { return }
 
       // 1. Active Telegram Video Stall & Interruption Auto-Healing Watchdog
@@ -3269,6 +3558,7 @@ struct TvTelegramGalleryModalView: View {
       }
     }
     .onDisappear {
+      appState.latestMeasuredSpeedBytesPerSec = 0
       appState.videoDirectSeekHandler = nil
       appState.cancel115Acceleration()
       cleanupPlayer()

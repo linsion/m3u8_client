@@ -832,6 +832,12 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                       ),
                     if (!isImmersive)
                       _buildTelegramFloatingNotifications(state, isDesktop),
+                    if (!isImmersive && _selectedIndex != 1)
+                      Positioned(
+                        top: isDesktop ? 64 : 52,
+                        right: 12,
+                        child: const GlobalFloatingSpeedBadge(compact: true),
+                      ),
                   ],
                 ),
               ),
@@ -1449,54 +1455,83 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
             ),
           ),
           const SizedBox(width: 14),
-          // Right: High-Contrast TV Remote Action Pills (Media Library Switcher, Search, Proxy)
-          _buildTvHeaderActionPill(
-            icon: Icons.video_library_rounded,
-            label: activeSource?.name ??
-                (state.isConnecting ? '加载中...' : '切换媒体库'),
-            highlighted: true,
-            onTap: state.sources.isEmpty
-                ? null
-                : () {
-                    SourcePickerDialog.show(
-                      context,
-                      sources: state.visibleSources,
-                      selectedSource: state.selectedSource,
-                      appState: state,
-                      onSelect: (src) {
-                        _selectTab(0);
-                        state.selectVodSource(src);
-                      },
+          // Right: Unified Floating Capsule Action Strip (1:1 matched height, capsule container, and pill button style with Center Tab Strip)
+          Container(
+            height: 48,
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+            decoration: BoxDecoration(
+              color: VideoPlatformTheme.bgElevated,
+              borderRadius: BorderRadius.circular(24),
+              border: Border.all(
+                color: VideoPlatformTheme.borderSubtle,
+              ),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _buildTvHeaderActionPill(
+                  icon: Icons.video_library_rounded,
+                  label: activeSource?.name ??
+                      (state.isConnecting ? '加载中...' : '切换媒体库'),
+                  highlighted: activeSource != null,
+                  onTap: state.sources.isEmpty
+                      ? null
+                      : () {
+                          SourcePickerDialog.show(
+                            context,
+                            sources: state.visibleSources,
+                            selectedSource: state.selectedSource,
+                            appState: state,
+                            onSelect: (src) {
+                              _selectTab(0);
+                              state.selectVodSource(src);
+                            },
+                          );
+                        },
+                ),
+                const SizedBox(width: 4),
+                _buildTvHeaderActionPill(
+                  icon: Icons.search_rounded,
+                  label: state.searchKeyword.isNotEmpty
+                      ? '搜索: ${state.searchKeyword}'
+                      : '搜索',
+                  highlighted: state.searchKeyword.isNotEmpty,
+                  onTap: () {
+                    if (_selectedIndex != 0) {
+                      _selectTab(0);
+                    }
+                    _showTvSearchInputDialog(state);
+                  },
+                ),
+                const SizedBox(width: 4),
+                _buildTvHeaderActionPill(
+                  icon: proxyEnabled
+                      ? Icons.vpn_lock_rounded
+                      : Icons.public_off_rounded,
+                  label: proxyEnabled
+                      ? (activeProxyNode?.displayTitle ?? '代理已开')
+                      : '直连',
+                  highlighted: proxyEnabled,
+                  onTap: () => _selectTab(6),
+                ),
+                const SizedBox(width: 4),
+                _buildTvHeaderActionPill(
+                  icon: Icons.tv_rounded,
+                  label: 'TV模式',
+                  highlighted: false,
+                  onTap: () {
+                    state.setTvMode(false);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        duration: Duration(seconds: 2),
+                        content: Text('已切换回标准桌面/触屏模式'),
+                      ),
                     );
                   },
+                ),
+              ],
+            ),
           ),
-          const SizedBox(width: 8),
-          _buildTvHeaderActionPill(
-            icon: Icons.search_rounded,
-            label: state.searchKeyword.isNotEmpty
-                ? '搜索: ${state.searchKeyword}'
-                : '搜索',
-            highlighted: state.searchKeyword.isNotEmpty,
-            onTap: () {
-              if (_selectedIndex != 0) {
-                _selectTab(0);
-              }
-              _showTvSearchInputDialog(state);
-            },
-          ),
-          const SizedBox(width: 8),
-          _buildTvHeaderActionPill(
-            icon: proxyEnabled
-                ? Icons.vpn_lock_rounded
-                : Icons.public_off_rounded,
-            label: proxyEnabled
-                ? (activeProxyNode?.displayTitle ?? '代理已开')
-                : '直连',
-            highlighted: proxyEnabled,
-            onTap: () => _selectTab(6),
-          ),
-          const SizedBox(width: 6),
-          _buildTvModeButton(state),
         ],
       ),
       ),
@@ -1649,29 +1684,29 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
             scale: isFocused ? 1.06 : 1.0,
             duration: const Duration(milliseconds: 140),
             child: Container(
-              height: 40,
-              padding: const EdgeInsets.symmetric(horizontal: 13),
+              height: 38,
+              padding: const EdgeInsets.symmetric(horizontal: 14),
               decoration: BoxDecoration(
                 color: isFocused
                     ? VideoPlatformTheme.accent
                     : (highlighted
-                        ? VideoPlatformTheme.accent.withValues(alpha: 0.16)
-                        : VideoPlatformTheme.bgCard),
+                        ? VideoPlatformTheme.accent.withValues(alpha: 0.20)
+                        : Colors.transparent),
                 borderRadius: BorderRadius.circular(20),
                 border: Border.all(
                   color: isFocused
                       ? Colors.white
                       : (highlighted
                           ? VideoPlatformTheme.accent
-                          : VideoPlatformTheme.borderSubtle),
-                  width: isFocused ? 2.4 : 1.2,
+                          : Colors.transparent),
+                  width: isFocused ? 2.2 : 1.4,
                 ),
                 boxShadow: isFocused
                     ? [
                         BoxShadow(
                           color:
-                              VideoPlatformTheme.accent.withValues(alpha: 0.5),
-                          blurRadius: 10,
+                              VideoPlatformTheme.accent.withValues(alpha: 0.55),
+                          blurRadius: 12,
                           spreadRadius: 1,
                         ),
                       ]
@@ -1682,28 +1717,30 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                 children: [
                   Icon(
                     icon,
-                    size: 16,
+                    size: 17,
                     color: isFocused
-                        ? Colors.white
+                        ? Colors.black
                         : (highlighted
                             ? VideoPlatformTheme.accent
                             : VideoPlatformTheme.textSecondary),
                   ),
                   const SizedBox(width: 6),
                   ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 120),
+                    constraints: const BoxConstraints(maxWidth: 118),
                     child: Text(
                       label,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
-                        fontSize: 13,
+                        fontSize: 14,
                         fontWeight: (isFocused || highlighted)
-                            ? FontWeight.w700
+                            ? FontWeight.w800
                             : FontWeight.w500,
                         color: isFocused
-                            ? Colors.white
-                            : VideoPlatformTheme.textPrimary,
+                            ? Colors.black
+                            : (highlighted
+                                ? VideoPlatformTheme.accent
+                                : VideoPlatformTheme.textPrimary),
                       ),
                     ),
                   ),

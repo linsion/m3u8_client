@@ -381,4 +381,105 @@ void main() {
       expect(aiCreated[1].tracks.length, 2);
     },
   );
+
+  testWidgets(
+    'Mobile (375x812) CloudMusicSmartPlaylistDialog renders both Keyword and AI tabs without layout overflow',
+    (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      final appState = AppState();
+      addTearDown(appState.dispose);
+
+      await appState.saveAiConfig(
+        provider: 'deepseek',
+        apiKey: 'sk-mobile-test-key',
+        baseUrl: 'https://api.deepseek.com/v1',
+        model: 'deepseek-chat',
+      );
+
+      final controller = CloudMusicController(appState: appState);
+      controller.customDirectoryLister = (mount, path) async {
+        return const [
+          FileEntry(
+            name: '陈奕迅 - 富士山下.flac',
+            path: '/华语精选/陈奕迅 - 富士山下.flac',
+            size: 32000000,
+            modTime: '',
+            isDir: false,
+            isMp4: false,
+            ext: '.flac',
+          ),
+          FileEntry(
+            name: '周杰伦 - 七里香.flac',
+            path: '/华语精选/周杰伦 - 七里香.flac',
+            size: 29000000,
+            modTime: '',
+            isDir: false,
+            isMp4: false,
+            ext: '.flac',
+          ),
+        ];
+      };
+      controller.customAiCompletionHandler = (prompt) async {
+        return '''
+{
+  "playlists": [
+    {
+      "name": "AI · 华语金曲精选",
+      "description": "陈奕迅与周杰伦代表作",
+      "track_ids": [0, 1]
+    }
+  ]
+}
+''';
+      };
+      addTearDown(() {
+        controller.customDirectoryLister = null;
+        controller.customAiCompletionHandler = null;
+      });
+
+      const targetDir = SavedMusicFolderItem(
+        mountId: 'builtin_server',
+        mountName: '流光服务端',
+        sourceKind: StorageSourceKind.server,
+        path: '/华语精选',
+        title: '华语精选',
+      );
+
+      tester.view.devicePixelRatio = 1;
+      tester.view.physicalSize = const Size(375, 812);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      addTearDown(tester.view.resetPhysicalSize);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: ThemeData.dark(),
+          home: Scaffold(
+            body: CloudMusicSmartPlaylistDialog(
+              controller: controller,
+              initialSources: const [targetDir],
+              initialTab: 1,
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+
+      // Toggle inline AI API Key configuration panel on mobile screen
+      await tester.tap(find.text('配置 Key'));
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+
+      // Run AI preview analysis on mobile screen
+      await tester.tap(find.text('AI 分析目录并预览分类'));
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+      expect(find.text('AI · 华语金曲精选'), findsOneWidget);
+
+      // Switch to Tab 0 (搜人名/关键词建表) on mobile screen
+      await tester.tap(find.text('搜人名/关键词建表'));
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+    },
+  );
 }

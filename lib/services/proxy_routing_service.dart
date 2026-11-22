@@ -2329,8 +2329,13 @@ class LocalProxyTunnelBridge {
   ServerSocket? _serverSocket;
   final ProxyNode? Function() _resolveDefaultNode;
   final List<ProxyNode> Function()? _resolveFallbackNodes;
+  final List<ProxyNode> Function()? _resolveEmergencyFallbackNodes;
   final void Function(String nodeId, {required bool success, int? rttMs})?
       _onNodeFeedback;
+  ({Uri proxyUri, Map<String, String> authHeaders})? Function(
+    Uri targetUri,
+    Map<String, String> headers,
+  )? _resolveServerVodProxy;
 
   final Map<String, HttpClient> _streamRelayClients =
       <String, HttpClient>{};
@@ -2390,11 +2395,132 @@ class LocalProxyTunnelBridge {
   LocalProxyTunnelBridge({
     required ProxyNode? Function() resolveDefaultNode,
     List<ProxyNode> Function()? resolveFallbackNodes,
+    List<ProxyNode> Function()? resolveEmergencyFallbackNodes,
     void Function(String nodeId, {required bool success, int? rttMs})?
         onNodeFeedback,
+    ({Uri proxyUri, Map<String, String> authHeaders})? Function(
+      Uri targetUri,
+      Map<String, String> headers,
+    )? resolveServerVodProxy,
   })  : _resolveDefaultNode = resolveDefaultNode,
         _resolveFallbackNodes = resolveFallbackNodes,
-        _onNodeFeedback = onNodeFeedback;
+        _resolveEmergencyFallbackNodes = resolveEmergencyFallbackNodes,
+        _onNodeFeedback = onNodeFeedback,
+        _resolveServerVodProxy = resolveServerVodProxy;
+
+  void setServerVodProxyResolver(
+    ({Uri proxyUri, Map<String, String> authHeaders})? Function(
+      Uri targetUri,
+      Map<String, String> headers,
+    )? resolver,
+  ) {
+    _resolveServerVodProxy = resolver;
+  }
+
+  static final Map<String, int> _directFailedHostTimestamps = <String, int>{};
+  static const int _directFailedHostTtlMs = 10 * 60 * 1000;
+
+  static String _directHostCacheKey(Uri uri) {
+    final auth = uri.authority.toLowerCase().trim();
+    return auth.isNotEmpty ? auth : uri.host.toLowerCase().trim();
+  }
+
+  static bool _isHostMarkedDirectFailed(Uri uri) {
+    final key = _directHostCacheKey(uri);
+    if (key.isEmpty) return false;
+    final ts = _directFailedHostTimestamps[key];
+    if (ts == null) return false;
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (nowMs - ts > _directFailedHostTtlMs) {
+      _directFailedHostTimestamps.remove(key);
+      return false;
+    }
+    return true;
+  }
+
+  static void _markHostDirectFailed(Uri uri) {
+    final key = _directHostCacheKey(uri);
+    if (key.isEmpty || isDomesticCloudOrLanHost(uri.host)) return;
+    _directFailedHostTimestamps[key] = DateTime.now().millisecondsSinceEpoch;
+  }
+
+  static void _clearHostDirectFailed(Uri uri) {
+    final key = _directHostCacheKey(uri);
+    if (key.isEmpty) return;
+    _directFailedHostTimestamps.remove(key);
+  }
+
+  static bool isDomesticCloudOrLanHost(String rawHost) {
+    final host = rawHost.toLowerCase().trim();
+    if (host.isEmpty ||
+        host == 'localhost' ||
+        host == '127.0.0.1' ||
+        host == '::1') {
+      return true;
+    }
+    if (RegExp(r'^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)')
+        .hasMatch(host)) {
+      return true;
+    }
+    return host.endsWith('.115.com') ||
+        host.endsWith('.115cdn.net') ||
+        host.endsWith('.115cdn.com') ||
+        host.endsWith('.baidupcs.com') ||
+        host.endsWith('.aliyundrive.com') ||
+        host.endsWith('.alipan.com');
+  }
+
+  /// Unwraps backend `/api/vod/proxy?url=...` lines inside an M3U8 playlist back to
+  /// their canonical upstream CDN URLs so `M3u8AdRemover` and `_rewriteM3u8PlaylistThroughRelay`
+  /// can resolve child variant playlists, strip ad blocks, and route segments through the local relay.
+  static String unwrapServerVodProxyLinesInM3u8(String text) {
+    if (!text.contains('/api/vod/proxy')) return text;
+    final uriAttrRegex = RegExp(
+      r'''URI=(?:"([^"]+)"|'([^']+)')''',
+      caseSensitive: false,
+    );
+    String? extractInnerUrl(String raw) {
+      final trimmed = raw.trim();
+      if (!trimmed.contains('/api/vod/proxy')) return null;
+      final parsed = Uri.tryParse(
+        trimmed.startsWith('http://') || trimmed.startsWith('https://')
+            ? trimmed
+            : 'http://localhost${trimmed.startsWith('/') ? '' : '/'}$trimmed',
+      );
+      final inner = parsed?.queryParameters['url']?.trim();
+      if (inner != null &&
+          (inner.startsWith('http://') || inner.startsWith('https://'))) {
+        return inner;
+      }
+      return null;
+    }
+
+    final lines = const LineSplitter().convert(text);
+    final sb = StringBuffer();
+    for (final rawLine in lines) {
+      final line = rawLine.trim();
+      if (line.isEmpty) {
+        sb.writeln();
+        continue;
+      }
+      if (line.startsWith('#')) {
+        if (line.contains('/api/vod/proxy') && uriAttrRegex.hasMatch(line)) {
+          final rewritten = line.replaceAllMapped(uriAttrRegex, (m) {
+            final u = (m.group(1) ?? m.group(2) ?? '').trim();
+            final inner = extractInnerUrl(u);
+            return inner != null ? 'URI="$inner"' : m.group(0)!;
+          });
+          sb.writeln(rewritten);
+        } else {
+          sb.writeln(line);
+        }
+      } else {
+        final inner = extractInnerUrl(line);
+        sb.writeln(inner ?? line);
+      }
+    }
+    return sb.toString();
+  }
 
   int get port => _serverSocket?.port ?? 0;
   bool get isRunning => _serverSocket != null;
@@ -2582,7 +2708,14 @@ class LocalProxyTunnelBridge {
     final encodedHeaders = cleanHeaders.isEmpty
         ? ''
         : base64Url.encode(utf8.encode(jsonEncode(cleanHeaders)));
-    final lower = targetUrl.toLowerCase();
+    var lower = targetUrl.toLowerCase();
+    if (lower.contains('/api/vod/proxy')) {
+      final parsed = Uri.tryParse(targetUrl);
+      final innerUrl = parsed?.queryParameters['url']?.trim() ?? '';
+      if (innerUrl.isNotEmpty) {
+        lower = innerUrl.toLowerCase();
+      }
+    }
     String suffix = forceSuffix ?? 'stream.bin';
     if (forceSuffix == null) {
       if (lower.contains('.m3u8')) {
@@ -2913,7 +3046,7 @@ class LocalProxyTunnelBridge {
         return;
       }
 
-      final targetUri = Uri.tryParse(targetUrl);
+      var targetUri = Uri.tryParse(targetUrl);
       if (targetUri == null || targetUri.host.isEmpty) {
         client.add(latin1.encode('HTTP/1.1 400 Bad Request\r\n\r\n'));
         await client.flush();
@@ -2940,6 +3073,43 @@ class LocalProxyTunnelBridge {
             });
           }
         } catch (_) {}
+      }
+
+      var preferServerVodProxy = false;
+      if (targetUri.path.toLowerCase().startsWith('/api/vod/proxy')) {
+        final innerUrl = (targetUri.queryParameters['url'] ?? '').trim();
+        final innerUri = Uri.tryParse(innerUrl);
+        if (innerUri != null &&
+            (innerUri.scheme == 'http' || innerUri.scheme == 'https') &&
+            innerUri.host.isNotEmpty) {
+          preferServerVodProxy = true;
+          final rawHdrParam = (targetUri.queryParameters['headers'] ?? '').trim();
+          if (rawHdrParam.isNotEmpty) {
+            try {
+              final decodedText = rawHdrParam.startsWith('{')
+                  ? rawHdrParam
+                  : utf8.decode(
+                      base64Url.decode(base64Url.normalize(rawHdrParam)),
+                      allowMalformed: true,
+                    );
+              final decodedMap = jsonDecode(decodedText);
+              if (decodedMap is Map) {
+                decodedMap.forEach((k, v) {
+                  if (k != null && v != null) {
+                    customHeaders.putIfAbsent(k.toString(), () => v.toString());
+                  }
+                });
+              }
+            } catch (_) {}
+          }
+          customHeaders.removeWhere(
+            (k, _) =>
+                k.toLowerCase() == 'authorization' ||
+                k.toLowerCase() == 'cookie',
+          );
+          targetUri = innerUri;
+          targetUrl = innerUri.toString();
+        }
       }
 
       String? rangeHeader;
@@ -3168,8 +3338,9 @@ class LocalProxyTunnelBridge {
         String? activeRange,
         int redirectsRemaining = 5,
         Duration timeout = const Duration(milliseconds: 8000),
+        int maxAttempts = 2,
       }) async {
-        for (var attempt = 0; attempt < 2; attempt++) {
+        for (var attempt = 0; attempt < maxAttempts; attempt++) {
           if (!_clientCleanups.containsKey(client)) return null;
           try {
             final hc = _getOrCreateDirectRelayHttpClient();
@@ -3196,6 +3367,7 @@ class LocalProxyTunnelBridge {
                   activeRange: activeRange,
                   redirectsRemaining: redirectsRemaining - 1,
                   timeout: timeout,
+                  maxAttempts: maxAttempts,
                 );
               }
             }
@@ -3211,6 +3383,77 @@ class LocalProxyTunnelBridge {
           } catch (_) {}
         }
         return null;
+      }
+
+      Future<({HttpClientResponse resp, Uri finalUri, HttpClient hc})?>
+      tryOpenViaServerVodProxy(
+        Uri uri, {
+        String? activeRange,
+        Duration timeout = const Duration(milliseconds: 9500),
+      }) async {
+        final resolver = _resolveServerVodProxy;
+        if (resolver == null) return null;
+        final resolved = resolver(uri, customHeaders);
+        if (resolved == null) return null;
+        if (!_clientCleanups.containsKey(client)) return null;
+        HttpClientRequest? pending;
+        var cancelled = false;
+        void cancel() {
+          cancelled = true;
+          pending?.abort();
+        }
+
+        pendingRequests.add(cancel);
+        try {
+          final hc = _getOrCreateDirectRelayHttpClient();
+          final req = await hc
+              .openUrl(isHead ? 'HEAD' : 'GET', resolved.proxyUri)
+              .then((r) {
+                if (cancelled) {
+                  unawaited(
+                    r.done.then<void>((_) {}, onError: (Object _) {}),
+                  );
+                  r.abort();
+                }
+                return r;
+              })
+              .timeout(timeout);
+          if (cancelled) return null;
+          pending = req;
+          req.followRedirects = true;
+          req.headers.set(
+            HttpHeaders.userAgentHeader,
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36',
+          );
+          req.headers.set(HttpHeaders.acceptHeader, '*/*');
+          req.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
+          resolved.authHeaders.forEach((name, value) {
+            if (name.toLowerCase() != HttpHeaders.hostHeader &&
+                value.trim().isNotEmpty) {
+              req.headers.set(name, value.trim());
+            }
+          });
+          if (activeRange != null && activeRange.isNotEmpty) {
+            req.headers.set(HttpHeaders.rangeHeader, activeRange);
+          }
+          final resp = await req.close().timeout(timeout);
+          if (cancelled || !_clientCleanups.containsKey(client)) {
+            await discardResponse(resp);
+            return null;
+          }
+          if (resp.statusCode >= 200 && resp.statusCode < 400) {
+            // Keep logical `finalUri: uri` so relative paths in M3U8 playlists
+            // resolve against the upstream CDN origin rather than `/api/vod/proxy`.
+            return (resp: resp, finalUri: uri, hc: hc);
+          }
+          await discardResponse(resp);
+          return null;
+        } catch (_) {
+          cancel();
+          return null;
+        } finally {
+          pendingRequests.remove(cancel);
+        }
       }
 
       Future<({HttpClientResponse resp, Uri finalUri, HttpClient hc})?>
@@ -3290,8 +3533,51 @@ class LocalProxyTunnelBridge {
       Future<({HttpClientResponse resp, Uri finalUri, HttpClient hc})?>
       openTargetUri(Uri uri, {String? overrideRange}) async {
         final activeRange = overrideRange ?? rangeHeader;
+        if (preferServerVodProxy) {
+          final viaServer = await tryOpenViaServerVodProxy(
+            uri,
+            activeRange: activeRange,
+          );
+          if (viaServer != null) return viaServer;
+        }
+
         if (forceDirect) {
-          return tryOpenDirect(uri, activeRange: activeRange);
+          final hasBackupRoute =
+              _resolveServerVodProxy != null ||
+              (_resolveEmergencyFallbackNodes?.call().isNotEmpty ?? false);
+          if (!_isHostMarkedDirectFailed(uri)) {
+            final directRes = await tryOpenDirect(
+              uri,
+              activeRange: activeRange,
+              timeout: hasBackupRoute
+                  ? const Duration(milliseconds: 4500)
+                  : const Duration(milliseconds: 8000),
+              maxAttempts: hasBackupRoute ? 1 : 2,
+            );
+            if (directRes != null) {
+              _clearHostDirectFailed(uri);
+              return directRes;
+            }
+            _markHostDirectFailed(uri);
+          }
+
+          final viaServer = await tryOpenViaServerVodProxy(
+            uri,
+            activeRange: activeRange,
+          );
+          if (viaServer != null) return viaServer;
+
+          final emergencyNodes =
+              _resolveEmergencyFallbackNodes?.call() ?? const <ProxyNode>[];
+          for (final node in emergencyNodes.take(2)) {
+            final res = await tryOpenWithNode(
+              node,
+              uri,
+              activeRange: activeRange,
+            );
+            if (res != null) return res;
+          }
+          return null;
         }
 
         final nodesToTry = candidateNodes;
@@ -3358,8 +3644,10 @@ class LocalProxyTunnelBridge {
             );
             if (res != null) return res;
           }
-          // Last-resort fallback: if all candidate proxy nodes failed or were blocked by a domestic VOD CDN, try direct connection
-          return await tryOpenDirect(uri, activeRange: activeRange);
+          // Last-resort fallback: if all candidate proxy nodes failed or were blocked by a domestic VOD CDN, try direct connection or server VOD proxy
+          final directRes = await tryOpenDirect(uri, activeRange: activeRange);
+          if (directRes != null) return directRes;
+          return await tryOpenViaServerVodProxy(uri, activeRange: activeRange);
         }
 
         for (final node in nodesToTry) {
@@ -3370,8 +3658,10 @@ class LocalProxyTunnelBridge {
           );
           if (res != null) return res;
         }
-        // Last-resort fallback: if all candidate proxy nodes failed or were blocked by a domestic VOD CDN, try direct connection
-        return await tryOpenDirect(uri, activeRange: activeRange);
+        // Last-resort fallback: if all candidate proxy nodes failed or were blocked by a domestic VOD CDN, try direct connection or server VOD proxy
+        final directRes = await tryOpenDirect(uri, activeRange: activeRange);
+        if (directRes != null) return directRes;
+        return await tryOpenViaServerVodProxy(uri, activeRange: activeRange);
       }
 
       final path = targetUri.path.toLowerCase();
@@ -3657,12 +3947,13 @@ class LocalProxyTunnelBridge {
                     .replaceFirst('\uFEFF', '');
                 if (nextText.contains('#EXTM3U')) {
                   currentUri = nextOpened.finalUri;
-                  text = nextText;
+                  text = unwrapServerVodProxyLinesInM3u8(nextText);
                 }
               }
             }
           }
           if (text.contains('#EXTM3U')) {
+            text = unwrapServerVodProxyLinesInM3u8(text);
             // Resolve Master Playlist (`#EXT-X-STREAM-INF`) on the same warm keep-alive connection
             // unless it declares separate `#EXT-X-MEDIA:TYPE=AUDIO` renditions with external URIs!
             final hasSeparateAudioRendition = RegExp(
@@ -3700,7 +3991,7 @@ class LocalProxyTunnelBridge {
                   .replaceFirst('\uFEFF', '');
               if (!nextText.contains('#EXTM3U')) break;
               currentUri = nextOpened.finalUri;
-              text = nextText;
+              text = unwrapServerVodProxyLinesInM3u8(nextText);
             }
 
             if (cleanAds && text.contains('#EXTINF')) {
@@ -3785,7 +4076,6 @@ class LocalProxyTunnelBridge {
                 !_hasDisguisedImageHeaderMagic(firstBuf.toBytes())) {
               break;
             }
-            if (firstBuf.length >= 512) break;
           }
           if (firstBuf.length > 0) {
             preBufferedBinaryChunk = firstBuf.takeBytes();
@@ -4680,7 +4970,10 @@ class LocalProxyTunnelBridge {
   }) async {
     final uri = Uri.tryParse(url);
     if (uri == null || uri.host.isEmpty) return null;
-    final routes = forceDirect ? <ProxyNode?>[null] : [...candidateNodes, null];
+    final directAlreadyFailed = forceDirect && _isHostMarkedDirectFailed(uri);
+    final routes = forceDirect
+        ? (directAlreadyFailed ? <ProxyNode?>[] : <ProxyNode?>[null])
+        : [...candidateNodes, null];
     for (final node in routes) {
       if (generation != _prefetchGeneration || !isRunning) return null;
       HttpClientRequest? request;
@@ -4722,6 +5015,9 @@ class LocalProxyTunnelBridge {
         if (cancelled ||
             response.statusCode != HttpStatus.ok ||
             response.contentLength > maxBytes) {
+          if (node == null && response.statusCode >= 400) {
+            _markHostDirectFailed(uri);
+          }
           await response.listen(null, onError: (Object _) {}).cancel();
           continue;
         }
@@ -4744,6 +5040,9 @@ class LocalProxyTunnelBridge {
                 rawBytes.length != response.contentLength)) {
           continue;
         }
+        if (node == null) {
+          _clearHostDirectFailed(uri);
+        }
         final stripped = stripDisguisedTsImageHeader(rawBytes);
         final cleanBytes = stripped.bytes;
         final cleanContentType = (stripped.strippedBytes > 0 ||
@@ -4754,7 +5053,90 @@ class LocalProxyTunnelBridge {
         _storePrefetchedSegment(url, cleanBytes, cleanContentType);
         return (bytes: cleanBytes, contentType: cleanContentType);
       } catch (_) {
+        if (node == null) {
+          _markHostDirectFailed(uri);
+        }
         // Try the next route if the upstream failed.
+      } finally {
+        _cancelPrefetches.remove(cancel);
+        cancel();
+        await body?.cancel();
+      }
+    }
+
+    // Fallback prefetch via backend `/api/vod/proxy` when direct/proxy failed
+    final srv = _resolveServerVodProxy?.call(uri, customHeaders);
+    if (srv != null && generation == _prefetchGeneration && isRunning) {
+      HttpClientRequest? request;
+      StreamIterator<List<int>>? body;
+      const timeout = Duration(seconds: 8);
+      var cancelled = false;
+      void cancel() {
+        cancelled = true;
+        request?.abort();
+        if (body != null) unawaited(body.cancel());
+      }
+
+      _cancelPrefetches.add(cancel);
+      try {
+        final hc = _getOrCreateDirectRelayHttpClient();
+        final openedRequest = await hc
+            .getUrl(srv.proxyUri)
+            .then((req) {
+              if (cancelled) {
+                unawaited(req.done.then<void>((_) {}, onError: (Object _) {}));
+                req.abort();
+              }
+              return req;
+            })
+            .timeout(timeout);
+        if (cancelled) return null;
+        request = openedRequest;
+        srv.authHeaders.forEach((name, value) {
+          if (name.toLowerCase() != HttpHeaders.hostHeader &&
+              value.trim().isNotEmpty) {
+            openedRequest.headers.set(name, value.trim());
+          }
+        });
+        openedRequest.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
+        final response = await openedRequest.close().timeout(timeout);
+        const maxBytes = 8 * 1024 * 1024;
+        if (cancelled ||
+            response.statusCode != HttpStatus.ok ||
+            response.contentLength > maxBytes) {
+          await response.listen(null, onError: (Object _) {}).cancel();
+          return null;
+        }
+        final contentType =
+            response.headers.value(HttpHeaders.contentTypeHeader) ??
+            'video/mp2t';
+        final builder = BytesBuilder(copy: false);
+        body = StreamIterator(response.timeout(timeout));
+        while (!cancelled && await body.moveNext()) {
+          final chunk = body.current;
+          recordDownstreamBytes(chunk.length);
+          if (builder.length + chunk.length > maxBytes) return null;
+          builder.add(chunk);
+        }
+        final rawBytes = builder.takeBytes();
+        if (cancelled ||
+            generation != _prefetchGeneration ||
+            rawBytes.isEmpty ||
+            (response.contentLength >= 0 &&
+                rawBytes.length != response.contentLength)) {
+          return null;
+        }
+        final stripped = stripDisguisedTsImageHeader(rawBytes);
+        final cleanBytes = stripped.bytes;
+        final cleanContentType = (stripped.strippedBytes > 0 ||
+                contentType.toLowerCase().startsWith('image/') ||
+                contentType.toLowerCase().startsWith('text/'))
+            ? 'video/mp2t'
+            : contentType;
+        _storePrefetchedSegment(url, cleanBytes, cleanContentType);
+        return (bytes: cleanBytes, contentType: cleanContentType);
+      } catch (_) {
+        return null;
       } finally {
         _cancelPrefetches.remove(cancel);
         cancel();
@@ -6540,14 +6922,33 @@ class ProxyRoutingService extends ChangeNotifier {
   final Map<String, LocalProxyTunnelBridge> _nodeBridges = {};
   final Map<String, int> _nodeFailureStreaks = {};
   int _lastAutoSwitchTimestampMs = 0;
+  ({Uri proxyUri, Map<String, String> authHeaders})? Function(
+    Uri targetUri,
+    Map<String, String> headers,
+  )? _serverVodProxyResolver;
 
   ProxyRoutingService() {
     _localBridge = LocalProxyTunnelBridge(
       resolveDefaultNode: () => _proxyEnabled ? activeNode : null,
       resolveFallbackNodes: () =>
           _proxyEnabled ? _resolveCandidateFallbackNodes() : const <ProxyNode>[],
+      resolveEmergencyFallbackNodes: _resolveCandidateFallbackNodes,
       onNodeFeedback: _handleNodeRuntimeFeedback,
+      resolveServerVodProxy: (u, h) => _serverVodProxyResolver?.call(u, h),
     );
+  }
+
+  void attachServerVodProxyResolver(
+    ({Uri proxyUri, Map<String, String> authHeaders})? Function(
+      Uri targetUri,
+      Map<String, String> headers,
+    )? resolver,
+  ) {
+    _serverVodProxyResolver = resolver;
+    _localBridge.setServerVodProxyResolver(resolver);
+    for (final b in _nodeBridges.values) {
+      b.setServerVodProxyResolver(resolver);
+    }
   }
 
   List<ProxyNode> _resolveCandidateFallbackNodes() {
@@ -6762,7 +7163,9 @@ class ProxyRoutingService extends ChangeNotifier {
         },
         resolveFallbackNodes: () =>
             _proxyEnabled ? _resolveCandidateFallbackNodes() : const <ProxyNode>[],
+        resolveEmergencyFallbackNodes: _resolveCandidateFallbackNodes,
         onNodeFeedback: _handleNodeRuntimeFeedback,
+        resolveServerVodProxy: (u, h) => _serverVodProxyResolver?.call(u, h),
       );
       _nodeBridges[node.id] = bridge;
     }
@@ -7302,13 +7705,16 @@ class ProxyRoutingService extends ChangeNotifier {
           );
         }
       }
-      final isDirectVodM3u8 = scenario == RequestScenario.vodStream &&
-          effective == ScenarioRouteMode.direct &&
-          !uri.path.toLowerCase().startsWith('/api/vod/proxy') &&
+      final isDirectOrRelayVodM3u8 = scenario == RequestScenario.vodStream &&
+          (effective == ScenarioRouteMode.direct ||
+              effective == ScenarioRouteMode.serverRelay ||
+              uri.path.toLowerCase().startsWith('/api/vod/proxy')) &&
           uri.host != '127.0.0.1' &&
           uri.host != 'localhost' &&
-          (lowerTrimmed.contains('.m3u8') || cleanM3u8Ads);
-      if (isDirectVodM3u8) {
+          (lowerTrimmed.contains('.m3u8') ||
+              uri.path.toLowerCase().startsWith('/api/vod/proxy') ||
+              cleanM3u8Ads);
+      if (isDirectOrRelayVodM3u8) {
         final directPort = await _localBridge.ensureStarted();
         if (directPort > 0) {
           return _localBridge.buildStreamRelayUrl(
@@ -7337,13 +7743,16 @@ class ProxyRoutingService extends ChangeNotifier {
           );
         }
       }
-      final isDirectVodM3u8 = scenario == RequestScenario.vodStream &&
-          effective == ScenarioRouteMode.direct &&
-          !uri.path.toLowerCase().startsWith('/api/vod/proxy') &&
+      final isDirectOrRelayVodM3u8 = scenario == RequestScenario.vodStream &&
+          (effective == ScenarioRouteMode.direct ||
+              effective == ScenarioRouteMode.serverRelay ||
+              uri.path.toLowerCase().startsWith('/api/vod/proxy')) &&
           uri.host != '127.0.0.1' &&
           uri.host != 'localhost' &&
-          (lowerTrimmed.contains('.m3u8') || cleanM3u8Ads);
-      if (isDirectVodM3u8) {
+          (lowerTrimmed.contains('.m3u8') ||
+              uri.path.toLowerCase().startsWith('/api/vod/proxy') ||
+              cleanM3u8Ads);
+      if (isDirectOrRelayVodM3u8) {
         final directPort = await _localBridge.ensureStarted();
         if (directPort > 0) {
           return _localBridge.buildStreamRelayUrl(

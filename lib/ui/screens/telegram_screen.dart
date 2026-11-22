@@ -17858,10 +17858,10 @@ class _TelegramPhotoGalleryDialogState
       _bottomMovePosFocusNode,
       _bottomHideBarFocusNode,
       if (_videoPlayer != null) _bottomProxyFocusNode,
-      _muteFocusNode,
       _bottomSaveFocusNode,
       if (att?.url.isNotEmpty ?? false) _bottomQueueFocusNode,
       _bottomExitFocusNode,
+      _muteFocusNode,
     ];
 
     final activeThumbNode =
@@ -18411,11 +18411,6 @@ class _TelegramPhotoGalleryDialogState
                                 });
                               },
                             ),
-                            const SizedBox(width: 6),
-                            VideoDownloadSpeedBadge(
-                              player: _videoPlayer!,
-                              compact: isMobileDialog,
-                            ),
                           ],
                           if (hasAlbumGroup) ...[
                             const SizedBox(width: 6),
@@ -18606,6 +18601,17 @@ class _TelegramPhotoGalleryDialogState
                 ],
               ),
             ),
+
+            // 2a. Floating movable / hideable / closable download speed tag on Telegram video stage
+            if (isVideo && _videoPlayer != null)
+              Positioned(
+                top: isMobileDialog ? 54 : 52,
+                right: 14,
+                child: VideoDownloadSpeedBadge(
+                  player: _videoPlayer!,
+                  compact: true,
+                ),
+              ),
 
             // 2b. Floating Animated HUD Banner inside Gallery Lightbox
             Positioned(
@@ -18838,7 +18844,7 @@ class _TelegramPhotoGalleryDialogState
                             });
                           },
                           child: Container(
-                            constraints: const BoxConstraints(maxWidth: 920),
+                            constraints: const BoxConstraints(maxWidth: 1120),
                             margin: const EdgeInsets.only(bottom: 8),
                             padding: const EdgeInsets.fromLTRB(12, 5, 12, 8),
                             decoration: BoxDecoration(
@@ -19134,456 +19140,465 @@ class _TelegramPhotoGalleryDialogState
                             },
                           ),
                           const SizedBox(height: 6),
-                          // Row 2: Focusable Control Buttons Row (Left/Right freely switches focus among all buttons)
-                          SingleChildScrollView(
-                            scrollDirection: Axis.horizontal,
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                _buildGalleryTvIconButton(
-                                  focusNode: _playPauseFocusNode,
-                                  autofocus: true,
-                                  icon: _isVideoPlaying
-                                      ? Icons.pause_rounded
-                                      : Icons.play_arrow_rounded,
-                                  label: _isVideoPlaying ? '暂停' : '播放',
-                                  onTap: () => _toggleGalleryPlayback(),
-                                  upFocusNode: _scrubberFocusNode,
-                                  downFocusNode: activeThumbNode,
-                                  leftFocusNode: _neighborInChain(
-                                    bottomFocusChain,
-                                    _playPauseFocusNode,
-                                    -1,
-                                    edgeTarget: list.length > 1
-                                        ? _prevItemFocusNode
-                                        : null,
-                                  ),
-                                  rightFocusNode: _neighborInChain(
-                                    bottomFocusChain,
-                                    _playPauseFocusNode,
-                                    1,
-                                  ),
-                                ),
-                                const SizedBox(width: 6),
-                                _buildGalleryTvIconButton(
-                                  focusNode: _rewindFocusNode,
-                                  icon: Icons.replay_5_rounded,
-                                  label: '快退5s',
-                                  onTap: () => _seekRelative(-5),
-                                  upFocusNode: _scrubberFocusNode,
-                                  downFocusNode: activeThumbNode,
-                                  leftFocusNode: _neighborInChain(
-                                    bottomFocusChain,
-                                    _rewindFocusNode,
-                                    -1,
-                                  ),
-                                  rightFocusNode: _neighborInChain(
-                                    bottomFocusChain,
-                                    _rewindFocusNode,
-                                    1,
-                                  ),
-                                ),
-                                const SizedBox(width: 6),
-                                _buildGalleryTvIconButton(
-                                  focusNode: _forwardFocusNode,
-                                  icon: Icons.forward_5_rounded,
-                                  label: '快进5s',
-                                  onTap: () => _seekRelative(5),
-                                  upFocusNode: _scrubberFocusNode,
-                                  downFocusNode: activeThumbNode,
-                                  leftFocusNode: _neighborInChain(
-                                    bottomFocusChain,
-                                    _forwardFocusNode,
-                                    -1,
-                                  ),
-                                  rightFocusNode: _neighborInChain(
-                                    bottomFocusChain,
-                                    _forwardFocusNode,
-                                    1,
-                                  ),
-                                ),
-                                if (list.length > 1) ...[
-                                  const SizedBox(width: 6),
-                                  _buildGalleryTvIconButton(
-                                    focusNode: _bottomPrevFocusNode,
-                                    icon: Icons.skip_previous_rounded,
-                                    label: '上一项',
-                                    onTap: () => _step(-1),
-                                    upFocusNode: _prevItemFocusNode,
-                                    downFocusNode: activeThumbNode,
-                                    leftFocusNode: _neighborInChain(
-                                      bottomFocusChain,
-                                      _bottomPrevFocusNode,
-                                      -1,
-                                    ),
-                                    rightFocusNode: _neighborInChain(
-                                      bottomFocusChain,
-                                      _bottomPrevFocusNode,
-                                      1,
-                                    ),
-                                  ),
-                                  const SizedBox(width: 6),
-                                  _buildGalleryTvIconButton(
-                                    focusNode: _bottomNextFocusNode,
-                                    icon: Icons.skip_next_rounded,
-                                    label: '下一项',
-                                    onTap: () => _step(1),
-                                    upFocusNode: _nextItemFocusNode,
-                                    downFocusNode: activeThumbNode,
-                                    leftFocusNode: _neighborInChain(
-                                      bottomFocusChain,
-                                      _bottomNextFocusNode,
-                                      -1,
-                                    ),
-                                    rightFocusNode: _neighborInChain(
-                                      bottomFocusChain,
-                                      _bottomNextFocusNode,
-                                      1,
-                                    ),
-                                  ),
-                                ],
-                                const SizedBox(width: 6),
-                                _buildGalleryTvIconButton(
-                                  focusNode: _speedFocusNode,
-                                  icon: Icons.speed_rounded,
-                                  label: '${_playbackSpeed}x',
-                                  onTap: _cycleSpeed,
-                                  upFocusNode: _scrubberFocusNode,
-                                  downFocusNode: activeThumbNode,
-                                  leftFocusNode: _neighborInChain(
-                                    bottomFocusChain,
-                                    _speedFocusNode,
-                                    -1,
-                                  ),
-                                  rightFocusNode: _neighborInChain(
-                                    bottomFocusChain,
-                                    _speedFocusNode,
-                                    1,
-                                  ),
-                                ),
-                                const SizedBox(width: 6),
-                                _buildGalleryTvIconButton(
-                                  focusNode: _aspectModeFocusNode,
-                                  icon: _galleryAspectMode == 'cover'
-                                      ? Icons.crop_free_rounded
-                                      : Icons.aspect_ratio_rounded,
-                                  label: _galleryAspectMode == 'cover'
-                                      ? '铺满'
-                                      : '适应',
-                                  onTap: _cycleGalleryAspectMode,
-                                  upFocusNode: _scrubberFocusNode,
-                                  downFocusNode: activeThumbNode,
-                                  leftFocusNode: _neighborInChain(
-                                    bottomFocusChain,
-                                    _aspectModeFocusNode,
-                                    -1,
-                                  ),
-                                  rightFocusNode: _neighborInChain(
-                                    bottomFocusChain,
-                                    _aspectModeFocusNode,
-                                    1,
-                                  ),
-                                ),
-                                if (msg.text.trim().isNotEmpty) ...[
-                                  const SizedBox(width: 6),
-                                  _buildGalleryTvIconButton(
-                                    focusNode: _bottomToggleCaptionFocusNode,
-                                    icon: _captionHidden
-                                        ? Icons.subtitles_outlined
-                                        : Icons.subtitles_off_outlined,
-                                    label: _captionHidden ? '显示标题' : '隐藏标题',
-                                    onTap: () => setState(
-                                      () => _captionHidden = !_captionHidden,
-                                    ),
-                                    upFocusNode: _scrubberFocusNode,
-                                    downFocusNode: activeThumbNode,
-                                    leftFocusNode: _neighborInChain(
-                                      bottomFocusChain,
-                                      _bottomToggleCaptionFocusNode,
-                                      -1,
-                                    ),
-                                    rightFocusNode: _neighborInChain(
-                                      bottomFocusChain,
-                                      _bottomToggleCaptionFocusNode,
-                                      1,
-                                    ),
-                                  ),
-                                ],
-                                const SizedBox(width: 6),
-                                _buildGalleryTvIconButton(
-                                  focusNode: _bottomMovePosFocusNode,
-                                  icon: Icons.open_with_rounded,
-                                  label: _controlsPosPresetLabel,
-                                  onTap: _cycleControlsAndCaptionPosition,
-                                  upFocusNode: _scrubberFocusNode,
-                                  downFocusNode: activeThumbNode,
-                                  leftFocusNode: _neighborInChain(
-                                    bottomFocusChain,
-                                    _bottomMovePosFocusNode,
-                                    -1,
-                                  ),
-                                  rightFocusNode: _neighborInChain(
-                                    bottomFocusChain,
-                                    _bottomMovePosFocusNode,
-                                    1,
-                                  ),
-                                ),
-                                const SizedBox(width: 6),
-                                _buildGalleryTvIconButton(
-                                  focusNode: _bottomHideBarFocusNode,
-                                  icon: Icons.visibility_off_outlined,
-                                  label: '隐藏进度条',
-                                  onTap: _hideControlsBar,
-                                  upFocusNode: _scrubberFocusNode,
-                                  downFocusNode: activeThumbNode,
-                                  leftFocusNode: _neighborInChain(
-                                    bottomFocusChain,
-                                    _bottomHideBarFocusNode,
-                                    -1,
-                                  ),
-                                  rightFocusNode: _neighborInChain(
-                                    bottomFocusChain,
-                                    _bottomHideBarFocusNode,
-                                    1,
-                                  ),
-                                ),
-                                if ((Platform.isAndroid || Platform.isIOS) &&
-                                    !widget.appState.tvMode) ...[
-                                  const SizedBox(width: 6),
-                                  _buildGalleryTvIconButton(
-                                    icon: Icons.screen_rotation_rounded,
-                                    label: '横竖屏',
-                                    onTap: _toggleGalleryOrientation,
-                                    upFocusNode: _scrubberFocusNode,
-                                  ),
-                                ],
-                                if (_videoPlayer != null) ...[
-                                  const SizedBox(width: 6),
-                                  Video115AccelerateButton(
-                                    api: widget.appState.api,
-                                    downloadUrlBuilder:
-                                        _resolveGallery115DownloadUrl,
-                                    videoNameBuilder:
-                                        _resolveGallery115VideoName,
-                                    headersBuilder: () =>
-                                        widget.appState.api.authHeaders,
-                                    telegramAccountId: widget.accountId,
-                                    player: _videoPlayer,
-                                    selected115Url: _usingGallery115Direct
-                                        ? _activeGalleryStreamUrl
-                                        : null,
-                                    overlayStyle: true,
-                                    compact: true,
-                                    onResolved: _applyGallery115Stream,
-                                  ),
-                                  const SizedBox(width: 6),
-                                  VideoProxyNodeSelector(
-                                    focusNode: _bottomProxyFocusNode,
-                                    upFocusNode: _scrubberFocusNode,
-                                    leftFocusNode: _neighborInChain(
-                                      bottomFocusChain,
-                                      _bottomProxyFocusNode,
-                                      -1,
-                                    ),
-                                    rightFocusNode: _neighborInChain(
-                                      bottomFocusChain,
-                                      _bottomProxyFocusNode,
-                                      1,
-                                    ),
-                                    proxyService: widget.appState.proxyService,
-                                    scenario: RequestScenario.telegram,
-                                    overlayStyle: true,
-                                    compact: true,
-                                    onProxyChanged: _switchGalleryProxy,
-                                  ),
-                                  const SizedBox(width: 6),
-                                  VideoProxyStatsButton(
-                                    proxyService: widget.appState.proxyService,
-                                    scenario: RequestScenario.telegram,
-                                    isShowingStats: _showProxyStatsOverlay,
-                                    overlayStyle: true,
-                                    compact: true,
-                                    onToggle: () {
-                                      setState(() {
-                                        _showProxyStatsOverlay =
-                                            !_showProxyStatsOverlay;
-                                      });
-                                    },
-                                  ),
-                                ],
-                                if (_videoPlayer != null) ...[
-                                  const SizedBox(width: 6),
-                                  VideoDownloadSpeedBadge(
-                                    player: _videoPlayer!,
-                                    compact: true,
-                                  ),
-                                ],
-                                const SizedBox(width: 6),
-                                Listener(
-                                  onPointerSignal: (signal) {
-                                    if (signal is PointerScrollEvent) {
-                                      _stepVolume(
-                                        signal.scrollDelta.dy < 0 ? 5 : -5,
-                                      );
-                                    }
-                                  },
+                          // Row 2: Focusable Control Buttons Row + Always-Visible Pinned Volume Control
+                          Row(
+                            children: [
+                              Expanded(
+                                child: SingleChildScrollView(
+                                  scrollDirection: Axis.horizontal,
                                   child: Row(
                                     mainAxisSize: MainAxisSize.min,
                                     children: [
                                       _buildGalleryTvIconButton(
-                                        focusNode: _muteFocusNode,
-                                        icon: _isMuted || _volume <= 0
-                                            ? Icons.volume_off_rounded
-                                            : (_volume < 50
-                                                ? Icons.volume_down_rounded
-                                                : Icons.volume_up_rounded),
-                                        label: _isMuted || _volume <= 0
-                                            ? '已静音'
-                                            : '静音',
-                                        onTap: _toggleMute,
+                                        focusNode: _playPauseFocusNode,
+                                        autofocus: true,
+                                        icon: _isVideoPlaying
+                                            ? Icons.pause_rounded
+                                            : Icons.play_arrow_rounded,
+                                        label: _isVideoPlaying ? '暂停' : '播放',
+                                        onTap: () => _toggleGalleryPlayback(),
                                         upFocusNode: _scrubberFocusNode,
                                         downFocusNode: activeThumbNode,
                                         leftFocusNode: _neighborInChain(
                                           bottomFocusChain,
-                                          _muteFocusNode,
+                                          _playPauseFocusNode,
+                                          -1,
+                                          edgeTarget: list.length > 1
+                                              ? _prevItemFocusNode
+                                              : null,
+                                        ),
+                                        rightFocusNode: _neighborInChain(
+                                          bottomFocusChain,
+                                          _playPauseFocusNode,
+                                          1,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 6),
+                                      _buildGalleryTvIconButton(
+                                        focusNode: _rewindFocusNode,
+                                        icon: Icons.replay_5_rounded,
+                                        label: '快退5s',
+                                        onTap: () => _seekRelative(-5),
+                                        upFocusNode: _scrubberFocusNode,
+                                        downFocusNode: activeThumbNode,
+                                        leftFocusNode: _neighborInChain(
+                                          bottomFocusChain,
+                                          _rewindFocusNode,
                                           -1,
                                         ),
                                         rightFocusNode: _neighborInChain(
                                           bottomFocusChain,
-                                          _muteFocusNode,
+                                          _rewindFocusNode,
                                           1,
                                         ),
                                       ),
-                                      SizedBox(
-                                        width: isMobileDialog ? 54 : 82,
-                                        child: ExcludeFocus(
-                                          child: SliderTheme(
-                                            data: SliderTheme.of(context)
-                                                .copyWith(
-                                              trackHeight: 3.0,
-                                              thumbShape:
-                                                  const RoundSliderThumbShape(
-                                                enabledThumbRadius: 5.5,
-                                              ),
-                                              overlayShape:
-                                                  const RoundSliderOverlayShape(
-                                                overlayRadius: 10,
-                                              ),
-                                              activeTrackColor:
-                                                  const Color(0xFF5EB5F7),
-                                              inactiveTrackColor:
-                                                  Colors.white24,
-                                              thumbColor: Colors.white,
-                                            ),
-                                            child: Slider(
-                                              value: (_isMuted
-                                                      ? 0.0
-                                                      : _volume)
-                                                  .clamp(0.0, 100.0),
-                                              min: 0,
-                                              max: 100,
-                                              onChanged: _setVolume,
-                                            ),
-                                          ),
+                                      const SizedBox(width: 6),
+                                      _buildGalleryTvIconButton(
+                                        focusNode: _forwardFocusNode,
+                                        icon: Icons.forward_5_rounded,
+                                        label: '快进5s',
+                                        onTap: () => _seekRelative(5),
+                                        upFocusNode: _scrubberFocusNode,
+                                        downFocusNode: activeThumbNode,
+                                        leftFocusNode: _neighborInChain(
+                                          bottomFocusChain,
+                                          _forwardFocusNode,
+                                          -1,
+                                        ),
+                                        rightFocusNode: _neighborInChain(
+                                          bottomFocusChain,
+                                          _forwardFocusNode,
+                                          1,
                                         ),
                                       ),
-                                      if (!isMobileDialog)
-                                        SizedBox(
-                                          width: 34,
-                                          child: Text(
-                                            '${(_isMuted ? 0 : _volume.round())}%',
-                                            style: const TextStyle(
-                                              color: Colors.white70,
-                                              fontSize: 11,
-                                              fontFeatures: [
-                                                ui.FontFeature.tabularFigures(),
-                                              ],
-                                            ),
+                                      if (list.length > 1) ...[
+                                        const SizedBox(width: 6),
+                                        _buildGalleryTvIconButton(
+                                          focusNode: _bottomPrevFocusNode,
+                                          icon: Icons.skip_previous_rounded,
+                                          label: '上一项',
+                                          onTap: () => _step(-1),
+                                          upFocusNode: _prevItemFocusNode,
+                                          downFocusNode: activeThumbNode,
+                                          leftFocusNode: _neighborInChain(
+                                            bottomFocusChain,
+                                            _bottomPrevFocusNode,
+                                            -1,
+                                          ),
+                                          rightFocusNode: _neighborInChain(
+                                            bottomFocusChain,
+                                            _bottomPrevFocusNode,
+                                            1,
                                           ),
                                         ),
+                                        const SizedBox(width: 6),
+                                        _buildGalleryTvIconButton(
+                                          focusNode: _bottomNextFocusNode,
+                                          icon: Icons.skip_next_rounded,
+                                          label: '下一项',
+                                          onTap: () => _step(1),
+                                          upFocusNode: _nextItemFocusNode,
+                                          downFocusNode: activeThumbNode,
+                                          leftFocusNode: _neighborInChain(
+                                            bottomFocusChain,
+                                            _bottomNextFocusNode,
+                                            -1,
+                                          ),
+                                          rightFocusNode: _neighborInChain(
+                                            bottomFocusChain,
+                                            _bottomNextFocusNode,
+                                            1,
+                                          ),
+                                        ),
+                                      ],
+                                      const SizedBox(width: 6),
+                                      _buildGalleryTvIconButton(
+                                        focusNode: _speedFocusNode,
+                                        icon: Icons.speed_rounded,
+                                        label: '${_playbackSpeed}x',
+                                        onTap: _cycleSpeed,
+                                        upFocusNode: _scrubberFocusNode,
+                                        downFocusNode: activeThumbNode,
+                                        leftFocusNode: _neighborInChain(
+                                          bottomFocusChain,
+                                          _speedFocusNode,
+                                          -1,
+                                        ),
+                                        rightFocusNode: _neighborInChain(
+                                          bottomFocusChain,
+                                          _speedFocusNode,
+                                          1,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 6),
+                                      _buildGalleryTvIconButton(
+                                        focusNode: _aspectModeFocusNode,
+                                        icon: _galleryAspectMode == 'cover'
+                                            ? Icons.crop_free_rounded
+                                            : Icons.aspect_ratio_rounded,
+                                        label: _galleryAspectMode == 'cover'
+                                            ? '铺满'
+                                            : '适应',
+                                        onTap: _cycleGalleryAspectMode,
+                                        upFocusNode: _scrubberFocusNode,
+                                        downFocusNode: activeThumbNode,
+                                        leftFocusNode: _neighborInChain(
+                                          bottomFocusChain,
+                                          _aspectModeFocusNode,
+                                          -1,
+                                        ),
+                                        rightFocusNode: _neighborInChain(
+                                          bottomFocusChain,
+                                          _aspectModeFocusNode,
+                                          1,
+                                        ),
+                                      ),
+                                      if (msg.text.trim().isNotEmpty) ...[
+                                        const SizedBox(width: 6),
+                                        _buildGalleryTvIconButton(
+                                          focusNode:
+                                              _bottomToggleCaptionFocusNode,
+                                          icon: _captionHidden
+                                              ? Icons.subtitles_outlined
+                                              : Icons.subtitles_off_outlined,
+                                          label: _captionHidden
+                                              ? '显示标题'
+                                              : '隐藏标题',
+                                          onTap: () => setState(
+                                            () => _captionHidden =
+                                                !_captionHidden,
+                                          ),
+                                          upFocusNode: _scrubberFocusNode,
+                                          downFocusNode: activeThumbNode,
+                                          leftFocusNode: _neighborInChain(
+                                            bottomFocusChain,
+                                            _bottomToggleCaptionFocusNode,
+                                            -1,
+                                          ),
+                                          rightFocusNode: _neighborInChain(
+                                            bottomFocusChain,
+                                            _bottomToggleCaptionFocusNode,
+                                            1,
+                                          ),
+                                        ),
+                                      ],
+                                      const SizedBox(width: 6),
+                                      _buildGalleryTvIconButton(
+                                        focusNode: _bottomMovePosFocusNode,
+                                        icon: Icons.open_with_rounded,
+                                        label: _controlsPosPresetLabel,
+                                        onTap: _cycleControlsAndCaptionPosition,
+                                        upFocusNode: _scrubberFocusNode,
+                                        downFocusNode: activeThumbNode,
+                                        leftFocusNode: _neighborInChain(
+                                          bottomFocusChain,
+                                          _bottomMovePosFocusNode,
+                                          -1,
+                                        ),
+                                        rightFocusNode: _neighborInChain(
+                                          bottomFocusChain,
+                                          _bottomMovePosFocusNode,
+                                          1,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 6),
+                                      _buildGalleryTvIconButton(
+                                        focusNode: _bottomHideBarFocusNode,
+                                        icon: Icons.visibility_off_outlined,
+                                        label: '隐藏进度条',
+                                        onTap: _hideControlsBar,
+                                        upFocusNode: _scrubberFocusNode,
+                                        downFocusNode: activeThumbNode,
+                                        leftFocusNode: _neighborInChain(
+                                          bottomFocusChain,
+                                          _bottomHideBarFocusNode,
+                                          -1,
+                                        ),
+                                        rightFocusNode: _neighborInChain(
+                                          bottomFocusChain,
+                                          _bottomHideBarFocusNode,
+                                          1,
+                                        ),
+                                      ),
+                                      if ((Platform.isAndroid ||
+                                              Platform.isIOS) &&
+                                          !widget.appState.tvMode) ...[
+                                        const SizedBox(width: 6),
+                                        _buildGalleryTvIconButton(
+                                          icon: Icons.screen_rotation_rounded,
+                                          label: '横竖屏',
+                                          onTap: _toggleGalleryOrientation,
+                                          upFocusNode: _scrubberFocusNode,
+                                        ),
+                                      ],
+                                      if (_videoPlayer != null) ...[
+                                        const SizedBox(width: 6),
+                                        Video115AccelerateButton(
+                                          api: widget.appState.api,
+                                          downloadUrlBuilder:
+                                              _resolveGallery115DownloadUrl,
+                                          videoNameBuilder:
+                                              _resolveGallery115VideoName,
+                                          headersBuilder: () =>
+                                              widget.appState.api.authHeaders,
+                                          telegramAccountId: widget.accountId,
+                                          player: _videoPlayer,
+                                          selected115Url: _usingGallery115Direct
+                                              ? _activeGalleryStreamUrl
+                                              : null,
+                                          overlayStyle: true,
+                                          compact: true,
+                                          onResolved: _applyGallery115Stream,
+                                        ),
+                                        const SizedBox(width: 6),
+                                        VideoProxyNodeSelector(
+                                          focusNode: _bottomProxyFocusNode,
+                                          upFocusNode: _scrubberFocusNode,
+                                          leftFocusNode: _neighborInChain(
+                                            bottomFocusChain,
+                                            _bottomProxyFocusNode,
+                                            -1,
+                                          ),
+                                          rightFocusNode: _neighborInChain(
+                                            bottomFocusChain,
+                                            _bottomProxyFocusNode,
+                                            1,
+                                          ),
+                                          proxyService:
+                                              widget.appState.proxyService,
+                                          scenario: RequestScenario.telegram,
+                                          overlayStyle: true,
+                                          compact: true,
+                                          onProxyChanged: _switchGalleryProxy,
+                                        ),
+                                        const SizedBox(width: 6),
+                                        VideoProxyStatsButton(
+                                          proxyService:
+                                              widget.appState.proxyService,
+                                          scenario: RequestScenario.telegram,
+                                          isShowingStats:
+                                              _showProxyStatsOverlay,
+                                          overlayStyle: true,
+                                          compact: true,
+                                          onToggle: () {
+                                            setState(() {
+                                              _showProxyStatsOverlay =
+                                                  !_showProxyStatsOverlay;
+                                            });
+                                          },
+                                        ),
+                                      ],
+                                      const SizedBox(width: 6),
+                                      _buildGalleryTvIconButton(
+                                        focusNode: _bottomSaveFocusNode,
+                                        icon: _savedLocalIds.contains(msg.id)
+                                            ? Icons.check_circle_rounded
+                                            : Icons.download_rounded,
+                                        label: _savingLocalIds.contains(msg.id)
+                                            ? '保存中'
+                                            : (_savedLocalIds.contains(msg.id)
+                                                ? '已存 ✓'
+                                                : '存本机'),
+                                        onTap: _savingLocalIds.contains(msg.id)
+                                            ? null
+                                            : () => _handleSaveLocal(msg),
+                                        upFocusNode: _scrubberFocusNode,
+                                        downFocusNode: activeThumbNode,
+                                        leftFocusNode: _neighborInChain(
+                                          bottomFocusChain,
+                                          _bottomSaveFocusNode,
+                                          -1,
+                                        ),
+                                        rightFocusNode: _neighborInChain(
+                                          bottomFocusChain,
+                                          _bottomSaveFocusNode,
+                                          1,
+                                        ),
+                                      ),
+                                      if (att?.url.isNotEmpty ?? false) ...[
+                                        const SizedBox(width: 6),
+                                        _buildGalleryTvIconButton(
+                                          focusNode: _bottomQueueFocusNode,
+                                          icon: _queuedIds.contains(msg.id)
+                                              ? Icons.check_circle_rounded
+                                              : Icons.cloud_download_outlined,
+                                          label: _queueingIds.contains(msg.id)
+                                              ? '添加中'
+                                              : (_queuedIds.contains(msg.id)
+                                                  ? '已入队 ✓'
+                                                  : '转存'),
+                                          onTap: _queueingIds.contains(msg.id)
+                                              ? null
+                                              : () => _handleQueueSingle(msg),
+                                          upFocusNode: _scrubberFocusNode,
+                                          downFocusNode: activeThumbNode,
+                                          leftFocusNode: _neighborInChain(
+                                            bottomFocusChain,
+                                            _bottomQueueFocusNode,
+                                            -1,
+                                          ),
+                                          rightFocusNode: _neighborInChain(
+                                            bottomFocusChain,
+                                            _bottomQueueFocusNode,
+                                            1,
+                                          ),
+                                        ),
+                                      ],
+                                      const SizedBox(width: 6),
+                                      _buildGalleryTvIconButton(
+                                        focusNode: _bottomExitFocusNode,
+                                        icon: Icons.close_rounded,
+                                        label: '退出全屏',
+                                        onTap: () =>
+                                            Navigator.of(context).pop(),
+                                        upFocusNode: _scrubberFocusNode,
+                                        downFocusNode: activeThumbNode,
+                                        leftFocusNode: _neighborInChain(
+                                          bottomFocusChain,
+                                          _bottomExitFocusNode,
+                                          -1,
+                                        ),
+                                        rightFocusNode: _neighborInChain(
+                                          bottomFocusChain,
+                                          _bottomExitFocusNode,
+                                          1,
+                                        ),
+                                      ),
                                     ],
                                   ),
                                 ),
-                                const SizedBox(width: 6),
-                                _buildGalleryTvIconButton(
-                                  focusNode: _bottomSaveFocusNode,
-                                  icon: _savedLocalIds.contains(msg.id)
-                                      ? Icons.check_circle_rounded
-                                      : Icons.download_rounded,
-                                  label: _savingLocalIds.contains(msg.id)
-                                      ? '保存中'
-                                      : (_savedLocalIds.contains(msg.id)
-                                          ? '已存 ✓'
-                                          : '存本机'),
-                                  onTap: _savingLocalIds.contains(msg.id)
-                                      ? null
-                                      : () => _handleSaveLocal(msg),
-                                  upFocusNode: _scrubberFocusNode,
-                                  downFocusNode: activeThumbNode,
-                                  leftFocusNode: _neighborInChain(
-                                    bottomFocusChain,
-                                    _bottomSaveFocusNode,
-                                    -1,
-                                  ),
-                                  rightFocusNode: _neighborInChain(
-                                    bottomFocusChain,
-                                    _bottomSaveFocusNode,
-                                    1,
-                                  ),
-                                ),
-                                if (att?.url.isNotEmpty ?? false) ...[
-                                  const SizedBox(width: 6),
-                                  _buildGalleryTvIconButton(
-                                    focusNode: _bottomQueueFocusNode,
-                                    icon: _queuedIds.contains(msg.id)
-                                        ? Icons.check_circle_rounded
-                                        : Icons.cloud_download_outlined,
-                                    label: _queueingIds.contains(msg.id)
-                                        ? '添加中'
-                                        : (_queuedIds.contains(msg.id)
-                                            ? '已入队 ✓'
-                                            : '转存'),
-                                    onTap: _queueingIds.contains(msg.id)
-                                        ? null
-                                        : () => _handleQueueSingle(msg),
-                                    upFocusNode: _scrubberFocusNode,
-                                    downFocusNode: activeThumbNode,
-                                    leftFocusNode: _neighborInChain(
-                                      bottomFocusChain,
-                                      _bottomQueueFocusNode,
-                                      -1,
+                              ),
+                              const SizedBox(width: 8),
+                              Container(
+                                width: 1,
+                                height: 22,
+                                color: Colors.white24,
+                              ),
+                              const SizedBox(width: 8),
+                              // Always-Visible Pinned Volume Control (never scrolled out of view!)
+                              Listener(
+                                onPointerSignal: (signal) {
+                                  if (signal is PointerScrollEvent) {
+                                    _stepVolume(
+                                      signal.scrollDelta.dy < 0 ? 5 : -5,
+                                    );
+                                  }
+                                },
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    _buildGalleryTvIconButton(
+                                      focusNode: _muteFocusNode,
+                                      icon: _isMuted || _volume <= 0
+                                          ? Icons.volume_off_rounded
+                                          : (_volume < 50
+                                              ? Icons.volume_down_rounded
+                                              : Icons.volume_up_rounded),
+                                      label: isMobileDialog
+                                          ? null
+                                          : (_isMuted || _volume <= 0
+                                              ? '已静音'
+                                              : '音量'),
+                                      onTap: _toggleMute,
+                                      upFocusNode: _scrubberFocusNode,
+                                      downFocusNode: activeThumbNode,
+                                      leftFocusNode: _neighborInChain(
+                                        bottomFocusChain,
+                                        _muteFocusNode,
+                                        -1,
+                                      ),
+                                      rightFocusNode: list.length > 1
+                                          ? _nextItemFocusNode
+                                          : null,
                                     ),
-                                    rightFocusNode: _neighborInChain(
-                                      bottomFocusChain,
-                                      _bottomQueueFocusNode,
-                                      1,
+                                    SizedBox(
+                                      width: isMobileDialog ? 56 : 84,
+                                      child: ExcludeFocus(
+                                        child: SliderTheme(
+                                          data: SliderTheme.of(context)
+                                              .copyWith(
+                                            trackHeight: 3.2,
+                                            thumbShape:
+                                                const RoundSliderThumbShape(
+                                              enabledThumbRadius: 6.0,
+                                            ),
+                                            overlayShape:
+                                                const RoundSliderOverlayShape(
+                                              overlayRadius: 10,
+                                            ),
+                                            activeTrackColor:
+                                                const Color(0xFF5EB5F7),
+                                            inactiveTrackColor: Colors.white24,
+                                            thumbColor: Colors.white,
+                                          ),
+                                          child: Slider(
+                                            value: (_isMuted ? 0.0 : _volume)
+                                                .clamp(0.0, 100.0),
+                                            min: 0,
+                                            max: 100,
+                                            onChanged: _setVolume,
+                                          ),
+                                        ),
+                                      ),
                                     ),
-                                  ),
-                                ],
-                                const SizedBox(width: 6),
-                                _buildGalleryTvIconButton(
-                                  focusNode: _bottomExitFocusNode,
-                                  icon: Icons.close_rounded,
-                                  label: '退出全屏',
-                                  onTap: () => Navigator.of(context).pop(),
-                                  upFocusNode: _scrubberFocusNode,
-                                  downFocusNode: activeThumbNode,
-                                  leftFocusNode: _neighborInChain(
-                                    bottomFocusChain,
-                                    _bottomExitFocusNode,
-                                    -1,
-                                  ),
-                                  rightFocusNode: _neighborInChain(
-                                    bottomFocusChain,
-                                    _bottomExitFocusNode,
-                                    1,
-                                    edgeTarget: list.length > 1
-                                        ? _nextItemFocusNode
-                                        : null,
-                                  ),
+                                    SizedBox(
+                                      width: isMobileDialog ? 30 : 34,
+                                      child: Text(
+                                        '${(_isMuted ? 0 : _volume.round())}%',
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.w600,
+                                          fontFeatures: [
+                                            ui.FontFeature.tabularFigures(),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                  ],
                                 ),
-                              ],
-                            ),
+                              ),
+                            ],
                           ),
                         ],
                       ),

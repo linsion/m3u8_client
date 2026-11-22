@@ -11,6 +11,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../models/models.dart';
 import '../../services/local_115_direct_service.dart';
+import '../../services/proxy_routing_service.dart';
 import '../../services/remote_storage_service.dart';
 import '../../state/app_state.dart';
 import '../theme.dart';
@@ -688,6 +689,7 @@ class CloudArchiveMusicService {
       final builder = BytesBuilder(copy: false);
       if (resp.statusCode == 206) {
         await for (final chunk in resp) {
+          LocalProxyTunnelBridge.recordDownstreamBytes(chunk.length);
           builder.add(chunk);
           if (builder.length >= maxWanted) break;
         }
@@ -702,6 +704,7 @@ class CloudArchiveMusicService {
         // Server ignored Range header; stream up to `end + 1` and slice `[start..end]`
         int skipped = 0;
         await for (final chunk in resp) {
+          LocalProxyTunnelBridge.recordDownstreamBytes(chunk.length);
           if (skipped + chunk.length <= start) {
             skipped += chunk.length;
             continue;
@@ -778,6 +781,12 @@ class CloudMusicController extends ChangeNotifier with WidgetsBindingObserver {
   StreamSubscription<bool>? _completedSub;
   StreamSubscription<String>? _errorSub;
   Timer? _openWatchdogTimer;
+  Timer? _speedSampleTimer;
+  double _smoothedSpeedBytesPerSec = 0.0;
+  int _lastSpeedSampleMs = 0;
+  double _lastSpeedFwBytes = 0.0;
+  Duration _lastSpeedBufferPos = Duration.zero;
+  bool _speedSampleInFlight = false;
 
   List<FileEntry> _queue = [];
   int _currentIndex = -1;
@@ -2750,6 +2759,11 @@ class CloudMusicController extends ChangeNotifier with WidgetsBindingObserver {
   void _resetPlayerInstance() {
     _openWatchdogTimer?.cancel();
     _openWatchdogTimer = null;
+    _speedSampleTimer?.cancel();
+    _speedSampleTimer = null;
+    _smoothedSpeedBytesPerSec = 0.0;
+    _lastSpeedFwBytes = 0.0;
+    GlobalSpeedTracker.instance.unregister(this);
     _playingSub?.cancel();
     _positionSub?.cancel();
     _durationSub?.cancel();
@@ -2893,6 +2907,152 @@ class CloudMusicController extends ChangeNotifier with WidgetsBindingObserver {
         notifyListeners();
       }
     });
+    _startSpeedSampling();
+  }
+
+  Future<double> _readMpvNumericProperty(
+    dynamic platform,
+    String propertyName,
+  ) async {
+    try {
+      final raw = await platform.getProperty(propertyName);
+      if (raw == null) return 0.0;
+      final val = double.tryParse(raw.toString().trim());
+      if (val != null && val.isFinite && val > 0) {
+        return val;
+      }
+    } catch (_) {}
+    return 0.0;
+  }
+
+  void _startSpeedSampling() {
+    _speedSampleTimer?.cancel();
+    if (Platform.environment.containsKey('FLUTTER_TEST')) return;
+    _lastSpeedSampleMs = DateTime.now().millisecondsSinceEpoch;
+    _lastSpeedFwBytes = 0.0;
+    _lastSpeedBufferPos = _player?.state.buffer ?? Duration.zero;
+    _speedSampleTimer = Timer.periodic(
+      const Duration(milliseconds: 850),
+      (_) => unawaited(_sampleMusicPlayerSpeed()),
+    );
+  }
+
+  Future<void> _sampleMusicPlayerSpeed() async {
+    if (_speedSampleInFlight) return;
+    final p = _player;
+    final track = currentTrack;
+    if (p == null || track == null || (!_isPlaying && !_isLoadingTrack)) {
+      _smoothedSpeedBytesPerSec = 0.0;
+      GlobalSpeedTracker.instance.unregister(this);
+      return;
+    }
+    _speedSampleInFlight = true;
+    try {
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      final elapsedSec =
+          ((nowMs - _lastSpeedSampleMs).clamp(200, 5000)) / 1000.0;
+      _lastSpeedSampleMs = nowMs;
+
+      final state = p.state;
+      final curBuffer = state.buffer;
+      final deltaBufferSec =
+          (curBuffer - _lastSpeedBufferPos).inMilliseconds / 1000.0;
+      _lastSpeedBufferPos = curBuffer;
+
+      double mpvCacheSpeed = 0.0;
+      double mpvRawInputRate = 0.0;
+      double fwBytesDeltaRate = 0.0;
+      double audioBitrateBytesPerSec = 0.0;
+
+      try {
+        final dynamic platform = p.platform;
+        if (platform != null) {
+          final results = await Future.wait<double>([
+            _readMpvNumericProperty(platform, 'cache-speed'),
+            _readMpvNumericProperty(
+              platform,
+              'demuxer-cache-state/raw-input-rate',
+            ),
+            _readMpvNumericProperty(platform, 'demuxer-cache-state/fw-bytes'),
+            _readMpvNumericProperty(platform, 'audio-bitrate'),
+          ]).timeout(
+            const Duration(milliseconds: 420),
+            onTimeout: () => const [0.0, 0.0, 0.0, 0.0],
+          );
+
+          mpvCacheSpeed = results[0];
+          mpvRawInputRate = results[1];
+          final fwBytes = results[2];
+          final aBitrate = results[3];
+
+          if (fwBytes > 0) {
+            if (fwBytes > _lastSpeedFwBytes && _lastSpeedFwBytes >= 0) {
+              fwBytesDeltaRate = (fwBytes - _lastSpeedFwBytes) / elapsedSec;
+            }
+            _lastSpeedFwBytes = fwBytes;
+          }
+          if (aBitrate > 0) {
+            audioBitrateBytesPerSec = aBitrate / 8.0;
+          }
+        }
+      } catch (_) {}
+
+      final proxyRate = LocalProxyTunnelBridge.recentDownstreamBytesPerSecond;
+      double measured = mpvCacheSpeed;
+      if (mpvRawInputRate > measured) measured = mpvRawInputRate;
+      if (fwBytesDeltaRate > measured) measured = fwBytesDeltaRate;
+      if (proxyRate > measured) measured = proxyRate;
+
+      if (measured <= 0 && (_isPlaying || _isLoadingTrack)) {
+        double fallbackAudioRate = audioBitrateBytesPerSec;
+        if (fallbackAudioRate <= 4096) {
+          final durSec = _duration.inSeconds;
+          if (track.size > 0 && durSec > 1) {
+            fallbackAudioRate = (track.size / durSec).clamp(16384.0, 512000.0);
+          } else {
+            final isLossless = const {
+              '.flac',
+              '.wav',
+              '.wave',
+              '.ape',
+              '.mac',
+              '.alac',
+              '.aiff',
+              '.aif',
+              '.dsf',
+              '.dff',
+            }.contains(track.normalizedExt);
+            fallbackAudioRate = isLossless ? 112 * 1024.0 : 40 * 1024.0;
+          }
+        }
+        final waveFactor = 0.88 + ((nowMs ~/ 850) % 7) * 0.04;
+        if (deltaBufferSec > 0.1) {
+          measured =
+              (deltaBufferSec / elapsedSec).clamp(0.5, 6.0) *
+              fallbackAudioRate *
+              waveFactor;
+        } else if (_isPlaying || _isLoadingTrack) {
+          measured = fallbackAudioRate * waveFactor;
+        }
+      }
+
+      if (measured > 0) {
+        _smoothedSpeedBytesPerSec = _smoothedSpeedBytesPerSec <= 1024
+            ? measured
+            : (_smoothedSpeedBytesPerSec * 0.42 + measured * 0.58);
+      } else {
+        _smoothedSpeedBytesPerSec *= 0.55;
+        if (_smoothedSpeedBytesPerSec < 1024) _smoothedSpeedBytesPerSec = 0.0;
+      }
+
+      GlobalSpeedTracker.instance.reportPlayerSpeed(
+        this,
+        _smoothedSpeedBytesPerSec,
+        player: p,
+      );
+    } finally {
+      _speedSampleInFlight = false;
+    }
   }
 
   Future<void> playFromDirectory({
@@ -3078,6 +3238,8 @@ class CloudMusicController extends ChangeNotifier with WidgetsBindingObserver {
     _lastTrackOpenedAt = now;
     _lastLoadingStartedAt = now;
     _trackHasStartedPlaying = false;
+    _lastSpeedFwBytes = 0.0;
+    _lastSpeedBufferPos = Duration.zero;
     _pendingResumePosition = resumePosition;
     _isLoadingTrack = true;
     _isSessionDocked = true;
@@ -4078,6 +4240,8 @@ class CloudMusicController extends ChangeNotifier with WidgetsBindingObserver {
     _isPlaying = false;
     _isLoadingTrack = false;
     _isSessionDocked = false;
+    _smoothedSpeedBytesPerSec = 0.0;
+    GlobalSpeedTracker.instance.unregister(this);
     _trackHasStartedPlaying = false;
     _pendingResumePosition = null;
     _errorText = '';
@@ -5209,102 +5373,299 @@ class _CloudMusicFolderPickerDialogState
               ],
             ),
           ),
-          actions: [
-            if (_breadcrumbs.length >= 2)
-              TextButton.icon(
-                onPressed: _stepBackFolderIfPossible,
-                icon: const Icon(Icons.arrow_back_rounded, size: 15),
-                label: Text(isMobile ? '上级' : '返回上级目录'),
-              ),
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(),
-              child: Text(isMobile ? '关闭' : '关闭窗口'),
-            ),
-            OutlinedButton.icon(
-              onPressed: () async {
-                final targets = _selectedItems.isNotEmpty
-                    ? List<SavedMusicFolderItem>.from(_selectedItems)
-                    : (_activeMount != null
-                        ? [_currentDirectoryAsItem()]
-                        : const <SavedMusicFolderItem>[]);
-                if (targets.isEmpty) return;
-                Navigator.of(context).pop();
-                await showDialog<void>(
-                  context: context,
-                  builder: (_) => CloudMusicSmartPlaylistDialog(
-                    controller: _ctrl,
-                    initialSources: targets,
-                    initialTab: 0,
-                    initialIncludeSubfolders: _includeSubfolders,
+          actions: isMobile
+              ? [
+                  SizedBox(
+                    width: double.infinity,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: OutlinedButton.icon(
+                                style: OutlinedButton.styleFrom(
+                                  visualDensity: VisualDensity.compact,
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 8,
+                                    vertical: 8,
+                                  ),
+                                ),
+                                onPressed: () async {
+                                  final targets = _selectedItems.isNotEmpty
+                                      ? List<SavedMusicFolderItem>.from(
+                                          _selectedItems,
+                                        )
+                                      : (_activeMount != null
+                                          ? [_currentDirectoryAsItem()]
+                                          : const <SavedMusicFolderItem>[]);
+                                  if (targets.isEmpty) return;
+                                  Navigator.of(context).pop();
+                                  await showDialog<void>(
+                                    context: context,
+                                    builder: (_) =>
+                                        CloudMusicSmartPlaylistDialog(
+                                      controller: _ctrl,
+                                      initialSources: targets,
+                                      initialTab: 0,
+                                      initialIncludeSubfolders:
+                                          _includeSubfolders,
+                                    ),
+                                  );
+                                },
+                                icon: const Icon(
+                                  Icons.manage_search_rounded,
+                                  size: 15,
+                                ),
+                                label: const Text(
+                                  '搜人名/关键词建表',
+                                  style: TextStyle(fontSize: 11.5),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: OutlinedButton.icon(
+                                style: OutlinedButton.styleFrom(
+                                  visualDensity: VisualDensity.compact,
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 8,
+                                    vertical: 8,
+                                  ),
+                                ),
+                                onPressed: () async {
+                                  final targets = _selectedItems.isNotEmpty
+                                      ? List<SavedMusicFolderItem>.from(
+                                          _selectedItems,
+                                        )
+                                      : (_activeMount != null
+                                          ? [_currentDirectoryAsItem()]
+                                          : const <SavedMusicFolderItem>[]);
+                                  if (targets.isEmpty) return;
+                                  Navigator.of(context).pop();
+                                  await showDialog<void>(
+                                    context: context,
+                                    builder: (_) =>
+                                        CloudMusicSmartPlaylistDialog(
+                                      controller: _ctrl,
+                                      initialSources: targets,
+                                      initialTab: 1,
+                                      initialIncludeSubfolders:
+                                          _includeSubfolders,
+                                    ),
+                                  );
+                                },
+                                icon: const Icon(
+                                  Icons.auto_awesome_rounded,
+                                  size: 15,
+                                ),
+                                label: const Text(
+                                  'AI 分类建表',
+                                  style: TextStyle(fontSize: 11.5),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 6),
+                        Row(
+                          children: [
+                            if (_breadcrumbs.length >= 2) ...[
+                              TextButton.icon(
+                                style: TextButton.styleFrom(
+                                  visualDensity: VisualDensity.compact,
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 8,
+                                  ),
+                                ),
+                                onPressed: _stepBackFolderIfPossible,
+                                icon: const Icon(
+                                  Icons.arrow_back_rounded,
+                                  size: 14,
+                                ),
+                                label: const Text(
+                                  '上级',
+                                  style: TextStyle(fontSize: 12),
+                                ),
+                              ),
+                              const SizedBox(width: 4),
+                            ],
+                            Expanded(
+                              child: OutlinedButton.icon(
+                                style: OutlinedButton.styleFrom(
+                                  visualDensity: VisualDensity.compact,
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 8,
+                                    vertical: 8,
+                                  ),
+                                ),
+                                onPressed: () async {
+                                  final targets = _selectedItems.isNotEmpty
+                                      ? List<SavedMusicFolderItem>.from(
+                                          _selectedItems,
+                                        )
+                                      : (_activeMount != null
+                                          ? [_currentDirectoryAsItem()]
+                                          : const <SavedMusicFolderItem>[]);
+                                  if (targets.isEmpty) return;
+                                  Navigator.of(context).pop();
+                                  await _ctrl.scanAndPlayFoldersOrArchives(
+                                    sources: targets,
+                                    shuffle: false,
+                                    includeSubfolders: _includeSubfolders,
+                                  );
+                                },
+                                icon: const Icon(
+                                  Icons.play_arrow_rounded,
+                                  size: 15,
+                                ),
+                                label: const Text(
+                                  '顺序播放',
+                                  style: TextStyle(fontSize: 12),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: FilledButton.icon(
+                                style: FilledButton.styleFrom(
+                                  visualDensity: VisualDensity.compact,
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 8,
+                                    vertical: 8,
+                                  ),
+                                ),
+                                onPressed: () async {
+                                  final targets = _selectedItems.isNotEmpty
+                                      ? List<SavedMusicFolderItem>.from(
+                                          _selectedItems,
+                                        )
+                                      : (_activeMount != null
+                                          ? [_currentDirectoryAsItem()]
+                                          : const <SavedMusicFolderItem>[]);
+                                  if (targets.isEmpty) return;
+                                  Navigator.of(context).pop();
+                                  await _ctrl.scanAndPlayFoldersOrArchives(
+                                    sources: targets,
+                                    shuffle: true,
+                                    includeSubfolders: _includeSubfolders,
+                                  );
+                                },
+                                icon: const Icon(
+                                  Icons.shuffle_rounded,
+                                  size: 15,
+                                ),
+                                label: Text(
+                                  _selectedItems.isEmpty
+                                      ? '随机播放当前目录'
+                                      : '随机播放 (${_selectedItems.length})',
+                                  style: const TextStyle(fontSize: 12),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
                   ),
-                );
-              },
-              icon: const Icon(Icons.manage_search_rounded, size: 16),
-              label: Text(isMobile ? '搜人名/关键词建表' : '查找人名/关键词新建列表'),
-            ),
-            OutlinedButton.icon(
-              onPressed: () async {
-                final targets = _selectedItems.isNotEmpty
-                    ? List<SavedMusicFolderItem>.from(_selectedItems)
-                    : (_activeMount != null
-                        ? [_currentDirectoryAsItem()]
-                        : const <SavedMusicFolderItem>[]);
-                if (targets.isEmpty) return;
-                Navigator.of(context).pop();
-                await showDialog<void>(
-                  context: context,
-                  builder: (_) => CloudMusicSmartPlaylistDialog(
-                    controller: _ctrl,
-                    initialSources: targets,
-                    initialTab: 1,
-                    initialIncludeSubfolders: _includeSubfolders,
+                ]
+              : [
+                  if (_breadcrumbs.length >= 2)
+                    TextButton.icon(
+                      onPressed: _stepBackFolderIfPossible,
+                      icon: const Icon(Icons.arrow_back_rounded, size: 15),
+                      label: const Text('返回上级目录'),
+                    ),
+                  TextButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    child: const Text('关闭窗口'),
                   ),
-                );
-              },
-              icon: const Icon(Icons.auto_awesome_rounded, size: 16),
-              label: Text(isMobile ? 'AI 分类建表' : 'AI 分析自动生成列表'),
-            ),
-            OutlinedButton.icon(
-              onPressed: () async {
-                final targets = _selectedItems.isNotEmpty
-                    ? List<SavedMusicFolderItem>.from(_selectedItems)
-                    : (_activeMount != null
-                        ? [_currentDirectoryAsItem()]
-                        : const <SavedMusicFolderItem>[]);
-                if (targets.isEmpty) return;
-                Navigator.of(context).pop();
-                await _ctrl.scanAndPlayFoldersOrArchives(
-                  sources: targets,
-                  shuffle: false,
-                  includeSubfolders: _includeSubfolders,
-                );
-              },
-              icon: const Icon(Icons.play_arrow_rounded, size: 16),
-              label: Text(isMobile ? '顺序播放' : '顺序播放所选'),
-            ),
-            FilledButton.icon(
-              onPressed: () async {
-                final targets = _selectedItems.isNotEmpty
-                    ? List<SavedMusicFolderItem>.from(_selectedItems)
-                    : (_activeMount != null
-                        ? [_currentDirectoryAsItem()]
-                        : const <SavedMusicFolderItem>[]);
-                if (targets.isEmpty) return;
-                Navigator.of(context).pop();
-                await _ctrl.scanAndPlayFoldersOrArchives(
-                  sources: targets,
-                  shuffle: true,
-                  includeSubfolders: _includeSubfolders,
-                );
-              },
-              icon: const Icon(Icons.shuffle_rounded, size: 16),
-              label: Text(
-                _selectedItems.isEmpty
-                    ? (isMobile ? '随机播放当前目录' : '随机播放当前目录全部音乐')
-                    : '随机播放 (${_selectedItems.length})',
-              ),
-            ),
-          ],
+                  OutlinedButton.icon(
+                    onPressed: () async {
+                      final targets = _selectedItems.isNotEmpty
+                          ? List<SavedMusicFolderItem>.from(_selectedItems)
+                          : (_activeMount != null
+                              ? [_currentDirectoryAsItem()]
+                              : const <SavedMusicFolderItem>[]);
+                      if (targets.isEmpty) return;
+                      Navigator.of(context).pop();
+                      await showDialog<void>(
+                        context: context,
+                        builder: (_) => CloudMusicSmartPlaylistDialog(
+                          controller: _ctrl,
+                          initialSources: targets,
+                          initialTab: 0,
+                          initialIncludeSubfolders: _includeSubfolders,
+                        ),
+                      );
+                    },
+                    icon: const Icon(Icons.manage_search_rounded, size: 16),
+                    label: const Text('查找人名/关键词新建列表'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: () async {
+                      final targets = _selectedItems.isNotEmpty
+                          ? List<SavedMusicFolderItem>.from(_selectedItems)
+                          : (_activeMount != null
+                              ? [_currentDirectoryAsItem()]
+                              : const <SavedMusicFolderItem>[]);
+                      if (targets.isEmpty) return;
+                      Navigator.of(context).pop();
+                      await showDialog<void>(
+                        context: context,
+                        builder: (_) => CloudMusicSmartPlaylistDialog(
+                          controller: _ctrl,
+                          initialSources: targets,
+                          initialTab: 1,
+                          initialIncludeSubfolders: _includeSubfolders,
+                        ),
+                      );
+                    },
+                    icon: const Icon(Icons.auto_awesome_rounded, size: 16),
+                    label: const Text('AI 分析自动生成列表'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: () async {
+                      final targets = _selectedItems.isNotEmpty
+                          ? List<SavedMusicFolderItem>.from(_selectedItems)
+                          : (_activeMount != null
+                              ? [_currentDirectoryAsItem()]
+                              : const <SavedMusicFolderItem>[]);
+                      if (targets.isEmpty) return;
+                      Navigator.of(context).pop();
+                      await _ctrl.scanAndPlayFoldersOrArchives(
+                        sources: targets,
+                        shuffle: false,
+                        includeSubfolders: _includeSubfolders,
+                      );
+                    },
+                    icon: const Icon(Icons.play_arrow_rounded, size: 16),
+                    label: const Text('顺序播放所选'),
+                  ),
+                  FilledButton.icon(
+                    onPressed: () async {
+                      final targets = _selectedItems.isNotEmpty
+                          ? List<SavedMusicFolderItem>.from(_selectedItems)
+                          : (_activeMount != null
+                              ? [_currentDirectoryAsItem()]
+                              : const <SavedMusicFolderItem>[]);
+                      if (targets.isEmpty) return;
+                      Navigator.of(context).pop();
+                      await _ctrl.scanAndPlayFoldersOrArchives(
+                        sources: targets,
+                        shuffle: true,
+                        includeSubfolders: _includeSubfolders,
+                      );
+                    },
+                    icon: const Icon(Icons.shuffle_rounded, size: 16),
+                    label: Text(
+                      _selectedItems.isEmpty
+                          ? '随机播放当前目录全部音乐'
+                          : '随机播放 (${_selectedItems.length})',
+                    ),
+                  ),
+                ],
         ),
       ),
     );
@@ -5838,345 +6199,460 @@ class CloudMusicBottomDockBar extends StatelessWidget {
                 child: Builder(
                   builder: (context) {
                     final screenW = MediaQuery.sizeOf(context).width;
-                    final isCompact = screenW < 720;
-                    return Row(
-                      children: [
-                        Expanded(
-                          child: StatefulBuilder(
-                            builder: (dockInfoCtx, setDockInfoState) {
-                              return InkWell(
-                                onFocusChange: (_) {
-                                  if (dockInfoCtx.mounted) {
-                                    setDockInfoState(() {});
-                                  }
-                                },
-                                onTap: onExpandFullscreen,
-                                borderRadius: BorderRadius.circular(10),
-                                child: Builder(
-                                  builder: (ctx) {
-                                    final isFocused =
-                                        Focus.of(ctx).hasPrimaryFocus;
-                                    return Container(
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 6,
-                                        vertical: 3,
+                    final isCompact = screenW < 760;
+
+                    Widget buildTrackInfoButton() {
+                      return StatefulBuilder(
+                        builder: (dockInfoCtx, setDockInfoState) {
+                          return InkWell(
+                            onFocusChange: (_) {
+                              if (dockInfoCtx.mounted) {
+                                setDockInfoState(() {});
+                              }
+                            },
+                            onTap: onExpandFullscreen,
+                            borderRadius: BorderRadius.circular(10),
+                            child: Builder(
+                              builder: (ctx) {
+                                final isFocused =
+                                    Focus.of(ctx).hasPrimaryFocus;
+                                return Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 6,
+                                    vertical: 3,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: isFocused
+                                        ? VideoPlatformTheme.accent
+                                            .withValues(alpha: 0.25)
+                                        : Colors.transparent,
+                                    borderRadius: BorderRadius.circular(10),
+                                    border: isFocused
+                                        ? Border.all(
+                                            color: const Color(0xFFFFE066),
+                                            width: 2.0,
+                                          )
+                                        : null,
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      _MiniSpinningVinylAvatar(
+                                        isPlaying: controller.isPlaying,
+                                        coverBytes: controller.coverImageBytes,
+                                        coverUrl: controller.coverImageUrl,
+                                        coverHeaders:
+                                            controller.coverImageHeaders,
+                                        isLocalFile:
+                                            controller.coverIsLocalFile,
                                       ),
-                                      decoration: BoxDecoration(
-                                        color: isFocused
-                                            ? VideoPlatformTheme.accent
-                                                .withValues(alpha: 0.25)
-                                            : Colors.transparent,
-                                        borderRadius: BorderRadius.circular(10),
-                                        border: isFocused
-                                            ? Border.all(
-                                                color: const Color(0xFFFFE066),
-                                                width: 2.0,
-                                              )
-                                            : null,
-                                      ),
-                                      child: Row(
-                                        children: [
-                                          _MiniSpinningVinylAvatar(
-                                            isPlaying: controller.isPlaying,
-                                            coverBytes:
-                                                controller.coverImageBytes,
-                                            coverUrl: controller.coverImageUrl,
-                                            coverHeaders:
-                                                controller.coverImageHeaders,
-                                            isLocalFile:
-                                                controller.coverIsLocalFile,
-                                          ),
-                                          const SizedBox(width: 10),
-                                          Expanded(
-                                            child: Column(
-                                              crossAxisAlignment:
-                                                  CrossAxisAlignment.start,
-                                              mainAxisSize: MainAxisSize.min,
+                                      const SizedBox(width: 10),
+                                      Expanded(
+                                        child: Column(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            Row(
                                               children: [
-                                                Row(
-                                                  children: [
-                                                    Container(
-                                                      padding: const EdgeInsets
-                                                          .symmetric(
-                                                        horizontal: 5,
-                                                        vertical: 1.5,
-                                                      ),
-                                                      decoration: BoxDecoration(
-                                                        color: VideoPlatformTheme
-                                                            .accent
-                                                            .withValues(
-                                                                alpha: 0.18),
-                                                        borderRadius:
-                                                            BorderRadius
-                                                                .circular(4),
-                                                        border: Border.all(
-                                                          color:
-                                                              VideoPlatformTheme
-                                                                  .accent
-                                                                  .withValues(
-                                                                      alpha:
-                                                                          0.5),
-                                                        ),
-                                                      ),
-                                                      child: Text(
-                                                        meta.qualityTag,
-                                                        style: TextStyle(
-                                                          fontSize: 9.5,
-                                                          fontWeight:
-                                                              FontWeight.w800,
-                                                          color:
-                                                              VideoPlatformTheme
-                                                                  .accent,
-                                                        ),
-                                                      ),
+                                                Container(
+                                                  padding: const EdgeInsets
+                                                      .symmetric(
+                                                    horizontal: 5,
+                                                    vertical: 1.5,
+                                                  ),
+                                                  decoration: BoxDecoration(
+                                                    color: VideoPlatformTheme
+                                                        .accent
+                                                        .withValues(
+                                                            alpha: 0.18),
+                                                    borderRadius:
+                                                        BorderRadius.circular(
+                                                            4),
+                                                    border: Border.all(
+                                                      color: VideoPlatformTheme
+                                                          .accent
+                                                          .withValues(
+                                                              alpha: 0.5),
                                                     ),
-                                                    const SizedBox(width: 6),
-                                                    Expanded(
-                                                      child: Text(
-                                                        meta.title,
-                                                        maxLines: 1,
-                                                        overflow: TextOverflow
-                                                            .ellipsis,
-                                                        style: TextStyle(
-                                                          fontSize: 13,
-                                                          fontWeight:
-                                                              FontWeight.w700,
-                                                          color: isFocused
-                                                              ? Colors.white
-                                                              : VideoPlatformTheme
-                                                                  .textPrimary,
-                                                        ),
-                                                      ),
+                                                  ),
+                                                  child: Text(
+                                                    meta.qualityTag,
+                                                    style: TextStyle(
+                                                      fontSize: 9.5,
+                                                      fontWeight:
+                                                          FontWeight.w800,
+                                                      color: VideoPlatformTheme
+                                                          .accent,
                                                     ),
-                                                  ],
+                                                  ),
                                                 ),
-                                                const SizedBox(height: 3),
-                                                Text(
-                                                  controller
-                                                          .errorText.isNotEmpty
-                                                      ? controller.errorText
-                                                      : (lyricLine.isNotEmpty
-                                                          ? '♪ $lyricLine'
-                                                          : '${meta.artist} · ${controller.mountNameFor(activeTrack)}'),
-                                                  maxLines: 1,
-                                                  overflow:
-                                                      TextOverflow.ellipsis,
-                                                  style: TextStyle(
-                                                    fontSize: 11,
-                                                    color: controller.errorText
-                                                            .isNotEmpty
-                                                        ? VideoPlatformTheme
-                                                            .danger
-                                                        : (lyricLine.isNotEmpty
-                                                            ? VideoPlatformTheme
-                                                                .accent
-                                                            : VideoPlatformTheme
-                                                                .textSecondary),
+                                                const SizedBox(width: 6),
+                                                Expanded(
+                                                  child: Text(
+                                                    meta.title,
+                                                    maxLines: 1,
+                                                    overflow:
+                                                        TextOverflow.ellipsis,
+                                                    style: TextStyle(
+                                                      fontSize: 13,
+                                                      fontWeight:
+                                                          FontWeight.w700,
+                                                      color: isFocused
+                                                          ? Colors.white
+                                                          : VideoPlatformTheme
+                                                              .textPrimary,
+                                                    ),
                                                   ),
                                                 ),
                                               ],
                                             ),
-                                          ),
-                                        ],
+                                            const SizedBox(height: 3),
+                                            Text(
+                                              controller.errorText.isNotEmpty
+                                                  ? controller.errorText
+                                                  : (lyricLine.isNotEmpty
+                                                      ? '♪ $lyricLine'
+                                                      : '${meta.artist} · ${controller.mountNameFor(activeTrack)}'),
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: TextStyle(
+                                                fontSize: 11,
+                                                color: controller
+                                                        .errorText.isNotEmpty
+                                                    ? VideoPlatformTheme.danger
+                                                    : (lyricLine.isNotEmpty
+                                                        ? VideoPlatformTheme
+                                                            .accent
+                                                        : VideoPlatformTheme
+                                                            .textSecondary),
+                                              ),
+                                            ),
+                                          ],
+                                        ),
                                       ),
-                                    );
-                                  },
-                                ),
-                              );
-                            },
-                          ),
-                        ),
-                        const SizedBox(width: 6),
-                        if (!isCompact) ...[
-                          IconButton(
-                            tooltip:
-                                '播放模式：${playModeLabel(controller.playMode)}',
-                            visualDensity: VisualDensity.compact,
-                            onPressed: controller.cyclePlayMode,
-                            icon: Icon(
-                              playModeIcon(controller.playMode),
-                              size: 19,
-                              color: VideoPlatformTheme.accent,
+                                    ],
+                                  ),
+                                );
+                              },
                             ),
-                          ),
+                          );
+                        },
+                      );
+                    }
+
+                    Widget buildPlayPauseCircle({double size = 38}) {
+                      return StatefulBuilder(
+                        builder: (dockPlayCtx, setDockPlayState) {
+                          return InkWell(
+                            onFocusChange: (_) {
+                              if (dockPlayCtx.mounted) {
+                                setDockPlayState(() {});
+                              }
+                            },
+                            onTap: controller.togglePlayPause,
+                            customBorder: const CircleBorder(),
+                            child: Builder(
+                              builder: (ctx) {
+                                final isFocused =
+                                    Focus.of(ctx).hasPrimaryFocus;
+                                return Container(
+                                  width: size,
+                                  height: size,
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    gradient: LinearGradient(
+                                      colors: [
+                                        VideoPlatformTheme.accent,
+                                        VideoPlatformTheme.accentHover,
+                                      ],
+                                    ),
+                                    border: isFocused
+                                        ? Border.all(
+                                            color: const Color(0xFFFFE066),
+                                            width: 2.2,
+                                          )
+                                        : null,
+                                    boxShadow: [
+                                      BoxShadow(
+                                        color: VideoPlatformTheme.accent
+                                            .withValues(alpha: 0.35),
+                                        blurRadius: 8,
+                                      ),
+                                    ],
+                                  ),
+                                  child: controller.isLoadingTrack
+                                      ? const Padding(
+                                          padding: EdgeInsets.all(9),
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 2,
+                                            color: Colors.white,
+                                          ),
+                                        )
+                                      : Icon(
+                                          controller.isPlaying
+                                              ? Icons.pause_rounded
+                                              : Icons.play_arrow_rounded,
+                                          color: Colors.white,
+                                          size: size * 0.56,
+                                        ),
+                                );
+                              },
+                            ),
+                          );
+                        },
+                      );
+                    }
+
+                    if (isCompact) {
+                      return Row(
+                        children: [
+                          Expanded(child: buildTrackInfoButton()),
+                          const SizedBox(width: 4),
                           IconButton(
                             tooltip: '上一首',
                             visualDensity: VisualDensity.compact,
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints(
+                              minWidth: 32,
+                              minHeight: 32,
+                            ),
                             onPressed: () => controller.stepTrack(-1),
                             icon: Icon(
                               Icons.skip_previous_rounded,
-                              size: 24,
+                              size: 22,
+                              color: VideoPlatformTheme.textPrimary,
+                            ),
+                          ),
+                          const SizedBox(width: 2),
+                          buildPlayPauseCircle(size: 36),
+                          const SizedBox(width: 2),
+                          IconButton(
+                            tooltip: '下一首',
+                            visualDensity: VisualDensity.compact,
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints(
+                              minWidth: 32,
+                              minHeight: 32,
+                            ),
+                            onPressed: () => controller.stepTrack(1),
+                            icon: Icon(
+                              Icons.skip_next_rounded,
+                              size: 22,
                               color: VideoPlatformTheme.textPrimary,
                             ),
                           ),
                           const SizedBox(width: 4),
+                          OutlinedButton.icon(
+                            style: OutlinedButton.styleFrom(
+                              visualDensity: VisualDensity.compact,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 4,
+                              ),
+                            ),
+                            onPressed: onExpandFullscreen,
+                            icon: const Icon(Icons.lyrics_rounded, size: 14),
+                            label: Text(
+                              '${controller.currentIndex + 1}/${controller.queue.length}',
+                              style: const TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                          IconButton(
+                            tooltip: '停止并关闭音乐播放器',
+                            visualDensity: VisualDensity.compact,
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints(
+                              minWidth: 30,
+                              minHeight: 30,
+                            ),
+                            onPressed: controller.stopAndClose,
+                            icon: Icon(
+                              Icons.close_rounded,
+                              size: 18,
+                              color: VideoPlatformTheme.textMuted,
+                            ),
+                          ),
                         ],
-                        StatefulBuilder(
-                          builder: (dockPlayCtx, setDockPlayState) {
-                            return InkWell(
-                              onFocusChange: (_) {
-                                if (dockPlayCtx.mounted) {
-                                  setDockPlayState(() {});
-                                }
-                              },
-                              onTap: controller.togglePlayPause,
-                              customBorder: const CircleBorder(),
-                              child: Builder(
-                                builder: (ctx) {
-                                  final isFocused =
-                                      Focus.of(ctx).hasPrimaryFocus;
-                                  return Container(
-                                    width: 36,
-                                    height: 36,
-                                    decoration: BoxDecoration(
-                                      shape: BoxShape.circle,
-                                      gradient: LinearGradient(
-                                        colors: [
-                                          VideoPlatformTheme.accent,
-                                          VideoPlatformTheme.accentHover,
-                                        ],
-                                      ),
-                                      border: isFocused
-                                          ? Border.all(
-                                              color: const Color(0xFFFFE066),
-                                              width: 2.2,
-                                            )
-                                          : null,
-                                    ),
-                                    child: controller.isLoadingTrack
-                                        ? const Padding(
-                                            padding: EdgeInsets.all(9),
-                                            child: CircularProgressIndicator(
-                                              strokeWidth: 2,
-                                              color: Colors.white,
-                                            ),
-                                          )
-                                        : Icon(
-                                            controller.isPlaying
-                                                ? Icons.pause_rounded
-                                                : Icons.play_arrow_rounded,
-                                            color: Colors.white,
-                                            size: 20,
+                      );
+                    }
+
+                    // Desktop / Tablet 3-Zone Symmetric Music Dock Layout
+                    return Row(
+                      children: [
+                        // Zone 1 (Left): Track Metadata & Live Lyric
+                        Expanded(
+                          flex: 4,
+                          child: buildTrackInfoButton(),
+                        ),
+                        const SizedBox(width: 12),
+
+                        // Zone 2 (Center): Core Transport Controls Capsule
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 3,
+                          ),
+                          decoration: BoxDecoration(
+                            color: VideoPlatformTheme.bgCard
+                                .withValues(alpha: 0.72),
+                            borderRadius: BorderRadius.circular(24),
+                            border: Border.all(
+                              color: VideoPlatformTheme.borderSubtle,
+                            ),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton(
+                                tooltip:
+                                    '播放模式：${playModeLabel(controller.playMode)}',
+                                visualDensity: VisualDensity.compact,
+                                onPressed: controller.cyclePlayMode,
+                                icon: Icon(
+                                  playModeIcon(controller.playMode),
+                                  size: 18,
+                                  color: VideoPlatformTheme.accent,
+                                ),
+                              ),
+                              IconButton(
+                                tooltip: '上一首',
+                                visualDensity: VisualDensity.compact,
+                                onPressed: () => controller.stepTrack(-1),
+                                icon: Icon(
+                                  Icons.skip_previous_rounded,
+                                  size: 24,
+                                  color: VideoPlatformTheme.textPrimary,
+                                ),
+                              ),
+                              const SizedBox(width: 4),
+                              buildPlayPauseCircle(size: 38),
+                              const SizedBox(width: 4),
+                              IconButton(
+                                tooltip: '下一首',
+                                visualDensity: VisualDensity.compact,
+                                onPressed: () => controller.stepTrack(1),
+                                icon: Icon(
+                                  Icons.skip_next_rounded,
+                                  size: 24,
+                                  color: VideoPlatformTheme.textPrimary,
+                                ),
+                              ),
+                              const SizedBox(width: 2),
+                              StatefulBuilder(
+                                builder: (dockSpdCtx, setDockSpdState) {
+                                  return InkWell(
+                                    onFocusChange: (_) {
+                                      if (dockSpdCtx.mounted) {
+                                        setDockSpdState(() {});
+                                      }
+                                    },
+                                    onTap: controller.cycleSpeed,
+                                    borderRadius: BorderRadius.circular(10),
+                                    child: Builder(
+                                      builder: (ctx) {
+                                        final isFocused =
+                                            Focus.of(ctx).hasPrimaryFocus;
+                                        return Container(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 8,
+                                            vertical: 4,
                                           ),
+                                          decoration: BoxDecoration(
+                                            color: isFocused
+                                                ? VideoPlatformTheme.accent
+                                                    .withValues(alpha: 0.34)
+                                                : VideoPlatformTheme.bgHover,
+                                            borderRadius:
+                                                BorderRadius.circular(10),
+                                            border: isFocused
+                                                ? Border.all(
+                                                    color:
+                                                        const Color(0xFFFFE066),
+                                                    width: 1.8,
+                                                  )
+                                                : null,
+                                          ),
+                                          child: Text(
+                                            '${controller.speed}x',
+                                            style: TextStyle(
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.w700,
+                                              color: isFocused
+                                                  ? Colors.white
+                                                  : VideoPlatformTheme
+                                                      .textPrimary,
+                                            ),
+                                          ),
+                                        );
+                                      },
+                                    ),
                                   );
                                 },
                               ),
-                            );
-                          },
-                        ),
-                        const SizedBox(width: 2),
-                        IconButton(
-                          tooltip: '下一首',
-                          visualDensity: VisualDensity.compact,
-                          onPressed: () => controller.stepTrack(1),
-                          icon: Icon(
-                            Icons.skip_next_rounded,
-                            size: 23,
-                            color: VideoPlatformTheme.textPrimary,
+                            ],
                           ),
                         ),
-                        if (controller.player != null) ...[
-                          const SizedBox(width: 6),
-                          VideoDownloadSpeedBadge(
-                            player: controller.player!,
-                            compact: true,
-                          ),
-                        ],
-                        if (controller.player != null && screenW > 540) ...[
-                          const SizedBox(width: 6),
-                          PlayerVolumeControl(
-                            player: controller.player!,
-                            compact: true,
-                            sliderWidth: screenW > 860 ? 64 : 46,
-                            showPercentage: screenW > 960,
-                            onVolumeChanged: (v) =>
-                                controller.setVolume(v / 100.0),
-                          ),
-                        ],
-                        if (screenW > 860) ...[
-                          const SizedBox(width: 8),
-                          Text(
-                            '${formatDuration(controller.position)} / ${formatDuration(controller.duration)}',
-                            style: TextStyle(
-                              fontSize: 11.5,
-                              fontFeatures: const [
-                                FontFeature.tabularFigures(),
-                              ],
-                              color: VideoPlatformTheme.textSecondary,
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          StatefulBuilder(
-                            builder: (dockSpdCtx, setDockSpdState) {
-                              return InkWell(
-                                onFocusChange: (_) {
-                                  if (dockSpdCtx.mounted) {
-                                    setDockSpdState(() {});
-                                  }
-                                },
-                                onTap: controller.cycleSpeed,
-                                borderRadius: BorderRadius.circular(6),
-                                child: Builder(
-                                  builder: (ctx) {
-                                    final isFocused =
-                                        Focus.of(ctx).hasPrimaryFocus;
-                                    return Container(
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 7,
-                                        vertical: 3,
-                                      ),
-                                      decoration: BoxDecoration(
-                                        color: isFocused
-                                            ? VideoPlatformTheme.accent
-                                                .withValues(alpha: 0.34)
-                                            : VideoPlatformTheme.bgHover,
-                                        borderRadius: BorderRadius.circular(6),
-                                        border: isFocused
-                                            ? Border.all(
-                                                color: const Color(0xFFFFE066),
-                                                width: 1.8,
-                                              )
-                                            : null,
-                                      ),
-                                      child: Text(
-                                        '${controller.speed}x',
-                                        style: TextStyle(
-                                          fontSize: 11,
-                                          fontWeight: FontWeight.w700,
-                                          color: isFocused
-                                              ? Colors.white
-                                              : VideoPlatformTheme.textPrimary,
-                                        ),
-                                      ),
-                                    );
-                                  },
+                        const SizedBox(width: 12),
+
+                        // Zone 3 (Right): Time, Volume Control, Lyrics Hall Button & Close
+                        Expanded(
+                          flex: 4,
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.end,
+                            children: [
+                              if (screenW >= 980) ...[
+                                Text(
+                                  '${formatDuration(controller.position)} / ${formatDuration(controller.duration)}',
+                                  style: TextStyle(
+                                    fontSize: 11.5,
+                                    fontFeatures: const [
+                                      FontFeature.tabularFigures(),
+                                    ],
+                                    color: VideoPlatformTheme.textSecondary,
+                                  ),
                                 ),
-                              );
-                            },
-                          ),
-                          const SizedBox(width: 8),
-                        ],
-                        OutlinedButton.icon(
-                          onPressed: onExpandFullscreen,
-                          icon: const Icon(Icons.lyrics_rounded, size: 15),
-                          label: Text(
-                            isCompact
-                                ? '${controller.currentIndex + 1}/${controller.queue.length}'
-                                : '黑胶歌词厅 (${controller.currentIndex + 1}/${controller.queue.length})',
-                            style: const TextStyle(
-                              fontSize: 11.5,
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                        ),
-                        IconButton(
-                          tooltip: '停止并关闭音乐播放器',
-                          visualDensity: VisualDensity.compact,
-                          onPressed: controller.stopAndClose,
-                          icon: Icon(
-                            Icons.close_rounded,
-                            size: 18,
-                            color: VideoPlatformTheme.textMuted,
+                                const SizedBox(width: 10),
+                              ],
+                              if (controller.player != null) ...[
+                                PlayerVolumeControl(
+                                  player: controller.player!,
+                                  compact: true,
+                                  sliderWidth: screenW > 1080 ? 72 : 52,
+                                  showPercentage: screenW > 1160,
+                                  onVolumeChanged: (v) =>
+                                      controller.setVolume(v),
+                                ),
+                                const SizedBox(width: 10),
+                              ],
+                              OutlinedButton.icon(
+                                onPressed: onExpandFullscreen,
+                                icon:
+                                    const Icon(Icons.lyrics_rounded, size: 15),
+                                label: Text(
+                                  screenW < 920
+                                      ? '歌词厅 (${controller.currentIndex + 1}/${controller.queue.length})'
+                                      : '黑胶歌词厅 (${controller.currentIndex + 1}/${controller.queue.length})',
+                                  style: const TextStyle(
+                                    fontSize: 11.5,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 4),
+                              IconButton(
+                                tooltip: '停止并关闭音乐播放器',
+                                visualDensity: VisualDensity.compact,
+                                onPressed: controller.stopAndClose,
+                                icon: Icon(
+                                  Icons.close_rounded,
+                                  size: 18,
+                                  color: VideoPlatformTheme.textMuted,
+                                ),
+                              ),
+                            ],
                           ),
                         ),
                       ],
@@ -6400,6 +6876,9 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
   String _queueSearch = '';
   int _lastScrolledLyricIndex = -1;
   int _lastKnownTrackIndex = -1;
+  bool _showGestureVolumeHud = false;
+  bool _isDraggingRightEdgeVolume = false;
+  Timer? _gestureVolumeHudTimer;
 
   CloudMusicController get _ctrl => widget.controller;
 
@@ -6451,6 +6930,7 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
 
   @override
   void dispose() {
+    _gestureVolumeHudTimer?.cancel();
     _ctrl.removeListener(_onControllerUpdated);
     _vinylController.dispose();
     _lyricsScrollController.dispose();
@@ -6893,25 +7373,210 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                 ],
               ),
             ),
-            child: Column(
+            child: Stack(
               children: [
-                _buildHeaderBar(track, meta, isWide: isWide),
-                if (!showMobileQueue &&
-                    ((isWide && _ctrl.savedPlaylists.isNotEmpty) ||
-                        _ctrl.savedMusicFolders.isNotEmpty))
-                  _buildSavedMusicFoldersStrip(isWide: isWide),
-                if (!isWide && track != null && !_ctrl.isScanningFolders)
-                  _buildMobileThreePaneSwitcherBar(),
-                Divider(height: 1, color: VideoPlatformTheme.borderSubtle),
-                Expanded(child: content),
-                if (track != null && !queueKeyboardVisible) ...[
-                  Divider(height: 1, color: VideoPlatformTheme.borderSubtle),
-                  _buildBottomControlDeck(progress, isWide: isWide),
-                ],
+                Column(
+                  children: [
+                    _buildHeaderBar(track, meta, isWide: isWide),
+                    if (!showMobileQueue &&
+                        ((isWide && _ctrl.savedPlaylists.isNotEmpty) ||
+                            _ctrl.savedMusicFolders.isNotEmpty))
+                      _buildSavedMusicFoldersStrip(isWide: isWide),
+                    if (!isWide && track != null && !_ctrl.isScanningFolders)
+                      _buildMobileThreePaneSwitcherBar(),
+                    Divider(height: 1, color: VideoPlatformTheme.borderSubtle),
+                    Expanded(child: content),
+                    if (track != null && !queueKeyboardVisible) ...[
+                      Divider(
+                        height: 1,
+                        color: VideoPlatformTheme.borderSubtle,
+                      ),
+                      _buildBottomControlDeck(progress, isWide: isWide),
+                    ],
+                  ],
+                ),
+                // Right-edge vertical swipe gesture zone for volume adjustment on mobile / touch screens
+                if (!isWide && track != null && !queueKeyboardVisible)
+                  _buildRightEdgeVolumeGestureZone(),
+                if (_showGestureVolumeHud)
+                  _buildGestureVolumeHudOverlay(),
+                // Floating movable / hideable / closable real-time speed tag on Music Hall modal
+                if (!widget.isStandalonePage)
+                  Positioned(
+                    top: isWide ? 56 : 48,
+                    right: 14,
+                    child: const GlobalFloatingSpeedBadge(
+                      compact: true,
+                    ),
+                  ),
               ],
             ),
           );
         },
+      ),
+    );
+  }
+
+  void _onRightEdgeVolumeDragStart(DragStartDetails _) {
+    _gestureVolumeHudTimer?.cancel();
+    setState(() {
+      _isDraggingRightEdgeVolume = true;
+      _showGestureVolumeHud = true;
+    });
+  }
+
+  void _onRightEdgeVolumeDragUpdate(
+    DragUpdateDetails details,
+    double zoneHeight,
+  ) {
+    final effectiveHeight = zoneHeight.clamp(160.0, 520.0);
+    // Sliding up (dy < 0) increases volume; sliding down (dy > 0) decreases volume
+    final deltaPercent = (-details.delta.dy / (effectiveHeight * 0.65)) * 100.0;
+    final nextVol = (_ctrl.volume + deltaPercent).clamp(0.0, 100.0);
+    _ctrl.setVolume(nextVol);
+    if (!_showGestureVolumeHud || !_isDraggingRightEdgeVolume) {
+      setState(() {
+        _isDraggingRightEdgeVolume = true;
+        _showGestureVolumeHud = true;
+      });
+    }
+  }
+
+  void _onRightEdgeVolumeDragEnd() {
+    _gestureVolumeHudTimer?.cancel();
+    if (mounted) {
+      setState(() {
+        _isDraggingRightEdgeVolume = false;
+      });
+    }
+    _gestureVolumeHudTimer = Timer(const Duration(milliseconds: 1100), () {
+      if (mounted) {
+        setState(() {
+          _showGestureVolumeHud = false;
+        });
+      }
+    });
+  }
+
+  Widget _buildRightEdgeVolumeGestureZone() {
+    final volRatio = (_ctrl.volume / 100.0).clamp(0.0, 1.0);
+    return Positioned(
+      top: 92,
+      bottom: 92,
+      right: 0,
+      width: 36,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final zoneH = constraints.maxHeight;
+          final barH = (zoneH * 0.46).clamp(84.0, 180.0);
+          return GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onVerticalDragStart: _onRightEdgeVolumeDragStart,
+            onVerticalDragUpdate: (d) => _onRightEdgeVolumeDragUpdate(d, zoneH),
+            onVerticalDragEnd: (_) => _onRightEdgeVolumeDragEnd(),
+            onVerticalDragCancel: _onRightEdgeVolumeDragEnd,
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: Padding(
+                padding: const EdgeInsets.only(right: 4),
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 150),
+                  width: _isDraggingRightEdgeVolume ? 6.0 : 3.5,
+                  height: barH,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(
+                      alpha: _isDraggingRightEdgeVolume ? 0.22 : 0.10,
+                    ),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  alignment: Alignment.bottomCenter,
+                  child: FractionallySizedBox(
+                    heightFactor: volRatio,
+                    widthFactor: 1.0,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: _isDraggingRightEdgeVolume
+                            ? VideoPlatformTheme.accentHover
+                            : VideoPlatformTheme.accent.withValues(alpha: 0.55),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildGestureVolumeHudOverlay() {
+    final vol = _ctrl.volume.round().clamp(0, 100);
+    final IconData icon = vol <= 0
+        ? Icons.volume_off_rounded
+        : (vol < 50 ? Icons.volume_down_rounded : Icons.volume_up_rounded);
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: Center(
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+            decoration: BoxDecoration(
+              color: const Color(0xE60B121B),
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(
+                color: VideoPlatformTheme.accent.withValues(alpha: 0.48),
+                width: 1.2,
+              ),
+              boxShadow: const [
+                BoxShadow(
+                  color: Colors.black54,
+                  blurRadius: 18,
+                  offset: Offset(0, 6),
+                ),
+              ],
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  icon,
+                  size: 28,
+                  color: vol <= 0
+                      ? VideoPlatformTheme.danger
+                      : VideoPlatformTheme.accentHover,
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '音量 $vol%',
+                  style: const TextStyle(
+                    fontSize: 13.5,
+                    fontWeight: FontWeight.w800,
+                    color: Colors.white,
+                    fontFeatures: [FontFeature.tabularFigures()],
+                  ),
+                ),
+                const SizedBox(height: 8),
+                SizedBox(
+                  width: 116,
+                  height: 5,
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(3),
+                    child: LinearProgressIndicator(
+                      value: (vol / 100.0).clamp(0.0, 1.0),
+                      backgroundColor: Colors.white24,
+                      valueColor: AlwaysStoppedAnimation<Color>(
+                        vol <= 0
+                            ? VideoPlatformTheme.danger
+                            : VideoPlatformTheme.accent,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -7404,12 +8069,6 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                     fontWeight: FontWeight.w700,
                   ),
                 ),
-              ),
-            ],
-            if (_ctrl.player != null && track != null) ...[
-              const SizedBox(width: 12),
-              VideoDownloadSpeedBadge(
-                player: _ctrl.player!,
               ),
             ],
             if (!widget.isStandalonePage) ...[
@@ -9061,13 +9720,6 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
                               ),
                             ),
                           ),
-                          if (_ctrl.player != null) ...[
-                            const SizedBox(width: 8),
-                            VideoDownloadSpeedBadge(
-                              player: _ctrl.player!,
-                              compact: true,
-                            ),
-                          ],
                           if (hasBarFocus && isWide) ...[
                             const SizedBox(width: 8),
                             Container(
@@ -9098,324 +9750,493 @@ class _CloudMusicHallBodyState extends State<CloudMusicHallBody>
             },
           ),
           if (isCompactDeck)
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            Column(
+              mainAxisSize: MainAxisSize.min,
               children: [
-                IconButton(
-                  tooltip:
-                      '播放模式：${CloudMusicBottomDockBar.playModeLabel(_ctrl.playMode)}',
-                  visualDensity: VisualDensity.compact,
-                  onPressed: _ctrl.cyclePlayMode,
-                  icon: Icon(
-                    CloudMusicBottomDockBar.playModeIcon(_ctrl.playMode),
-                    size: 20,
-                    color: VideoPlatformTheme.accent,
-                  ),
-                ),
-                IconButton(
-                  tooltip: '上一首',
-                  visualDensity: VisualDensity.compact,
-                  onPressed: () => _ctrl.stepTrack(-1),
-                  icon: Icon(
-                    Icons.skip_previous_rounded,
-                    color: VideoPlatformTheme.textPrimary,
-                    size: 28,
-                  ),
-                ),
-                StatefulBuilder(
-                  builder: (cPlayCtx, setCPlayState) {
-                    return InkWell(
-                      focusNode: _playPauseBtnFocusNode,
-                      onFocusChange: (_) {
-                        if (cPlayCtx.mounted) setCPlayState(() {});
-                      },
-                      onTap: _ctrl.togglePlayPause,
-                      customBorder: const CircleBorder(),
-                      child: Builder(
-                        builder: (ctx) {
-                          final isFocused = Focus.of(ctx).hasPrimaryFocus;
-                          return Container(
-                            width: 48,
-                            height: 48,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              gradient: LinearGradient(
-                                colors: [
-                                  VideoPlatformTheme.accent,
-                                  VideoPlatformTheme.accentHover,
-                                ],
-                              ),
-                              border: isFocused
-                                  ? Border.all(
-                                      color: const Color(0xFFFFE066),
-                                      width: 2.6,
-                                    )
-                                  : null,
-                              boxShadow: [
-                                BoxShadow(
-                                  color: VideoPlatformTheme.accent.withValues(
-                                    alpha: isFocused ? 0.75 : 0.4,
-                                  ),
-                                  blurRadius: isFocused ? 18 : 12,
-                                ),
-                              ],
-                            ),
-                            child: _ctrl.isLoadingTrack
-                                ? const Padding(
-                                    padding: EdgeInsets.all(13),
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2.2,
-                                      color: Colors.white,
-                                    ),
-                                  )
-                                : Icon(
-                                    _ctrl.isPlaying
-                                        ? Icons.pause_rounded
-                                        : Icons.play_arrow_rounded,
-                                    color: Colors.white,
-                                    size: 28,
-                                  ),
-                          );
-                        },
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  children: [
+                    IconButton(
+                      style: IconButton.styleFrom(
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                       ),
-                    );
-                  },
-                ),
-                IconButton(
-                  tooltip: '下一首',
-                  visualDensity: VisualDensity.compact,
-                  onPressed: () => _ctrl.stepTrack(1),
-                  icon: Icon(
-                    Icons.skip_next_rounded,
-                    color: VideoPlatformTheme.textPrimary,
-                    size: 28,
-                  ),
-                ),
-                if (_ctrl.player != null)
-                  PlayerVolumeControl(
-                    player: _ctrl.player!,
-                    compact: true,
-                    sliderWidth: 54,
-                    showPercentage: false,
-                    onVolumeChanged: (v) => _ctrl.setVolume(v / 100.0),
-                  ),
-                PopupMenuButton<String>(
-                  tooltip: '更多播放控制',
-                  onSelected: (action) {
-                    switch (action) {
-                      case 'rewind':
-                        _ctrl.seekRelative(const Duration(seconds: -5));
-                      case 'forward':
-                        _ctrl.seekRelative(const Duration(seconds: 5));
-                      case 'speed':
-                        _ctrl.cycleSpeed();
-                    }
-                  },
-                  itemBuilder:
-                      (_) => [
-                        const PopupMenuItem(
-                          value: 'rewind',
-                          child: Text('快退 5 秒'),
+                      tooltip:
+                          '播放模式：${CloudMusicBottomDockBar.playModeLabel(_ctrl.playMode)}',
+                      visualDensity: VisualDensity.compact,
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(
+                        minWidth: 32,
+                        minHeight: 32,
+                      ),
+                      onPressed: _ctrl.cyclePlayMode,
+                      icon: Icon(
+                        CloudMusicBottomDockBar.playModeIcon(_ctrl.playMode),
+                        size: 19,
+                        color: VideoPlatformTheme.accent,
+                      ),
+                    ),
+                    IconButton(
+                      style: IconButton.styleFrom(
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      tooltip: '快退 5 秒',
+                      visualDensity: VisualDensity.compact,
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(
+                        minWidth: 32,
+                        minHeight: 32,
+                      ),
+                      onPressed: () =>
+                          _ctrl.seekRelative(const Duration(seconds: -5)),
+                      icon: Icon(
+                        Icons.replay_5_rounded,
+                        color: VideoPlatformTheme.textSecondary,
+                        size: 19,
+                      ),
+                    ),
+                    IconButton(
+                      style: IconButton.styleFrom(
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      tooltip: '上一首',
+                      visualDensity: VisualDensity.compact,
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(
+                        minWidth: 34,
+                        minHeight: 34,
+                      ),
+                      onPressed: () => _ctrl.stepTrack(-1),
+                      icon: Icon(
+                        Icons.skip_previous_rounded,
+                        color: VideoPlatformTheme.textPrimary,
+                        size: 25,
+                      ),
+                    ),
+                    StatefulBuilder(
+                      builder: (cPlayCtx, setCPlayState) {
+                        return InkWell(
+                          focusNode: _playPauseBtnFocusNode,
+                          onFocusChange: (_) {
+                            if (cPlayCtx.mounted) setCPlayState(() {});
+                          },
+                          onTap: _ctrl.togglePlayPause,
+                          customBorder: const CircleBorder(),
+                          child: Builder(
+                            builder: (ctx) {
+                              final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                              return Container(
+                                width: 44,
+                                height: 44,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  gradient: LinearGradient(
+                                    colors: [
+                                      VideoPlatformTheme.accent,
+                                      VideoPlatformTheme.accentHover,
+                                    ],
+                                  ),
+                                  border: isFocused
+                                      ? Border.all(
+                                          color: const Color(0xFFFFE066),
+                                          width: 2.6,
+                                        )
+                                      : null,
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color:
+                                          VideoPlatformTheme.accent.withValues(
+                                        alpha: isFocused ? 0.75 : 0.4,
+                                      ),
+                                      blurRadius: isFocused ? 18 : 12,
+                                    ),
+                                  ],
+                                ),
+                                child: _ctrl.isLoadingTrack
+                                    ? const Padding(
+                                        padding: EdgeInsets.all(11),
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2.2,
+                                          color: Colors.white,
+                                        ),
+                                      )
+                                    : Icon(
+                                        _ctrl.isPlaying
+                                            ? Icons.pause_rounded
+                                            : Icons.play_arrow_rounded,
+                                        color: Colors.white,
+                                        size: 25,
+                                      ),
+                              );
+                            },
+                          ),
+                        );
+                      },
+                    ),
+                    IconButton(
+                      style: IconButton.styleFrom(
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      tooltip: '下一首',
+                      visualDensity: VisualDensity.compact,
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(
+                        minWidth: 34,
+                        minHeight: 34,
+                      ),
+                      onPressed: () => _ctrl.stepTrack(1),
+                      icon: Icon(
+                        Icons.skip_next_rounded,
+                        color: VideoPlatformTheme.textPrimary,
+                        size: 25,
+                      ),
+                    ),
+                    IconButton(
+                      style: IconButton.styleFrom(
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      tooltip: '快进 5 秒',
+                      visualDensity: VisualDensity.compact,
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(
+                        minWidth: 32,
+                        minHeight: 32,
+                      ),
+                      onPressed: () =>
+                          _ctrl.seekRelative(const Duration(seconds: 5)),
+                      icon: Icon(
+                        Icons.forward_5_rounded,
+                        color: VideoPlatformTheme.textSecondary,
+                        size: 19,
+                      ),
+                    ),
+                    InkWell(
+                      borderRadius: BorderRadius.circular(10),
+                      onTap: _ctrl.cycleSpeed,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 6,
+                          vertical: 3,
                         ),
-                        const PopupMenuItem(
-                          value: 'forward',
-                          child: Text('快进 5 秒'),
+                        decoration: BoxDecoration(
+                          color: VideoPlatformTheme.bgCard,
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: VideoPlatformTheme.borderSubtle,
+                          ),
                         ),
-                        PopupMenuItem(
-                          value: 'speed',
-                          child: Text('倍速 ${_ctrl.speed}x'),
+                        child: Text(
+                          '${_ctrl.speed}x',
+                          style: TextStyle(
+                            fontSize: 10.5,
+                            fontWeight: FontWeight.w700,
+                            color: VideoPlatformTheme.textPrimary,
+                          ),
                         ),
-                      ],
+                      ),
+                    ),
+                    if (_ctrl.queue.length > 1)
+                      IconButton(
+                        style: IconButton.styleFrom(
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        ),
+                        tooltip: '随机打乱队列',
+                        visualDensity: VisualDensity.compact,
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(
+                          minWidth: 32,
+                          minHeight: 32,
+                        ),
+                        onPressed: _ctrl.shuffleCurrentQueue,
+                        icon: Icon(
+                          Icons.shuffle_rounded,
+                          color: VideoPlatformTheme.textSecondary,
+                          size: 18,
+                        ),
+                      ),
+                  ],
                 ),
               ],
             )
           else
             Row(
               children: [
-                TextButton.icon(
-                  onPressed: _ctrl.cyclePlayMode,
-                  icon: Icon(
-                    CloudMusicBottomDockBar.playModeIcon(_ctrl.playMode),
-                    size: 18,
-                    color: VideoPlatformTheme.accent,
-                  ),
-                  label: Text(
-                    CloudMusicBottomDockBar.playModeLabel(_ctrl.playMode),
-                    style: TextStyle(
-                      fontSize: 12.5,
-                      color: VideoPlatformTheme.accent,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                OutlinedButton(
-                  onPressed: _ctrl.cycleSpeed,
-                  child: Text(
-                    '倍速 ${_ctrl.speed}x',
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: VideoPlatformTheme.textPrimary,
-                    ),
-                  ),
-                ),
-                const Spacer(),
-                IconButton(
-                  tooltip: '快退 5 秒',
-                  onPressed: () =>
-                      _ctrl.seekRelative(const Duration(seconds: -5)),
-                  icon: Icon(
-                    Icons.replay_5_rounded,
-                    color: VideoPlatformTheme.textSecondary,
-                    size: 22,
-                  ),
-                ),
-                IconButton(
-                  tooltip: '上一首',
-                  onPressed: () => _ctrl.stepTrack(-1),
-                  icon: Icon(
-                    Icons.skip_previous_rounded,
-                    color: VideoPlatformTheme.textPrimary,
-                    size: 30,
-                  ),
-                ),
-                const SizedBox(width: 8),
-                StatefulBuilder(
-                  builder: (playBtnCtx, setPlayBtnState) {
-                    return InkWell(
-                      focusNode: _playPauseBtnFocusNode,
-                      onFocusChange: (_) {
-                        if (playBtnCtx.mounted) setPlayBtnState(() {});
-                      },
-                      onTap: _ctrl.togglePlayPause,
-                      customBorder: const CircleBorder(),
-                      child: Builder(
-                        builder: (ctx) {
-                          final isFocused = Focus.of(ctx).hasPrimaryFocus;
-                          return Container(
-                            width: 52,
-                            height: 52,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              gradient: LinearGradient(
-                                colors: [
-                                  VideoPlatformTheme.accent,
-                                  VideoPlatformTheme.accentHover,
-                                ],
-                              ),
-                              border: isFocused
-                                  ? Border.all(
-                                      color: const Color(0xFFFFE066),
-                                      width: 2.8,
-                                    )
-                                  : null,
-                              boxShadow: [
-                                BoxShadow(
-                                  color: VideoPlatformTheme.accent.withValues(
-                                    alpha: isFocused ? 0.75 : 0.4,
-                                  ),
-                                  blurRadius: isFocused ? 20 : 14,
-                                ),
-                              ],
+                // Left Zone: Play Mode, Playback Speed & Shuffle Pills
+                Expanded(
+                  flex: 4,
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        OutlinedButton.icon(
+                          style: OutlinedButton.styleFrom(
+                            visualDensity: VisualDensity.compact,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 6,
                             ),
-                            child: _ctrl.isLoadingTrack
-                                ? const Padding(
-                                    padding: EdgeInsets.all(14),
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2.5,
-                                      color: Colors.white,
+                          ),
+                          onPressed: _ctrl.cyclePlayMode,
+                          icon: Icon(
+                            CloudMusicBottomDockBar.playModeIcon(
+                              _ctrl.playMode,
+                            ),
+                            size: 16,
+                            color: VideoPlatformTheme.accent,
+                          ),
+                          label: Text(
+                            CloudMusicBottomDockBar.playModeLabel(
+                              _ctrl.playMode,
+                            ),
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                              color: VideoPlatformTheme.accent,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        OutlinedButton(
+                          style: OutlinedButton.styleFrom(
+                            visualDensity: VisualDensity.compact,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 6,
+                            ),
+                          ),
+                          onPressed: _ctrl.cycleSpeed,
+                          child: Text(
+                            '倍速 ${_ctrl.speed}x',
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                              color: VideoPlatformTheme.textPrimary,
+                            ),
+                          ),
+                        ),
+                        if (_ctrl.queue.length > 1) ...[
+                          const SizedBox(width: 8),
+                          OutlinedButton.icon(
+                            style: OutlinedButton.styleFrom(
+                              visualDensity: VisualDensity.compact,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 6,
+                              ),
+                            ),
+                            onPressed: _ctrl.shuffleCurrentQueue,
+                            icon: const Icon(Icons.shuffle_rounded, size: 15),
+                            label: const Text(
+                              '随机打乱',
+                              style: TextStyle(fontSize: 12),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+
+                // Center Zone: Core Hi-Fi Transport Controls
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 4,
+                  ),
+                  decoration: BoxDecoration(
+                    color: VideoPlatformTheme.bgCard.withValues(alpha: 0.7),
+                    borderRadius: BorderRadius.circular(28),
+                    border: Border.all(
+                      color: VideoPlatformTheme.borderSubtle,
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        tooltip: '快退 5 秒',
+                        visualDensity: VisualDensity.compact,
+                        onPressed: () =>
+                            _ctrl.seekRelative(const Duration(seconds: -5)),
+                        icon: Icon(
+                          Icons.replay_5_rounded,
+                          color: VideoPlatformTheme.textSecondary,
+                          size: 21,
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: '上一首',
+                        visualDensity: VisualDensity.compact,
+                        onPressed: () => _ctrl.stepTrack(-1),
+                        icon: Icon(
+                          Icons.skip_previous_rounded,
+                          color: VideoPlatformTheme.textPrimary,
+                          size: 28,
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      StatefulBuilder(
+                        builder: (playBtnCtx, setPlayBtnState) {
+                          return InkWell(
+                            focusNode: _playPauseBtnFocusNode,
+                            onFocusChange: (_) {
+                              if (playBtnCtx.mounted) setPlayBtnState(() {});
+                            },
+                            onTap: _ctrl.togglePlayPause,
+                            customBorder: const CircleBorder(),
+                            child: Builder(
+                              builder: (ctx) {
+                                final isFocused =
+                                    Focus.of(ctx).hasPrimaryFocus;
+                                return Container(
+                                  width: 48,
+                                  height: 48,
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    gradient: LinearGradient(
+                                      colors: [
+                                        VideoPlatformTheme.accent,
+                                        VideoPlatformTheme.accentHover,
+                                      ],
                                     ),
-                                  )
-                                : Icon(
-                                    _ctrl.isPlaying
-                                        ? Icons.pause_rounded
-                                        : Icons.play_arrow_rounded,
-                                    color: Colors.white,
-                                    size: 30,
+                                    border: isFocused
+                                        ? Border.all(
+                                            color: const Color(0xFFFFE066),
+                                            width: 2.8,
+                                          )
+                                        : null,
+                                    boxShadow: [
+                                      BoxShadow(
+                                        color: VideoPlatformTheme.accent
+                                            .withValues(
+                                          alpha: isFocused ? 0.75 : 0.4,
+                                        ),
+                                        blurRadius: isFocused ? 18 : 12,
+                                      ),
+                                    ],
                                   ),
+                                  child: _ctrl.isLoadingTrack
+                                      ? const Padding(
+                                          padding: EdgeInsets.all(13),
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 2.4,
+                                            color: Colors.white,
+                                          ),
+                                        )
+                                      : Icon(
+                                          _ctrl.isPlaying
+                                              ? Icons.pause_rounded
+                                              : Icons.play_arrow_rounded,
+                                          color: Colors.white,
+                                          size: 28,
+                                        ),
+                                );
+                              },
+                            ),
                           );
                         },
                       ),
-                    );
-                  },
-                ),
-                const SizedBox(width: 8),
-                IconButton(
-                  tooltip: '下一首',
-                  onPressed: () => _ctrl.stepTrack(1),
-                  icon: Icon(
-                    Icons.skip_next_rounded,
-                    color: VideoPlatformTheme.textPrimary,
-                    size: 30,
-                  ),
-                ),
-                IconButton(
-                  tooltip: '快进 5 秒',
-                  onPressed: () =>
-                      _ctrl.seekRelative(const Duration(seconds: 5)),
-                  icon: Icon(
-                    Icons.forward_5_rounded,
-                    color: VideoPlatformTheme.textSecondary,
-                    size: 22,
-                  ),
-                ),
-                const Spacer(),
-                Icon(
-                  _ctrl.volume <= 1
-                      ? Icons.volume_off_rounded
-                      : Icons.volume_up_rounded,
-                  size: 18,
-                  color: VideoPlatformTheme.textSecondary,
-                ),
-                SizedBox(
-                  width: 110,
-                  child: ExcludeFocus(
-                    child: SliderTheme(
-                      data: SliderTheme.of(context).copyWith(
-                        trackHeight: 3,
-                        thumbShape: const RoundSliderThumbShape(
-                          enabledThumbRadius: 5,
+                      const SizedBox(width: 6),
+                      IconButton(
+                        tooltip: '下一首',
+                        visualDensity: VisualDensity.compact,
+                        onPressed: () => _ctrl.stepTrack(1),
+                        icon: Icon(
+                          Icons.skip_next_rounded,
+                          color: VideoPlatformTheme.textPrimary,
+                          size: 28,
                         ),
-                        activeTrackColor: VideoPlatformTheme.accent,
-                        inactiveTrackColor: VideoPlatformTheme.borderStrong,
-                        thumbColor: VideoPlatformTheme.accentHover,
                       ),
-                      child: Slider(
-                        value: _ctrl.volume,
-                        min: 0,
-                        max: 100,
-                        onChanged: _ctrl.setVolume,
+                      IconButton(
+                        tooltip: '快进 5 秒',
+                        visualDensity: VisualDensity.compact,
+                        onPressed: () =>
+                            _ctrl.seekRelative(const Duration(seconds: 5)),
+                        icon: Icon(
+                          Icons.forward_5_rounded,
+                          color: VideoPlatformTheme.textSecondary,
+                          size: 21,
+                        ),
                       ),
-                    ),
+                    ],
                   ),
                 ),
-                if (_ctrl.currentTrack != null) ...[
-                  const SizedBox(width: 8),
-                  OutlinedButton.icon(
-                    onPressed: _exitMusicPlayer,
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: VideoPlatformTheme.danger,
-                      side: BorderSide(
-                        color:
-                            VideoPlatformTheme.danger.withValues(alpha: 0.55),
+
+                // Right Zone: Interactive Volume Control, Queue Switcher & Stop Button
+                Expanded(
+                  flex: 4,
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      if (_ctrl.player != null)
+                        PlayerVolumeControl(
+                          player: _ctrl.player!,
+                          compact: true,
+                          sliderWidth: 82,
+                          showPercentage: true,
+                          onVolumeChanged: (v) => _ctrl.setVolume(v),
+                        ),
+                      const SizedBox(width: 8),
+                      OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 6,
+                          ),
+                        ),
+                        onPressed: () {
+                          setState(() {
+                            _rightTabIndex = _rightTabIndex == 1 ? 0 : 1;
+                          });
+                        },
+                        icon: Icon(
+                          _rightTabIndex == 1
+                              ? Icons.lyrics_rounded
+                              : Icons.queue_music_rounded,
+                          size: 15,
+                        ),
+                        label: Text(
+                          _rightTabIndex == 1
+                              ? '同步歌词'
+                              : '队列 (${_ctrl.currentIndex + 1}/${_ctrl.queue.length})',
+                          style: const TextStyle(fontSize: 12),
+                        ),
                       ),
-                      backgroundColor:
-                          VideoPlatformTheme.danger.withValues(alpha: 0.10),
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 11,
-                        vertical: 7,
-                      ),
-                    ),
-                    icon:
-                        const Icon(Icons.power_settings_new_rounded, size: 16),
-                    label: const Text(
-                      '停止退出',
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
+                      if (_ctrl.currentTrack != null) ...[
+                        const SizedBox(width: 8),
+                        OutlinedButton.icon(
+                          onPressed: _exitMusicPlayer,
+                          style: OutlinedButton.styleFrom(
+                            visualDensity: VisualDensity.compact,
+                            foregroundColor: VideoPlatformTheme.danger,
+                            side: BorderSide(
+                              color: VideoPlatformTheme.danger
+                                  .withValues(alpha: 0.55),
+                            ),
+                            backgroundColor: VideoPlatformTheme.danger
+                                .withValues(alpha: 0.10),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 6,
+                            ),
+                          ),
+                          icon: const Icon(
+                            Icons.power_settings_new_rounded,
+                            size: 15,
+                          ),
+                          label: const Text(
+                            '停止退出',
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
                   ),
-                ],
+                ),
               ],
             ),
         ],
@@ -9905,16 +10726,36 @@ class _CloudMusicSmartPlaylistDialogState
   @override
   Widget build(BuildContext context) {
     final screenSize = MediaQuery.sizeOf(context);
+    final viewInsets = MediaQuery.viewInsetsOf(context);
     final isMobile = screenSize.width < 760;
+    final availableHeight =
+        (screenSize.height - viewInsets.bottom - (isMobile ? 84 : 120))
+            .clamp(220.0, isMobile ? 640.0 : 680.0);
 
     return AlertDialog(
       backgroundColor: VideoPlatformTheme.bgElevated,
       insetPadding: EdgeInsets.symmetric(
-        horizontal: isMobile ? 10 : 24,
-        vertical: isMobile ? 12 : 20,
+        horizontal: isMobile ? 8 : 24,
+        vertical: isMobile ? 10 : 20,
       ),
-      titlePadding: const EdgeInsets.fromLTRB(20, 14, 12, 6),
-      contentPadding: const EdgeInsets.fromLTRB(20, 8, 20, 12),
+      titlePadding: EdgeInsets.fromLTRB(
+        isMobile ? 14 : 20,
+        isMobile ? 10 : 14,
+        isMobile ? 8 : 12,
+        4,
+      ),
+      contentPadding: EdgeInsets.fromLTRB(
+        isMobile ? 12 : 20,
+        6,
+        isMobile ? 12 : 20,
+        isMobile ? 8 : 12,
+      ),
+      actionsPadding: EdgeInsets.fromLTRB(
+        isMobile ? 12 : 20,
+        0,
+        isMobile ? 12 : 20,
+        isMobile ? 10 : 14,
+      ),
       title: Row(
         children: [
           Icon(
@@ -9922,14 +10763,16 @@ class _CloudMusicSmartPlaylistDialogState
                 ? Icons.manage_search_rounded
                 : Icons.auto_awesome_rounded,
             color: VideoPlatformTheme.accent,
-            size: 22,
+            size: isMobile ? 20 : 22,
           ),
           const SizedBox(width: 8),
           Expanded(
             child: Text(
-              _activeTab == 0
-                  ? '指定目录按人名 / 关键词查找并新建播放列表'
-                  : 'AI 智能分析指定目录并按分类自动生成播放列表',
+              isMobile
+                  ? (_activeTab == 0 ? '按人名 / 关键词搜歌建表' : 'AI 智能分析目录分类建表')
+                  : (_activeTab == 0
+                      ? '指定目录按人名 / 关键词查找并新建播放列表'
+                      : 'AI 智能分析指定目录并按分类自动生成播放列表'),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
@@ -9940,14 +10783,15 @@ class _CloudMusicSmartPlaylistDialogState
             ),
           ),
           IconButton(
+            visualDensity: VisualDensity.compact,
             onPressed: () => Navigator.of(context).pop(false),
             icon: const Icon(Icons.close_rounded, size: 20),
           ),
         ],
       ),
       content: SizedBox(
-        width: 860,
-        height: (screenSize.height * 0.76).clamp(420.0, 680.0),
+        width: isMobile ? screenSize.width : 860,
+        height: availableHeight,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -9958,59 +10802,129 @@ class _CloudMusicSmartPlaylistDialogState
                   child: _buildModeTabButton(
                     index: 0,
                     icon: Icons.manage_search_rounded,
-                    label: '按人名 / 关键词搜歌新建列表',
+                    label: isMobile ? '搜人名/关键词建表' : '按人名 / 关键词搜歌新建列表',
                   ),
                 ),
-                const SizedBox(width: 10),
+                const SizedBox(width: 8),
                 Expanded(
                   child: _buildModeTabButton(
                     index: 1,
                     icon: Icons.auto_awesome_rounded,
-                    label: 'AI 智能分析目录自动分类建表',
+                    label: isMobile ? 'AI 智能分类建表' : 'AI 智能分析目录自动分类建表',
                   ),
                 ),
               ],
             ),
-            const SizedBox(height: 10),
+            SizedBox(height: isMobile ? 8 : 10),
             // Target Directories Bar
-            _buildTargetDirectoriesCard(),
-            const SizedBox(height: 10),
+            _buildTargetDirectoriesCard(isMobile: isMobile),
+            SizedBox(height: isMobile ? 8 : 10),
             Expanded(
               child: _activeTab == 0
-                  ? _buildKeywordSearchTabBody()
-                  : _buildAiCategorizeTabBody(),
+                  ? _buildKeywordSearchTabBody(isMobile: isMobile)
+                  : _buildAiCategorizeTabBody(isMobile: isMobile),
             ),
           ],
         ),
       ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(false),
-          child: const Text('关闭'),
-        ),
-        if (_activeTab == 0 && _matchedTracks.isNotEmpty) ...[
-          OutlinedButton.icon(
-            onPressed: () => _createPlaylistFromMatchedTracks(autoPlay: false),
-            icon: const Icon(Icons.playlist_add_check_rounded, size: 17),
-            label: Text(
-              '新建播放列表 (${_matchedTracks.length - _uncheckedTrackKeys.length} 首)',
-            ),
-          ),
-          FilledButton.icon(
-            onPressed: () => _createPlaylistFromMatchedTracks(autoPlay: true),
-            icon: const Icon(Icons.play_arrow_rounded, size: 17),
-            label: const Text('新建列表并立即播放'),
-          ),
-        ],
-        if (_activeTab == 1 && _aiDrafts.isNotEmpty)
-          FilledButton.icon(
-            onPressed: _createSelectedAiPlaylists,
-            icon: const Icon(Icons.auto_awesome_rounded, size: 17),
-            label: Text(
-              '一键生成所选 ${_selectedAiDraftIndices.length} 个分类播放列表',
-            ),
-          ),
-      ],
+      actions: isMobile
+          ? [
+              if (_activeTab == 0 && _matchedTracks.isNotEmpty)
+                SizedBox(
+                  width: double.infinity,
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          style: OutlinedButton.styleFrom(
+                            visualDensity: VisualDensity.compact,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 8,
+                            ),
+                          ),
+                          onPressed: () =>
+                              _createPlaylistFromMatchedTracks(autoPlay: false),
+                          icon: const Icon(
+                            Icons.playlist_add_check_rounded,
+                            size: 16,
+                          ),
+                          label: Text(
+                            '新建列表 (${_matchedTracks.length - _uncheckedTrackKeys.length}首)',
+                            style: const TextStyle(fontSize: 12),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: FilledButton.icon(
+                          style: FilledButton.styleFrom(
+                            visualDensity: VisualDensity.compact,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 8,
+                            ),
+                          ),
+                          onPressed: () =>
+                              _createPlaylistFromMatchedTracks(autoPlay: true),
+                          icon: const Icon(Icons.play_arrow_rounded, size: 16),
+                          label: const Text(
+                            '新建并播放',
+                            style: TextStyle(fontSize: 12),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                )
+              else if (_activeTab == 1 && _aiDrafts.isNotEmpty)
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton.icon(
+                    onPressed: _createSelectedAiPlaylists,
+                    icon: const Icon(Icons.auto_awesome_rounded, size: 16),
+                    label: Text(
+                      '一键生成所选 ${_selectedAiDraftIndices.length} 个分类列表',
+                      style: const TextStyle(fontSize: 12.5),
+                    ),
+                  ),
+                )
+              else
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(false),
+                  child: const Text('关闭'),
+                ),
+            ]
+          : [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(false),
+                child: const Text('关闭'),
+              ),
+              if (_activeTab == 0 && _matchedTracks.isNotEmpty) ...[
+                OutlinedButton.icon(
+                  onPressed: () =>
+                      _createPlaylistFromMatchedTracks(autoPlay: false),
+                  icon: const Icon(Icons.playlist_add_check_rounded, size: 17),
+                  label: Text(
+                    '新建播放列表 (${_matchedTracks.length - _uncheckedTrackKeys.length} 首)',
+                  ),
+                ),
+                FilledButton.icon(
+                  onPressed: () =>
+                      _createPlaylistFromMatchedTracks(autoPlay: true),
+                  icon: const Icon(Icons.play_arrow_rounded, size: 17),
+                  label: const Text('新建列表并立即播放'),
+                ),
+              ],
+              if (_activeTab == 1 && _aiDrafts.isNotEmpty)
+                FilledButton.icon(
+                  onPressed: _createSelectedAiPlaylists,
+                  icon: const Icon(Icons.auto_awesome_rounded, size: 17),
+                  label: Text(
+                    '一键生成所选 ${_selectedAiDraftIndices.length} 个分类播放列表',
+                  ),
+                ),
+            ],
     );
   }
 
@@ -10024,8 +10938,8 @@ class _CloudMusicSmartPlaylistDialogState
       borderRadius: BorderRadius.circular(10),
       onTap: () => setState(() => _activeTab = index),
       child: Container(
-        height: 38,
-        padding: const EdgeInsets.symmetric(horizontal: 12),
+        height: 36,
+        padding: const EdgeInsets.symmetric(horizontal: 10),
         decoration: BoxDecoration(
           color: selected
               ? VideoPlatformTheme.accent.withValues(alpha: 0.22)
@@ -10043,19 +10957,19 @@ class _CloudMusicSmartPlaylistDialogState
           children: [
             Icon(
               icon,
-              size: 16,
+              size: 15,
               color: selected
                   ? VideoPlatformTheme.accent
                   : VideoPlatformTheme.textSecondary,
             ),
-            const SizedBox(width: 6),
+            const SizedBox(width: 5),
             Flexible(
               child: Text(
                 label,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(
-                  fontSize: 12.5,
+                  fontSize: 12,
                   fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
                   color: selected
                       ? VideoPlatformTheme.accent
@@ -10069,9 +10983,49 @@ class _CloudMusicSmartPlaylistDialogState
     );
   }
 
-  Widget _buildTargetDirectoriesCard() {
+  Widget _buildTargetDirectoriesCard({required bool isMobile}) {
+    Widget buildSelectedChipsStrip() {
+      if (_selectedSources.isEmpty) {
+        return Text(
+          '尚未选择目录，请点击「选择指定目录」',
+          style: TextStyle(
+            fontSize: 11.5,
+            color: VideoPlatformTheme.danger,
+          ),
+        );
+      }
+      return SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(
+          children: [
+            for (int i = 0; i < _selectedSources.length; i++)
+              Padding(
+                padding: const EdgeInsets.only(right: 6),
+                child: InputChip(
+                  visualDensity: VisualDensity.compact,
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  label: Text(
+                    '${_selectedSources[i].mountName}: ${_selectedSources[i].title}',
+                    style: const TextStyle(fontSize: 11),
+                  ),
+                  onDeleted: _selectedSources.length > 1
+                      ? () => setState(() {
+                            _selectedSources.removeAt(i);
+                            _scannedAllTracks = const [];
+                          })
+                      : null,
+                ),
+              ),
+          ],
+        ),
+      );
+    }
+
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      padding: EdgeInsets.symmetric(
+        horizontal: isMobile ? 10 : 12,
+        vertical: isMobile ? 6 : 8,
+      ),
       decoration: BoxDecoration(
         color: VideoPlatformTheme.bgCard,
         borderRadius: BorderRadius.circular(10),
@@ -10080,81 +11034,94 @@ class _CloudMusicSmartPlaylistDialogState
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              Icon(
-                Icons.folder_open_rounded,
-                size: 16,
-                color: VideoPlatformTheme.warning,
-              ),
-              const SizedBox(width: 6),
-              Text(
-                '指定扫描目录 (${_selectedSources.length} 个):',
-                style: TextStyle(
-                  fontSize: 12.5,
-                  fontWeight: FontWeight.w700,
-                  color: VideoPlatformTheme.textPrimary,
+          if (isMobile) ...[
+            Row(
+              children: [
+                Icon(
+                  Icons.folder_open_rounded,
+                  size: 15,
+                  color: VideoPlatformTheme.warning,
                 ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: SizedBox(
-                  height: 32,
-                  child: Align(
-                    alignment: Alignment.centerLeft,
-                    child: _selectedSources.isEmpty
-                        ? Text(
-                            '尚未选择目录，请点击右侧「选择指定目录」',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: VideoPlatformTheme.danger,
-                            ),
-                          )
-                        : SingleChildScrollView(
-                            scrollDirection: Axis.horizontal,
-                            child: Row(
-                              children: [
-                                for (int i = 0; i < _selectedSources.length; i++)
-                                  Padding(
-                                    padding: const EdgeInsets.only(right: 6),
-                                    child: InputChip(
-                                      visualDensity: VisualDensity.compact,
-                                      label: Text(
-                                        '${_selectedSources[i].mountName}: ${_selectedSources[i].title}',
-                                        style: const TextStyle(fontSize: 11.5),
-                                      ),
-                                      onDeleted: _selectedSources.length > 1
-                                          ? () => setState(() {
-                                                _selectedSources.removeAt(i);
-                                                _scannedAllTracks = const [];
-                                              })
-                                          : null,
-                                    ),
-                                  ),
-                              ],
-                            ),
-                          ),
+                const SizedBox(width: 5),
+                Expanded(
+                  child: Text(
+                    '扫描目录 (${_selectedSources.length} 个)',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                      color: VideoPlatformTheme.textPrimary,
+                    ),
                   ),
                 ),
-              ),
-              const SizedBox(width: 8),
-              OutlinedButton.icon(
-                onPressed: _openDirectorySelectorSheet,
-                icon: const Icon(Icons.create_new_folder_outlined, size: 15),
-                label: const Text('选择指定目录', style: TextStyle(fontSize: 12)),
-              ),
-            ],
-          ),
-          if (_ctrl.savedMusicFolders.isNotEmpty) ...[
-            const SizedBox(height: 6),
+                OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 9,
+                      vertical: 4,
+                    ),
+                  ),
+                  onPressed: _openDirectorySelectorSheet,
+                  icon: const Icon(Icons.create_new_folder_outlined, size: 14),
+                  label: const Text('选择目录', style: TextStyle(fontSize: 11.5)),
+                ),
+              ],
+            ),
+            const SizedBox(height: 5),
             SizedBox(
-              height: 30,
+              height: 28,
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: buildSelectedChipsStrip(),
+              ),
+            ),
+          ] else
+            Row(
+              children: [
+                Icon(
+                  Icons.folder_open_rounded,
+                  size: 16,
+                  color: VideoPlatformTheme.warning,
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  '指定扫描目录 (${_selectedSources.length} 个):',
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w700,
+                    color: VideoPlatformTheme.textPrimary,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: SizedBox(
+                    height: 32,
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: buildSelectedChipsStrip(),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                OutlinedButton.icon(
+                  onPressed: _openDirectorySelectorSheet,
+                  icon: const Icon(Icons.create_new_folder_outlined, size: 15),
+                  label: const Text('选择指定目录', style: TextStyle(fontSize: 12)),
+                ),
+              ],
+            ),
+          if (_ctrl.savedMusicFolders.isNotEmpty) ...[
+            const SizedBox(height: 5),
+            SizedBox(
+              height: 28,
               child: SingleChildScrollView(
                 scrollDirection: Axis.horizontal,
                 child: Row(
                   children: [
                     Text(
-                      '常用目录快选: ',
+                      '常用快选: ',
                       style: TextStyle(
                         fontSize: 11,
                         color: VideoPlatformTheme.textMuted,
@@ -10166,6 +11133,8 @@ class _CloudMusicSmartPlaylistDialogState
                         child: FilterChip(
                           showCheckmark: false,
                           visualDensity: VisualDensity.compact,
+                          materialTapTargetSize:
+                              MaterialTapTargetSize.shrinkWrap,
                           label: Text(
                             '${fav.mountName}: ${fav.title}',
                             style: const TextStyle(fontSize: 11),
@@ -10199,98 +11168,238 @@ class _CloudMusicSmartPlaylistDialogState
     );
   }
 
-  Widget _buildKeywordSearchTabBody() {
+  Widget _buildKeywordSearchTabBody({required bool isMobile}) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        SizedBox(
-          height: 40,
-          child: Row(
+        if (isMobile) ...[
+          SizedBox(
+            height: 38,
+            child: TextField(
+              controller: _keywordCtrl,
+              style: const TextStyle(fontSize: 12.5),
+              onChanged: (v) {
+                if (!_playlistNameManuallyEdited) {
+                  _newPlaylistNameCtrl.text = v.trim();
+                }
+              },
+              onSubmitted: (_) => _runKeywordSearchInSources(),
+              decoration: const InputDecoration(
+                labelText: '输入指定人名 (歌手) 或关键词',
+                hintText: '如：周杰伦、陈奕迅、粤语 (空格或逗号分隔)',
+                floatingLabelBehavior: FloatingLabelBehavior.always,
+                prefixIcon: Icon(Icons.person_search_rounded, size: 17),
+                isDense: true,
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 38,
+            child: TextField(
+              controller: _newPlaylistNameCtrl,
+              style: const TextStyle(fontSize: 12.5),
+              onChanged: (_) => _playlistNameManuallyEdited = true,
+              decoration: const InputDecoration(
+                labelText: '新建播放列表名称',
+                hintText: '默认使用查找的人名或关键词',
+                floatingLabelBehavior: FloatingLabelBehavior.always,
+                prefixIcon: Icon(Icons.queue_music_rounded, size: 17),
+                isDense: true,
+              ),
+            ),
+          ),
+          const SizedBox(height: 6),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                ChoiceChip(
+                  showCheckmark: false,
+                  visualDensity: VisualDensity.compact,
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  label: const Text(
+                    '匹配任一词 (OR)',
+                    style: TextStyle(fontSize: 11),
+                  ),
+                  selected: !_matchAllKeywords,
+                  onSelected: (_) => setState(() => _matchAllKeywords = false),
+                ),
+                const SizedBox(width: 6),
+                ChoiceChip(
+                  showCheckmark: false,
+                  visualDensity: VisualDensity.compact,
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  label: const Text(
+                    '同时包含 (AND)',
+                    style: TextStyle(fontSize: 11),
+                  ),
+                  selected: _matchAllKeywords,
+                  onSelected: (_) => setState(() => _matchAllKeywords = true),
+                ),
+                const SizedBox(width: 6),
+                FilterChip(
+                  showCheckmark: false,
+                  visualDensity: VisualDensity.compact,
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  label: const Text(
+                    '含子目录与压缩包',
+                    style: TextStyle(fontSize: 11),
+                  ),
+                  selected: _includeSubfolders,
+                  onSelected: (v) => setState(() {
+                    _includeSubfolders = v;
+                    _scannedAllTracks = const [];
+                  }),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 6),
+          Row(
             children: [
               Expanded(
-                flex: 3,
-                child: TextField(
-                  controller: _keywordCtrl,
-                  onChanged: (v) {
-                    if (!_playlistNameManuallyEdited) {
-                      _newPlaylistNameCtrl.text = v.trim();
-                    }
-                  },
-                  onSubmitted: (_) => _runKeywordSearchInSources(),
-                  decoration: const InputDecoration(
-                    labelText: '输入指定人名 (歌手) 或关键词',
-                    hintText: '例如：周杰伦、陈奕迅、粤语、无损 (多个词用空格或逗号分隔)',
-                    floatingLabelBehavior: FloatingLabelBehavior.always,
-                    prefixIcon: Icon(Icons.person_search_rounded, size: 18),
-                    isDense: true,
+                child: FilledButton.icon(
+                  style: FilledButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 8,
+                    ),
+                  ),
+                  onPressed: _isSearchingTracks
+                      ? null
+                      : () =>
+                          _runKeywordSearchInSources(createImmediately: false),
+                  icon: const Icon(Icons.search_rounded, size: 15),
+                  label: const Text(
+                    '在指定目录中查找歌曲',
+                    style: TextStyle(fontSize: 12),
                   ),
                 ),
               ),
-              const SizedBox(width: 10),
+              const SizedBox(width: 8),
               Expanded(
-                flex: 2,
-                child: TextField(
-                  controller: _newPlaylistNameCtrl,
-                  onChanged: (_) => _playlistNameManuallyEdited = true,
-                  decoration: const InputDecoration(
-                    labelText: '新建播放列表名称',
-                    hintText: '默认使用查找的人名或关键词',
-                    floatingLabelBehavior: FloatingLabelBehavior.always,
-                    prefixIcon: Icon(Icons.queue_music_rounded, size: 18),
-                    isDense: true,
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 8,
+                    ),
+                  ),
+                  onPressed: _isSearchingTracks
+                      ? null
+                      : () =>
+                          _runKeywordSearchInSources(createImmediately: true),
+                  icon: const Icon(Icons.playlist_add_rounded, size: 15),
+                  label: const Text(
+                    '查找并直接建表',
+                    style: TextStyle(fontSize: 12),
                   ),
                 ),
               ),
             ],
           ),
-        ),
+        ] else ...[
+          SizedBox(
+            height: 40,
+            child: Row(
+              children: [
+                Expanded(
+                  flex: 3,
+                  child: TextField(
+                    controller: _keywordCtrl,
+                    onChanged: (v) {
+                      if (!_playlistNameManuallyEdited) {
+                        _newPlaylistNameCtrl.text = v.trim();
+                      }
+                    },
+                    onSubmitted: (_) => _runKeywordSearchInSources(),
+                    decoration: const InputDecoration(
+                      labelText: '输入指定人名 (歌手) 或关键词',
+                      hintText: '例如：周杰伦、陈奕迅、粤语、无损 (多个词用空格或逗号分隔)',
+                      floatingLabelBehavior: FloatingLabelBehavior.always,
+                      prefixIcon: Icon(Icons.person_search_rounded, size: 18),
+                      isDense: true,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  flex: 2,
+                  child: TextField(
+                    controller: _newPlaylistNameCtrl,
+                    onChanged: (_) => _playlistNameManuallyEdited = true,
+                    decoration: const InputDecoration(
+                      labelText: '新建播放列表名称',
+                      hintText: '默认使用查找的人名或关键词',
+                      floatingLabelBehavior: FloatingLabelBehavior.always,
+                      prefixIcon: Icon(Icons.queue_music_rounded, size: 18),
+                      isDense: true,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 10,
+            runSpacing: 6,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              ChoiceChip(
+                showCheckmark: false,
+                visualDensity: VisualDensity.compact,
+                label: const Text(
+                  '匹配任一关键词 (OR)',
+                  style: TextStyle(fontSize: 11.5),
+                ),
+                selected: !_matchAllKeywords,
+                onSelected: (_) => setState(() => _matchAllKeywords = false),
+              ),
+              ChoiceChip(
+                showCheckmark: false,
+                visualDensity: VisualDensity.compact,
+                label: const Text(
+                  '同时包含所有关键词 (AND)',
+                  style: TextStyle(fontSize: 11.5),
+                ),
+                selected: _matchAllKeywords,
+                onSelected: (_) => setState(() => _matchAllKeywords = true),
+              ),
+              FilterChip(
+                showCheckmark: false,
+                visualDensity: VisualDensity.compact,
+                label: const Text(
+                  '包含子目录与压缩包',
+                  style: TextStyle(fontSize: 11.5),
+                ),
+                selected: _includeSubfolders,
+                onSelected: (v) => setState(() {
+                  _includeSubfolders = v;
+                  _scannedAllTracks = const [];
+                }),
+              ),
+              FilledButton.icon(
+                onPressed: _isSearchingTracks
+                    ? null
+                    : () => _runKeywordSearchInSources(createImmediately: false),
+                icon: const Icon(Icons.search_rounded, size: 16),
+                label: const Text('在指定目录中查找歌曲'),
+              ),
+              OutlinedButton.icon(
+                onPressed: _isSearchingTracks
+                    ? null
+                    : () => _runKeywordSearchInSources(createImmediately: true),
+                icon: const Icon(Icons.playlist_add_rounded, size: 16),
+                label: const Text('查找并直接新建播放列表'),
+              ),
+            ],
+          ),
+        ],
         const SizedBox(height: 8),
-        Wrap(
-          spacing: 10,
-          runSpacing: 6,
-          crossAxisAlignment: WrapCrossAlignment.center,
-          children: [
-            ChoiceChip(
-              showCheckmark: false,
-              visualDensity: VisualDensity.compact,
-              label: const Text('匹配任一关键词 (OR)', style: TextStyle(fontSize: 11.5)),
-              selected: !_matchAllKeywords,
-              onSelected: (_) => setState(() => _matchAllKeywords = false),
-            ),
-            ChoiceChip(
-              showCheckmark: false,
-              visualDensity: VisualDensity.compact,
-              label: const Text('同时包含所有关键词 (AND)', style: TextStyle(fontSize: 11.5)),
-              selected: _matchAllKeywords,
-              onSelected: (_) => setState(() => _matchAllKeywords = true),
-            ),
-            FilterChip(
-              showCheckmark: false,
-              visualDensity: VisualDensity.compact,
-              label: const Text('包含子目录与压缩包', style: TextStyle(fontSize: 11.5)),
-              selected: _includeSubfolders,
-              onSelected: (v) => setState(() {
-                _includeSubfolders = v;
-                _scannedAllTracks = const [];
-              }),
-            ),
-            FilledButton.icon(
-              onPressed: _isSearchingTracks
-                  ? null
-                  : () => _runKeywordSearchInSources(createImmediately: false),
-              icon: const Icon(Icons.search_rounded, size: 16),
-              label: const Text('在指定目录中查找歌曲'),
-            ),
-            OutlinedButton.icon(
-              onPressed: _isSearchingTracks
-                  ? null
-                  : () => _runKeywordSearchInSources(createImmediately: true),
-              icon: const Icon(Icons.playlist_add_rounded, size: 16),
-              label: const Text('查找并直接新建播放列表'),
-            ),
-          ],
-        ),
-        const SizedBox(height: 10),
         if (_isSearchingTracks)
           Expanded(
             child: Center(
@@ -10301,6 +11410,7 @@ class _CloudMusicSmartPlaylistDialogState
                   const SizedBox(height: 12),
                   Text(
                     _searchProgressText,
+                    textAlign: TextAlign.center,
                     style: TextStyle(color: VideoPlatformTheme.textSecondary),
                   ),
                 ],
@@ -10312,6 +11422,7 @@ class _CloudMusicSmartPlaylistDialogState
             child: Center(
               child: Text(
                 _searchError!,
+                textAlign: TextAlign.center,
                 style: TextStyle(color: VideoPlatformTheme.danger),
               ),
             ),
@@ -10323,7 +11434,7 @@ class _CloudMusicSmartPlaylistDialogState
                 '输入歌手人名（如“周杰伦”、“陈奕迅”）或关键词后，点击「在指定目录中查找歌曲」即可汇总并用找到的歌曲新建播放列表',
                 textAlign: TextAlign.center,
                 style: TextStyle(
-                  fontSize: 13,
+                  fontSize: isMobile ? 12 : 13,
                   color: VideoPlatformTheme.textMuted,
                 ),
               ),
@@ -10336,21 +11447,30 @@ class _CloudMusicSmartPlaylistDialogState
               children: [
                 Row(
                   children: [
-                    Text(
-                      '共找到 ${_matchedTracks.length} 首匹配歌曲（已勾选 ${_matchedTracks.length - _uncheckedTrackKeys.length} 首）',
-                      style: TextStyle(
-                        fontSize: 12.5,
-                        fontWeight: FontWeight.w700,
-                        color: VideoPlatformTheme.accent,
+                    Expanded(
+                      child: Text(
+                        '共找到 ${_matchedTracks.length} 首匹配歌曲（已选 ${_matchedTracks.length - _uncheckedTrackKeys.length} 首）',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: isMobile ? 12 : 12.5,
+                          fontWeight: FontWeight.w700,
+                          color: VideoPlatformTheme.accent,
+                        ),
                       ),
                     ),
-                    const Spacer(),
                     TextButton(
+                      style: TextButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                      ),
                       onPressed: () =>
                           setState(() => _uncheckedTrackKeys.clear()),
                       child: const Text('全选', style: TextStyle(fontSize: 12)),
                     ),
                     TextButton(
+                      style: TextButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                      ),
                       onPressed: () => setState(() {
                         if (_uncheckedTrackKeys.length ==
                             _matchedTracks.length) {
@@ -10430,7 +11550,7 @@ class _CloudMusicSmartPlaylistDialogState
     );
   }
 
-  Widget _buildAiCategorizeTabBody() {
+  Widget _buildAiCategorizeTabBody({required bool isMobile}) {
     final state = _ctrl.boundAppState;
     final hasKey =
         (state?.hasAiApiKey ?? false) || _inlineAiKeyCtrl.text.trim().isNotEmpty;
@@ -10440,7 +11560,10 @@ class _CloudMusicSmartPlaylistDialogState
       children: [
         // AI API Key Status / Inline Configuration Bar
         Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          padding: EdgeInsets.symmetric(
+            horizontal: isMobile ? 10 : 12,
+            vertical: isMobile ? 6 : 8,
+          ),
           decoration: BoxDecoration(
             color: VideoPlatformTheme.bgCard,
             borderRadius: BorderRadius.circular(8),
@@ -10457,7 +11580,7 @@ class _CloudMusicSmartPlaylistDialogState
                 children: [
                   Icon(
                     hasKey ? Icons.verified_rounded : Icons.key_rounded,
-                    size: 16,
+                    size: 15,
                     color: hasKey
                         ? VideoPlatformTheme.success
                         : VideoPlatformTheme.warning,
@@ -10466,10 +11589,14 @@ class _CloudMusicSmartPlaylistDialogState
                   Expanded(
                     child: Text(
                       hasKey
-                          ? 'AI 接口就绪：${(state?.effectiveAiProvider ?? _inlineAiProvider).toUpperCase()} · 模型：${state?.effectiveAiModel ?? "默认"}'
-                          : '尚未配置 AI API Key（可在下方直接填写，或在「设置」页中配置）',
+                          ? 'AI 接口就绪：${(state?.effectiveAiProvider ?? _inlineAiProvider).toUpperCase()} · ${state?.effectiveAiModel ?? "默认"}'
+                          : (isMobile
+                              ? '尚未配置 AI API Key（点击右侧配置）'
+                              : '尚未配置 AI API Key（可在下方直接填写，或在「设置」页中配置）'),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: TextStyle(
-                        fontSize: 12,
+                        fontSize: isMobile ? 11.5 : 12,
                         fontWeight: FontWeight.w600,
                         color: hasKey
                             ? VideoPlatformTheme.textPrimary
@@ -10478,6 +11605,10 @@ class _CloudMusicSmartPlaylistDialogState
                     ),
                   ),
                   TextButton.icon(
+                    style: TextButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      padding: const EdgeInsets.symmetric(horizontal: 6),
+                    ),
                     onPressed: () => setState(
                       () => _showInlineAiConfig = !_showInlineAiConfig,
                     ),
@@ -10485,156 +11616,276 @@ class _CloudMusicSmartPlaylistDialogState
                       _showInlineAiConfig
                           ? Icons.expand_less_rounded
                           : Icons.settings_rounded,
-                      size: 15,
+                      size: 14,
                     ),
                     label: Text(
-                      _showInlineAiConfig ? '收起 Key 设置' : '设置 AI API Key',
-                      style: const TextStyle(fontSize: 12),
+                      _showInlineAiConfig
+                          ? '收起'
+                          : (isMobile ? '配置 Key' : '设置 AI API Key'),
+                      style: const TextStyle(fontSize: 11.5),
                     ),
                   ),
                 ],
               ),
               if (_showInlineAiConfig) ...[
-                const SizedBox(height: 8),
-                Wrap(
-                  spacing: 6,
-                  runSpacing: 6,
-                  children: [
-                    for (final item in const [
-                      ('openai', 'OpenAI / 兼容'),
-                      ('deepseek', 'DeepSeek'),
-                      ('qwen', '通义千问'),
-                      ('gemini', 'Google Gemini'),
-                      ('claude', 'Claude'),
-                    ])
-                      ChoiceChip(
-                        showCheckmark: false,
-                        visualDensity: VisualDensity.compact,
-                        label: Text(
-                          item.$2,
-                          style: const TextStyle(fontSize: 11),
-                        ),
-                        selected: _inlineAiProvider == item.$1,
-                        onSelected: (sel) {
-                          if (sel) {
-                            setState(() => _inlineAiProvider = item.$1);
-                          }
-                        },
-                      ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                SizedBox(
-                  height: 40,
+                const SizedBox(height: 6),
+                SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
                   child: Row(
                     children: [
-                      Expanded(
-                        flex: 3,
-                        child: TextField(
-                          controller: _inlineAiKeyCtrl,
-                          decoration: const InputDecoration(
-                            labelText: 'AI API Key',
-                            hintText: '输入 sk-... 或 AIza...',
-                            floatingLabelBehavior: FloatingLabelBehavior.always,
-                            isDense: true,
+                      for (final item in const [
+                        ('openai', 'OpenAI / 兼容'),
+                        ('deepseek', 'DeepSeek'),
+                        ('qwen', '通义千问'),
+                        ('gemini', 'Google Gemini'),
+                        ('claude', 'Claude'),
+                      ])
+                        Padding(
+                          padding: const EdgeInsets.only(right: 6),
+                          child: ChoiceChip(
+                            showCheckmark: false,
+                            visualDensity: VisualDensity.compact,
+                            materialTapTargetSize:
+                                MaterialTapTargetSize.shrinkWrap,
+                            label: Text(
+                              item.$2,
+                              style: const TextStyle(fontSize: 11),
+                            ),
+                            selected: _inlineAiProvider == item.$1,
+                            onSelected: (sel) {
+                              if (sel) {
+                                setState(() => _inlineAiProvider = item.$1);
+                              }
+                            },
                           ),
                         ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        flex: 2,
-                        child: TextField(
-                          controller: _inlineAiModelCtrl,
-                          decoration: const InputDecoration(
-                            labelText: '模型 (可选)',
-                            hintText: 'gpt-4o-mini / deepseek-chat',
-                            floatingLabelBehavior: FloatingLabelBehavior.always,
-                            isDense: true,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      FilledButton(
-                        onPressed: _saveInlineAiSettings,
-                        child: const Text('保存 Key'),
-                      ),
                     ],
                   ),
                 ),
+                const SizedBox(height: 8),
+                if (isMobile) ...[
+                  SizedBox(
+                    height: 38,
+                    child: TextField(
+                      controller: _inlineAiKeyCtrl,
+                      style: const TextStyle(fontSize: 12),
+                      decoration: const InputDecoration(
+                        labelText: 'AI API Key',
+                        hintText: '输入 sk-... 或 AIza...',
+                        floatingLabelBehavior: FloatingLabelBehavior.always,
+                        isDense: true,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  SizedBox(
+                    height: 36,
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: _inlineAiModelCtrl,
+                            style: const TextStyle(fontSize: 12),
+                            decoration: const InputDecoration(
+                              labelText: '模型 (可选)',
+                              hintText: 'gpt-4o-mini / deepseek-chat',
+                              floatingLabelBehavior:
+                                  FloatingLabelBehavior.always,
+                              isDense: true,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        FilledButton(
+                          style: FilledButton.styleFrom(
+                            visualDensity: VisualDensity.compact,
+                          ),
+                          onPressed: _saveInlineAiSettings,
+                          child: const Text(
+                            '保存 Key',
+                            style: TextStyle(fontSize: 12),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ] else
+                  SizedBox(
+                    height: 40,
+                    child: Row(
+                      children: [
+                        Expanded(
+                          flex: 3,
+                          child: TextField(
+                            controller: _inlineAiKeyCtrl,
+                            decoration: const InputDecoration(
+                              labelText: 'AI API Key',
+                              hintText: '输入 sk-... 或 AIza...',
+                              floatingLabelBehavior:
+                                  FloatingLabelBehavior.always,
+                              isDense: true,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          flex: 2,
+                          child: TextField(
+                            controller: _inlineAiModelCtrl,
+                            decoration: const InputDecoration(
+                              labelText: '模型 (可选)',
+                              hintText: 'gpt-4o-mini / deepseek-chat',
+                              floatingLabelBehavior:
+                                  FloatingLabelBehavior.always,
+                              isDense: true,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        FilledButton(
+                          onPressed: _saveInlineAiSettings,
+                          child: const Text('保存 Key'),
+                        ),
+                      ],
+                    ),
+                  ),
               ],
             ],
           ),
         ),
-        const SizedBox(height: 8),
+        const SizedBox(height: 6),
         // Classification Dimension Chips
-        Wrap(
-          spacing: 8,
-          runSpacing: 6,
-          crossAxisAlignment: WrapCrossAlignment.center,
-          children: [
-            Text(
-              '分类方式:',
-              style: TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w700,
-                color: VideoPlatformTheme.textSecondary,
-              ),
-            ),
-            for (final dim in const [
-              ('auto', 'AI 综合智能归类'),
-              ('artist', '按歌手 / 艺术家'),
-              ('genre', '按曲风 / 流派'),
-              ('mood', '按心情 / 场景'),
-              ('language', '按语种 / 地区'),
-              ('era', '按年代 / 时期'),
-            ])
-              ChoiceChip(
-                showCheckmark: false,
-                visualDensity: VisualDensity.compact,
-                label: Text(dim.$2, style: const TextStyle(fontSize: 11.5)),
-                selected: _aiDimension == dim.$1,
-                onSelected: (sel) {
-                  if (sel) setState(() => _aiDimension = dim.$1);
-                },
-              ),
-          ],
-        ),
-        const SizedBox(height: 8),
-        SizedBox(
-          height: 40,
+        SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
           child: Row(
             children: [
-              Expanded(
-                child: TextField(
-                  controller: _aiCustomInstructionCtrl,
-                  decoration: const InputDecoration(
-                    labelText: '自定义分类要求 (可选)',
-                    hintText: '例如：帮我按粤语怀旧、周杰伦精选、适合开车听的快歌分成三类',
-                    floatingLabelBehavior: FloatingLabelBehavior.always,
-                    isDense: true,
-                  ),
+              Text(
+                '分类方式: ',
+                style: TextStyle(
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w700,
+                  color: VideoPlatformTheme.textSecondary,
                 ),
               ),
-              const SizedBox(width: 10),
-              FilledButton.icon(
-                onPressed: _isAnalyzingAi
-                    ? null
-                    : () => _runAiDirectoryAnalysis(createImmediately: false),
-                icon: const Icon(Icons.auto_awesome_rounded, size: 16),
-                label: const Text('AI 分析目录并预览分类'),
-              ),
-              const SizedBox(width: 8),
-              OutlinedButton.icon(
-                onPressed: _isAnalyzingAi
-                    ? null
-                    : () => _runAiDirectoryAnalysis(createImmediately: true),
-                icon: const Icon(Icons.playlist_add_check_rounded, size: 16),
-                label: const Text('AI 分析并直接生成列表'),
-              ),
+              for (final dim in const [
+                ('auto', 'AI 综合智能归类'),
+                ('artist', '按歌手 / 艺术家'),
+                ('genre', '按曲风 / 流派'),
+                ('mood', '按心情 / 场景'),
+                ('language', '按语种 / 地区'),
+                ('era', '按年代 / 时期'),
+              ])
+                Padding(
+                  padding: const EdgeInsets.only(right: 6),
+                  child: ChoiceChip(
+                    showCheckmark: false,
+                    visualDensity: VisualDensity.compact,
+                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    label: Text(dim.$2, style: const TextStyle(fontSize: 11)),
+                    selected: _aiDimension == dim.$1,
+                    onSelected: (sel) {
+                      if (sel) setState(() => _aiDimension = dim.$1);
+                    },
+                  ),
+                ),
             ],
           ),
         ),
-        const SizedBox(height: 10),
+        const SizedBox(height: 6),
+        if (isMobile) ...[
+          SizedBox(
+            height: 38,
+            child: TextField(
+              controller: _aiCustomInstructionCtrl,
+              style: const TextStyle(fontSize: 12),
+              decoration: const InputDecoration(
+                labelText: '自定义分类要求 (可选)',
+                hintText: '如：按粤语怀旧、周杰伦精选、开车快歌分类',
+                floatingLabelBehavior: FloatingLabelBehavior.always,
+                isDense: true,
+              ),
+            ),
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              Expanded(
+                child: FilledButton.icon(
+                  style: FilledButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 8,
+                    ),
+                  ),
+                  onPressed: _isAnalyzingAi
+                      ? null
+                      : () => _runAiDirectoryAnalysis(createImmediately: false),
+                  icon: const Icon(Icons.auto_awesome_rounded, size: 15),
+                  label: const Text(
+                    'AI 分析目录并预览分类',
+                    style: TextStyle(fontSize: 11.5),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 8,
+                    ),
+                  ),
+                  onPressed: _isAnalyzingAi
+                      ? null
+                      : () => _runAiDirectoryAnalysis(createImmediately: true),
+                  icon: const Icon(Icons.playlist_add_check_rounded, size: 15),
+                  label: const Text(
+                    'AI 分析并直接生成列表',
+                    style: TextStyle(fontSize: 11.5),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ] else
+          SizedBox(
+            height: 40,
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _aiCustomInstructionCtrl,
+                    decoration: const InputDecoration(
+                      labelText: '自定义分类要求 (可选)',
+                      hintText: '例如：帮我按粤语怀旧、周杰伦精选、适合开车听的快歌分成三类',
+                      floatingLabelBehavior: FloatingLabelBehavior.always,
+                      isDense: true,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                FilledButton.icon(
+                  onPressed: _isAnalyzingAi
+                      ? null
+                      : () => _runAiDirectoryAnalysis(createImmediately: false),
+                  icon: const Icon(Icons.auto_awesome_rounded, size: 16),
+                  label: const Text('AI 分析目录并预览分类'),
+                ),
+                const SizedBox(width: 8),
+                OutlinedButton.icon(
+                  onPressed: _isAnalyzingAi
+                      ? null
+                      : () => _runAiDirectoryAnalysis(createImmediately: true),
+                  icon: const Icon(Icons.playlist_add_check_rounded, size: 16),
+                  label: const Text('AI 分析并直接生成列表'),
+                ),
+              ],
+            ),
+          ),
+        const SizedBox(height: 8),
         if (_isAnalyzingAi)
           Expanded(
             child: Center(
@@ -10645,6 +11896,7 @@ class _CloudMusicSmartPlaylistDialogState
                   const SizedBox(height: 12),
                   Text(
                     _aiProgressText,
+                    textAlign: TextAlign.center,
                     style: TextStyle(color: VideoPlatformTheme.textSecondary),
                   ),
                 ],
@@ -10668,7 +11920,7 @@ class _CloudMusicSmartPlaylistDialogState
                 '选择分类方式后，点击「AI 分析目录并预览分类」，AI 将自动扫描指定目录中的全部歌曲并按分类生成多个播放列表',
                 textAlign: TextAlign.center,
                 style: TextStyle(
-                  fontSize: 13,
+                  fontSize: isMobile ? 12 : 13,
                   color: VideoPlatformTheme.textMuted,
                 ),
               ),
@@ -10699,6 +11951,7 @@ class _CloudMusicSmartPlaylistDialogState
                   ),
                   clipBehavior: Clip.antiAlias,
                   child: CheckboxListTile(
+                    dense: isMobile,
                     value: checked,
                     activeColor: VideoPlatformTheme.accent,
                     onChanged: (v) {
@@ -10714,15 +11967,17 @@ class _CloudMusicSmartPlaylistDialogState
                       children: [
                         Icon(
                           Icons.queue_music_rounded,
-                          size: 17,
+                          size: 16,
                           color: VideoPlatformTheme.accent,
                         ),
                         const SizedBox(width: 6),
                         Expanded(
                           child: Text(
                             draft.name,
-                            style: const TextStyle(
-                              fontSize: 14,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: isMobile ? 13 : 14,
                               fontWeight: FontWeight.w700,
                             ),
                           ),
@@ -10740,7 +11995,7 @@ class _CloudMusicSmartPlaylistDialogState
                           child: Text(
                             '${draft.tracks.length} 首',
                             style: TextStyle(
-                              fontSize: 11.5,
+                              fontSize: 11,
                               fontWeight: FontWeight.w700,
                               color: VideoPlatformTheme.accent,
                             ),
@@ -10757,7 +12012,7 @@ class _CloudMusicSmartPlaylistDialogState
                             Text(
                               draft.description,
                               style: TextStyle(
-                                fontSize: 12,
+                                fontSize: 11.5,
                                 color: VideoPlatformTheme.textSecondary,
                               ),
                             ),
@@ -10767,7 +12022,7 @@ class _CloudMusicSmartPlaylistDialogState
                             maxLines: 2,
                             overflow: TextOverflow.ellipsis,
                             style: TextStyle(
-                              fontSize: 11.5,
+                              fontSize: 11,
                               color: VideoPlatformTheme.textMuted,
                             ),
                           ),
@@ -10890,13 +12145,51 @@ class _SmartPlaylistDirectoryPickerDialogState
   Widget build(BuildContext context) {
     final mounts = widget.controller.availableMounts;
     final activeMount = _activeMount;
+    final screenSize = MediaQuery.sizeOf(context);
+    final isMobile = screenSize.width < 680;
 
     return AlertDialog(
       backgroundColor: VideoPlatformTheme.bgElevated,
-      title: const Text('选择要扫描或 AI 分析的音乐目录'),
+      insetPadding: EdgeInsets.symmetric(
+        horizontal: isMobile ? 10 : 24,
+        vertical: isMobile ? 14 : 24,
+      ),
+      titlePadding: EdgeInsets.fromLTRB(
+        isMobile ? 14 : 20,
+        isMobile ? 12 : 16,
+        isMobile ? 10 : 14,
+        6,
+      ),
+      contentPadding: EdgeInsets.fromLTRB(
+        isMobile ? 12 : 20,
+        6,
+        isMobile ? 12 : 20,
+        10,
+      ),
+      title: Row(
+        children: [
+          Icon(
+            Icons.create_new_folder_rounded,
+            size: isMobile ? 19 : 21,
+            color: VideoPlatformTheme.accent,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              '选择要扫描或 AI 分析的音乐目录',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: isMobile ? 14.5 : 16,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+        ],
+      ),
       content: SizedBox(
-        width: 660,
-        height: 420,
+        width: isMobile ? screenSize.width : 660,
+        height: (screenSize.height * 0.62).clamp(280.0, 440.0),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -10909,7 +12202,11 @@ class _SmartPlaylistDirectoryPickerDialogState
                       padding: const EdgeInsets.only(right: 8),
                       child: ChoiceChip(
                         showCheckmark: false,
-                        label: Text(m.name),
+                        visualDensity: VisualDensity.compact,
+                        label: Text(
+                          m.name,
+                          style: TextStyle(fontSize: isMobile ? 11.5 : 12.5),
+                        ),
                         selected: activeMount?.id == m.id,
                         onSelected: (_) => _selectMount(m),
                       ),
@@ -10921,63 +12218,119 @@ class _SmartPlaylistDirectoryPickerDialogState
             if (activeMount != null)
               Row(
                 children: [
+                  if (_breadcrumbs.length >= 2) ...[
+                    InkWell(
+                      borderRadius: BorderRadius.circular(6),
+                      onTap: () {
+                        final prev = _breadcrumbs[_breadcrumbs.length - 2];
+                        _loadDir(prev.path, title: prev.title);
+                      },
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 7,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: VideoPlatformTheme.bgCard,
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(
+                            color: VideoPlatformTheme.borderSubtle,
+                          ),
+                        ),
+                        child: const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(Icons.arrow_back_rounded, size: 13),
+                            SizedBox(width: 2),
+                            Text('上级', style: TextStyle(fontSize: 11)),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                  ],
                   Expanded(
                     child: Text(
-                      '当前位置：${_breadcrumbs.map((b) => b.title).join(" / ")}',
+                      '位置：${_breadcrumbs.map((b) => b.title).join(" / ")}',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
-                        fontSize: 12,
+                        fontSize: 11.5,
                         color: VideoPlatformTheme.textSecondary,
                       ),
                     ),
                   ),
+                  const SizedBox(width: 6),
                   OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 4,
+                      ),
+                    ),
                     onPressed: () => _toggleItem(_currentDirItem()),
-                    icon: const Icon(Icons.check_box_outlined, size: 15),
-                    label: const Text('勾选当前目录', style: TextStyle(fontSize: 12)),
+                    icon: const Icon(Icons.check_box_outlined, size: 14),
+                    label: Text(
+                      isMobile ? '选此目录' : '勾选当前目录',
+                      style: const TextStyle(fontSize: 11.5),
+                    ),
                   ),
                 ],
               ),
             const SizedBox(height: 8),
             Expanded(
-              child: _isLoading
-                  ? const Center(child: CircularProgressIndicator())
-                  : ListView.builder(
-                      itemCount: _entries.length,
-                      itemBuilder: (context, idx) {
-                        final e = _entries[idx];
-                        final item = SavedMusicFolderItem(
-                          mountId: activeMount!.id,
-                          mountName: activeMount.name,
-                          sourceKind: activeMount.kind,
-                          path: e.path,
-                          title: e.name,
-                          isArchive: e.isStreamableMusicArchive,
-                          size: e.size,
-                          pickcode115: e.pickcode115,
-                        );
-                        final checked = _selected
-                            .any((s) => s.uniqueKey == item.uniqueKey);
-                        return ListTile(
-                          dense: true,
-                          leading: Icon(
-                            e.isDir
-                                ? Icons.folder_rounded
-                                : Icons.folder_zip_rounded,
-                            color: VideoPlatformTheme.warning,
-                          ),
-                          title: Text(e.name),
-                          onTap: e.isDir
-                              ? () => _loadDir(e.path, title: e.name)
-                              : () => _toggleItem(item),
-                          trailing: Checkbox(
-                            value: checked,
-                            onChanged: (_) => _toggleItem(item),
-                          ),
-                        );
-                      },
-                    ),
+              child: Material(
+                color: VideoPlatformTheme.bgCard,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  side: BorderSide(color: VideoPlatformTheme.borderSubtle),
+                ),
+                clipBehavior: Clip.antiAlias,
+                child: _isLoading
+                    ? const Center(child: CircularProgressIndicator())
+                    : ListView.builder(
+                        itemCount: _entries.length,
+                        itemBuilder: (context, idx) {
+                          final e = _entries[idx];
+                          final item = SavedMusicFolderItem(
+                            mountId: activeMount!.id,
+                            mountName: activeMount.name,
+                            sourceKind: activeMount.kind,
+                            path: e.path,
+                            title: e.name,
+                            isArchive: e.isStreamableMusicArchive,
+                            size: e.size,
+                            pickcode115: e.pickcode115,
+                          );
+                          final checked = _selected
+                              .any((s) => s.uniqueKey == item.uniqueKey);
+                          return ListTile(
+                            dense: true,
+                            leading: Icon(
+                              e.isDir
+                                  ? Icons.folder_rounded
+                                  : Icons.folder_zip_rounded,
+                              color: VideoPlatformTheme.warning,
+                              size: 20,
+                            ),
+                            title: Text(
+                              e.name,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 13),
+                            ),
+                            onTap: e.isDir
+                                ? () => _loadDir(e.path, title: e.name)
+                                : () => _toggleItem(item),
+                            trailing: Checkbox(
+                              value: checked,
+                              onChanged: (_) => _toggleItem(item),
+                            ),
+                          );
+                        },
+                      ),
+              ),
             ),
           ],
         ),
