@@ -308,14 +308,22 @@ struct TvVodDetail: Identifiable, Hashable {
       }
     }
 
+    func playGroupScore(_ g: TvPlayGroup) -> Int {
+      let firstUrl = g.episodes.first?.rawUrl.lowercased() ?? ""
+      if firstUrl.contains(".m3u8") || firstUrl.contains(".mp4") || firstUrl.contains(".flv") {
+        return 3
+      }
+      if g.name.lowercased().contains("m3u8") && !firstUrl.contains("/share/") {
+        return 2
+      }
+      if !firstUrl.contains("/share/") {
+        return 1
+      }
+      return 0
+    }
+
     groups.sort { a, b in
-      let aM3u8 = a.name.lowercased().contains("m3u8")
-        || a.episodes.contains { $0.rawUrl.lowercased().contains(".m3u8") }
-      let bM3u8 = b.name.lowercased().contains("m3u8")
-        || b.episodes.contains { $0.rawUrl.lowercased().contains(".m3u8") }
-      if aM3u8 && !bM3u8 { return true }
-      if !aM3u8 && bM3u8 { return false }
-      return false
+      playGroupScore(a) > playGroupScore(b)
     }
 
     return groups

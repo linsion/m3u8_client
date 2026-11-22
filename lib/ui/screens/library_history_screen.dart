@@ -337,61 +337,84 @@ class _LibraryHistoryScreenState extends State<LibraryHistoryScreen> {
                     child: InkWell(
                       key: const ValueKey('library_watch_history_toggle_btn'),
                       borderRadius: BorderRadius.circular(6),
+                      onFocusChange: (_) {
+                        if (mounted) setState(() {});
+                      },
                       onTap: () => state.setWatchHistoryEnabled(
                         !state.watchHistoryEnabled,
                       ),
-                      child: Container(
-                        height: 32,
-                        padding: const EdgeInsets.symmetric(horizontal: 10),
-                        decoration: BoxDecoration(
-                          color: state.watchHistoryEnabled
-                              ? VideoPlatformTheme.accent
-                                  .withValues(alpha: 0.14)
-                              : VideoPlatformTheme.bgCard,
-                          borderRadius: BorderRadius.circular(6),
-                          border: Border.all(
-                            color: state.watchHistoryEnabled
-                                ? VideoPlatformTheme.accent
-                                    .withValues(alpha: 0.55)
-                                : VideoPlatformTheme.borderSubtle,
-                          ),
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(
-                              state.watchHistoryEnabled
-                                  ? Icons.history_toggle_off_rounded
-                                  : Icons.pause_circle_outline_rounded,
-                              size: 15,
-                              color: state.watchHistoryEnabled
+                      child: Builder(
+                        builder: (ctx) {
+                          final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                          return Container(
+                            height: 32,
+                            padding: const EdgeInsets.symmetric(horizontal: 10),
+                            decoration: BoxDecoration(
+                              color: isFocused
                                   ? VideoPlatformTheme.accent
-                                  : VideoPlatformTheme.textMuted,
-                            ),
-                            const SizedBox(width: 5),
-                            Text(
-                              state.watchHistoryEnabled ? '记录已开启' : '记录已关闭',
-                              style: TextStyle(
-                                fontSize: 12,
-                                fontWeight: FontWeight.w600,
-                                color: state.watchHistoryEnabled
-                                    ? VideoPlatformTheme.accent
-                                    : VideoPlatformTheme.textSecondary,
+                                      .withValues(alpha: 0.26)
+                                  : (state.watchHistoryEnabled
+                                      ? VideoPlatformTheme.accent
+                                          .withValues(alpha: 0.14)
+                                      : VideoPlatformTheme.bgCard),
+                              borderRadius: BorderRadius.circular(6),
+                              border: Border.all(
+                                color: isFocused
+                                    ? (state.tvMode
+                                        ? Colors.white
+                                        : VideoPlatformTheme.accent)
+                                    : (state.watchHistoryEnabled
+                                        ? VideoPlatformTheme.accent
+                                            .withValues(alpha: 0.55)
+                                        : VideoPlatformTheme.borderSubtle),
+                                width: isFocused ? 2.0 : 1.0,
                               ),
                             ),
-                            const SizedBox(width: 4),
-                            SizedBox(
-                              height: 20,
-                              child: Switch(
-                                value: state.watchHistoryEnabled,
-                                activeColor: VideoPlatformTheme.accent,
-                                materialTapTargetSize:
-                                    MaterialTapTargetSize.shrinkWrap,
-                                onChanged: state.setWatchHistoryEnabled,
-                              ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  state.watchHistoryEnabled
+                                      ? Icons.history_toggle_off_rounded
+                                      : Icons.pause_circle_outline_rounded,
+                                  size: 15,
+                                  color: (state.watchHistoryEnabled ||
+                                          isFocused)
+                                      ? VideoPlatformTheme.accent
+                                      : VideoPlatformTheme.textMuted,
+                                ),
+                                const SizedBox(width: 5),
+                                Text(
+                                  state.watchHistoryEnabled
+                                      ? '记录已开启'
+                                      : '记录已关闭',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                    color: isFocused
+                                        ? Colors.white
+                                        : (state.watchHistoryEnabled
+                                            ? VideoPlatformTheme.accent
+                                            : VideoPlatformTheme.textSecondary),
+                                  ),
+                                ),
+                                const SizedBox(width: 4),
+                                ExcludeFocus(
+                                  child: SizedBox(
+                                    height: 20,
+                                    child: Switch(
+                                      value: state.watchHistoryEnabled,
+                                      activeColor: VideoPlatformTheme.accent,
+                                      materialTapTargetSize:
+                                          MaterialTapTargetSize.shrinkWrap,
+                                      onChanged: state.setWatchHistoryEnabled,
+                                    ),
+                                  ),
+                                ),
+                              ],
                             ),
-                          ],
-                        ),
+                          );
+                        },
                       ),
                     ),
                   ),

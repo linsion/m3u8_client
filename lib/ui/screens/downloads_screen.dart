@@ -1431,40 +1431,58 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
     final selected = _statusFilter == key;
     return InkWell(
       borderRadius: BorderRadius.circular(7),
+      onFocusChange: (_) {
+        if (mounted) setState(() {});
+      },
       onTap: () => setState(() => _statusFilter = key),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
-        decoration: BoxDecoration(
-          color: selected
-              ? VideoPlatformTheme.accent
-              : VideoPlatformTheme.bgCard,
-          borderRadius: BorderRadius.circular(7),
-          border: Border.all(
-            color: selected
-                ? VideoPlatformTheme.accent
-                : VideoPlatformTheme.borderSubtle,
-          ),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              icon,
-              size: 13.5,
-              color: selected ? Colors.white : VideoPlatformTheme.textSecondary,
-            ),
-            const SizedBox(width: 5),
-            Text(
-              label,
-              style: TextStyle(
-                fontSize: 12,
-                color:
-                    selected ? Colors.white : VideoPlatformTheme.textSecondary,
-                fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+      child: Builder(
+        builder: (ctx) {
+          final isFocused = Focus.of(ctx).hasPrimaryFocus;
+          return Container(
+            padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
+            decoration: BoxDecoration(
+              color: selected
+                  ? VideoPlatformTheme.accent
+                  : (isFocused
+                      ? VideoPlatformTheme.accent.withValues(alpha: 0.25)
+                      : VideoPlatformTheme.bgCard),
+              borderRadius: BorderRadius.circular(7),
+              border: Border.all(
+                color: isFocused
+                    ? Colors.white
+                    : (selected
+                        ? VideoPlatformTheme.accent
+                        : VideoPlatformTheme.borderSubtle),
+                width: isFocused ? 2.0 : 1.0,
               ),
             ),
-          ],
-        ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  icon,
+                  size: 13.5,
+                  color: (selected || isFocused)
+                      ? Colors.white
+                      : VideoPlatformTheme.textSecondary,
+                ),
+                const SizedBox(width: 5),
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: (selected || isFocused)
+                        ? Colors.white
+                        : VideoPlatformTheme.textSecondary,
+                    fontWeight: (selected || isFocused)
+                        ? FontWeight.w700
+                        : FontWeight.w500,
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
       ),
     );
   }

@@ -1215,12 +1215,15 @@ class AppState extends ChangeNotifier {
     VodSource src, {
     Duration? timeout,
     bool forceRefresh = true,
+    bool silent = false,
   }) async {
     if (_testingSourceIds.contains(src.id)) {
       return _sourceLatencyMs[src.id] ?? -1;
     }
     _testingSourceIds.add(src.id);
-    notifyListeners();
+    if (!silent) {
+      notifyListeners();
+    }
 
     final effectiveTimeout = timeout ??
         Duration(
@@ -1242,7 +1245,9 @@ class AppState extends ChangeNotifier {
     } finally {
       _sourceLatencyMs[src.id] = latency;
       _testingSourceIds.remove(src.id);
-      notifyListeners();
+      if (!silent) {
+        notifyListeners();
+      }
     }
     return latency;
   }
@@ -1265,16 +1270,25 @@ class AppState extends ChangeNotifier {
       Duration timeout,
     ) async {
       for (var i = 0; i < list.length; i += concurrency) {
-        final batch = list.skip(i).take(concurrency);
+        final batch = list.skip(i).take(concurrency).toList();
+        for (final src in batch) {
+          _testingSourceIds.add(src.id);
+        }
+        notifyListeners();
+        for (final src in batch) {
+          _testingSourceIds.remove(src.id);
+        }
         await Future.wait(
           batch.map(
             (src) => testSingleVodSource(
               src,
               timeout: timeout,
               forceRefresh: true,
+              silent: true,
             ),
           ),
         );
+        notifyListeners();
       }
     }
 

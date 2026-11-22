@@ -2729,6 +2729,62 @@ proxies:
     expect(picked?.id, 'custom_0');
   });
 
+  testWidgets('SourcePickerDialog mobile compact layout has zero overflow and clickable buttons',
+      (WidgetTester tester) async {
+    tester.view.physicalSize = const Size(375, 812);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    const sources = <VodSource>[
+      VodSource(
+        id: 'custom_0',
+        name: '量子资源',
+        api: 'https://cj.lziapi.com/api.php/provide/vod/',
+        isTvBox: false,
+        customIndex: 0,
+      ),
+      VodSource(
+        id: 'tvbox_0_1',
+        name: '玩偶哥哥',
+        api: 'csp_WoggGuard',
+        isTvBox: true,
+        tvboxType: 3,
+        tvboxSiteIndex: 1,
+        tvboxSourceIndex: 0,
+        tvboxSourceName: '饭太硬',
+      ),
+    ];
+
+    VodSource? mobilePicked;
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: VideoPlatformTheme.buildTheme(),
+        home: Scaffold(
+          body: SourcePickerDialog(
+            sources: sources,
+            selectedSource: sources.first,
+            onSelect: (s) => mobilePicked = s,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+
+    // Tap sort button on mobile
+    await tester.tap(find.byKey(const ValueKey('source_picker_sort_speed_btn')));
+    await tester.pumpAndSettle();
+    expect(find.text('已按速度排序'), findsOneWidget);
+
+    // Tap the second source card on mobile
+    await tester.tap(find.text('玩偶哥哥'));
+    await tester.pumpAndSettle();
+    expect(mobilePicked?.id, 'tvbox_0_1');
+  });
+
   testWidgets('watchHistoryEnabled toggle disables watch history and progress recording',
       (WidgetTester tester) async {
     SharedPreferences.setMockInitialValues({});

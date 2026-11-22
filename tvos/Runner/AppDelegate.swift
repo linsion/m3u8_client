@@ -1867,39 +1867,169 @@ struct TvSourcePickerSheet: View {
   @EnvironmentObject var appState: TvAppState
   @Binding var isPresented: Bool
   @State private var filterText: String = ""
-  @State private var sourceTypeFilter: Int = 0 // 0: 全部, 1: CMS 标准站, 2: TVBox 爬虫站
+  @State private var sourceTypeFilter: Int = 0 // 0: 全部, 1: CMS 标准站, 2: TVBox 爬虫站, 3: 常用置顶
+  @State private var sortByLatency: Bool = false
 
   private var filteredSources: [TvVodSource] {
     let kw = filterText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    return appState.vodSources.filter { src in
+    var list = appState.vodSources.filter { src in
       if sourceTypeFilter == 1 && src.isSpiderSource { return false }
       if sourceTypeFilter == 2 && !src.isSpiderSource { return false }
+      if sourceTypeFilter == 3 && !appState.pinnedSourceIds.contains(src.id) { return false }
       guard !kw.isEmpty else { return true }
       return src.displayName.lowercased().contains(kw) || src.api.lowercased().contains(kw)
     }
+    list.sort { a, b in
+      let ap = appState.pinnedSourceIds.contains(a.id) ? 0 : 1
+      let bp = appState.pinnedSourceIds.contains(b.id) ? 0 : 1
+      if ap != bp { return ap < bp }
+      if sortByLatency && !appState.sourceLatencyMs.isEmpty {
+        let la = appState.sourceLatencyMs[a.id]
+        let lb = appState.sourceLatencyMs[b.id]
+        let effA = (la == nil) ? 500000 : (la! <= 0 ? 999999 : la!)
+        let effB = (lb == nil) ? 500000 : (lb! <= 0 ? 999999 : lb!)
+        if effA != effB { return effA < effB }
+      }
+      return false
+    }
+    return list
+  }
+
+  private var fastestSource: TvVodSource? {
+    var best: TvVodSource? = nil
+    var bestMs = 999999
+    for s in filteredSources {
+      if let ms = appState.sourceLatencyMs[s.id], ms > 0, ms < bestMs {
+        bestMs = ms
+        best = s
+      }
+    }
+    return best
+  }
+
+  private static func protocolTag(for src: TvVodSource) -> String {
+    if !src.isSpiderSource {
+      return src.api.lowercased().contains("xml") ? "CMS XML" : "CMS JSON"
+    }
+    switch src.tvboxType {
+    case 0: return "TVBox XML"
+    case 1: return "TVBox JSON"
+    case 3: return "Spider JAR"
+    case 4: return "Remote Spider"
+    default: return "TVBox"
+    }
+  }
+
+  private static func latencyGradeInfo(ms: Int?, isTesting: Bool) -> (label: String, grade: String, color: Color, bars: Int) {
+    if isTesting {
+      return ("测速中...", "检测中", .cyan, 2)
+    }
+    guard let ms = ms else {
+      return ("未测速", "长按测速", Color.white.opacity(0.45), 0)
+    }
+    if ms <= 0 {
+      return ("连接超时", "不可达", Color(red: 0.96, green: 0.28, blue: 0.32), 0)
+    }
+    if ms < 500 {
+      return ("\(ms)ms", "极速", Color(red: 0.13, green: 0.77, blue: 0.37), 4)
+    }
+    if ms < 1200 {
+      return ("\(ms)ms", "良好", Color(red: 0.22, green: 0.74, blue: 0.97), 3)
+    }
+    if ms < 2500 {
+      return ("\(ms)ms", "一般", Color(red: 0.96, green: 0.62, blue: 0.04), 2)
+    }
+    return ("\(ms)ms", "较慢", Color(red: 0.98, green: 0.45, blue: 0.09), 1)
   }
 
   var body: some View {
     let theme = appState.activeTheme
     let cmsCount = appState.vodSources.filter { !$0.isSpiderSource }.count
     let tvboxCount = appState.vodSources.filter { $0.isSpiderSource }.count
+    let pinnedCount = appState.vodSources.filter { appState.pinnedSourceIds.contains($0.id) }.count
+    let testedCount = appState.sourceLatencyMs.count
+    let onlineCount = appState.sourceLatencyMs.values.filter { $0 > 0 }.count
+    let fastCount = appState.sourceLatencyMs.values.filter { $0 > 0 && $0 < 600 }.count
 
     ZStack {
       TvAmbientBackdropView(imageUrl: appState.ambientBackdropUrl)
 
-      VStack(alignment: .leading, spacing: 18) {
+      VStack(alignment: .leading, spacing: 16) {
+        // Row 1: Title, Summary Stats & Speed Test Controls
         HStack(spacing: 14) {
-          Label("切换片源站点 (\(filteredSources.count))", systemImage: "server.rack")
-            .font(.system(size: 22, weight: .bold))
-            .foregroundColor(.white)
+          VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 10) {
+              Label("切换片源站点", systemImage: "server.rack")
+                .font(.system(size: 24, weight: .heavy))
+                .foregroundColor(.white)
+              Text("共 \(appState.vodSources.count) 个站点")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundColor(theme.accentHover)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 3)
+                .background(theme.accent.opacity(0.18))
+                .clipShape(Capsule())
+            }
+            Text(
+              testedCount > 0
+                ? "已测速 \(testedCount) 个 · 可用 \(onlineCount) 个 (极速 \(fastCount) 个) · 长按站点卡片可单独测速或常用置顶"
+                : "支持并发检测各站点连接延迟、按速度排序与一键优选最快片源（长按卡片可单独测速/置顶）"
+            )
+            .font(.system(size: 13))
+            .foregroundColor(.white.opacity(0.65))
+          }
 
+          Spacer()
+
+          Button {
+            Task { await appState.batchTestVodSources(targetSources: filteredSources) }
+          } label: {
+            Label(
+              appState.isTestingSources ? "测速中 (\(testedCount)/\(min(40, filteredSources.count)))..." : "一键测速",
+              systemImage: "speedometer"
+            )
+          }
+          .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+          .disabled(appState.isTestingSources)
+
+          Button {
+            sortByLatency.toggle()
+            if sortByLatency {
+              appState.sortVodSourcesByLatency()
+            }
+          } label: {
+            Label(sortByLatency ? "已按速度排序" : "按速度排序", systemImage: "arrow.up.arrow.down.circle")
+          }
+          .buttonStyle(TvApplePillButtonStyle(isSelected: sortByLatency, compact: true))
+
+          if let fastest = fastestSource, let ms = appState.sourceLatencyMs[fastest.id] {
+            Button {
+              isPresented = false
+              Task { await appState.selectSource(fastest) }
+            } label: {
+              Label("秒选最快 (\(ms)ms)", systemImage: "bolt.fill")
+            }
+            .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+          }
+
+          Button("关闭") { isPresented = false }
+            .buttonStyle(TvApplePillButtonStyle(compact: true))
+        }
+        .focusSection()
+
+        // Row 2: Filter Tabs + Search Box
+        HStack(spacing: 12) {
           HStack(spacing: 8) {
             Button("全部 (\(appState.vodSources.count))") { sourceTypeFilter = 0 }
               .buttonStyle(TvApplePillButtonStyle(isSelected: sourceTypeFilter == 0, compact: true))
-            Button("标准采集站 (\(cmsCount))") { sourceTypeFilter = 1 }
+            Button("标准资源站 (\(cmsCount))") { sourceTypeFilter = 1 }
               .buttonStyle(TvApplePillButtonStyle(isSelected: sourceTypeFilter == 1, compact: true))
-            Button("TVBox 站 (\(tvboxCount))") { sourceTypeFilter = 2 }
+            Button("TVBox 站点 (\(tvboxCount))") { sourceTypeFilter = 2 }
               .buttonStyle(TvApplePillButtonStyle(isSelected: sourceTypeFilter == 2, compact: true))
+            if pinnedCount > 0 || sourceTypeFilter == 3 {
+              Button("常用置顶 (\(pinnedCount))") { sourceTypeFilter = 3 }
+                .buttonStyle(TvApplePillButtonStyle(isSelected: sourceTypeFilter == 3, compact: true))
+            }
           }
 
           Spacer()
@@ -1913,53 +2043,130 @@ struct TvSourcePickerSheet: View {
           ) { text in
             filterText = text
           }
-
-          Button("关闭") { isPresented = false }
-            .buttonStyle(TvApplePillButtonStyle(compact: true))
         }
         .focusSection()
 
         ScrollView {
-          LazyVGrid(columns: [GridItem(.adaptive(minimum: 270, maximum: 325), spacing: 12)], spacing: 12) {
+          LazyVGrid(columns: [GridItem(.adaptive(minimum: 340, maximum: 420), spacing: 14)], spacing: 14) {
             ForEach(filteredSources) { src in
               let isSelected = appState.selectedSource?.id == src.id
+              let isPinned = appState.pinnedSourceIds.contains(src.id)
+              let ms = appState.sourceLatencyMs[src.id]
+              let isTesting = appState.testingSourceIds.contains(src.id)
+              let latInfo = Self.latencyGradeInfo(ms: ms, isTesting: isTesting)
+              let proto = Self.protocolTag(for: src)
               let host = URL(string: src.api)?.host ?? (src.isSpiderSource ? src.api : "cms-api")
               Button {
                 isPresented = false
                 Task { await appState.selectSource(src) }
               } label: {
-                HStack(spacing: 10) {
-                  Text(src.isSpiderSource ? "TVBox" : "CMS")
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundColor(src.isSpiderSource ? Color(red: 0.35, green: 0.82, blue: 1.0) : theme.accentHover)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 3)
-                    .background((src.isSpiderSource ? Color.blue : theme.accent).opacity(0.18))
-                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                HStack(spacing: 12) {
+                  ZStack {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                      .fill(
+                        isSelected
+                          ? theme.accent
+                          : (src.isSpiderSource ? Color.indigo.opacity(0.28) : theme.accent.opacity(0.22))
+                      )
+                      .frame(width: 42, height: 42)
+                    if isSelected {
+                      Image(systemName: "play.fill")
+                        .font(.system(size: 17, weight: .bold))
+                        .foregroundColor(.white)
+                    } else {
+                      Text(String(src.displayName.prefix(1)))
+                        .font(.system(size: 17, weight: .heavy))
+                        .foregroundColor(src.isSpiderSource ? Color(red: 0.55, green: 0.62, blue: 1.0) : theme.accentHover)
+                    }
+                  }
 
-                  VStack(alignment: .leading, spacing: 2) {
-                    Text(src.displayName)
-                      .font(.system(size: 15, weight: .semibold))
-                      .foregroundColor(.white)
-                      .lineLimit(1)
-                    Text(host)
-                      .font(.system(size: 11, design: .monospaced))
-                      .foregroundColor(.white.opacity(0.48))
-                      .lineLimit(1)
+                  VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                      if isPinned {
+                        Image(systemName: "pin.fill")
+                          .font(.system(size: 11))
+                          .foregroundColor(.yellow)
+                      }
+                      Text(src.displayName)
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                      if isSelected {
+                        Text("当前")
+                          .font(.system(size: 10, weight: .bold))
+                          .foregroundColor(theme.accentHover)
+                          .padding(.horizontal, 6)
+                          .padding(.vertical, 1)
+                          .background(theme.accent.opacity(0.22))
+                          .clipShape(Capsule())
+                      }
+                    }
+                    HStack(spacing: 6) {
+                      Text(proto)
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundColor(src.isSpiderSource ? Color(red: 0.55, green: 0.78, blue: 1.0) : theme.accentHover)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background((src.isSpiderSource ? Color.indigo : theme.accent).opacity(0.18))
+                        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                      Text(host)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.5))
+                        .lineLimit(1)
+                    }
                   }
 
                   Spacer()
 
-                  if isSelected {
-                    Image(systemName: "checkmark.circle.fill")
-                      .font(.system(size: 16))
-                      .foregroundColor(Color(red: 0.30, green: 0.85, blue: 0.48))
+                  // Latency & Signal Bars Badge
+                  HStack(spacing: 6) {
+                    HStack(alignment: .bottom, spacing: 2) {
+                      ForEach(0..<4, id: \.self) { barIdx in
+                        RoundedRectangle(cornerRadius: 1)
+                          .fill(barIdx < latInfo.bars ? latInfo.color : Color.white.opacity(0.22))
+                          .frame(width: 3, height: CGFloat(5 + barIdx * 3))
+                      }
+                    }
+                    VStack(alignment: .trailing, spacing: 1) {
+                      Text(latInfo.label)
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                        .foregroundColor(latInfo.color)
+                      Text(latInfo.grade)
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundColor(latInfo.color.opacity(0.85))
+                    }
                   }
+                  .padding(.horizontal, 9)
+                  .padding(.vertical, 5)
+                  .background(latInfo.color.opacity(0.12))
+                  .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                  .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                      .stroke(latInfo.color.opacity(0.38), lineWidth: 1)
+                  )
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
               }
               .buttonStyle(TvAppleSurfaceButtonStyle(isSelected: isSelected, cornerRadius: 12))
+              .contextMenu {
+                Button {
+                  isPresented = false
+                  Task { await appState.selectSource(src) }
+                } label: {
+                  Label("切换到此片源站点", systemImage: "play.circle.fill")
+                }
+                Button {
+                  Task { _ = await appState.testSingleVodSource(src) }
+                } label: {
+                  Label("单独测试此站点连接速度", systemImage: "speedometer")
+                }
+                Button {
+                  appState.togglePinSource(src.id)
+                } label: {
+                  Label(isPinned ? "取消置顶此站点" : "置顶此常用站点", systemImage: isPinned ? "pin.slash" : "pin.fill")
+                }
+              }
             }
           }
           .padding(4)
@@ -6674,6 +6881,24 @@ struct TvFavoritesHistorySectionView: View {
             }
             .buttonStyle(TvApplePillButtonStyle(isSelected: selectedTab == "history"))
 
+            if selectedTab == "history" {
+              Button {
+                appState.setWatchHistoryEnabled(!appState.watchHistoryEnabled)
+              } label: {
+                Label(
+                  appState.watchHistoryEnabled ? "记录已开启" : "记录已关闭",
+                  systemImage: appState.watchHistoryEnabled ? "checkmark.circle.fill" : "pause.circle.fill"
+                )
+              }
+              .buttonStyle(
+                TvApplePillButtonStyle(
+                  isSelected: appState.watchHistoryEnabled,
+                  isPrimary: appState.watchHistoryEnabled,
+                  compact: true
+                )
+              )
+            }
+
             Spacer()
 
             Button {
@@ -6698,6 +6923,31 @@ struct TvFavoritesHistorySectionView: View {
           .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
           .id("fav_top_anchor")
           .focusSection()
+
+          if selectedTab == "history" && !appState.watchHistoryEnabled {
+            HStack(spacing: 14) {
+              Image(systemName: "eye.slash.fill")
+                .font(.system(size: 18, weight: .bold))
+                .foregroundColor(.orange)
+              Text("当前已关闭观看历史记录（无痕观看模式），新播放的视频将不会记录观看历史与剧集播放进度。")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundColor(.white.opacity(0.88))
+              Spacer()
+              Button("重新开启") {
+                appState.setWatchHistoryEnabled(true)
+              }
+              .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+            .background(Color.orange.opacity(0.14))
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(
+              RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color.orange.opacity(0.42), lineWidth: 1)
+            )
+            .focusSection()
+          }
 
           if items.isEmpty {
             VStack(spacing: 18) {
@@ -6802,10 +7052,52 @@ struct TvDownloadsSectionView: View {
   @State private var newUrl: String = ""
   @State private var newName: String = ""
   @State private var snifferInput: String = ""
+  @State private var statusFilter: String = "all" // all, active, completed, failed
+  @State private var sortBySpeed: Bool = false
   @FocusState private var focusedDlTop: Bool
+
+  private static func detectStreamFormatBadge(_ url: String) -> String {
+    let lower = url.lowercased()
+    if lower.hasPrefix("magnet:?") || lower.contains(".torrent") { return "MAGNET" }
+    if lower.contains(".m3u8") { return "HLS / M3U8" }
+    if lower.contains(".mp4") { return "MP4" }
+    if lower.contains(".mkv") { return "MKV" }
+    if lower.contains(".flv") { return "FLV" }
+    return "STREAM"
+  }
+
+  private var filteredTasks: [TvDownloadTask] {
+    var list = appState.downloadTasks.filter { t in
+      switch statusFilter {
+      case "active": return !t.isCompleted && !t.isFailed
+      case "completed": return t.isCompleted
+      case "failed": return t.isFailed
+      default: return true
+      }
+    }
+    if sortBySpeed {
+      list.sort { a, b in
+        if a.speed != b.speed { return a.speed > b.speed }
+        return a.progress > b.progress
+      }
+    }
+    return list
+  }
 
   var body: some View {
     let theme = appState.activeTheme
+    let allTasks = appState.downloadTasks
+    let activeCount = allTasks.filter { !$0.isCompleted && !$0.isFailed }.count
+    let completedCount = allTasks.filter { $0.isCompleted }.count
+    let failedCount = allTasks.filter { $0.isFailed }.count
+    let totalSpeedBytes = allTasks.filter { !$0.isCompleted && !$0.isFailed }.reduce(0.0) { $0 + $1.speed }
+    let totalSpeedStr: String = {
+      if totalSpeedBytes <= 0 { return "0 KB/s" }
+      if totalSpeedBytes >= 1024 * 1024 {
+        return String(format: "%.2f MB/s", totalSpeedBytes / (1024 * 1024))
+      }
+      return String(format: "%.0f KB/s", totalSpeedBytes / 1024)
+    }()
 
     ScrollViewReader { scrollProxy in
       ScrollView {
@@ -6933,74 +7225,160 @@ struct TvDownloadsSectionView: View {
           .id("dl_top_anchor")
           .focusSection()
 
-          // Task Queue List
-          VStack(alignment: .leading, spacing: 10) {
-            Text("服务器下载任务列表 (\(appState.downloadTasks.count))")
-              .font(.system(size: 17, weight: .bold))
+          // Task Queue Dashboard & List
+          VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 14) {
+              Label("下载工作台 (\(filteredTasks.count)/\(allTasks.count))", systemImage: "arrow.down.doc.fill")
+                .font(.system(size: 20, weight: .heavy))
+                .foregroundColor(.white)
 
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 520, maximum: 860), spacing: 12)], spacing: 12) {
-              ForEach(appState.downloadTasks) { task in
-                HStack(spacing: 14) {
-                  VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 8) {
-                      Text(task.name)
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundColor(.white)
-                        .lineLimit(1)
-                      Text(task.statusLabel)
-                        .font(.system(size: 11, weight: .bold))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 2)
-                        .background(task.isCompleted ? Color.green.opacity(0.26) : (task.isFailed ? Color.red.opacity(0.26) : theme.accent.opacity(0.26)))
-                        .clipShape(Capsule())
+              // Summary Dashboard Pills
+              HStack(spacing: 10) {
+                Text("进行中 \(activeCount)")
+                  .font(.system(size: 13, weight: .bold, design: .monospaced))
+                  .foregroundColor(theme.accentHover)
+                  .padding(.horizontal, 10)
+                  .padding(.vertical, 4)
+                  .background(theme.accent.opacity(0.18))
+                  .clipShape(Capsule())
+
+                Text("总速率 \(totalSpeedStr)")
+                  .font(.system(size: 13, weight: .bold, design: .monospaced))
+                  .foregroundColor(.cyan)
+                  .padding(.horizontal, 10)
+                  .padding(.vertical, 4)
+                  .background(Color.cyan.opacity(0.16))
+                  .clipShape(Capsule())
+
+                Text("已完成 \(completedCount)")
+                  .font(.system(size: 13, weight: .bold, design: .monospaced))
+                  .foregroundColor(.green)
+                  .padding(.horizontal, 10)
+                  .padding(.vertical, 4)
+                  .background(Color.green.opacity(0.16))
+                  .clipShape(Capsule())
+
+                if failedCount > 0 {
+                  Text("异常 \(failedCount)")
+                    .font(.system(size: 13, weight: .bold, design: .monospaced))
+                    .foregroundColor(.red)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(Color.red.opacity(0.18))
+                    .clipShape(Capsule())
+                }
+              }
+
+              Spacer()
+
+              HStack(spacing: 8) {
+                Button("全部 (\(allTasks.count))") { statusFilter = "all" }
+                  .buttonStyle(TvApplePillButtonStyle(isSelected: statusFilter == "all", compact: true))
+                Button("下载中 (\(activeCount))") { statusFilter = "active" }
+                  .buttonStyle(TvApplePillButtonStyle(isSelected: statusFilter == "active", compact: true))
+                Button("已完成 (\(completedCount))") { statusFilter = "completed" }
+                  .buttonStyle(TvApplePillButtonStyle(isSelected: statusFilter == "completed", compact: true))
+                if failedCount > 0 || statusFilter == "failed" {
+                  Button("异常 (\(failedCount))") { statusFilter = "failed" }
+                    .buttonStyle(TvApplePillButtonStyle(isSelected: statusFilter == "failed", compact: true))
+                }
+                Button {
+                  sortBySpeed.toggle()
+                } label: {
+                  Label(sortBySpeed ? "已按速度排序" : "按速度排序", systemImage: "speedometer")
+                }
+                .buttonStyle(TvApplePillButtonStyle(isSelected: sortBySpeed, compact: true))
+              }
+            }
+            .focusSection()
+
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 520, maximum: 860), spacing: 14)], spacing: 14) {
+              ForEach(filteredTasks) { task in
+                let fmtBadge = Self.detectStreamFormatBadge(task.url)
+                let host = URL(string: task.url)?.host ?? "direct-stream"
+                let pct = task.isCompleted ? 100.0 : min(100.0, max(0.0, task.progress))
+                VStack(alignment: .leading, spacing: 8) {
+                  HStack(spacing: 14) {
+                    VStack(alignment: .leading, spacing: 4) {
+                      HStack(spacing: 8) {
+                        Text(task.statusLabel)
+                          .font(.system(size: 11, weight: .bold))
+                          .padding(.horizontal, 8)
+                          .padding(.vertical, 2)
+                          .background(task.isCompleted ? Color.green.opacity(0.26) : (task.isFailed ? Color.red.opacity(0.26) : theme.accent.opacity(0.26)))
+                          .clipShape(Capsule())
+                        Text(fmtBadge)
+                          .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                          .foregroundColor(.white.opacity(0.85))
+                          .padding(.horizontal, 7)
+                          .padding(.vertical, 2)
+                          .background(Color.white.opacity(0.10))
+                          .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                        Text(task.name)
+                          .font(.system(size: 15, weight: .bold))
+                          .foregroundColor(.white)
+                          .lineLimit(1)
+                      }
+                      Text(String(format: "%@ · 进度 %.1f%% · %@ · 分片 %d/%d", host, pct, task.formattedSpeed, task.downloadedSegments, task.totalSegments))
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.62))
+                      if !task.error.isEmpty {
+                        Text(task.error)
+                          .font(.system(size: 11))
+                          .foregroundColor(.red)
+                          .lineLimit(1)
+                      }
                     }
-                    Text(String(format: "进度 %.1f%% · %@ · 分片 %d/%d", task.progress, task.formattedSpeed, task.downloadedSegments, task.totalSegments))
-                      .font(.system(size: 12, design: .monospaced))
-                      .foregroundColor(.white.opacity(0.58))
-                    if !task.error.isEmpty {
-                      Text(task.error)
-                        .font(.system(size: 11))
-                        .foregroundColor(.red)
-                        .lineLimit(1)
+
+                    Spacer()
+
+                    if task.isCompleted && !task.outputFile.isEmpty {
+                      Button("播放") {
+                        let url = appState.api.buildFileStreamUrl(path: task.outputFile)
+                        appState.playDirectStream(title: task.name, subtitle: "已完成下载任务", url: url, headers: appState.api.authHeaders)
+                      }
+                      .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+
+                      Button("上传115") {
+                        Task {
+                          try? await appState.api.uploadTaskTo115(id: task.id)
+                          appState.showToast("已触发上传 115：\(task.name)")
+                          await appState.refreshDownloadTasks()
+                        }
+                      }
+                      .buttonStyle(TvApplePillButtonStyle(compact: true))
                     }
-                  }
 
-                  Spacer()
-
-                  if task.isCompleted && !task.outputFile.isEmpty {
-                    Button("播放") {
-                      let url = appState.api.buildFileStreamUrl(path: task.outputFile)
-                      appState.playDirectStream(title: task.name, subtitle: "已完成下载任务", url: url, headers: appState.api.authHeaders)
+                    if task.isFailed {
+                      Button("重试") {
+                        Task {
+                          try? await appState.api.retryDownloadTask(id: task.id)
+                          await appState.refreshDownloadTasks()
+                        }
+                      }
+                      .buttonStyle(TvApplePillButtonStyle(compact: true))
                     }
-                    .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
 
-                    Button("上传115") {
+                    Button("删除") {
                       Task {
-                        try? await appState.api.uploadTaskTo115(id: task.id)
-                        appState.showToast("已触发上传 115：\(task.name)")
+                        try? await appState.api.deleteDownloadTask(id: task.id, deleteFiles: false)
                         await appState.refreshDownloadTasks()
                       }
                     }
-                    .buttonStyle(TvApplePillButtonStyle(compact: true))
+                    .buttonStyle(TvApplePillButtonStyle(isDestructive: true, compact: true))
                   }
 
-                  if task.isFailed {
-                    Button("重试") {
-                      Task {
-                        try? await appState.api.retryDownloadTask(id: task.id)
-                        await appState.refreshDownloadTasks()
-                      }
-                    }
-                    .buttonStyle(TvApplePillButtonStyle(compact: true))
-                  }
-
-                  Button("删除") {
-                    Task {
-                      try? await appState.api.deleteDownloadTask(id: task.id, deleteFiles: false)
-                      await appState.refreshDownloadTasks()
+                  GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                      Capsule()
+                        .fill(Color.white.opacity(0.10))
+                        .frame(height: 5)
+                      Capsule()
+                        .fill(task.isCompleted ? Color.green : (task.isFailed ? Color.red : theme.accent))
+                        .frame(width: max(6, geo.size.width * CGFloat(pct / 100.0)), height: 5)
                     }
                   }
-                  .buttonStyle(TvApplePillButtonStyle(isDestructive: true, compact: true))
+                  .frame(height: 5)
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
@@ -9710,6 +10088,15 @@ struct TvProxySectionView: View {
   @ViewBuilder
   private func topGlobalProxyBar(theme: TvThemePalette, activeNode: TvSubscriptionNode?) -> some View {
     HStack(spacing: 14) {
+      // Return to Previous Section Button
+      Button {
+        appState.navigateBackToPreviousSection()
+      } label: {
+        Label("返回 \(appState.lastPrimarySection.rawValue)", systemImage: "arrow.uturn.backward")
+      }
+      .buttonStyle(TvApplePillButtonStyle(compact: true))
+      .fixedSize(horizontal: true, vertical: false)
+
       // Global Proxy Switch Button (`代理已开启` vs `代理已关闭`)
       Button {
         appState.setProxyEnabled(!appState.proxyEnabled)
@@ -10803,6 +11190,10 @@ struct TvSettingsSectionView: View {
   @State private var introSec: Int = 0
   @State private var outroSec: Int = 0
   @State private var cookie115Input: String = ""
+  @State private var aiProviderDraft: String = "openai"
+  @State private var aiApiKeyDraft: String = ""
+  @State private var aiBaseUrlDraft: String = ""
+  @State private var aiModelDraft: String = ""
   @FocusState private var focusedSidebarTab: TvSettingsCategoryTab?
 
   private var portalUrl: String {
@@ -10861,6 +11252,12 @@ struct TvSettingsSectionView: View {
                 .foregroundColor(theme.accentHover)
             }
             Spacer()
+            Button {
+              appState.navigateBackToPreviousSection()
+            } label: {
+              Label("返回 \(appState.lastPrimarySection.rawValue)", systemImage: "arrow.uturn.backward")
+            }
+            .buttonStyle(TvApplePillButtonStyle(compact: true))
           }
 
           HStack(spacing: 8) {
@@ -11347,6 +11744,122 @@ struct TvSettingsSectionView: View {
       .padding(20)
       .background(Color.white.opacity(0.06))
       .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+
+      // Row 5: Watch History Recording Toggle (无痕观看模式)
+      HStack(spacing: 18) {
+        ZStack {
+          RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .fill((appState.watchHistoryEnabled ? Color.green : Color.orange).opacity(0.22))
+            .frame(width: 52, height: 52)
+          Image(systemName: appState.watchHistoryEnabled ? "clock.badge.checkmark.fill" : "eye.slash.fill")
+            .font(.system(size: 22, weight: .bold))
+            .foregroundColor(appState.watchHistoryEnabled ? .green : .orange)
+        }
+
+        VStack(alignment: .leading, spacing: 4) {
+          Text("开启观看历史记录")
+            .font(.system(size: 18, weight: .bold))
+            .foregroundColor(.white)
+          Text("关闭后进入无痕观看模式，新播放的影视不再记录观看历史与剧集播放进度")
+            .font(.system(size: 13))
+            .foregroundColor(.white.opacity(0.65))
+        }
+
+        Spacer()
+
+        Button {
+          appState.setWatchHistoryEnabled(!appState.watchHistoryEnabled)
+        } label: {
+          Label(
+            appState.watchHistoryEnabled ? "记录已开启" : "记录已关闭",
+            systemImage: appState.watchHistoryEnabled ? "checkmark.circle.fill" : "pause.circle.fill"
+          )
+        }
+        .buttonStyle(
+          TvApplePillButtonStyle(
+            isSelected: appState.watchHistoryEnabled,
+            isPrimary: appState.watchHistoryEnabled
+          )
+        )
+      }
+      .padding(20)
+      .background(Color.white.opacity(0.06))
+      .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+
+      // Row 6: AI Smart Music Categorization Configuration
+      VStack(alignment: .leading, spacing: 14) {
+        HStack(spacing: 14) {
+          ZStack {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+              .fill(theme.accent.opacity(0.22))
+              .frame(width: 48, height: 48)
+            Image(systemName: "sparkles")
+              .font(.system(size: 21, weight: .bold))
+              .foregroundColor(theme.accentHover)
+          }
+          VStack(alignment: .leading, spacing: 2) {
+            Text("AI 智能音乐分类配置（流光音乐目录分析建表）")
+              .font(.system(size: 18, weight: .bold))
+              .foregroundColor(.white)
+            Text("配置 AI 服务商与 API Key，用于在音乐目录浏览器中一键按歌手/曲风自动分类生成播放列表（未配置时自动使用本地智能歌手/无损分类）")
+              .font(.system(size: 12.5))
+              .foregroundColor(.white.opacity(0.65))
+          }
+          Spacer()
+          Button {
+            appState.saveAiConfig(
+              provider: aiProviderDraft,
+              apiKey: aiApiKeyDraft,
+              baseUrl: aiBaseUrlDraft,
+              model: aiModelDraft
+            )
+          } label: {
+            Label("保存 AI 配置", systemImage: "checkmark.circle.fill")
+          }
+          .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+        }
+
+        HStack(spacing: 10) {
+          ForEach(["openai", "gemini", "deepseek", "custom"], id: \.self) { prov in
+            let isSel = (aiProviderDraft.lowercased() == prov)
+            Button(prov.uppercased()) {
+              aiProviderDraft = prov
+            }
+            .buttonStyle(TvApplePillButtonStyle(isSelected: isSel, isPrimary: isSel, compact: true))
+          }
+          Spacer()
+          TextField("API Key (sk-... / AIza...)", text: $aiApiKeyDraft)
+            .frame(width: 340)
+          TvQrInputTriggerButton(
+            prompt: "输入 AI API Key",
+            placeholder: "sk-... 或 Gemini API Key",
+            labelText: "扫码填Key"
+          ) { text in
+            aiApiKeyDraft = text
+            appState.saveAiConfig(
+              provider: aiProviderDraft,
+              apiKey: text,
+              baseUrl: aiBaseUrlDraft,
+              model: aiModelDraft
+            )
+          }
+        }
+
+        HStack(spacing: 12) {
+          TextField("自定义 Base URL (可选，如 https://api.openai.com/v1)", text: $aiBaseUrlDraft)
+          TextField("模型名称 (可选，如 gpt-4o-mini / gemini-2.0-flash)", text: $aiModelDraft)
+            .frame(width: 340)
+        }
+      }
+      .padding(20)
+      .background(Color.white.opacity(0.06))
+      .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+      .onAppear {
+        aiProviderDraft = appState.aiProvider
+        aiApiKeyDraft = appState.aiApiKey
+        aiBaseUrlDraft = appState.aiBaseUrl
+        aiModelDraft = appState.aiModel
+      }
     }
     .padding(28)
     .background(.ultraThinMaterial)
@@ -12999,6 +13512,9 @@ struct TvMusicFolderPickerSheet: View {
   @State private var errorText: String? = nil
   @State private var includeSubfolders: Bool = true
   @State private var selectedItems: [TvSavedMusicFolderItem] = []
+  @State private var showKeywordPlaylistSheet: Bool = false
+  @State private var keywordPlaylistQuery: String = ""
+  @State private var keywordPlaylistName: String = ""
 
   private var filteredEntries: [TvFileEntry] {
     let kw = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -13254,6 +13770,28 @@ struct TvMusicFolderPickerSheet: View {
           Spacer()
 
           Button {
+            showKeywordPlaylistSheet = true
+          } label: {
+            Label("查找人名/关键词新建列表", systemImage: "person.text.rectangle.fill")
+          }
+          .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+          Button {
+            let targets = effectiveTargetSources()
+            guard !targets.isEmpty else { return }
+            appState.showMusicFolderPickerSheet = false
+            Task {
+              _ = await appState.aiCategorizeMusicDirectoryAndCreatePlaylists(
+                sources: targets,
+                includeSubfolders: includeSubfolders
+              )
+            }
+          } label: {
+            Label("AI 分析自动生成列表", systemImage: "sparkles")
+          }
+          .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+          Button {
             let targets = effectiveTargetSources()
             guard !targets.isEmpty else { return }
             appState.showMusicFolderPickerSheet = false
@@ -13312,6 +13850,80 @@ struct TvMusicFolderPickerSheet: View {
       if !stepBackFolderIfPossible() {
         appState.showMusicFolderPickerSheet = false
       }
+    }
+    .sheet(isPresented: $showKeywordPlaylistSheet) {
+      ZStack {
+        TvAmbientBackdropView(imageUrl: appState.ambientBackdropUrl)
+        VStack(alignment: .leading, spacing: 20) {
+          Label("按歌手人名 / 关键词查找并新建播放列表", systemImage: "person.text.rectangle.fill")
+            .font(.system(size: 26, weight: .heavy))
+            .foregroundColor(theme.accentHover)
+
+          Text("自动递归扫描当前或所选音乐文件夹（含 .zip/.tar 压缩包），提取匹配歌手人名或关键词的歌曲并生成独立歌单")
+            .font(.system(size: 15))
+            .foregroundColor(.white.opacity(0.75))
+
+          HStack(spacing: 12) {
+            TextField("输入歌手人名或关键词（支持多个，如：周杰伦, 林俊杰）...", text: $keywordPlaylistQuery)
+              .frame(width: 560)
+            TvQrInputTriggerButton(
+              prompt: "查找歌手人名或歌曲关键词",
+              placeholder: "如：周杰伦 / 陈奕迅 / 粤语经典",
+              labelText: "扫码输入"
+            ) { text in
+              keywordPlaylistQuery = text
+            }
+          }
+          .focusSection()
+
+          HStack(spacing: 12) {
+            TextField("新播放列表名称（可选，留空自动按关键词命名）...", text: $keywordPlaylistName)
+              .frame(width: 560)
+            TvQrInputTriggerButton(
+              prompt: "新播放列表名称",
+              placeholder: "如：周杰伦无损精选",
+              labelText: "扫码命名"
+            ) { text in
+              keywordPlaylistName = text
+            }
+          }
+          .focusSection()
+
+          HStack(spacing: 18) {
+            Button("取消") {
+              showKeywordPlaylistSheet = false
+            }
+            .buttonStyle(TvApplePillButtonStyle())
+
+            Button {
+              let kw = keywordPlaylistQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+              guard !kw.isEmpty else { return }
+              let title = keywordPlaylistName
+              let targets = effectiveTargetSources()
+              showKeywordPlaylistSheet = false
+              appState.showMusicFolderPickerSheet = false
+              Task {
+                _ = await appState.searchMusicDirectoryAndCreatePlaylist(
+                  sources: targets,
+                  keyword: kw,
+                  playlistName: title,
+                  includeSubfolders: includeSubfolders,
+                  playImmediately: true
+                )
+              }
+            } label: {
+              Label("立即查找并新建播放列表", systemImage: "music.note.list")
+            }
+            .buttonStyle(TvApplePillButtonStyle(isPrimary: true))
+          }
+          .focusSection()
+        }
+        .padding(44)
+        .frame(width: 920)
+        .background(.regularMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+      }
+      .withTvLanQuickInputOverlay(appState)
     }
   }
 

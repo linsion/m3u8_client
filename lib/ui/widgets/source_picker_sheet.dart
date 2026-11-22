@@ -60,16 +60,6 @@ class _SourcePickerDialogState extends State<SourcePickerDialog> {
   void initState() {
     super.initState();
     _scrollToSelectedSourceOnce();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      final state = widget.appState;
-      if (state != null &&
-          state.sourceLatencyMs.isEmpty &&
-          !state.isTestingSources &&
-          _effectiveAllSources.isNotEmpty) {
-        unawaited(state.batchTestVodSources(targetSources: _effectiveAllSources));
-      }
-    });
   }
 
   @override
@@ -355,12 +345,90 @@ class _SourcePickerDialogState extends State<SourcePickerDialog> {
     final screenW = MediaQuery.sizeOf(context).width;
     final isCompact = screenW < 640;
 
+    final actionButtons = <Widget>[
+      _buildHeaderActionButton(
+        key: const ValueKey('source_picker_batch_test_btn'),
+        onPressed: _isBatchTesting ? null : _triggerBatchTest,
+        icon: _isBatchTesting
+            ? SizedBox(
+                width: 13,
+                height: 13,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: VideoPlatformTheme.accent,
+                ),
+              )
+            : Icon(
+                Icons.speed_rounded,
+                size: 15,
+                color: VideoPlatformTheme.accent,
+              ),
+        label: _isBatchTesting
+            ? '测速中 ($testedCount/${allSources.take(40).length})'
+            : '一键测速',
+        highlighted: true,
+      ),
+      _buildHeaderActionButton(
+        key: const ValueKey('source_picker_sort_speed_btn'),
+        onPressed: _applySortByLatency,
+        icon: Icon(
+          Icons.sort_rounded,
+          size: 15,
+          color: _sortByLatency
+              ? VideoPlatformTheme.accent
+              : VideoPlatformTheme.textSecondary,
+        ),
+        label: _sortByLatency ? '已按速度排序' : '按速度排序',
+        highlighted: _sortByLatency,
+      ),
+      if (fastestSource != null)
+        _buildHeaderActionButton(
+          key: const ValueKey('source_picker_pick_fastest_btn'),
+          onPressed: () {
+            Navigator.of(context).pop();
+            widget.onSelect(fastestSource);
+          },
+          icon: const Icon(
+            Icons.bolt_rounded,
+            size: 15,
+            color: Colors.white,
+          ),
+          label: '秒选最快 (${_latencyOf(fastestSource.id)}ms)',
+          solidBgColor: const Color(0xFF16A34A),
+          solidFgColor: Colors.white,
+        ),
+    ];
+
+    final filterTabChips = <Widget>[
+      _buildFilterTab(
+        0,
+        '全部 (${allSources.length})',
+        Icons.apps_rounded,
+      ),
+      _buildFilterTab(
+        1,
+        '标准资源站 ($customCount)',
+        Icons.dns_rounded,
+      ),
+      _buildFilterTab(
+        2,
+        'TVBox 站点 ($tvboxCount)',
+        Icons.extension_rounded,
+      ),
+      if (pinnedCount > 0 || _tabIndex == 3)
+        _buildFilterTab(
+          3,
+          '常用置顶 ($pinnedCount)',
+          Icons.push_pin_rounded,
+        ),
+    ];
+
     return Dialog(
       backgroundColor: VideoPlatformTheme.bgElevated,
       surfaceTintColor: Colors.transparent,
       insetPadding: EdgeInsets.symmetric(
-        horizontal: isCompact ? 12 : 22,
-        vertical: isCompact ? 16 : 24,
+        horizontal: isCompact ? 10 : 22,
+        vertical: isCompact ? 14 : 24,
       ),
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(14),
@@ -374,10 +442,10 @@ class _SourcePickerDialogState extends State<SourcePickerDialog> {
             // 1. Top Header Bar with Title, Stats & Batch Speed Test Controls
             Container(
               padding: EdgeInsets.fromLTRB(
-                isCompact ? 14 : 18,
-                14,
-                isCompact ? 10 : 14,
-                12,
+                isCompact ? 12 : 18,
+                isCompact ? 11 : 14,
+                isCompact ? 8 : 14,
+                isCompact ? 10 : 12,
               ),
               decoration: BoxDecoration(
                 gradient: LinearGradient(
@@ -401,8 +469,8 @@ class _SourcePickerDialogState extends State<SourcePickerDialog> {
                   Row(
                     children: [
                       Container(
-                        width: 34,
-                        height: 34,
+                        width: isCompact ? 32 : 34,
+                        height: isCompact ? 32 : 34,
                         decoration: BoxDecoration(
                           color:
                               VideoPlatformTheme.accent.withValues(alpha: 0.16),
@@ -414,7 +482,7 @@ class _SourcePickerDialogState extends State<SourcePickerDialog> {
                         ),
                         child: Icon(
                           Icons.hub_rounded,
-                          size: 18,
+                          size: isCompact ? 16 : 18,
                           color: VideoPlatformTheme.accent,
                         ),
                       ),
@@ -425,12 +493,16 @@ class _SourcePickerDialogState extends State<SourcePickerDialog> {
                           children: [
                             Row(
                               children: [
-                                Text(
-                                  '切换片源站点',
-                                  style: TextStyle(
-                                    fontSize: 16,
-                                    fontWeight: FontWeight.w800,
-                                    color: VideoPlatformTheme.textPrimary,
+                                Flexible(
+                                  child: Text(
+                                    '切换片源站点',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontSize: isCompact ? 15 : 16,
+                                      fontWeight: FontWeight.w800,
+                                      color: VideoPlatformTheme.textPrimary,
+                                    ),
                                   ),
                                 ),
                                 const SizedBox(width: 8),
@@ -472,96 +544,15 @@ class _SourcePickerDialogState extends State<SourcePickerDialog> {
                           ],
                         ),
                       ),
-                      // Action Buttons: Batch Speed Test, Sort by Speed, Pick Fastest
-                      Wrap(
-                        spacing: 6,
-                        runSpacing: 6,
-                        crossAxisAlignment: WrapCrossAlignment.center,
-                        children: [
-                          FilledButton.tonalIcon(
-                            key: const ValueKey('source_picker_batch_test_btn'),
-                            style: FilledButton.styleFrom(
-                              visualDensity: VisualDensity.compact,
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 10,
-                                vertical: 6,
-                              ),
-                            ),
-                            onPressed:
-                                _isBatchTesting ? null : _triggerBatchTest,
-                            icon: _isBatchTesting
-                                ? SizedBox(
-                                    width: 13,
-                                    height: 13,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
-                                      color: VideoPlatformTheme.accent,
-                                    ),
-                                  )
-                                : const Icon(Icons.speed_rounded, size: 15),
-                            label: Text(
-                              _isBatchTesting
-                                  ? '测速中 ($testedCount/${allSources.take(40).length})'
-                                  : '一键测速',
-                              style: const TextStyle(
-                                fontSize: 12,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                          ),
-                          OutlinedButton.icon(
-                            key: const ValueKey('source_picker_sort_speed_btn'),
-                            style: OutlinedButton.styleFrom(
-                              visualDensity: VisualDensity.compact,
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 10,
-                                vertical: 6,
-                              ),
-                              foregroundColor: _sortByLatency
-                                  ? VideoPlatformTheme.accent
-                                  : VideoPlatformTheme.textSecondary,
-                              side: BorderSide(
-                                color: _sortByLatency
-                                    ? VideoPlatformTheme.accent
-                                    : VideoPlatformTheme.borderSubtle,
-                              ),
-                            ),
-                            onPressed: _applySortByLatency,
-                            icon: const Icon(Icons.sort_rounded, size: 15),
-                            label: Text(
-                              _sortByLatency ? '已按速度排序' : '按速度排序',
-                              style: const TextStyle(fontSize: 12),
-                            ),
-                          ),
-                          if (fastestSource != null && !isCompact)
-                            FilledButton.icon(
-                              key: const ValueKey(
-                                'source_picker_pick_fastest_btn',
-                              ),
-                              style: FilledButton.styleFrom(
-                                visualDensity: VisualDensity.compact,
-                                backgroundColor: const Color(0xFF16A34A),
-                                foregroundColor: Colors.white,
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 10,
-                                  vertical: 6,
-                                ),
-                              ),
-                              onPressed: () {
-                                Navigator.of(context).pop();
-                                widget.onSelect(fastestSource);
-                              },
-                              icon: const Icon(Icons.bolt_rounded, size: 15),
-                              label: Text(
-                                '秒选最快 (${_latencyOf(fastestSource.id)}ms)',
-                                style: const TextStyle(
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w700,
-                                ),
-                              ),
-                            ),
-                        ],
-                      ),
+                      if (!isCompact) ...[
+                        const SizedBox(width: 8),
+                        Wrap(
+                          spacing: 6,
+                          runSpacing: 6,
+                          crossAxisAlignment: WrapCrossAlignment.center,
+                          children: actionButtons,
+                        ),
+                      ],
                       const SizedBox(width: 4),
                       IconButton(
                         tooltip: '关闭',
@@ -571,6 +562,20 @@ class _SourcePickerDialogState extends State<SourcePickerDialog> {
                       ),
                     ],
                   ),
+                  if (isCompact) ...[
+                    const SizedBox(height: 8),
+                    SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Row(
+                        children: [
+                          for (int i = 0; i < actionButtons.length; i++) ...[
+                            if (i > 0) const SizedBox(width: 6),
+                            actionButtons[i],
+                          ],
+                        ],
+                      ),
+                    ),
+                  ],
                   if (_isBatchTesting) ...[
                     const SizedBox(height: 8),
                     ClipRRect(
@@ -582,44 +587,37 @@ class _SourcePickerDialogState extends State<SourcePickerDialog> {
                       ),
                     ),
                   ],
-                  const SizedBox(height: 12),
+                  SizedBox(height: isCompact ? 8 : 12),
                   // 2. Category Tabs + Search Box Row
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    crossAxisAlignment: WrapCrossAlignment.center,
-                    alignment: WrapAlignment.spaceBetween,
-                    children: [
-                      Wrap(
-                        spacing: 6,
-                        runSpacing: 6,
+                  if (isCompact) ...[
+                    _buildSearchField(context, isCompact: true),
+                    const SizedBox(height: 8),
+                    SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Row(
                         children: [
-                          _buildFilterTab(
-                            0,
-                            '全部 (${allSources.length})',
-                            Icons.apps_rounded,
-                          ),
-                          _buildFilterTab(
-                            1,
-                            '标准资源站 ($customCount)',
-                            Icons.dns_rounded,
-                          ),
-                          _buildFilterTab(
-                            2,
-                            'TVBox 站点 ($tvboxCount)',
-                            Icons.extension_rounded,
-                          ),
-                          if (pinnedCount > 0 || _tabIndex == 3)
-                            _buildFilterTab(
-                              3,
-                              '常用置顶 ($pinnedCount)',
-                              Icons.push_pin_rounded,
-                            ),
+                          for (int i = 0; i < filterTabChips.length; i++) ...[
+                            if (i > 0) const SizedBox(width: 6),
+                            filterTabChips[i],
+                          ],
                         ],
                       ),
-                      _buildSearchField(context, isCompact: isCompact),
-                    ],
-                  ),
+                    ),
+                  ] else
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      alignment: WrapAlignment.spaceBetween,
+                      children: [
+                        Wrap(
+                          spacing: 6,
+                          runSpacing: 6,
+                          children: filterTabChips,
+                        ),
+                        _buildSearchField(context, isCompact: false),
+                      ],
+                    ),
                 ],
               ),
             ),
@@ -685,6 +683,86 @@ class _SourcePickerDialogState extends State<SourcePickerDialog> {
                     ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHeaderActionButton({
+    required Key key,
+    required VoidCallback? onPressed,
+    required Widget icon,
+    required String label,
+    bool highlighted = false,
+    Color? solidBgColor,
+    Color? solidFgColor,
+  }) {
+    final disabled = onPressed == null;
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        key: key,
+        borderRadius: BorderRadius.circular(18),
+        onFocusChange: (_) {
+          if (mounted) setState(() {});
+        },
+        onTap: onPressed,
+        child: Builder(
+          builder: (ctx) {
+            final isFocused = Focus.of(ctx).hasPrimaryFocus;
+            final bgColor = solidBgColor != null
+                ? (isFocused
+                    ? solidBgColor.withValues(alpha: 0.92)
+                    : solidBgColor)
+                : (isFocused
+                    ? VideoPlatformTheme.accent.withValues(alpha: 0.28)
+                    : (highlighted
+                        ? VideoPlatformTheme.accent.withValues(alpha: 0.16)
+                        : VideoPlatformTheme.bgCard));
+            final borderColor = isFocused
+                ? Colors.white
+                : (solidBgColor ??
+                    (highlighted
+                        ? VideoPlatformTheme.accent
+                        : VideoPlatformTheme.borderSubtle));
+            final textColor = solidFgColor ??
+                (isFocused
+                    ? Colors.white
+                    : (highlighted
+                        ? VideoPlatformTheme.accent
+                        : (disabled
+                            ? VideoPlatformTheme.textMuted
+                            : VideoPlatformTheme.textSecondary)));
+            return AnimatedContainer(
+              duration: const Duration(milliseconds: 140),
+              padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6.5),
+              decoration: BoxDecoration(
+                color: bgColor,
+                borderRadius: BorderRadius.circular(18),
+                border: Border.all(
+                  color: borderColor,
+                  width: isFocused ? 2.0 : 1.0,
+                ),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  icon,
+                  const SizedBox(width: 5),
+                  Text(
+                    label,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: (highlighted || isFocused || solidBgColor != null)
+                          ? FontWeight.w700
+                          : FontWeight.w500,
+                      color: textColor,
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
         ),
       ),
     );
@@ -768,8 +846,8 @@ class _SourcePickerDialogState extends State<SourcePickerDialog> {
     }
 
     return SizedBox(
-      width: isCompact ? 185 : 220,
-      height: 33,
+      width: isCompact ? double.infinity : 220,
+      height: 34,
       child: TextField(
         controller: _searchController,
         onChanged: (v) => setState(() => _filter = v.trim()),
@@ -875,287 +953,310 @@ class _SourcePickerDialogState extends State<SourcePickerDialog> {
     final latencyInfo = _describeLatency(ms, isTesting: isTesting);
     final protoTag = _protocolTypeTag(src);
     final hostLabel = _extractCleanApiLabel(src);
+    final isTv = widget.appState?.tvMode ?? false;
+    final isCompact = MediaQuery.sizeOf(context).width < 640;
 
     return StatefulBuilder(
       builder: (tileCtx, setTileState) {
-        return InkWell(
-          autofocus: autofocus,
-          borderRadius: BorderRadius.circular(10),
-          onFocusChange: (_) {
-            if (tileCtx.mounted) {
-              setTileState(() {});
-            }
-          },
-          onTap: () {
-            Navigator.of(context).pop();
-            widget.onSelect(src);
-          },
-          child: Builder(
-            builder: (ctx) {
-              final isFocused = Focus.of(ctx).hasPrimaryFocus;
-              return AnimatedContainer(
-                duration: const Duration(milliseconds: 140),
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 13,
-                  vertical: 11,
-                ),
-                decoration: BoxDecoration(
-                  color: isFocused
-                      ? VideoPlatformTheme.accent.withValues(alpha: 0.22)
-                      : (isSelected
-                          ? VideoPlatformTheme.accent.withValues(alpha: 0.12)
-                          : VideoPlatformTheme.bgCard),
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(
-                    color: isFocused
-                        ? VideoPlatformTheme.accent
-                        : (isSelected
-                            ? VideoPlatformTheme.accent.withValues(alpha: 0.65)
-                            : VideoPlatformTheme.borderSubtle),
-                    width: (isFocused || isSelected) ? 1.6 : 1.0,
+        return Material(
+          color: Colors.transparent,
+          child: InkWell(
+            autofocus: autofocus,
+            borderRadius: BorderRadius.circular(10),
+            onFocusChange: (_) {
+              if (tileCtx.mounted) {
+                setTileState(() {});
+              }
+            },
+            onTap: () {
+              Navigator.of(context).pop();
+              widget.onSelect(src);
+            },
+            child: Builder(
+              builder: (ctx) {
+                final isFocused = Focus.of(ctx).hasPrimaryFocus;
+                return AnimatedContainer(
+                  duration: const Duration(milliseconds: 140),
+                  padding: EdgeInsets.symmetric(
+                    horizontal: isCompact ? 10 : 13,
+                    vertical: isCompact ? 9 : 11,
                   ),
-                ),
-                child: Row(
-                  children: [
-                    // Leading Source Avatar / Type Badge
-                    Container(
-                      width: 38,
-                      height: 38,
-                      decoration: BoxDecoration(
-                        gradient: LinearGradient(
-                          begin: Alignment.topLeft,
-                          end: Alignment.bottomRight,
-                          colors: isSelected
-                              ? [
-                                  VideoPlatformTheme.accent,
-                                  VideoPlatformTheme.accent
-                                      .withValues(alpha: 0.72),
-                                ]
-                              : (src.isTvBox
-                                  ? [
-                                      const Color(0xFF6366F1)
-                                          .withValues(alpha: 0.22),
-                                      const Color(0xFF4F46E5)
-                                          .withValues(alpha: 0.12),
-                                    ]
-                                  : [
-                                      VideoPlatformTheme.accent
-                                          .withValues(alpha: 0.20),
-                                      VideoPlatformTheme.accent
-                                          .withValues(alpha: 0.08),
-                                    ]),
-                        ),
-                        borderRadius: BorderRadius.circular(9),
-                        border: Border.all(
-                          color: isSelected
-                              ? VideoPlatformTheme.accent
-                              : (src.isTvBox
-                                  ? const Color(0xFF6366F1)
-                                      .withValues(alpha: 0.4)
-                                  : VideoPlatformTheme.accent
-                                      .withValues(alpha: 0.35)),
-                        ),
-                      ),
-                      alignment: Alignment.center,
-                      child: isSelected
-                          ? const Icon(
-                              Icons.play_arrow_rounded,
-                              color: Colors.white,
-                              size: 21,
-                            )
-                          : Text(
-                              src.name.trim().isNotEmpty
-                                  ? src.name.trim().characters.first
-                                  : '${index + 1}',
-                              style: TextStyle(
-                                fontSize: 14,
-                                fontWeight: FontWeight.w800,
-                                color: src.isTvBox
-                                    ? const Color(0xFF818CF8)
-                                    : VideoPlatformTheme.accent,
-                              ),
-                            ),
+                  decoration: BoxDecoration(
+                    color: isFocused
+                        ? VideoPlatformTheme.accent.withValues(alpha: 0.22)
+                        : (isSelected
+                            ? VideoPlatformTheme.accent.withValues(alpha: 0.12)
+                            : VideoPlatformTheme.bgCard),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(
+                      color: isFocused
+                          ? (isTv ? Colors.white : VideoPlatformTheme.accent)
+                          : (isSelected
+                              ? VideoPlatformTheme.accent.withValues(alpha: 0.65)
+                              : VideoPlatformTheme.borderSubtle),
+                      width: isFocused ? (isTv ? 2.2 : 1.6) : (isSelected ? 1.6 : 1.0),
                     ),
-                    const SizedBox(width: 12),
-
-                    // Center: Source Name + Tags + Host Info
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            children: [
-                              if (isPinned) ...[
-                                Icon(
-                                  Icons.push_pin_rounded,
-                                  size: 13.5,
-                                  color: VideoPlatformTheme.warning,
-                                ),
-                                const SizedBox(width: 4),
-                              ],
-                              Flexible(
-                                child: Text(
-                                  src.name,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(
-                                    color: (isSelected || isFocused)
-                                        ? VideoPlatformTheme.accent
-                                        : VideoPlatformTheme.textPrimary,
-                                    fontSize: 14,
-                                    fontWeight: (isSelected || isFocused)
-                                        ? FontWeight.w700
-                                        : FontWeight.w600,
-                                  ),
-                                ),
-                              ),
-                              if (isSelected) ...[
-                                const SizedBox(width: 6),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 6,
-                                    vertical: 1.5,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: VideoPlatformTheme.accent
-                                        .withValues(alpha: 0.18),
-                                    borderRadius: BorderRadius.circular(4),
-                                    border: Border.all(
-                                      color: VideoPlatformTheme.accent
-                                          .withValues(alpha: 0.6),
-                                    ),
-                                  ),
-                                  child: Text(
-                                    '当前使用',
-                                    style: TextStyle(
-                                      fontSize: 10,
-                                      fontWeight: FontWeight.w700,
-                                      color: VideoPlatformTheme.accent,
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ],
+                  ),
+                  child: Row(
+                    children: [
+                      // Leading Source Avatar / Type Badge
+                      Container(
+                        width: isCompact ? 34 : 38,
+                        height: isCompact ? 34 : 38,
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                            colors: isSelected
+                                ? [
+                                    VideoPlatformTheme.accent,
+                                    VideoPlatformTheme.accent
+                                        .withValues(alpha: 0.72),
+                                  ]
+                                : (src.isTvBox
+                                    ? [
+                                        const Color(0xFF6366F1)
+                                            .withValues(alpha: 0.22),
+                                        const Color(0xFF4F46E5)
+                                            .withValues(alpha: 0.12),
+                                      ]
+                                    : [
+                                        VideoPlatformTheme.accent
+                                            .withValues(alpha: 0.20),
+                                        VideoPlatformTheme.accent
+                                            .withValues(alpha: 0.08),
+                                      ]),
                           ),
-                          const SizedBox(height: 5),
-                          Wrap(
-                            spacing: 6,
-                            runSpacing: 4,
-                            crossAxisAlignment: WrapCrossAlignment.center,
-                            children: [
-                              _buildMiniMetaBadge(
-                                label: src.groupLabel,
-                                color: src.isTvBox
-                                    ? const Color(0xFF818CF8)
-                                    : VideoPlatformTheme.accent,
-                              ),
-                              _buildMiniMetaBadge(
-                                label: protoTag,
-                                color: VideoPlatformTheme.textSecondary,
-                              ),
-                              if (src.searchable)
-                                _buildMiniMetaBadge(
-                                  label: '支持聚合搜',
-                                  color: const Color(0xFF10B981),
-                                ),
-                              Text(
-                                hostLabel,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
+                          borderRadius: BorderRadius.circular(9),
+                          border: Border.all(
+                            color: isSelected
+                                ? VideoPlatformTheme.accent
+                                : (src.isTvBox
+                                    ? const Color(0xFF6366F1)
+                                        .withValues(alpha: 0.4)
+                                    : VideoPlatformTheme.accent
+                                        .withValues(alpha: 0.35)),
+                          ),
+                        ),
+                        alignment: Alignment.center,
+                        child: isSelected
+                            ? Icon(
+                                Icons.play_arrow_rounded,
+                                color: Colors.white,
+                                size: isCompact ? 19 : 21,
+                              )
+                            : Text(
+                                src.name.trim().isNotEmpty
+                                    ? src.name.trim().characters.first
+                                    : '${index + 1}',
                                 style: TextStyle(
-                                  color: VideoPlatformTheme.textMuted,
-                                  fontSize: 11,
+                                  fontSize: isCompact ? 13 : 14,
+                                  fontWeight: FontWeight.w800,
+                                  color: src.isTvBox
+                                      ? const Color(0xFF818CF8)
+                                      : VideoPlatformTheme.accent,
                                 ),
                               ),
-                            ],
-                          ),
-                        ],
                       ),
-                    ),
-                    const SizedBox(width: 8),
+                      SizedBox(width: isCompact ? 10 : 12),
 
-                    // Right: Interactive Latency / Speed Test Pill + Pin Button
-                    Tooltip(
-                      message: '点击单独测试「${src.name}」连接响应速度',
-                      child: InkWell(
-                        borderRadius: BorderRadius.circular(8),
-                        onTap: isTesting ? null : () => _triggerSingleTest(src),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 9,
-                            vertical: 6,
-                          ),
-                          decoration: BoxDecoration(
-                            color: latencyInfo.color.withValues(alpha: 0.12),
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(
-                              color: latencyInfo.color.withValues(alpha: 0.42),
-                            ),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              if (isTesting)
-                                SizedBox(
-                                  width: 12,
-                                  height: 12,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 1.8,
-                                    color: latencyInfo.color,
+                      // Center: Source Name + Tags + Host Info
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                if (isPinned) ...[
+                                  Icon(
+                                    Icons.push_pin_rounded,
+                                    size: 13.5,
+                                    color: VideoPlatformTheme.warning,
                                   ),
-                                )
-                              else
-                                _buildSignalBars(
-                                  latencyInfo.bars,
-                                  latencyInfo.color,
-                                ),
-                              const SizedBox(width: 6),
-                              Column(
-                                crossAxisAlignment: CrossAxisAlignment.end,
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Text(
-                                    latencyInfo.label,
+                                  const SizedBox(width: 4),
+                                ],
+                                Flexible(
+                                  child: Text(
+                                    src.name,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
                                     style: TextStyle(
-                                      fontSize: 11.5,
-                                      fontWeight: FontWeight.w700,
-                                      color: latencyInfo.color,
+                                      color: (isSelected || isFocused)
+                                          ? VideoPlatformTheme.accent
+                                          : VideoPlatformTheme.textPrimary,
+                                      fontSize: isCompact ? 13.5 : 14,
+                                      fontWeight: (isSelected || isFocused)
+                                          ? FontWeight.w700
+                                          : FontWeight.w600,
                                     ),
                                   ),
-                                  Text(
-                                    latencyInfo.grade,
-                                    style: TextStyle(
-                                      fontSize: 9.5,
-                                      color: latencyInfo.color
-                                          .withValues(alpha: 0.85),
+                                ),
+                                if (isSelected) ...[
+                                  const SizedBox(width: 6),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 6,
+                                      vertical: 1.5,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: VideoPlatformTheme.accent
+                                          .withValues(alpha: 0.18),
+                                      borderRadius: BorderRadius.circular(4),
+                                      border: Border.all(
+                                        color: VideoPlatformTheme.accent
+                                            .withValues(alpha: 0.6),
+                                      ),
+                                    ),
+                                    child: Text(
+                                      '当前使用',
+                                      style: TextStyle(
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.w700,
+                                        color: VideoPlatformTheme.accent,
+                                      ),
                                     ),
                                   ),
                                 ],
-                              ),
-                            ],
-                          ),
+                              ],
+                            ),
+                            const SizedBox(height: 5),
+                            Wrap(
+                              spacing: 6,
+                              runSpacing: 4,
+                              crossAxisAlignment: WrapCrossAlignment.center,
+                              children: [
+                                _buildMiniMetaBadge(
+                                  label: src.groupLabel,
+                                  color: src.isTvBox
+                                      ? const Color(0xFF818CF8)
+                                      : VideoPlatformTheme.accent,
+                                ),
+                                _buildMiniMetaBadge(
+                                  label: protoTag,
+                                  color: VideoPlatformTheme.textSecondary,
+                                ),
+                                if (src.searchable && !isCompact)
+                                  _buildMiniMetaBadge(
+                                    label: '支持聚合搜',
+                                    color: const Color(0xFF10B981),
+                                  ),
+                                Text(
+                                  hostLabel,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    color: VideoPlatformTheme.textMuted,
+                                    fontSize: 11,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
                         ),
                       ),
-                    ),
-                    const SizedBox(width: 4),
-                    IconButton(
-                      visualDensity: VisualDensity.compact,
-                      tooltip: isPinned ? '取消置顶此站点' : '置顶此常用站点',
-                      onPressed: () => _togglePin(src),
-                      icon: Icon(
-                        isPinned
-                            ? Icons.push_pin_rounded
-                            : Icons.push_pin_outlined,
-                        size: 16,
-                        color: isPinned
-                            ? VideoPlatformTheme.warning
-                            : VideoPlatformTheme.textMuted,
+                      const SizedBox(width: 6),
+
+                      // Right: Interactive Latency / Speed Test Pill + Pin Button
+                      ExcludeFocus(
+                        excluding: isTv,
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Tooltip(
+                              message: '点击单独测试「${src.name}」连接响应速度',
+                              child: InkWell(
+                                borderRadius: BorderRadius.circular(8),
+                                onTap: isTesting
+                                    ? null
+                                    : () => _triggerSingleTest(src),
+                                child: Container(
+                                  padding: EdgeInsets.symmetric(
+                                    horizontal: isCompact ? 7 : 9,
+                                    vertical: isCompact ? 5 : 6,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: latencyInfo.color
+                                        .withValues(alpha: 0.12),
+                                    borderRadius: BorderRadius.circular(8),
+                                    border: Border.all(
+                                      color: latencyInfo.color
+                                          .withValues(alpha: 0.42),
+                                    ),
+                                  ),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      if (isTesting)
+                                        SizedBox(
+                                          width: 12,
+                                          height: 12,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 1.8,
+                                            color: latencyInfo.color,
+                                          ),
+                                        )
+                                      else
+                                        _buildSignalBars(
+                                          latencyInfo.bars,
+                                          latencyInfo.color,
+                                        ),
+                                      const SizedBox(width: 5),
+                                      Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.end,
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Text(
+                                            latencyInfo.label,
+                                            style: TextStyle(
+                                              fontSize: isCompact ? 11 : 11.5,
+                                              fontWeight: FontWeight.w700,
+                                              color: latencyInfo.color,
+                                            ),
+                                          ),
+                                          Text(
+                                            latencyInfo.grade,
+                                            style: TextStyle(
+                                              fontSize: 9.5,
+                                              color: latencyInfo.color
+                                                  .withValues(alpha: 0.85),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 2),
+                            IconButton(
+                              visualDensity: VisualDensity.compact,
+                              padding: EdgeInsets.zero,
+                              constraints: const BoxConstraints(
+                                minWidth: 30,
+                                minHeight: 30,
+                              ),
+                              tooltip: isPinned ? '取消置顶此站点' : '置顶此常用站点',
+                              onPressed: () => _togglePin(src),
+                              icon: Icon(
+                                isPinned
+                                    ? Icons.push_pin_rounded
+                                    : Icons.push_pin_outlined,
+                                size: 15.5,
+                                color: isPinned
+                                    ? VideoPlatformTheme.warning
+                                    : VideoPlatformTheme.textMuted,
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
-                    ),
-                  ],
-                ),
-              );
-            },
+                    ],
+                  ),
+                );
+              },
+            ),
           ),
         );
       },

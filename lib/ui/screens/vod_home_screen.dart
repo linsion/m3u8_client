@@ -1719,6 +1719,7 @@ class _VodHomeScreenState extends State<VodHomeScreen> {
                                       context,
                                       sources: state.visibleSources,
                                       selectedSource: state.selectedSource,
+                                      appState: state,
                                       onSelect: state.selectVodSource,
                                     );
                                   },
