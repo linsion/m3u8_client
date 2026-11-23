@@ -638,6 +638,7 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
             api: widget.appState.api,
             title: entry.name,
             streamUrl: resolved.url,
+            fallbackUrl: resolved.fallbackUrl,
             headers: resolved.headers,
             initialPosition: initialSeekPos,
             initialAudioTrackOrderIndex: initialAudioTrackOrderIdx,
@@ -4750,6 +4751,7 @@ class _MediaFilePlayerDialog extends StatefulWidget {
   final ApiClient api;
   final String title;
   final String streamUrl;
+  final String fallbackUrl;
   final Map<String, String> headers;
   final Duration? initialPosition;
   final int? initialAudioTrackOrderIndex;
@@ -4766,6 +4768,7 @@ class _MediaFilePlayerDialog extends StatefulWidget {
     required this.api,
     required this.title,
     required this.streamUrl,
+    this.fallbackUrl = '',
     required this.headers,
     this.initialPosition,
     this.initialAudioTrackOrderIndex,
@@ -4984,6 +4987,18 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
 
   Future<void> _handlePlaybackError() async {
     if (!mounted || _tryingFallback) return;
+    // 1) If an AList direct proxy fallback URL (`/d/<path>?sign=...`) is available and we haven't tried it yet,
+    //    switch to it so AList generates a fresh 302 redirect (critical for iOS / macOS / 115 raw_url 403).
+    if (widget.fallbackUrl.isNotEmpty && _activeUrl != widget.fallbackUrl) {
+      final position = _player.state.position;
+      setState(() {
+        _activeUrl = widget.fallbackUrl;
+      });
+      try {
+        await _openActiveStream(position: position);
+        return;
+      } catch (_) {}
+    }
     final fallback = widget.fallback115;
     if (fallback != null && !_triedFallback) {
       _triedFallback = true;
@@ -5034,8 +5049,13 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
         'vd-lavc-skiploopfilter': 'nonref',
         'vd-lavc-threads': '0',
         'ad-lavc-threads': '0',
+        'ad-lavc-downmix': 'yes',
+        'audio-channels': 'stereo',
+        'hr-seek-framedrop': 'yes',
         'framedrop': 'vo',
         'demuxer-thread': 'yes',
+        'demuxer-lavf-probesize': '131072',
+        'demuxer-lavf-analyzeduration': '0.5',
         'cache': 'yes',
         'cache-on-disk': 'no',
         'cache-secs': isMobileOrTv ? '90' : '180',
@@ -5146,6 +5166,7 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
     await _player.pause();
     final res = await TvPlatformService.openNativeExoPlayer(
       streamUrl: _activeUrl,
+      fallbackUrl: widget.fallbackUrl,
       title: widget.title,
       headers: _activeHeaders,
       startPositionMs: curMs,

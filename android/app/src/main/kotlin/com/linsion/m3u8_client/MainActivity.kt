@@ -12,6 +12,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Bitmap
@@ -32,9 +33,11 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.os.SystemClock
+import android.view.GestureDetector
 import android.view.Gravity
 import android.view.View
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.ViewGroup
@@ -42,6 +45,7 @@ import android.view.Window
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.app.ActivityCompat
@@ -115,6 +119,7 @@ class MainActivity : FlutterActivity() {
     private var activeQrDialog: Dialog? = null
     private var activeExoDialog: Dialog? = null
     private var activeExoPlayer: ExoPlayer? = null
+    private var savedExoOrientation: Int? = null
     private var pendingTapPayload: Map<String, Any>? = null
 
     private var mediaSession: MediaSession? = null
@@ -1145,6 +1150,13 @@ class MainActivity : FlutterActivity() {
             activeExoDialog?.dismiss()
         } catch (_: Exception) {}
         activeExoDialog = null
+        val prevOrientation = savedExoOrientation
+        if (prevOrientation != null) {
+            savedExoOrientation = null
+            try {
+                requestedOrientation = prevOrientation
+            } catch (_: Exception) {}
+        }
     }
 
     @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
@@ -1387,7 +1399,48 @@ class MainActivity : FlutterActivity() {
             }
             root.addView(playerView)
 
-            // High-visibility Android TV D-Pad focus styling so users always see which top bar or dialog button is selected!
+            // High-visibility Android TV & Mobile focus/touch styling
+            val isTv = isAndroidTvDevice()
+            var normalPlaybackSpeed = 1.0f
+            var isLongPressFastForward = false
+            var currentResizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+
+            fun formatClockMs(ms: Long): String {
+                val totalSec = (ms / 1000L).coerceAtLeast(0L)
+                val h = totalSec / 3600L
+                val m = (totalSec % 3600L) / 60L
+                val s = totalSec % 60L
+                return if (h > 0L) {
+                    String.format("%02d:%02d:%02d", h, m, s)
+                } else {
+                    String.format("%02d:%02d", m, s)
+                }
+            }
+
+            // Floating HUD pill for 3.0x long-press fast-forward and horizontal touch / D-Pad continuous seek
+            val gestureHudBadge = TextView(this).apply {
+                textSize = 13.5f
+                setTextColor(Color.WHITE)
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                setPadding(32, 14, 32, 14)
+                visibility = View.GONE
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.RECTANGLE
+                    cornerRadius = 28f
+                    setColor(Color.argb(225, 13, 24, 36))
+                    setStroke(2, Color.rgb(56, 189, 248))
+                }
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                ).apply {
+                    topMargin = if (isTv) 110 else 135
+                }
+            }
+            root.addView(gestureHudBadge)
+
             fun styleTvFocusableButton(
                 btn: Button,
                 normalBgColor: Int,
@@ -1426,13 +1479,13 @@ class MainActivity : FlutterActivity() {
                 }
             }
 
-            // Top bar with video title, audio track pop-up list button, soft-audio fallback button, and Exit button
+            // Top bar with video title + horizontally scrollable action buttons (responsive for both Phone & TV)
             val topBar = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 clipChildren = false
                 clipToPadding = false
-                setPadding(36, 24, 36, 20)
+                setPadding(if (isTv) 36 else 20, if (isTv) 24 else 18, if (isTv) 36 else 20, 16)
                 background = GradientDrawable(
                     GradientDrawable.Orientation.TOP_BOTTOM,
                     intArrayOf(Color.argb(225, 0, 0, 0), Color.TRANSPARENT)
@@ -1445,11 +1498,11 @@ class MainActivity : FlutterActivity() {
             }
 
             val badgeView = TextView(this).apply {
-                text = "ExoPlayer 零拷贝硬解"
-                textSize = 11.5f
+                text = if (isTv) "ExoPlayer 零拷贝硬解" else "Exo硬解"
+                textSize = 11f
                 setTextColor(Color.WHITE)
                 typeface = Typeface.DEFAULT_BOLD
-                setPadding(18, 6, 18, 6)
+                setPadding(14, 5, 14, 5)
                 background = GradientDrawable().apply {
                     setColor(Color.rgb(2, 132, 199))
                     cornerRadius = 12f
@@ -1459,13 +1512,35 @@ class MainActivity : FlutterActivity() {
 
             val titleView = TextView(this).apply {
                 text = "  $title"
-                textSize = 15f
+                textSize = if (isTv) 15f else 13.5f
                 setTextColor(Color.WHITE)
                 typeface = Typeface.DEFAULT_BOLD
                 maxLines = 1
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    rightMargin = 10
+                }
             }
             topBar.addView(titleView)
+
+            val actionsScroll = HorizontalScrollView(this).apply {
+                isHorizontalScrollBarEnabled = false
+                clipChildren = false
+                clipToPadding = false
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                )
+            }
+            val actionsRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                clipChildren = false
+                clipToPadding = false
+                setPadding(4, 4, 4, 4)
+            }
+            actionsScroll.addView(actionsRow)
+            topBar.addView(actionsScroll)
 
             data class AudioTrackChoice(
                 val orderIndex: Int,
@@ -1586,18 +1661,23 @@ class MainActivity : FlutterActivity() {
                 return list
             }
 
+            val btnHPadding = if (isTv) 22 else 16
+            val btnVPadding = if (isTv) 10 else 8
+            val btnTextSize = if (isTv) 12.5f else 11.5f
+            val btnMargin = if (isTv) 14 else 10
+
             val audioTrackBtn = Button(this).apply {
                 id = View.generateViewId()
                 text = "🔊 音轨: 自动 ▾"
-                textSize = 13f
+                textSize = btnTextSize
                 setTextColor(Color.WHITE)
                 typeface = Typeface.DEFAULT_BOLD
-                setPadding(24, 10, 24, 10)
+                setPadding(btnHPadding, btnVPadding, btnHPadding, btnVPadding)
                 layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
                 ).apply {
-                    rightMargin = 18
+                    rightMargin = btnMargin
                 }
             }
             styleTvFocusableButton(
@@ -1605,20 +1685,113 @@ class MainActivity : FlutterActivity() {
                 normalBgColor = Color.argb(215, 30, 64, 175),
                 focusedBgColor = Color.rgb(3, 105, 161)
             )
-            topBar.addView(audioTrackBtn)
+            actionsRow.addView(audioTrackBtn)
 
-            val mpvFallbackBtn = Button(this).apply {
+            val aspectRatioBtn = Button(this).apply {
                 id = View.generateViewId()
-                text = "⚡ 切换全能软解音轨"
-                textSize = 13f
+                text = "📺 比例:适应"
+                textSize = btnTextSize
                 setTextColor(Color.WHITE)
                 typeface = Typeface.DEFAULT_BOLD
-                setPadding(24, 10, 24, 10)
+                setPadding(btnHPadding, btnVPadding, btnHPadding, btnVPadding)
                 layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
                 ).apply {
-                    rightMargin = 18
+                    rightMargin = btnMargin
+                }
+                setOnClickListener {
+                    currentResizeMode = when (currentResizeMode) {
+                        AspectRatioFrameLayout.RESIZE_MODE_FIT -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                        AspectRatioFrameLayout.RESIZE_MODE_ZOOM -> AspectRatioFrameLayout.RESIZE_MODE_FILL
+                        else -> AspectRatioFrameLayout.RESIZE_MODE_FIT
+                    }
+                    playerView.resizeMode = currentResizeMode
+                    text = when (currentResizeMode) {
+                        AspectRatioFrameLayout.RESIZE_MODE_ZOOM -> "📺 比例:铺满"
+                        AspectRatioFrameLayout.RESIZE_MODE_FILL -> "📺 比例:拉伸"
+                        else -> "📺 比例:适应"
+                    }
+                    playerView.showController()
+                }
+            }
+            styleTvFocusableButton(
+                btn = aspectRatioBtn,
+                normalBgColor = Color.argb(215, 30, 41, 59),
+                focusedBgColor = Color.rgb(2, 132, 199)
+            )
+            actionsRow.addView(aspectRatioBtn)
+
+            val speedBtn = Button(this).apply {
+                id = View.generateViewId()
+                text = "⏩ 倍速 1.0x ▾"
+                textSize = btnTextSize
+                setTextColor(Color.WHITE)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(btnHPadding, btnVPadding, btnHPadding, btnVPadding)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    rightMargin = btnMargin
+                }
+            }
+            styleTvFocusableButton(
+                btn = speedBtn,
+                normalBgColor = Color.argb(215, 30, 41, 59),
+                focusedBgColor = Color.rgb(2, 132, 199)
+            )
+            actionsRow.addView(speedBtn)
+
+            var orientationBtn: Button? = null
+            if (!isTv) {
+                val rotBtn = Button(this).apply {
+                    id = View.generateViewId()
+                    text = "🔄 横竖屏"
+                    textSize = btnTextSize
+                    setTextColor(Color.WHITE)
+                    typeface = Typeface.DEFAULT_BOLD
+                    setPadding(btnHPadding, btnVPadding, btnHPadding, btnVPadding)
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        rightMargin = btnMargin
+                    }
+                    setOnClickListener {
+                        if (savedExoOrientation == null) {
+                            savedExoOrientation = requestedOrientation
+                        }
+                        val isCurrentlyLandscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+                        requestedOrientation = if (isCurrentlyLandscape) {
+                            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                        } else {
+                            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                        }
+                        playerView.showController()
+                    }
+                }
+                styleTvFocusableButton(
+                    btn = rotBtn,
+                    normalBgColor = Color.argb(215, 30, 41, 59),
+                    focusedBgColor = Color.rgb(2, 132, 199)
+                )
+                actionsRow.addView(rotBtn)
+                orientationBtn = rotBtn
+            }
+
+            val mpvFallbackBtn = Button(this).apply {
+                id = View.generateViewId()
+                text = if (isTv) "⚡ 切换全能软解音轨" else "⚡ 切MPV软解"
+                textSize = btnTextSize
+                setTextColor(Color.WHITE)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(btnHPadding, btnVPadding, btnHPadding, btnVPadding)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    rightMargin = btnMargin
                 }
                 setOnClickListener {
                     finishWithCurrentPos("FALLBACK_MPV_SOFT_AUDIO")
@@ -1630,15 +1803,15 @@ class MainActivity : FlutterActivity() {
                 normalBgColor = Color.argb(215, 15, 118, 110),
                 focusedBgColor = Color.rgb(13, 148, 136)
             )
-            topBar.addView(mpvFallbackBtn)
+            actionsRow.addView(mpvFallbackBtn)
 
             val closeBtn = Button(this).apply {
                 id = View.generateViewId()
-                text = "✕ 退出播放"
-                textSize = 13f
+                text = if (isTv) "✕ 退出播放" else "✕ 退出"
+                textSize = btnTextSize
                 setTextColor(Color.WHITE)
                 typeface = Typeface.DEFAULT_BOLD
-                setPadding(24, 10, 24, 10)
+                setPadding(btnHPadding, btnVPadding, btnHPadding, btnVPadding)
                 setOnClickListener {
                     finishWithCurrentPos()
                     dismissNativeExoPlayerDialog()
@@ -1649,18 +1822,102 @@ class MainActivity : FlutterActivity() {
                 normalBgColor = Color.argb(215, 51, 65, 85),
                 focusedBgColor = Color.rgb(185, 28, 28)
             )
-            topBar.addView(closeBtn)
+            actionsRow.addView(closeBtn)
 
             // Explicit D-Pad focus graph between top bar buttons and PlayerView
-            audioTrackBtn.nextFocusRightId = mpvFallbackBtn.id
-            audioTrackBtn.nextFocusLeftId = audioTrackBtn.id
-            audioTrackBtn.nextFocusDownId = playerView.id
-            mpvFallbackBtn.nextFocusLeftId = audioTrackBtn.id
-            mpvFallbackBtn.nextFocusRightId = closeBtn.id
-            mpvFallbackBtn.nextFocusDownId = playerView.id
-            closeBtn.nextFocusLeftId = mpvFallbackBtn.id
-            closeBtn.nextFocusRightId = closeBtn.id
-            closeBtn.nextFocusDownId = playerView.id
+            val topButtons = listOfNotNull(audioTrackBtn, aspectRatioBtn, speedBtn, orientationBtn, mpvFallbackBtn, closeBtn)
+            for (i in topButtons.indices) {
+                val btn = topButtons[i]
+                btn.nextFocusLeftId = if (i > 0) topButtons[i - 1].id else btn.id
+                btn.nextFocusRightId = if (i < topButtons.lastIndex) topButtons[i + 1].id else btn.id
+                btn.nextFocusDownId = playerView.id
+            }
+
+            fun showSpeedListDialog() {
+                val speeds = listOf(
+                    0.75f to "0.75x 慢速",
+                    1.0f to "1.0x 正常速度",
+                    1.25f to "1.25x 轻快",
+                    1.5f to "1.5x 快速",
+                    2.0f to "2.0x 倍速",
+                    3.0f to "3.0x 极速"
+                )
+                val dm = resources.displayMetrics
+                val dialogW = (dm.widthPixels * 0.85f).toInt().coerceAtMost(640)
+                val pickerDialog = Dialog(this, android.R.style.Theme_Translucent_NoTitleBar_Fullscreen)
+                val overlayRoot = FrameLayout(this).apply {
+                    setBackgroundColor(Color.argb(190, 0, 0, 0))
+                    setOnClickListener { pickerDialog.dismiss() }
+                }
+                val card = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(34, 28, 34, 28)
+                    clipChildren = false
+                    clipToPadding = false
+                    background = GradientDrawable().apply {
+                        shape = GradientDrawable.RECTANGLE
+                        cornerRadius = 26f
+                        setColor(Color.rgb(15, 23, 42))
+                        setStroke(2, Color.argb(110, 56, 189, 248))
+                    }
+                    layoutParams = FrameLayout.LayoutParams(
+                        dialogW,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        Gravity.CENTER
+                    )
+                    isClickable = true
+                }
+                val headerTitle = TextView(this).apply {
+                    text = "选择播放倍速 (长按画面可临时 3.0x 快进)"
+                    textSize = if (isTv) 17f else 15.5f
+                    setTextColor(Color.WHITE)
+                    typeface = Typeface.DEFAULT_BOLD
+                    setPadding(4, 0, 4, 16)
+                }
+                card.addView(headerTitle)
+
+                var initialFocusBtn: Button? = null
+                for ((spd, label) in speeds) {
+                    val isCurrent = kotlin.math.abs(normalPlaybackSpeed - spd) < 0.01f
+                    val itemBtn = Button(this).apply {
+                        text = (if (isCurrent) "● [当前]  " else "    ") + label
+                        textSize = 14f
+                        setTextColor(Color.WHITE)
+                        typeface = if (isCurrent) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+                        gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                        setPadding(24, 14, 24, 14)
+                        layoutParams = LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.WRAP_CONTENT
+                        ).apply {
+                            bottomMargin = 10
+                        }
+                        setOnClickListener {
+                            pickerDialog.dismiss()
+                            normalPlaybackSpeed = spd
+                            exoPlayer.setPlaybackSpeed(spd)
+                            speedBtn.text = "⏩ 倍速 ${spd}x ▾"
+                        }
+                    }
+                    styleTvFocusableButton(
+                        btn = itemBtn,
+                        normalBgColor = if (isCurrent) Color.argb(230, 30, 64, 175) else Color.argb(210, 30, 41, 59),
+                        focusedBgColor = Color.rgb(2, 132, 199)
+                    )
+                    if (isCurrent || initialFocusBtn == null) {
+                        initialFocusBtn = itemBtn
+                    }
+                    card.addView(itemBtn)
+                }
+                overlayRoot.addView(card)
+                pickerDialog.setContentView(overlayRoot)
+                pickerDialog.show()
+                initialFocusBtn?.post { initialFocusBtn?.requestFocus() }
+            }
+
+            speedBtn.setOnClickListener {
+                showSpeedListDialog()
+            }
 
             fun selectAudioChoice(choice: AudioTrackChoice) {
                 trackSelector.setParameters(
@@ -1680,6 +1937,10 @@ class MainActivity : FlutterActivity() {
                     dismissNativeExoPlayerDialog()
                     return
                 }
+                val dm = resources.displayMetrics
+                val dialogW = (dm.widthPixels * 0.92f).toInt().coerceAtMost(920)
+                val listMaxH = (dm.heightPixels * 0.56f).toInt().coerceIn(240, 540)
+
                 val pickerDialog = Dialog(this, android.R.style.Theme_Translucent_NoTitleBar_Fullscreen)
                 val overlayRoot = FrameLayout(this).apply {
                     setBackgroundColor(Color.argb(190, 0, 0, 0))
@@ -1687,7 +1948,7 @@ class MainActivity : FlutterActivity() {
                 }
                 val card = LinearLayout(this).apply {
                     orientation = LinearLayout.VERTICAL
-                    setPadding(42, 34, 42, 34)
+                    setPadding(if (isTv) 42 else 26, if (isTv) 34 else 24, if (isTv) 42 else 26, if (isTv) 34 else 24)
                     clipChildren = false
                     clipToPadding = false
                     background = GradientDrawable().apply {
@@ -1697,7 +1958,7 @@ class MainActivity : FlutterActivity() {
                         setStroke(2, Color.argb(110, 56, 189, 248))
                     }
                     layoutParams = FrameLayout.LayoutParams(
-                        920,
+                        dialogW,
                         ViewGroup.LayoutParams.WRAP_CONTENT,
                         Gravity.CENTER
                     )
@@ -1705,8 +1966,12 @@ class MainActivity : FlutterActivity() {
                 }
 
                 val headerTitle = TextView(this).apply {
-                    text = "选择音轨 / 声道 (遥控器上下键移动高亮，确认键切换)"
-                    textSize = 18f
+                    text = if (isTv) {
+                        "选择音轨 / 声道 (遥控器上下键移动高亮，确认键切换)"
+                    } else {
+                        "选择音轨 / 声道 (点击即可切换 · 全格式有声播放)"
+                    }
+                    textSize = if (isTv) 18f else 15.5f
                     setTextColor(Color.WHITE)
                     typeface = Typeface.DEFAULT_BOLD
                     setPadding(4, 0, 4, 8)
@@ -1715,23 +1980,23 @@ class MainActivity : FlutterActivity() {
 
                 val headerSub = TextView(this).apply {
                     text = "提示：已内置 TVBox 级 FFmpeg + Media3 混音软硬解双引擎，所有 TrueHD 7.1 / DTS-HD / 杜比 5.1 音轨均可直接切换有声播放"
-                    textSize = 12.5f
+                    textSize = if (isTv) 12.5f else 11.5f
                     setTextColor(Color.argb(195, 226, 232, 240))
-                    setPadding(4, 0, 4, 20)
+                    setPadding(4, 0, 4, 16)
                 }
                 card.addView(headerSub)
 
                 val scrollView = android.widget.ScrollView(this).apply {
                     layoutParams = LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
-                        540
+                        listMaxH
                     )
                 }
                 val listLayout = LinearLayout(this).apply {
                     orientation = LinearLayout.VERTICAL
                     clipChildren = false
                     clipToPadding = false
-                    setPadding(8, 8, 8, 8)
+                    setPadding(6, 6, 6, 6)
                 }
 
                 var initialFocusBtn: Button? = null
@@ -1743,17 +2008,17 @@ class MainActivity : FlutterActivity() {
                     val nameSuffix = if (rawName.isNotEmpty() && !choice.label.contains(rawName)) " ($rawName)" else ""
 
                     val itemBtn = Button(this).apply {
-                        text = "$prefix#${choice.orderIndex + 1}  ${choice.label}$nameSuffix    ·    $statusBadge"
-                        textSize = 14f
+                        text = "$prefix#${choice.orderIndex + 1}  ${choice.label}$nameSuffix  ·  $statusBadge"
+                        textSize = if (isTv) 14f else 12.5f
                         setTextColor(Color.WHITE)
                         typeface = if (isCurrent) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
                         gravity = Gravity.START or Gravity.CENTER_VERTICAL
-                        setPadding(28, 18, 28, 18)
+                        setPadding(if (isTv) 28 else 18, if (isTv) 18 else 14, if (isTv) 28 else 18, if (isTv) 18 else 14)
                         layoutParams = LinearLayout.LayoutParams(
                             ViewGroup.LayoutParams.MATCH_PARENT,
                             ViewGroup.LayoutParams.WRAP_CONTENT
                         ).apply {
-                            bottomMargin = 14
+                            bottomMargin = 12
                         }
                         setOnClickListener {
                             pickerDialog.dismiss()
@@ -1774,16 +2039,16 @@ class MainActivity : FlutterActivity() {
 
                 val softSwitchBtn = Button(this).apply {
                     text = "⚡ 切换至备用 MPV 播放器内核"
-                    textSize = 13.5f
+                    textSize = if (isTv) 13.5f else 12.5f
                     setTextColor(Color.WHITE)
                     typeface = Typeface.DEFAULT_BOLD
                     gravity = Gravity.CENTER
-                    setPadding(24, 16, 24, 16)
+                    setPadding(22, 14, 22, 14)
                     layoutParams = LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.WRAP_CONTENT
                     ).apply {
-                        topMargin = 6
+                        topMargin = 4
                     }
                     setOnClickListener {
                         pickerDialog.dismiss()
@@ -1820,9 +2085,104 @@ class MainActivity : FlutterActivity() {
                 }
             )
 
+            // Mobile Touch Gestures on PlayerView:
+            // - Double-tap: toggle Play/Pause
+            // - Long-press: temporary 3.0x fast-forward (release to restore normalPlaybackSpeed)
+            // - Horizontal drag: scrub progress with live timestamp preview badge
+            var isTouchHorizontalSeeking = false
+            var touchSeekStartMs = 0L
+            var touchSeekPreviewMs = 0L
+            val touchGestureDetector = GestureDetector(
+                this,
+                object : GestureDetector.SimpleOnGestureListener() {
+                    override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                        if (playerView.isControllerFullyVisible) {
+                            playerView.hideController()
+                        } else {
+                            playerView.showController()
+                        }
+                        return true
+                    }
+
+                    override fun onDoubleTap(e: MotionEvent): Boolean {
+                        if (exoPlayer.isPlaying) {
+                            exoPlayer.pause()
+                        } else {
+                            exoPlayer.play()
+                        }
+                        playerView.showController()
+                        return true
+                    }
+
+                    override fun onLongPress(e: MotionEvent) {
+                        if (isTouchHorizontalSeeking) return
+                        isLongPressFastForward = true
+                        exoPlayer.setPlaybackSpeed(3.0f)
+                        gestureHudBadge.text = "⚡ 3.0x 倍速快进中 (松手恢复)"
+                        gestureHudBadge.visibility = View.VISIBLE
+                    }
+
+                    override fun onScroll(
+                        e1: MotionEvent?,
+                        e2: MotionEvent,
+                        distanceX: Float,
+                        distanceY: Float
+                    ): Boolean {
+                        if (e1 == null || isLongPressFastForward) return false
+                        val totalDx = e2.x - e1.x
+                        val totalDy = e2.y - e1.y
+                        if (!isTouchHorizontalSeeking) {
+                            if (e1.x <= 48f) return false
+                            if (kotlin.math.abs(totalDx) > 36f && kotlin.math.abs(totalDx) > kotlin.math.abs(totalDy) * 1.5f) {
+                                isTouchHorizontalSeeking = true
+                                touchSeekStartMs = exoPlayer.currentPosition.coerceAtLeast(0L)
+                                touchSeekPreviewMs = touchSeekStartMs
+                            }
+                        }
+                        if (isTouchHorizontalSeeking) {
+                            val durMs = exoPlayer.duration.takeIf { it > 0L } ?: 3600_000L
+                            val viewW = playerView.width.coerceAtLeast(320).toFloat()
+                            val spanMs = durMs.coerceIn(90_000L, 300_000L)
+                            val deltaMs = ((totalDx / viewW) * spanMs).toLong()
+                            touchSeekPreviewMs = (touchSeekStartMs + deltaMs).coerceIn(0L, durMs)
+                            val diffSec = (touchSeekPreviewMs - touchSeekStartMs) / 1000L
+                            val sign = if (diffSec >= 0L) "+" else ""
+                            val dirIcon = if (diffSec >= 0L) "⏩ 快进" else "⏪ 快退"
+                            gestureHudBadge.text = "$dirIcon  ${formatClockMs(touchSeekPreviewMs)} / ${formatClockMs(durMs)} ($sign${diffSec}秒)"
+                            gestureHudBadge.visibility = View.VISIBLE
+                            return true
+                        }
+                        return false
+                    }
+                }
+            )
+
+            playerView.setOnTouchListener { _, event ->
+                val handled = touchGestureDetector.onTouchEvent(event)
+                if (event.action == MotionEvent.ACTION_UP || event.action == MotionEvent.ACTION_CANCEL) {
+                    if (isLongPressFastForward) {
+                        isLongPressFastForward = false
+                        exoPlayer.setPlaybackSpeed(normalPlaybackSpeed)
+                        gestureHudBadge.visibility = View.GONE
+                    }
+                    if (isTouchHorizontalSeeking) {
+                        isTouchHorizontalSeeking = false
+                        gestureHudBadge.visibility = View.GONE
+                        exoPlayer.seekTo(touchSeekPreviewMs)
+                        playerView.showController()
+                    }
+                }
+                handled
+            }
+
             dialog.setOnKeyListener { _, keyCode, event ->
+                if (event.action == KeyEvent.ACTION_UP) {
+                    if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) {
+                        gestureHudBadge.visibility = View.GONE
+                    }
+                }
                 if (event.action == KeyEvent.ACTION_DOWN) {
-                    val topBarHasFocus = audioTrackBtn.hasFocus() || mpvFallbackBtn.hasFocus() || closeBtn.hasFocus()
+                    val topBarHasFocus = topButtons.any { it.hasFocus() }
                     when (keyCode) {
                         KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_ESCAPE -> {
                             if (playerView.isControllerFullyVisible) {
@@ -1854,8 +2214,19 @@ class MainActivity : FlutterActivity() {
                             }
                         }
                         KeyEvent.KEYCODE_DPAD_LEFT -> {
-                            if (!playerView.isControllerFullyVisible) {
-                                exoPlayer.seekBack()
+                            if (!playerView.isControllerFullyVisible || !topBarHasFocus) {
+                                val stepMs = when {
+                                    event.repeatCount > 25 -> 60_000L
+                                    event.repeatCount > 8 -> 30_000L
+                                    else -> 15_000L
+                                }
+                                val durMs = exoPlayer.duration.takeIf { it > 0L } ?: Long.MAX_VALUE
+                                val targetMs = (exoPlayer.currentPosition - stepMs).coerceIn(0L, durMs)
+                                exoPlayer.seekTo(targetMs)
+                                if (event.repeatCount > 0 && durMs != Long.MAX_VALUE) {
+                                    gestureHudBadge.text = "⏪ 快退  ${formatClockMs(targetMs)} / ${formatClockMs(durMs)}"
+                                    gestureHudBadge.visibility = View.VISIBLE
+                                }
                                 playerView.showController()
                                 true
                             } else {
@@ -1863,8 +2234,19 @@ class MainActivity : FlutterActivity() {
                             }
                         }
                         KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                            if (!playerView.isControllerFullyVisible) {
-                                exoPlayer.seekForward()
+                            if (!playerView.isControllerFullyVisible || !topBarHasFocus) {
+                                val stepMs = when {
+                                    event.repeatCount > 25 -> 60_000L
+                                    event.repeatCount > 8 -> 30_000L
+                                    else -> 15_000L
+                                }
+                                val durMs = exoPlayer.duration.takeIf { it > 0L } ?: Long.MAX_VALUE
+                                val targetMs = (exoPlayer.currentPosition + stepMs).coerceIn(0L, durMs)
+                                exoPlayer.seekTo(targetMs)
+                                if (event.repeatCount > 0 && durMs != Long.MAX_VALUE) {
+                                    gestureHudBadge.text = "⏩ 快进  ${formatClockMs(targetMs)} / ${formatClockMs(durMs)}"
+                                    gestureHudBadge.visibility = View.VISIBLE
+                                }
                                 playerView.showController()
                                 true
                             } else {

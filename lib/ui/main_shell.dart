@@ -3832,6 +3832,8 @@ class _FloatingMiniPlayerOverlayState
         'framedrop': 'vo',
         'vd-lavc-threads': '0',
         'ad-lavc-threads': '0',
+        'ad-lavc-downmix': 'yes',
+        'audio-channels': 'stereo',
         'demuxer-lavf-probesize': '524288',
         'demuxer-lavf-analyzeduration': '0',
         'network-timeout': '15',
@@ -3921,7 +3923,7 @@ class _FloatingMiniPlayerOverlayState
       final ua =
           headers['User-Agent'] ??
           headers['user-agent'] ??
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 115Browser/27.0.5.7';
       await platform.setProperty('user-agent', ua);
       final ref =
           headers['Referer'] ?? headers['referer'] ?? headers['Referrer'] ?? '';

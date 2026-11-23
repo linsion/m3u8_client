@@ -590,6 +590,9 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         'framedrop': 'vo',
         'vd-lavc-threads': '0',
         'ad-lavc-threads': '0',
+        'ad-lavc-downmix': 'yes',
+        'audio-channels': 'stereo',
+        'hr-seek-framedrop': 'yes',
         'demuxer-lavf-probesize': '131072',
         'demuxer-lavf-analyzeduration': '0.5',
         'network-timeout': '15',
@@ -614,7 +617,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       final dynamic platform = _player.platform;
       final ua = headers['User-Agent'] ??
           headers['user-agent'] ??
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 115Browser/27.0.5.7';
       await platform.setProperty('user-agent', ua);
       final referer =
           headers['Referer'] ?? headers['referer'] ?? headers['Referrer'] ?? '';
@@ -628,6 +631,256 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       _usingClientProxy = proxyUrl.isNotEmpty;
       await platform.setProperty('http-proxy', proxyUrl);
     } catch (_) {}
+  }
+
+  Future<void> _openCurrentStreamInNativeExoPlayer() async {
+    if (!Platform.isAndroid || !mounted || _activeStreamUrl.isEmpty) return;
+    final curMs = _player.state.position.inMilliseconds;
+    await _player.pause();
+    final res = await TvPlatformService.openNativeExoPlayer(
+      streamUrl: _activeStreamUrl,
+      title: _resolveCurrent115VideoName(),
+      headers: _activeStreamHeaders,
+      startPositionMs: curMs,
+    );
+    if (!mounted) return;
+    if (res.positionMs > 1000) {
+      await _player.seek(Duration(milliseconds: res.positionMs));
+    }
+    final errStr = res.error ?? '';
+    if (errStr.startsWith('FALLBACK_MPV_SOFT_AUDIO')) {
+      if (errStr.startsWith('FALLBACK_MPV_SOFT_AUDIO:')) {
+        final idx = int.tryParse(
+          errStr.substring('FALLBACK_MPV_SOFT_AUDIO:'.length),
+        );
+        final realTracks = _player.state.tracks.audio
+            .where((t) => t.id != 'auto' && t.id != 'no')
+            .toList();
+        if (idx != null && idx >= 0 && idx < realTracks.length) {
+          await _player.setAudioTrack(realTracks[idx]);
+        }
+      }
+      await _player.play();
+    }
+  }
+
+  String _formatVodAudioTrackLabel(AudioTrack t, int index) {
+    final parts = <String>[];
+    final lang = (t.language ?? '').trim().toLowerCase();
+    final rawTitle = (t.title ?? '').trim();
+    if (rawTitle.contains('国语') ||
+        rawTitle.contains('国配') ||
+        lang.startsWith('cmn')) {
+      parts.add('国语');
+    } else if (rawTitle.contains('粤语') || lang.startsWith('yue')) {
+      parts.add('粤语');
+    } else if (lang.startsWith('zh') ||
+        lang.startsWith('chi') ||
+        lang.startsWith('zho')) {
+      parts.add('中文');
+    } else if (lang.startsWith('en')) {
+      parts.add('英语');
+    } else if (lang.startsWith('ja') || lang.startsWith('jpn')) {
+      parts.add('日语');
+    } else if (lang.startsWith('ko') || lang.startsWith('kor')) {
+      parts.add('韩语');
+    } else if (lang.isNotEmpty && lang != 'und') {
+      parts.add(lang.toUpperCase());
+    } else {
+      parts.add('音轨${index + 1}');
+    }
+    if (rawTitle.isNotEmpty && !parts.any((p) => rawTitle == p)) {
+      parts.add(rawTitle);
+    }
+    final codec = (t.codec ?? '').trim();
+    if (codec.isNotEmpty) {
+      parts.add(codec.toUpperCase());
+    }
+    if ((t.channelscount ?? 0) > 0) {
+      final ch = t.channelscount!;
+      parts.add(
+        ch == 8 ? '7.1' : (ch == 6 ? '5.1' : (ch == 2 ? '2.0' : '${ch}ch')),
+      );
+    }
+    return parts.join(' · ');
+  }
+
+  Future<void> _showVodAudioTrackSelectorDialog() async {
+    final allTracks = _player.state.tracks.audio;
+    final realTracks =
+        allTracks.where((t) => t.id != 'auto' && t.id != 'no').toList();
+    final tracks = realTracks.isNotEmpty ? realTracks : allTracks;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setDialogState) {
+            final current = _player.state.track.audio;
+            return AlertDialog(
+              backgroundColor: VideoPlatformTheme.bgElevated,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(18),
+                side: BorderSide(
+                  color: VideoPlatformTheme.accent.withValues(alpha: 0.45),
+                ),
+              ),
+              title: Row(
+                children: [
+                  Icon(
+                    Icons.surround_sound_rounded,
+                    color: VideoPlatformTheme.accent,
+                    size: 22,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      '选择音轨 / 声道 (共 ${tracks.length} 条 · 全格式软解混音)',
+                      style: const TextStyle(
+                        fontSize: 15.5,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              content: SizedBox(
+                width: 540,
+                child: tracks.isEmpty
+                    ? const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 20),
+                        child: Text('当前视频流仅包含默认音轨，或正在解析音轨列表...'),
+                      )
+                    : ConstrainedBox(
+                        constraints: const BoxConstraints(maxHeight: 400),
+                        child: ListView.separated(
+                          shrinkWrap: true,
+                          itemCount: tracks.length,
+                          separatorBuilder: (_, __) =>
+                              const SizedBox(height: 8),
+                          itemBuilder: (_, idx) {
+                            final t = tracks[idx];
+                            final isSelected = current.id == t.id;
+                            final label = _formatVodAudioTrackLabel(t, idx);
+                            return StatefulBuilder(
+                              builder: (itemCtx, setItemState) {
+                                return InkWell(
+                                  autofocus: isSelected || idx == 0,
+                                  borderRadius: BorderRadius.circular(12),
+                                  onFocusChange: (_) {
+                                    if (itemCtx.mounted) setItemState(() {});
+                                  },
+                                  onTap: () async {
+                                    await _player.setAudioTrack(t);
+                                    if (mounted) {
+                                      setState(
+                                        () => _selectedAudioTrackLabel = label,
+                                      );
+                                    }
+                                    if (ctx.mounted) {
+                                      Navigator.of(ctx).pop();
+                                    }
+                                    _showAdToast('已切换至音轨：$label');
+                                  },
+                                  child: Builder(
+                                    builder: (bCtx) {
+                                      final isFocused =
+                                          Focus.of(bCtx).hasPrimaryFocus;
+                                      return AnimatedContainer(
+                                        duration:
+                                            const Duration(milliseconds: 120),
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 16,
+                                          vertical: 12,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: isFocused
+                                              ? VideoPlatformTheme.accent
+                                              : (isSelected
+                                                  ? VideoPlatformTheme.accent
+                                                      .withValues(alpha: 0.22)
+                                                  : VideoPlatformTheme.bgCard),
+                                          borderRadius:
+                                              BorderRadius.circular(12),
+                                          border: Border.all(
+                                            color: isFocused
+                                                ? const Color(0xFFFFE066)
+                                                : (isSelected
+                                                    ? VideoPlatformTheme.accent
+                                                    : VideoPlatformTheme
+                                                        .borderSubtle),
+                                            width: isFocused ? 2.6 : 1.2,
+                                          ),
+                                        ),
+                                        child: Row(
+                                          children: [
+                                            Icon(
+                                              isSelected
+                                                  ? Icons.check_circle_rounded
+                                                  : Icons.audiotrack_rounded,
+                                              size: 19,
+                                              color: isFocused || isSelected
+                                                  ? Colors.white
+                                                  : VideoPlatformTheme
+                                                      .textSecondary,
+                                            ),
+                                            const SizedBox(width: 10),
+                                            Expanded(
+                                              child: Text(
+                                                '#${idx + 1}  $label',
+                                                style: TextStyle(
+                                                  fontSize: 13.5,
+                                                  fontWeight:
+                                                      isFocused || isSelected
+                                                          ? FontWeight.w700
+                                                          : FontWeight.w500,
+                                                  color: Colors.white,
+                                                ),
+                                              ),
+                                            ),
+                                            if (isSelected)
+                                              Container(
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                  horizontal: 8,
+                                                  vertical: 2,
+                                                ),
+                                                decoration: BoxDecoration(
+                                                  color: Colors.black26,
+                                                  borderRadius:
+                                                      BorderRadius.circular(8),
+                                                ),
+                                                child: const Text(
+                                                  '当前音轨',
+                                                  style: TextStyle(
+                                                    fontSize: 11,
+                                                    fontWeight: FontWeight.w700,
+                                                    color: Colors.white,
+                                                  ),
+                                                ),
+                                              ),
+                                          ],
+                                        ),
+                                      );
+                                    },
+                                  ),
+                                );
+                              },
+                            );
+                          },
+                        ),
+                      ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  child: const Text('关闭'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
   }
 
   void _showAdToast(String message) {
@@ -3005,28 +3258,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                 tooltip: '使用内嵌 ExoPlayer 零拷贝硬解全屏播放',
                                 onPressed: _activeStreamUrl.isEmpty
                                     ? null
-                                    : () async {
-                                        final curMs =
-                                            _player.state.position.inMilliseconds;
-                                        await _player.pause();
-                                        final res = await TvPlatformService
-                                            .openNativeExoPlayer(
-                                              streamUrl: _activeStreamUrl,
-                                              title: _resolveCurrent115VideoName(),
-                                              headers: _activeStreamHeaders,
-                                              startPositionMs: curMs,
-                                            );
-                                        if (!mounted) return;
-                                        if (res.positionMs > 1000) {
-                                          await _player.seek(
-                                            Duration(milliseconds: res.positionMs),
-                                          );
-                                        }
-                                        if (res.error ==
-                                            'FALLBACK_MPV_SOFT_AUDIO') {
-                                          await _player.play();
-                                        }
-                                      },
+                                    : _openCurrentStreamInNativeExoPlayer,
                                 icon: const Icon(
                                   Icons.bolt_rounded,
                                   size: 19,
@@ -3475,32 +3707,16 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                 tooltip: '使用内嵌 ExoPlayer 零拷贝硬解全屏播放',
                                 onPressed: _activeStreamUrl.isEmpty
                                     ? null
-                                    : () async {
-                                        final curMs = _player
-                                            .state.position.inMilliseconds;
-                                        await _player.pause();
-                                        final res = await TvPlatformService
-                                            .openNativeExoPlayer(
-                                              streamUrl: _activeStreamUrl,
-                                              title: _resolveCurrent115VideoName(),
-                                              headers: _activeStreamHeaders,
-                                              startPositionMs: curMs,
-                                            );
-                                        if (!mounted) return;
-                                        if (res.positionMs > 1000) {
-                                          await _player.seek(
-                                            Duration(
-                                              milliseconds: res.positionMs,
-                                            ),
-                                          );
-                                        }
-                                        if (res.error ==
-                                            'FALLBACK_MPV_SOFT_AUDIO') {
-                                          await _player.play();
-                                        }
-                                      },
+                                    : _openCurrentStreamInNativeExoPlayer,
                               ),
                             ],
+                            const SizedBox(width: 10),
+                            _buildTvFocusableControlBtn(
+                              icon: Icons.surround_sound_rounded,
+                              label: '音轨/声道',
+                              tooltip: '弹出列表选择音轨与声道',
+                              onPressed: _showVodAudioTrackSelectorDialog,
+                            ),
                             if (hasMultipleEps) ...[
                               const SizedBox(width: 10),
                               _buildTvFocusableControlBtn(
@@ -4419,6 +4635,24 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                   label: '换源',
                                   tooltip: '跨站点智能切换同名片源',
                                   onPressed: _showCrossSiteSourceSwitchDialog,
+                                ),
+                              ],
+                              const SizedBox(width: 8),
+                              _buildTvFocusableControlBtn(
+                                icon: Icons.surround_sound_rounded,
+                                label: '音轨',
+                                tooltip: '弹出列表选择音轨与声道',
+                                onPressed: _showVodAudioTrackSelectorDialog,
+                              ),
+                              if (Platform.isAndroid) ...[
+                                const SizedBox(width: 8),
+                                _buildTvFocusableControlBtn(
+                                  icon: Icons.bolt_rounded,
+                                  label: 'Exo硬解',
+                                  tooltip: '使用内嵌 ExoPlayer 零拷贝硬解全屏播放',
+                                  onPressed: _activeStreamUrl.isEmpty
+                                      ? null
+                                      : _openCurrentStreamInNativeExoPlayer,
                                 ),
                               ],
                               const SizedBox(width: 8),
@@ -5625,6 +5859,44 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                           },
                         ),
                         const SizedBox(width: 4),
+                        // Audio track pop-up list pill
+                        InkWell(
+                          borderRadius: BorderRadius.circular(12),
+                          onTap: _showVodAudioTrackSelectorDialog,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 7,
+                              vertical: 4,
+                            ),
+                            decoration: BoxDecoration(
+                              color: VideoPlatformTheme.bgCard,
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: VideoPlatformTheme.borderSubtle,
+                              ),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  Icons.surround_sound_rounded,
+                                  size: 13,
+                                  color: VideoPlatformTheme.accent,
+                                ),
+                                const SizedBox(width: 2),
+                                Text(
+                                  '音轨',
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                    color: VideoPlatformTheme.textSecondary,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 4),
                         // Aspect ratio / Fit-Cover quick toggle pill
                         InkWell(
                           borderRadius: BorderRadius.circular(12),
@@ -5820,6 +6092,25 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       child: ListView(
         scrollDirection: Axis.horizontal,
         children: [
+          if (Platform.isAndroid) ...[
+            buildActionPill(
+              icon: Icons.bolt_rounded,
+              label: 'Exo硬解全屏',
+              highlighted: true,
+              activeColor: const Color(0xFF38BDF8),
+              onTap: _activeStreamUrl.isEmpty
+                  ? null
+                  : _openCurrentStreamInNativeExoPlayer,
+            ),
+            const SizedBox(width: 8),
+          ],
+          buildActionPill(
+            icon: Icons.surround_sound_rounded,
+            label: '音轨/声道',
+            highlighted: true,
+            onTap: _showVodAudioTrackSelectorDialog,
+          ),
+          const SizedBox(width: 8),
           buildActionPill(
             icon: Icons.swap_horiz_rounded,
             label: '同片换源',

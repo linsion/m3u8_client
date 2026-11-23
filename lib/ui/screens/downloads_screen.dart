@@ -2107,8 +2107,13 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
         'vd-lavc-skiploopfilter': 'nonref',
         'vd-lavc-threads': '0',
         'ad-lavc-threads': '0',
+        'ad-lavc-downmix': 'yes',
+        'audio-channels': 'stereo',
+        'hr-seek-framedrop': 'yes',
         'framedrop': 'vo',
         'demuxer-thread': 'yes',
+        'demuxer-lavf-probesize': '131072',
+        'demuxer-lavf-analyzeduration': '0.5',
         'cache': 'yes',
         'cache-on-disk': 'no',
         'cache-secs': isMobileOrTv ? '90' : '150',
@@ -2119,6 +2124,17 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
       };
       for (final entry in props.entries) {
         await platform.setProperty(entry.key, entry.value);
+      }
+      final ua = widget.headers['User-Agent'] ??
+          widget.headers['user-agent'] ??
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 115Browser/27.0.5.7';
+      await platform.setProperty('user-agent', ua);
+      final referer = widget.headers['Referer'] ??
+          widget.headers['referer'] ??
+          widget.headers['Referrer'] ??
+          '';
+      if (referer.isNotEmpty) {
+        await platform.setProperty('referrer', referer);
       }
     } catch (_) {}
     if (!mounted) return;
@@ -2207,6 +2223,234 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
     if (res.positionMs > 1000) {
       await _player.seek(Duration(milliseconds: res.positionMs));
     }
+    final errStr = res.error ?? '';
+    if (errStr.startsWith('FALLBACK_MPV_SOFT_AUDIO')) {
+      if (errStr.startsWith('FALLBACK_MPV_SOFT_AUDIO:')) {
+        final idx = int.tryParse(
+          errStr.substring('FALLBACK_MPV_SOFT_AUDIO:'.length),
+        );
+        final realTracks = _player.state.tracks.audio
+            .where((t) => t.id != 'auto' && t.id != 'no')
+            .toList();
+        if (idx != null && idx >= 0 && idx < realTracks.length) {
+          await _player.setAudioTrack(realTracks[idx]);
+        }
+      }
+      await _player.play();
+    }
+  }
+
+  String _formatAudioTrackTitle(AudioTrack t, int index) {
+    final parts = <String>[];
+    final lang = (t.language ?? '').trim().toLowerCase();
+    final rawTitle = (t.title ?? '').trim();
+    if (rawTitle.contains('国语') ||
+        rawTitle.contains('国配') ||
+        lang.startsWith('cmn')) {
+      parts.add('国语');
+    } else if (rawTitle.contains('粤语') || lang.startsWith('yue')) {
+      parts.add('粤语');
+    } else if (lang.startsWith('zh') ||
+        lang.startsWith('chi') ||
+        lang.startsWith('zho')) {
+      parts.add('中文');
+    } else if (lang.startsWith('en')) {
+      parts.add('英语');
+    } else if (lang.startsWith('ja') || lang.startsWith('jpn')) {
+      parts.add('日语');
+    } else if (lang.startsWith('ko') || lang.startsWith('kor')) {
+      parts.add('韩语');
+    } else if (lang.isNotEmpty && lang != 'und') {
+      parts.add(lang.toUpperCase());
+    } else {
+      parts.add('音轨${index + 1}');
+    }
+    if (rawTitle.isNotEmpty && !parts.any((p) => rawTitle == p)) {
+      parts.add(rawTitle);
+    }
+    final codec = (t.codec ?? '').trim();
+    if (codec.isNotEmpty) {
+      parts.add(codec.toUpperCase());
+    }
+    if ((t.channelscount ?? 0) > 0) {
+      final ch = t.channelscount!;
+      parts.add(
+        ch == 8 ? '7.1' : (ch == 6 ? '5.1' : (ch == 2 ? '2.0' : '${ch}ch')),
+      );
+    }
+    return parts.join(' · ');
+  }
+
+  Future<void> _showAudioTrackSelectorDialog() async {
+    final allTracks = _player.state.tracks.audio;
+    final realTracks =
+        allTracks.where((t) => t.id != 'auto' && t.id != 'no').toList();
+    final tracks = realTracks.isNotEmpty ? realTracks : allTracks;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setDialogState) {
+            final current = _player.state.track.audio;
+            return AlertDialog(
+              backgroundColor: VideoPlatformTheme.bgElevated,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(18),
+                side: BorderSide(
+                  color: VideoPlatformTheme.accent.withValues(alpha: 0.45),
+                ),
+              ),
+              title: Row(
+                children: [
+                  Icon(
+                    Icons.surround_sound_rounded,
+                    color: VideoPlatformTheme.accent,
+                    size: 22,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      '选择音轨 / 声道 (共 ${tracks.length} 条 · 全格式软解混音)',
+                      style: const TextStyle(
+                        fontSize: 15.5,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              content: SizedBox(
+                width: 540,
+                child: tracks.isEmpty
+                    ? const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 20),
+                        child: Text('当前视频仅包含默认音轨，或正在解析音轨列表...'),
+                      )
+                    : ConstrainedBox(
+                        constraints: const BoxConstraints(maxHeight: 400),
+                        child: ListView.separated(
+                          shrinkWrap: true,
+                          itemCount: tracks.length,
+                          separatorBuilder: (_, __) =>
+                              const SizedBox(height: 8),
+                          itemBuilder: (_, idx) {
+                            final t = tracks[idx];
+                            final isSelected = current.id == t.id;
+                            final label = _formatAudioTrackTitle(t, idx);
+                            return InkWell(
+                              autofocus: isSelected || idx == 0,
+                              borderRadius: BorderRadius.circular(12),
+                              onTap: () async {
+                                await _player.setAudioTrack(t);
+                                if (mounted) setState(() {});
+                                if (ctx.mounted) {
+                                  Navigator.of(ctx).pop();
+                                }
+                              },
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 16,
+                                  vertical: 12,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: isSelected
+                                      ? VideoPlatformTheme.accent
+                                          .withValues(alpha: 0.22)
+                                      : VideoPlatformTheme.bgCard,
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(
+                                    color: isSelected
+                                        ? VideoPlatformTheme.accent
+                                        : VideoPlatformTheme.borderSubtle,
+                                  ),
+                                ),
+                                child: Row(
+                                  children: [
+                                    Icon(
+                                      isSelected
+                                          ? Icons.check_circle_rounded
+                                          : Icons.audiotrack_rounded,
+                                      size: 19,
+                                      color: isSelected
+                                          ? VideoPlatformTheme.accent
+                                          : VideoPlatformTheme.textSecondary,
+                                    ),
+                                    const SizedBox(width: 10),
+                                    Expanded(
+                                      child: Text(
+                                        '#${idx + 1}  $label',
+                                        style: TextStyle(
+                                          fontSize: 13.5,
+                                          fontWeight: isSelected
+                                              ? FontWeight.w700
+                                              : FontWeight.w500,
+                                          color: Colors.white,
+                                        ),
+                                      ),
+                                    ),
+                                    if (isSelected)
+                                      const Text(
+                                        '当前音轨',
+                                        style: TextStyle(
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.w700,
+                                          color: Colors.white,
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  child: const Text('关闭'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    _wakeControls();
+  }
+
+  Widget _buildAudioTrackButton() {
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: _showAudioTrackSelectorDialog,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1E3A8A).withValues(alpha: 0.55),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: const Color(0xFF60A5FA)),
+        ),
+        child: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.surround_sound_rounded,
+              size: 14,
+              color: Color(0xFF93C5FD),
+            ),
+            SizedBox(width: 4),
+            Text(
+              '音轨 ▾',
+              style: TextStyle(
+                fontSize: 11.5,
+                fontWeight: FontWeight.w700,
+                color: Colors.white,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   Widget _buildExoHardwareButton() {
@@ -2709,6 +2953,8 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
                                       _buildExoHardwareButton(),
                                       const SizedBox(width: 6),
                                     ],
+                                    _buildAudioTrackButton(),
+                                    const SizedBox(width: 6),
                                     _buildFitModePill(),
                                     const SizedBox(width: 6),
                                     _buildSpeedPopupPill(),
@@ -2976,6 +3222,8 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
                     _buildExoHardwareButton(),
                     const SizedBox(width: 6),
                   ],
+                  _buildAudioTrackButton(),
+                  const SizedBox(width: 6),
                   _buildFitModePill(),
                   const SizedBox(width: 6),
                   _buildSpeedPopupPill(),
