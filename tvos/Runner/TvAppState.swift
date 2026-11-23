@@ -3475,36 +3475,45 @@ final class TvAppState: ObservableObject {
       self.isResolvingPlay = true
       defer { self.isResolvingPlay = false }
 
-      // For server files, check if 115 Cloud Drive already has this file for instant domestic CDN acceleration
-      if entry.sourceKind == .server, TvLocal115DirectClient.shared.hasLocalCookie {
-        if let resolved115 = await TvLocal115DirectClient.shared.findAndResolveDirectPlayUrl(keywords: [entry.name]) {
-          let serverFallback = self.api.buildFileStreamUrl(path: entry.path)
-          let primary115 = resolved115.directCdnUrl.isEmpty ? resolved115.proxyStreamUrl : resolved115.directCdnUrl
-          self.showToast("⚡ 已从本地直连 115 网盘播放：\(entry.name)")
-          self.playerControlsVisible = true
-          self.playerShowEpisodeDrawer = false
-          self.activePlayback = TvPlaybackRequest(
-            title: entry.name,
-            subtitle: "115 本地直连 · \(entry.formattedSize)",
-            streamUrl: primary115,
-            backupProxyUrl: serverFallback,
-            headers: resolved115.headers,
-            resumeSeconds: 0,
-            isLive: false,
-            vodSource: nil,
-            vodDetail: nil,
-            playGroupIndex: 0,
-            episodeIndex: 0,
-            liveChannel: nil,
-            liveUrlIndex: 0
-          )
+      // 1. Server Media Library files: open immediately with multi-block Range prefetch proxy acceleration (0ms wait, no blocking 115 search)
+      if entry.sourceKind == .server {
+        let rawServerUrl = self.api.buildFileStreamUrl(path: entry.path)
+        guard !rawServerUrl.isEmpty else {
+          self.showToast("⚠️ 无法生成服务端文件播放地址")
           return
         }
+        let ext = entry.normalizedExt
+        let isHls = ext == ".m3u8" || rawServerUrl.lowercased().contains(".m3u8")
+        let primaryUrl = isHls
+          ? rawServerUrl
+          : TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
+              remoteUrl: rawServerUrl,
+              headers: self.api.authHeaders,
+              extHint: ext.isEmpty ? ".mp4" : ext
+            )
+        self.playerControlsVisible = true
+        self.playerShowEpisodeDrawer = false
+        self.activePlayback = TvPlaybackRequest(
+          title: entry.name,
+          subtitle: "流光服务端高速直连 · \(entry.formattedSize)",
+          streamUrl: primaryUrl,
+          backupProxyUrl: rawServerUrl,
+          headers: self.api.authHeaders,
+          resumeSeconds: 0,
+          isLive: false,
+          vodSource: nil,
+          vodDetail: nil,
+          playGroupIndex: 0,
+          episodeIndex: 0,
+          liveChannel: nil,
+          liveUrlIndex: 0
+        )
+        return
       }
 
-      // Direct 115 Cloud Drive playback:
-      // - For non-MP4/MOV containers (.mkv / .avi / .rmvb / .wmv / .flv / .ts), prefer 115 official HLS .m3u8 transcode stream proxied via local HLS server so tvOS AVPlayer decodes seamlessly
-      // - For .mp4 / .mov / .m4v / audio, play the resolved 115 CDN direct link directly with 115 headers (avoiding multi-connection 403 on large tail-moov MP4s), with 115 HLS .m3u8 or local chunked proxy as backup
+      // 2. Direct 115 Cloud Drive playback:
+      // - For .mp4 / .mov / .m4v, resolve ONLY `resolvePickcodeStreamUrl` first (skips unnecessary `files/video` + m3u8 fetch round-trips for instant startup!)
+      // - For non-MP4 containers (.mkv / .avi / .rmvb / .wmv / .flv / .ts), resolve ONLY `resolvePickcodeHlsM3u8Url` first and fall back to `resolvePickcodeStreamUrl` only if needed
       if entry.sourceKind == .cloud115 {
         guard !entry.pickcode115.isEmpty else {
           self.showToast("⚠️ 该 115 文件缺少 pickcode，无法播放")
@@ -3512,42 +3521,63 @@ final class TvAppState: ObservableObject {
         }
         let ext = entry.normalizedExt
         let needsHlsTranscode = [".f4v", ".flv", ".mkv", ".avi", ".rmvb", ".wmv", ".ts", ".webm", ".iso"].contains(ext)
-        async let hlsTask = TvLocal115DirectClient.shared.resolvePickcodeHlsM3u8Url(pickcode: entry.pickcode115)
-        async let directTask = TvLocal115DirectClient.shared.resolvePickcodeStreamUrl(pickcode: entry.pickcode115)
-        let (hlsUrl, directUrl) = await (hlsTask, directTask)
-        let hdrs = TvLocal115DirectClient.shared.streamHeaders(forUrl: directUrl ?? "")
-
-        var proxiedHlsUrl: String? = nil
-        if let hls = hlsUrl, !hls.isEmpty {
-          proxiedHlsUrl = await TvLocalHlsProxyServer.shared.prepareProxyPlaylistUrl(
-            gatewayUrl: hls,
-            resolvedUrl: hls,
-            headers: hdrs
-          ) ?? hls
-        }
 
         var primaryStream = ""
         var backupStream = ""
+        var hdrs: [String: String] = [:]
 
-        if needsHlsTranscode, let phls = proxiedHlsUrl, !phls.isEmpty {
-          primaryStream = phls
-          if let dir = directUrl, !dir.isEmpty {
+        if needsHlsTranscode {
+          if let hls = await TvLocal115DirectClient.shared.resolvePickcodeHlsM3u8Url(pickcode: entry.pickcode115),
+             !hls.isEmpty {
+            hdrs = TvLocal115DirectClient.shared.streamHeaders(forUrl: hls)
+            let phls = await TvLocalHlsProxyServer.shared.prepareProxyPlaylistUrl(
+              gatewayUrl: hls,
+              resolvedUrl: hls,
+              headers: hdrs
+            ) ?? hls
+            primaryStream = phls
+            backupStream = hls
+          } else if let dir = await TvLocal115DirectClient.shared.resolvePickcodeStreamUrl(pickcode: entry.pickcode115),
+                    !dir.isEmpty {
+            hdrs = TvLocal115DirectClient.shared.streamHeaders(forUrl: dir)
+            primaryStream = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
+              remoteUrl: dir,
+              headers: hdrs,
+              extHint: ext
+            )
             backupStream = dir
-          } else {
-            backupStream = hlsUrl ?? phls
           }
-        } else if let dir = directUrl, !dir.isEmpty {
-          if dir.lowercased().contains(".m3u8") {
-            primaryStream = proxiedHlsUrl ?? dir
-            backupStream = dir
-          } else {
-            primaryStream = dir
-            backupStream = proxiedHlsUrl
-              ?? TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(remoteUrl: dir, headers: hdrs, extHint: ext)
+        } else {
+          if let dir = await TvLocal115DirectClient.shared.resolvePickcodeStreamUrl(pickcode: entry.pickcode115),
+             !dir.isEmpty {
+            hdrs = TvLocal115DirectClient.shared.streamHeaders(forUrl: dir)
+            if dir.lowercased().contains(".m3u8") {
+              let phls = await TvLocalHlsProxyServer.shared.prepareProxyPlaylistUrl(
+                gatewayUrl: dir,
+                resolvedUrl: dir,
+                headers: hdrs
+              ) ?? dir
+              primaryStream = phls
+              backupStream = dir
+            } else {
+              primaryStream = dir
+              backupStream = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
+                remoteUrl: dir,
+                headers: hdrs,
+                extHint: ext.isEmpty ? ".mp4" : ext
+              )
+            }
+          } else if let hls = await TvLocal115DirectClient.shared.resolvePickcodeHlsM3u8Url(pickcode: entry.pickcode115),
+                    !hls.isEmpty {
+            hdrs = TvLocal115DirectClient.shared.streamHeaders(forUrl: hls)
+            let phls = await TvLocalHlsProxyServer.shared.prepareProxyPlaylistUrl(
+              gatewayUrl: hls,
+              resolvedUrl: hls,
+              headers: hdrs
+            ) ?? hls
+            primaryStream = phls
+            backupStream = hls
           }
-        } else if let phls = proxiedHlsUrl, !phls.isEmpty {
-          primaryStream = phls
-          backupStream = hlsUrl ?? phls
         }
 
         guard !primaryStream.isEmpty else {
@@ -3584,23 +3614,9 @@ final class TvAppState: ObservableObject {
             fallbackUrl: entry.rawDownloadUrl
           )
           guard !info.url.isEmpty else { return }
-          var primaryUrl = info.url
-          var backupUrl = info.alistProxyUrl != info.url ? info.alistProxyUrl : info.url
-          var playHeaders = info.headers
-
-          // If this AList file is a non-MP4 container (.mkv / .avi / .ts / .rmvb / .flv) and the user has 115 logged in locally,
-          // also check if 115 has an official HLS .m3u8 transcode stream for this file as a seamless fallback
-          let ext = entry.normalizedExt
-          let isNonMp4Container = [".mkv", ".avi", ".rmvb", ".wmv", ".flv", ".ts", ".webm", ".iso"].contains(ext)
-          if isNonMp4Container, TvLocal115DirectClient.shared.hasLocalCookie {
-            if let resolved115 = await TvLocal115DirectClient.shared.findAndResolveDirectPlayUrl(keywords: [entry.name]) {
-              backupUrl = primaryUrl
-              primaryUrl = resolved115.proxyStreamUrl
-              for (k, v) in resolved115.headers {
-                playHeaders[k] = v
-              }
-            }
-          }
+          let primaryUrl = info.url
+          let backupUrl = info.alistProxyUrl != info.url ? info.alistProxyUrl : info.url
+          let playHeaders = info.headers
 
           self.playerControlsVisible = true
           self.playerShowEpisodeDrawer = false

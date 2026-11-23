@@ -1939,6 +1939,8 @@ actor TvHlsSegmentCacheActor {
   private var cacheOrder: [String] = []
   private var inFlight: [String: Task<Data?, Never>] = [:]
   private var slidingWindow: [SegmentEntry] = []
+  private var vodSegmentUrls: [String] = []
+  private var vodSegmentIndexByUrl: [String: Int] = [:]
   private var nextSeqNumber: Int = 1
   private var prefetchTask: Task<Void, Never>? = nil
   private var cachedRewrittenVodPlaylist: String? = nil
@@ -1951,6 +1953,8 @@ actor TvHlsSegmentCacheActor {
     cache.removeAll()
     cacheOrder.removeAll()
     slidingWindow.removeAll()
+    vodSegmentUrls.removeAll()
+    vodSegmentIndexByUrl.removeAll()
     cachedRewrittenVodPlaylist = nil
     nextSeqNumber = 1
     generation &+= 1
@@ -1980,6 +1984,34 @@ actor TvHlsSegmentCacheActor {
   func setCachedVodPlaylist(_ playlist: String, forGen gen: Int) {
     guard gen == generation else { return }
     cachedRewrittenVodPlaylist = playlist
+  }
+
+  func registerVodSegments(_ urls: [String], forGen gen: Int) {
+    guard gen == generation else { return }
+    vodSegmentUrls = urls
+    var indexMap: [String: Int] = [:]
+    indexMap.reserveCapacity(urls.count)
+    for (idx, u) in urls.enumerated() where indexMap[u] == nil {
+      indexMap[u] = idx
+    }
+    vodSegmentIndexByUrl = indexMap
+  }
+
+  func nextVodSegmentsToPrefetch(after url: String, count: Int, gen: Int) -> [String] {
+    guard gen == generation,
+          count > 0,
+          let idx = vodSegmentIndexByUrl[url] else { return [] }
+    let start = idx + 1
+    guard start < vodSegmentUrls.count else { return [] }
+    let end = min(vodSegmentUrls.count, start + count)
+    var out: [String] = []
+    for i in start..<end {
+      let candidate = vodSegmentUrls[i]
+      if cache[candidate] == nil && inFlight[candidate] == nil {
+        out.append(candidate)
+      }
+    }
+    return out
   }
 
   func mergeSlidingSegments(newSegments: [(inf: String, url: String)], forGen gen: Int) -> [SegmentEntry] {
@@ -2030,7 +2062,7 @@ actor TvHlsSegmentCacheActor {
     guard gen == generation, let valid = data, !valid.isEmpty else { return data }
     cache[url] = valid
     cacheOrder.append(url)
-    if cacheOrder.count > 10 {
+    if cacheOrder.count > 24 {
       let old = cacheOrder.removeFirst()
       cache.removeValue(forKey: old)
     }
@@ -3570,10 +3602,10 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
   private var tgVideoMetaCache: [String: (totalSize: Int64, contentType: String, headerChunk: Data, stripPrefixBytes: Int)] = [:]
   private var tgMetaOrder: [String] = []
   private var tgMetaInFlight: [String: Task<(totalSize: Int64, contentType: String, headerChunk: Data, stripPrefixBytes: Int)?, Never>] = [:]
-  private static let tgBlockSize: Int64 = 2_097_152 // 2 MB block size -> 3.43+ MB/s sustained throughput across 6 workers
-  private static let tgMaxCachedBlocks: Int = 36 // 36 x 2 MB = 72 MB shared in-memory LRU stitch cache
-  private static let tgMaxConcurrentPrefetchPerUrl = 3
-  private static let tgLookaheadBlocks = 8
+  private static let tgBlockSize: Int64 = 2_097_152 // 2 MB block size -> high sustained throughput across parallel workers
+  private static let tgMaxCachedBlocks: Int = 48 // 48 x 2 MB = 96 MB shared in-memory LRU stitch cache
+  private static let tgMaxConcurrentPrefetchPerUrl = 6
+  private static let tgLookaheadBlocks = 12
   private var tgBlockCache: [String: Data] = [:]
   private var tgBlockOrder: [String] = []
   private var tgInFlightBlocks: [String: Task<Data?, Never>] = [:]
@@ -4197,6 +4229,27 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       let activeGen = genParam ?? cfg.gen
       let sessionRef = self.preferredSession(for: targetUrl)
       let fallbackSessionRef = self.directUrlSession
+      let storeRef = self.store
+
+      // Lookahead prefetch the next 3 VOD / 115 HLS .ts segments concurrently while serving the current segment
+      let lookaheadUrls = await store.nextVodSegmentsToPrefetch(after: targetUrl, count: 3, gen: activeGen)
+      if !lookaheadUrls.isEmpty {
+        Task.detached(priority: .utility) {
+          for nextUrl in lookaheadUrls {
+            if Task.isCancelled { break }
+            if await storeRef.cachedData(for: nextUrl, gen: activeGen) != nil { continue }
+            _ = await storeRef.fetchOrJoinSegment(url: nextUrl, gen: activeGen) { u, h in
+              await Self.downloadSegmentMultiRange(
+                urlStr: u,
+                headers: h,
+                session: sessionRef,
+                fallbackDirectSession: fallbackSessionRef
+              )
+            }
+          }
+        }
+      }
+
       let data = await store.fetchOrJoinSegment(url: targetUrl, gen: activeGen) { urlStr, hdrs in
         await Self.downloadSegmentMultiRange(
           urlStr: urlStr,
@@ -4347,28 +4400,18 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
   }
 
   private static func readMediaHeader(_ request: URLRequest, session: URLSession) async throws -> (Data, HTTPURLResponse)? {
-    let (stream, response) = try await session.bytes(for: request)
+    let (data, response) = try await session.data(for: request)
     if let http = response as? HTTPURLResponse, http.statusCode == 200,
-       http.expectedContentLength < 0 || http.expectedContentLength > 524288 {
-      stream.task.cancel()
+       http.expectedContentLength < 0 || http.expectedContentLength > 524288 || data.count > 524288 {
       throw MediaHeaderError.rangeUnsupported
     }
     guard let http = response as? HTTPURLResponse,
           http.statusCode == 206 || http.statusCode == 200,
           http.statusCode != 206 || http.value(forHTTPHeaderField: "Content-Range")?.hasPrefix("bytes 0-") == true else {
-      stream.task.cancel()
       return nil
     }
-    var result = Data()
-    result.reserveCapacity(524288)
-    for try await byte in stream {
-      result.append(byte)
-      if result.count == 524288 {
-        stream.task.cancel()
-        break
-      }
-    }
-    return (result, http)
+    let headerSlice = data.count > 524288 ? data.subdata(in: 0..<524288) : data
+    return (headerSlice, http)
   }
 
   private func registerMediaPassthrough(
@@ -4489,7 +4532,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       return
     }
 
-    let allowParallelLookahead = !Self.isDomesticOrLocalUrl(targetUrl) && !meta.contentType.hasPrefix("audio/")
+    let allowParallelLookahead = !meta.contentType.hasPrefix("audio/")
 
     var reqStart: Int64 = 0
     var reqEnd = meta.totalSize - 1
@@ -4673,7 +4716,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     if Self.isDomesticOrLocalUrl(targetUrl) {
       return directUrlSession
     }
-    if targetUrl.contains("/api/telegram/") {
+    if targetUrl.contains("/api/telegram/") || targetUrl.contains("/api/files/") {
       tgLock.lock()
       let preferDirectAt = tgPreferDirectByUrl[targetUrl]
       tgLock.unlock()
@@ -4685,7 +4728,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
   }
 
   private func markTelegramUrlPreferDirect(_ targetUrl: String) {
-    guard targetUrl.contains("/api/telegram/") else { return }
+    guard targetUrl.contains("/api/telegram/") || targetUrl.contains("/api/files/") else { return }
     tgLock.lock()
     guard tgHeadersByUrl[targetUrl] != nil else {
       tgLock.unlock()
@@ -4706,6 +4749,9 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
   ) {
     let blockSize = Self.tgBlockSize
     let maxBlockIndex = max(0, (meta.totalSize - 1) / blockSize)
+    let isDomestic = Self.isDomesticOrLocalUrl(targetUrl)
+    let maxWorkersForTarget = isDomestic ? 2 : Self.tgMaxConcurrentPrefetchPerUrl
+    let lookaheadForTarget = isDomestic ? 3 : Self.tgLookaheadBlocks
 
     tgLock.lock()
     guard tgActiveBackgroundUrl == targetUrl else {
@@ -4733,16 +4779,18 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       candidates.append(playhead + 1)
     }
     // While the active playhead block is still downloading, limit background concurrency to 1 extra block (`playhead + 1`)
-    // so the playhead block finishes with maximum bandwidth; once playhead is cached, unleash all 6 workers across +40 MB!
-    let maxWorkersNow = isPlayheadReady ? Self.tgMaxConcurrentPrefetchPerUrl : 2
+    // so the playhead block finishes with maximum bandwidth; once playhead is cached, unleash parallel workers across the lookahead window!
+    let maxWorkersNow = isPlayheadReady ? maxWorkersForTarget : min(2, maxWorkersForTarget)
     if isPlayheadReady {
-      if playhead <= 1 && maxBlockIndex > playhead + 1 {
+      if !isDomestic && playhead <= 1 && maxBlockIndex > playhead + 1 {
         candidates.append(maxBlockIndex)
       }
-      for offset in 2...Self.tgLookaheadBlocks {
-        let idx = playhead + Int64(offset)
-        if idx <= maxBlockIndex && idx != maxBlockIndex {
-          candidates.append(idx)
+      if lookaheadForTarget >= 2 {
+        for offset in 2...lookaheadForTarget {
+          let idx = playhead + Int64(offset)
+          if idx <= maxBlockIndex && idx != maxBlockIndex {
+            candidates.append(idx)
+          }
         }
       }
     }
@@ -4854,8 +4902,8 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     }
     tgLock.unlock()
 
-    // Self-driving continuation: immediately launch the next 2 MB block in the +40 MB window!
-    if shouldPump && !Self.isDomesticOrLocalUrl(targetUrl) && !meta.contentType.hasPrefix("audio/") {
+    // Self-driving continuation: immediately launch the next 2 MB block in the lookahead window!
+    if shouldPump && !meta.contentType.hasPrefix("audio/") {
       pumpTelegramSlidingWindow(targetUrl: targetUrl, url: url, meta: meta)
     }
   }
@@ -5301,7 +5349,32 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       }
       headerLines.append("#EXT-X-ENDLIST")
       let rewritten = headerLines.joined(separator: "\n") + "\n"
+      let allVodUrls = parsedSegments.map(\.url)
+      await store.registerVodSegments(allVodUrls, forGen: activeGen)
       await store.setCachedVodPlaylist(rewritten, forGen: activeGen)
+
+      // Immediately prefetch the first 3 VOD / 115 HLS segments so AVPlayer starts playback at 0ms without segment wait
+      let initialVodPrefetch = Array(allVodUrls.prefix(3))
+      if !initialVodPrefetch.isEmpty {
+        let sessionRef = self.preferredSession(for: activeStreamUrl)
+        let fallbackSessionRef = self.directUrlSession
+        let storeRef = self.store
+        let pTask = Task {
+          for segUrl in initialVodPrefetch {
+            if Task.isCancelled { break }
+            if await storeRef.cachedData(for: segUrl, gen: activeGen) != nil { continue }
+            _ = await storeRef.fetchOrJoinSegment(url: segUrl, gen: activeGen) { u, h in
+              await Self.downloadSegmentMultiRange(
+                urlStr: u,
+                headers: h,
+                session: sessionRef,
+                fallbackDirectSession: fallbackSessionRef
+              )
+            }
+          }
+        }
+        await store.setPrefetchTask(pTask, forGen: activeGen)
+      }
       return rewritten
     }
 
@@ -10839,9 +10912,37 @@ final class TvSmbClient: @unchecked Sendable {
 
   private let lock = NSLock()
   private var registeredMounts: [String: TvStorageMount] = [:]
+  private var fileHeaderCache: [String: (totalSize: Int64, headerChunk: Data, cachedAt: Date)] = [:]
+  private var fileHeaderOrder: [String] = []
   private var listener: NWListener?
   private(set) var proxyPort: UInt16 = 0
   private let proxyQueue = DispatchQueue(label: "tv.liuguang.smb.proxy", qos: .userInitiated, attributes: .concurrent)
+
+  private func cachedSmbHeader(for key: String) -> (totalSize: Int64, headerChunk: Data)? {
+    lock.lock()
+    defer { lock.unlock() }
+    guard let hit = fileHeaderCache[key] else { return nil }
+    if Date().timeIntervalSince(hit.cachedAt) > 180 {
+      fileHeaderCache.removeValue(forKey: key)
+      fileHeaderOrder.removeAll { $0 == key }
+      return nil
+    }
+    return (hit.totalSize, hit.headerChunk)
+  }
+
+  private func storeSmbHeader(key: String, totalSize: Int64, headerChunk: Data) {
+    guard totalSize > 0, !headerChunk.isEmpty else { return }
+    lock.lock()
+    defer { lock.unlock() }
+    if fileHeaderCache[key] == nil {
+      fileHeaderOrder.append(key)
+      while fileHeaderOrder.count > 24 {
+        let old = fileHeaderOrder.removeFirst()
+        fileHeaderCache.removeValue(forKey: old)
+      }
+    }
+    fileHeaderCache[key] = (totalSize, headerChunk, Date())
+  }
 
   private init() {
     startProxyServerIfNeeded()
@@ -11086,6 +11187,52 @@ final class TvSmbClient: @unchecked Sendable {
       }
     }
 
+    let cacheKey = "\(mount.id)::\(target.share)::\(target.relPath)"
+    let mime = Self.guessMimeType(target.relPath)
+
+    // Fast path: serve HEAD and initial 256 KB header probes directly from RAM cache in 0ms without opening a new SMB connection
+    if let cached = cachedSmbHeader(for: cacheKey) {
+      let totalSize = cached.totalSize
+      var start: Int64 = 0
+      var end: Int64 = totalSize > 0 ? (totalSize - 1) : 0
+      var isPartial = false
+      if let rh = rangeHeader, rh.lowercased().hasPrefix("bytes="), totalSize > 0 {
+        let spec = rh.dropFirst(6).split(separator: ",").first.map(String.init)?.trimmingCharacters(in: .whitespaces) ?? ""
+        if let dashIdx = spec.firstIndex(of: "-") {
+          let sStr = String(spec[..<dashIdx]).trimmingCharacters(in: .whitespaces)
+          let eStr = String(spec[spec.index(after: dashIdx)...]).trimmingCharacters(in: .whitespaces)
+          if sStr.isEmpty, let suffix = Int64(eStr) {
+            start = max(0, totalSize - suffix)
+            end = totalSize - 1
+            isPartial = true
+          } else if let sVal = Int64(sStr) {
+            start = sVal
+            if let eVal = Int64(eStr) {
+              end = min(totalSize - 1, eVal)
+            } else {
+              end = totalSize - 1
+            }
+            isPartial = true
+          }
+        }
+      }
+      if method == "HEAD" || (start >= 0 && end >= start && end < Int64(cached.headerChunk.count)) {
+        let contentLength = max(Int64(0), end - start + 1)
+        let statusLine = isPartial ? "HTTP/1.1 206 Partial Content" : "HTTP/1.1 200 OK"
+        var hdr = "\(statusLine)\r\nContent-Type: \(mime)\r\nAccept-Ranges: bytes\r\nContent-Length: \(contentLength)\r\n"
+        if isPartial && totalSize > 0 {
+          hdr += "Content-Range: bytes \(start)-\(end)/\(totalSize)\r\n"
+        }
+        hdr += "Connection: close\r\n\r\n"
+        if await Self.sendRawHttp(client: client, header: hdr), method != "HEAD", contentLength > 0 {
+          let slice = cached.headerChunk.subdata(in: Int(start)..<(Int(end) + 1))
+          _ = await Self.sendRawData(client: client, data: slice)
+        }
+        client.cancel()
+        return
+      }
+    }
+
     do {
       let conn = try await TvSmb2Session.connectAndAuthenticate(
         host: target.host,
@@ -11136,7 +11283,6 @@ final class TvSmbClient: @unchecked Sendable {
 
         let contentLength: Int64 = totalSize > 0 ? (end - start + 1) : 0
         let statusLine = isPartial ? "HTTP/1.1 206 Partial Content" : "HTTP/1.1 200 OK"
-        let mime = Self.guessMimeType(target.relPath)
         var hdr = "\(statusLine)\r\nContent-Type: \(mime)\r\nAccept-Ranges: bytes\r\nContent-Length: \(contentLength)\r\n"
         if isPartial && totalSize > 0 {
           hdr += "Content-Range: bytes \(start)-\(end)/\(totalSize)\r\n"
@@ -11153,15 +11299,27 @@ final class TvSmbClient: @unchecked Sendable {
         var offset = start
         var remaining = contentLength
         let chunkSize = Int64(conn.safeReadChunkSize)
+        var capturedHeader = Data()
+        let shouldCaptureHeader = (start == 0 && cachedSmbHeader(for: cacheKey) == nil)
         while remaining > 0 {
           let toRead = Int(min(remaining, chunkSize))
           let chunk = try await conn.readFileChunk(fileId: opened.fileId, offset: UInt64(offset), length: UInt32(toRead))
           if chunk.isEmpty { break }
+          if shouldCaptureHeader && capturedHeader.count < 262144 {
+            let need = min(chunk.count, 262144 - capturedHeader.count)
+            capturedHeader.append(chunk.subdata(in: 0..<need))
+            if capturedHeader.count >= min(Int(totalSize), 262144) {
+              storeSmbHeader(key: cacheKey, totalSize: totalSize, headerChunk: capturedHeader)
+            }
+          }
           TvNetworkSpeedMonitor.shared.recordDownstreamBytes(chunk.count)
           let sentOk = await Self.sendRawData(client: client, data: chunk)
           if !sentOk { break }
           offset += Int64(chunk.count)
           remaining -= Int64(chunk.count)
+        }
+        if shouldCaptureHeader && !capturedHeader.isEmpty {
+          storeSmbHeader(key: cacheKey, totalSize: totalSize, headerChunk: capturedHeader)
         }
       } catch {}
       if let fid = fileId {
@@ -11398,12 +11556,12 @@ private final class TvSmb2Session: @unchecked Sendable {
   private var sessionId: UInt64 = 0
   private var treeId: UInt32 = 0
   private var serverSecurityMode: UInt16 = 0
-  private var maxReadSize: Int = 65536
-  private var maxWriteSize: Int = 65536
+  private var maxReadSize: Int = 262144
+  private var maxWriteSize: Int = 262144
   private var signingKey: Data?
 
-  var safeReadChunkSize: Int { min(maxReadSize, 65536) }
-  var safeWriteChunkSize: Int { min(maxWriteSize, 65536) }
+  var safeReadChunkSize: Int { min(maxReadSize, 262144) }
+  var safeWriteChunkSize: Int { min(maxWriteSize, 262144) }
 
   private init(host: String, port: UInt16, conn: NWConnection) {
     self.host = host
@@ -11483,11 +11641,14 @@ private final class TvSmb2Session: @unchecked Sendable {
     command: UInt16,
     body: Data,
     flags: UInt32 = 0,
+    creditCharge: UInt16 = 1,
     allowMoreProcessing: Bool = false,
     allowNoMoreFiles: Bool = false
   ) async throws -> Data {
+    let effCharge: UInt16 = command == 0 ? 0 : max(1, creditCharge)
     let msgId = messageId
-    messageId &+= 1
+    // MS-SMB2 3.2.4.1.4: multi-credit requests consume `CreditCharge` consecutive sequence numbers
+    messageId &+= UInt64(max(1, effCharge))
 
     var packet = Data(count: 64 + body.count)
     packet[0] = 0xFE
@@ -11495,10 +11656,10 @@ private final class TvSmb2Session: @unchecked Sendable {
     packet[2] = 0x4D
     packet[3] = 0x42
     packet.setLE16(at: 4, 64)
-    packet.setLE16(at: 6, command == 0 ? 0 : 1)
+    packet.setLE16(at: 6, effCharge)
     packet.setLE32(at: 8, 0)
     packet.setLE16(at: 12, command)
-    packet.setLE16(at: 14, 32)
+    packet.setLE16(at: 14, max(128, effCharge))
     let shouldSign = signingKey != nil && command != 0 && command != 1 && ((serverSecurityMode & 0x03) != 0)
     let effFlags = shouldSign ? (flags | 0x00000008) : flags
     packet.setLE32(at: 16, effFlags)
@@ -11573,7 +11734,7 @@ private final class TvSmb2Session: @unchecked Sendable {
         }
       }
       let chunk = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Data, Error>) in
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 131072) { data, _, _, err in
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 262144) { data, _, _, err in
           if let err {
             cont.resume(throwing: err)
           } else if let data, !data.isEmpty {
@@ -11592,6 +11753,8 @@ private final class TvSmb2Session: @unchecked Sendable {
     body.setLE16(at: 0, 36)
     body.setLE16(at: 2, 2)
     body.setLE16(at: 4, 0x0001)
+    // Advertise SMB2_GLOBAL_CAP_LARGE_MTU (0x00000004) for 256 KB multi-credit reads
+    body.setLE32(at: 8, 0x00000004)
     for i in 0..<16 {
       body[12 + i] = UInt8((i * 19 + 0x37) & 0xFF)
     }
@@ -11600,11 +11763,15 @@ private final class TvSmb2Session: @unchecked Sendable {
 
     let resp = try await sendAndReceive(command: 0x0000, body: body)
     if resp.count >= 64 + 48 {
+      let dialect = resp.getLE16(at: 64 + 4)
       serverSecurityMode = resp.getLE16(at: 64 + 2)
+      let serverCaps = resp.getLE32(at: 64 + 24)
+      let supportsLargeMtu = dialect >= 0x0210 && (serverCaps & 0x00000004) != 0
+      let capLimit = supportsLargeMtu ? 262144 : 65536
       let maxR = Int(resp.getLE32(at: 64 + 40))
       let maxW = Int(resp.getLE32(at: 64 + 44))
-      if maxR >= 4096 { maxReadSize = min(maxR, 65536) }
-      if maxW >= 4096 { maxWriteSize = min(maxW, 65536) }
+      maxReadSize = maxR >= 4096 ? min(maxR, capLimit) : 65536
+      maxWriteSize = maxW >= 4096 ? min(maxW, capLimit) : 65536
     }
   }
 
@@ -12005,7 +12172,8 @@ private final class TvSmb2Session: @unchecked Sendable {
     body.setLE64(at: 8, offset)
     body.replaceSubrange(16..<32, with: fileId)
 
-    let resp = try await sendAndReceive(command: 0x0008, body: body, allowNoMoreFiles: true)
+    let charge = UInt16(max(1, (Int(length) - 1) / 65536 + 1))
+    let resp = try await sendAndReceive(command: 0x0008, body: body, creditCharge: charge, allowNoMoreFiles: true)
     if resp.getLE32(at: 8) == 0x00000107 || resp.count < 64 + 16 {
       return Data()
     }
@@ -12023,7 +12191,8 @@ private final class TvSmb2Session: @unchecked Sendable {
     body.setLE64(at: 8, offset)
     body.replaceSubrange(16..<32, with: fileId)
     body.replaceSubrange(48..<(48 + data.count), with: data)
-    _ = try await sendAndReceive(command: 0x0009, body: body)
+    let charge = UInt16(max(1, (max(1, data.count) - 1) / 65536 + 1))
+    _ = try await sendAndReceive(command: 0x0009, body: body, creditCharge: charge)
   }
 
   func closeFile(fileId: Data) async throws {

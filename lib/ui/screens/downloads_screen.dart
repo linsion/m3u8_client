@@ -8,6 +8,7 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
 import '../../models/models.dart';
+import '../../services/tv_platform_service.dart';
 import '../../state/app_state.dart';
 import '../theme.dart';
 import '../widgets/cloud_music_player.dart';
@@ -531,6 +532,8 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
                                       onPressed: () {
                                         showDialog<void>(
                                           context: context,
+                                          useSafeArea: false,
+                                          barrierColor: Colors.black,
                                           builder: (_) =>
                                               _DirectVideoPlayerDialog(
                                             title: c.title.isNotEmpty
@@ -760,6 +763,8 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
 
     showDialog<void>(
       context: context,
+      useSafeArea: false,
+      barrierColor: Colors.black,
       builder: (_) => _DirectVideoPlayerDialog(
         title: hasLocal ? '${task.name} (本机离线)' : task.name,
         streamUrl: streamUrl,
@@ -1981,13 +1986,33 @@ class _DirectVideoPlayerDialog extends StatefulWidget {
 class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
   late final Player _player;
   late final VideoController _controller;
-  String _fitMode = 'fit'; // 'fit', 'cover'
+  StreamSubscription<Duration>? _posSub;
+  StreamSubscription<Duration>? _durSub;
+  StreamSubscription<bool>? _playingSub;
+  StreamSubscription<bool>? _bufferingSub;
+  Timer? _osdHideTimer;
+  double _rate = 1.0;
+  String _fitMode = 'fit'; // 'fit' (适应), 'cover' (铺满), 'fill' (拉伸)
   bool? _landscapeOverride;
   bool _didChangeOrientation = false;
+  bool _controlsVisible = true;
+  bool _isScreenLocked = false;
+  bool _isPlaying = true;
+  bool _isBuffering = false;
+  bool _isLongPressFastForward = false;
+  bool _isHorizontalSeeking = false;
+  Duration _position = Duration.zero;
+  Duration _duration = Duration.zero;
+  Duration _seekStartPos = Duration.zero;
+  Duration _seekPreviewPos = Duration.zero;
+  double? _scrubOverrideMs;
 
   @override
   void initState() {
     super.initState();
+    if (Platform.isAndroid || Platform.isIOS) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    }
     unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
     _player = Player(
       configuration: PlayerConfiguration(
@@ -2003,7 +2028,69 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
         enableHardwareAcceleration: true,
       ),
     );
+    _posSub = _player.stream.position.listen((pos) {
+      if (!mounted) return;
+      if ((pos - _position).inMilliseconds.abs() >= 200 || pos == Duration.zero) {
+        setState(() => _position = pos);
+      }
+    });
+    _durSub = _player.stream.duration.listen((dur) {
+      if (!mounted) return;
+      if (dur != _duration) {
+        setState(() => _duration = dur);
+      }
+    });
+    _playingSub = _player.stream.playing.listen((playing) {
+      if (!mounted) return;
+      setState(() => _isPlaying = playing);
+      if (playing) {
+        _scheduleOsdAutoHide();
+      } else {
+        _osdHideTimer?.cancel();
+        if (!_controlsVisible) {
+          setState(() => _controlsVisible = true);
+        }
+      }
+    });
+    _bufferingSub = _player.stream.buffering.listen((buf) {
+      if (!mounted) return;
+      if (buf != _isBuffering) {
+        setState(() => _isBuffering = buf);
+      }
+    });
     unawaited(_configureDownloadPlayerAndOpen());
+    _scheduleOsdAutoHide();
+  }
+
+  void _scheduleOsdAutoHide() {
+    _osdHideTimer?.cancel();
+    _osdHideTimer = Timer(const Duration(seconds: 4), () {
+      if (!mounted ||
+          !_isPlaying ||
+          _isHorizontalSeeking ||
+          _scrubOverrideMs != null) {
+        return;
+      }
+      setState(() => _controlsVisible = false);
+    });
+  }
+
+  void _wakeControls() {
+    if (!_controlsVisible) {
+      setState(() => _controlsVisible = true);
+    }
+    _scheduleOsdAutoHide();
+  }
+
+  static String _formatClock(Duration d) {
+    final totalSec = d.inSeconds.clamp(0, 359999);
+    final h = totalSec ~/ 3600;
+    final m = (totalSec % 3600) ~/ 60;
+    final s = totalSec % 60;
+    if (h > 0) {
+      return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
+    }
+    return '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
   }
 
   Future<void> _configureDownloadPlayerAndOpen() async {
@@ -2050,9 +2137,11 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
     setState(() {
       _landscapeOverride = nextLandscape;
       _didChangeOrientation = true;
+      _controlsVisible = true;
     });
+    _scheduleOsdAutoHide();
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     if (nextLandscape) {
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
       SystemChrome.setPreferredOrientations(const [
         DeviceOrientation.landscapeLeft,
         DeviceOrientation.landscapeRight,
@@ -2064,11 +2153,400 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
     }
   }
 
+  void _cycleFitMode() {
+    setState(() {
+      _fitMode = switch (_fitMode) {
+        'fit' => 'cover',
+        'cover' => 'fill',
+        _ => 'fit',
+      };
+    });
+    _wakeControls();
+  }
+
+  BoxFit _resolveBoxFit() {
+    return switch (_fitMode) {
+      'cover' => BoxFit.cover,
+      'fill' => BoxFit.fill,
+      _ => BoxFit.contain,
+    };
+  }
+
+  String _fitModeLabel() {
+    return switch (_fitMode) {
+      'cover' => '画面:铺满',
+      'fill' => '画面:拉伸',
+      _ => '画面:适应',
+    };
+  }
+
+  void _seekRelativeSeconds(int deltaSeconds) {
+    final pos = _player.state.position;
+    final dur =
+        _duration.inMilliseconds > 0 ? _duration : _player.state.duration;
+    final target = pos + Duration(seconds: deltaSeconds);
+    final clamped = target < Duration.zero
+        ? Duration.zero
+        : (dur > Duration.zero && target > dur ? dur : target);
+    setState(() => _position = clamped);
+    _player.seek(clamped);
+    _wakeControls();
+  }
+
+  Future<void> _openInEmbeddedExoPlayer() async {
+    if (!Platform.isAndroid || !mounted) return;
+    final curMs = _player.state.position.inMilliseconds;
+    await _player.pause();
+    final res = await TvPlatformService.openNativeExoPlayer(
+      streamUrl: widget.streamUrl,
+      title: widget.title,
+      headers: widget.headers,
+      startPositionMs: curMs,
+    );
+    if (!mounted) return;
+    if (res.positionMs > 1000) {
+      await _player.seek(Duration(milliseconds: res.positionMs));
+    }
+  }
+
+  Widget _buildExoHardwareButton() {
+    if (!Platform.isAndroid) return const SizedBox.shrink();
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: _openInEmbeddedExoPlayer,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        decoration: BoxDecoration(
+          color: const Color(0xFF0284C7).withValues(alpha: 0.22),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: const Color(0xFF38BDF8)),
+        ),
+        child: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.bolt_rounded, size: 14, color: Color(0xFF38BDF8)),
+            SizedBox(width: 3),
+            Text(
+              'Exo硬解',
+              style: TextStyle(
+                fontSize: 11.5,
+                fontWeight: FontWeight.w700,
+                color: Color(0xFF38BDF8),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildFitModePill() {
+    final isFull = _fitMode != 'fit';
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: _cycleFitMode,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        decoration: BoxDecoration(
+          color: isFull
+              ? VideoPlatformTheme.accent.withValues(alpha: 0.22)
+              : VideoPlatformTheme.bgCard.withValues(alpha: 0.85),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: isFull
+                ? VideoPlatformTheme.accent
+                : VideoPlatformTheme.borderSubtle,
+          ),
+        ),
+        child: Text(
+          _fitModeLabel(),
+          style: TextStyle(
+            fontSize: 11.5,
+            fontWeight: FontWeight.w600,
+            color: isFull
+                ? VideoPlatformTheme.accent
+                : VideoPlatformTheme.textPrimary,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSpeedPopupPill() {
+    return PopupMenuButton<double>(
+      tooltip: '倍速播放',
+      initialValue: _rate,
+      onSelected: (r) {
+        setState(() => _rate = r);
+        _player.setRate(r);
+        _wakeControls();
+      },
+      itemBuilder: (_) => const [
+        PopupMenuItem(value: 0.75, child: Text('0.75x')),
+        PopupMenuItem(value: 1.0, child: Text('1.0x 正常')),
+        PopupMenuItem(value: 1.25, child: Text('1.25x')),
+        PopupMenuItem(value: 1.5, child: Text('1.5x')),
+        PopupMenuItem(value: 2.0, child: Text('2.0x')),
+        PopupMenuItem(value: 3.0, child: Text('3.0x')),
+      ],
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        decoration: BoxDecoration(
+          color: _rate != 1.0
+              ? VideoPlatformTheme.accent.withValues(alpha: 0.18)
+              : VideoPlatformTheme.bgCard,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: _rate != 1.0
+                ? VideoPlatformTheme.accent
+                : VideoPlatformTheme.borderSubtle,
+          ),
+        ),
+        child: Text(
+          '倍速 ${_rate}x',
+          style: TextStyle(
+            fontSize: 11.5,
+            fontWeight: FontWeight.w700,
+            color: VideoPlatformTheme.accent,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildInteractiveVideoStage({required bool isMobileDialog}) {
+    return LayoutBuilder(
+      builder: (context, stageConstraints) {
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () {
+            setState(() => _controlsVisible = !_controlsVisible);
+            if (_controlsVisible) {
+              _scheduleOsdAutoHide();
+            }
+          },
+          onDoubleTap: () {
+            if (_isScreenLocked) {
+              _wakeControls();
+              return;
+            }
+            _player.playOrPause();
+            _wakeControls();
+          },
+          onLongPressStart: (_) {
+            if (_isScreenLocked) return;
+            setState(() => _isLongPressFastForward = true);
+            _player.setRate(3.0);
+          },
+          onLongPressEnd: (_) {
+            if (!_isLongPressFastForward) return;
+            setState(() => _isLongPressFastForward = false);
+            _player.setRate(_rate);
+          },
+          onLongPressCancel: () {
+            if (!_isLongPressFastForward) return;
+            setState(() => _isLongPressFastForward = false);
+            _player.setRate(_rate);
+          },
+          onHorizontalDragStart: (details) {
+            if (_isScreenLocked) return;
+            if (details.globalPosition.dx <= 36.0) return;
+            setState(() {
+              _isHorizontalSeeking = true;
+              _seekStartPos = _player.state.position;
+              _seekPreviewPos = _seekStartPos;
+            });
+          },
+          onHorizontalDragUpdate: (details) {
+            if (!_isHorizontalSeeking || _isScreenLocked) return;
+            final stageW = stageConstraints.maxWidth.clamp(220.0, 1920.0);
+            final maxSec = _duration.inSeconds > 0 ? _duration.inSeconds : 300;
+            final spanSec = maxSec.clamp(60, 240);
+            final deltaMs =
+                ((details.delta.dx / stageW) * spanSec * 1000).round();
+            final nextMs = (_seekPreviewPos.inMilliseconds + deltaMs)
+                .clamp(0, maxSec * 1000);
+            setState(() {
+              _seekPreviewPos = Duration(milliseconds: nextMs);
+            });
+          },
+          onHorizontalDragEnd: (_) {
+            if (!_isHorizontalSeeking) return;
+            final target = _seekPreviewPos;
+            setState(() {
+              _isHorizontalSeeking = false;
+              _position = target;
+            });
+            _player.seek(target);
+            _wakeControls();
+          },
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              Video(
+                controller: _controller,
+                width: stageConstraints.maxWidth,
+                height: stageConstraints.maxHeight,
+                fit: _resolveBoxFit(),
+                fill: Colors.black,
+                pauseUponEnteringBackgroundMode: false,
+                resumeUponEnteringForegroundMode: true,
+                controls: NoVideoControls,
+              ),
+              if (!isMobileDialog)
+                Positioned(
+                  top: 12,
+                  right: 12,
+                  child: VideoDownloadSpeedBadge(
+                    player: _player,
+                    compact: true,
+                  ),
+                ),
+              if (_isLongPressFastForward)
+                Positioned(
+                  top: isMobileDialog ? 64 : 14,
+                  left: 0,
+                  right: 0,
+                  child: Center(
+                    child: IgnorePointer(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: const Color(0xDD0D1824),
+                          borderRadius: BorderRadius.circular(20),
+                          border: Border.all(
+                            color: VideoPlatformTheme.accent,
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Icons.bolt_rounded,
+                              size: 16,
+                              color: VideoPlatformTheme.accent,
+                            ),
+                            const SizedBox(width: 4),
+                            const Text(
+                              '3.0x 倍速快进中 (松手恢复)',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 12.5,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              if (_isHorizontalSeeking)
+                Center(
+                  child: IgnorePointer(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 18,
+                        vertical: 10,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xE0090E14),
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(
+                          color: VideoPlatformTheme.accent,
+                          width: 1.4,
+                        ),
+                      ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            '${_seekPreviewPos >= _seekStartPos ? "⏩ 快进" : "⏪ 快退"}  ${_formatClock(_seekPreviewPos)} / ${_formatClock(_duration)}',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 15,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            '${(_seekPreviewPos.inSeconds - _seekStartPos.inSeconds) >= 0 ? "+" : ""}${_seekPreviewPos.inSeconds - _seekStartPos.inSeconds} 秒',
+                            style: TextStyle(
+                              color: VideoPlatformTheme.accent,
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                )
+              else if (_isBuffering)
+                Center(
+                  child: IgnorePointer(
+                    child: Container(
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: Colors.black54,
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2.6,
+                        color: VideoPlatformTheme.accent,
+                      ),
+                    ),
+                  ),
+                )
+              else if (!_isPlaying && !_isScreenLocked)
+                Center(
+                  child: GestureDetector(
+                    onTap: () {
+                      _player.play();
+                      _wakeControls();
+                    },
+                    child: Container(
+                      width: 64,
+                      height: 64,
+                      decoration: BoxDecoration(
+                        color: const Color(0xAA090E14),
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: VideoPlatformTheme.accent,
+                          width: 2.0,
+                        ),
+                      ),
+                      alignment: Alignment.center,
+                      child: const Icon(
+                        Icons.play_arrow_rounded,
+                        color: Colors.white,
+                        size: 40,
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
   @override
   void dispose() {
-    if (_didChangeOrientation && (Platform.isAndroid || Platform.isIOS)) {
+    _osdHideTimer?.cancel();
+    _posSub?.cancel();
+    _durSub?.cancel();
+    _playingSub?.cancel();
+    _bufferingSub?.cancel();
+    if (Platform.isAndroid || Platform.isIOS) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-      SystemChrome.setPreferredOrientations(const []);
+      if (_didChangeOrientation) {
+        SystemChrome.setPreferredOrientations(const []);
+      }
     }
     _player.dispose();
     super.dispose();
@@ -2077,160 +2555,550 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
   @override
   Widget build(BuildContext context) {
     final mqSize = MediaQuery.sizeOf(context);
+    final viewPadding = MediaQuery.viewPaddingOf(context);
     final isMobileDialog = mqSize.shortestSide < 600 || mqSize.width < 760;
+    final isLandscape =
+        _landscapeOverride ?? (mqSize.width > mqSize.height);
+    final effectiveDurMs = _duration.inMilliseconds > 0
+        ? _duration.inMilliseconds.toDouble()
+        : (_player.state.duration.inMilliseconds > 0
+            ? _player.state.duration.inMilliseconds.toDouble()
+            : 1.0);
+    final effectivePosMs = (_scrubOverrideMs ??
+            _position.inMilliseconds.toDouble())
+        .clamp(0.0, effectiveDurMs);
 
-    return MobileEdgeSwipeBack(
-      onBack: () => Navigator.of(context).pop(),
-      child: Dialog(
-        backgroundColor: Colors.black,
-        insetPadding:
-            isMobileDialog ? EdgeInsets.zero : const EdgeInsets.all(14),
-        child: SafeArea(
-          top: isMobileDialog,
-          bottom: isMobileDialog,
-          left: isMobileDialog,
-          right: isMobileDialog,
-          child: ConstrainedBox(
-            constraints: BoxConstraints(
-              maxWidth: isMobileDialog ? double.infinity : 1200,
-              maxHeight: isMobileDialog ? double.infinity : 820,
-            ),
-            child: Column(
+    if (isMobileDialog) {
+      final showHud = _controlsVisible && !_isScreenLocked;
+      final topInset = viewPadding.top > 4 ? viewPadding.top : 8.0;
+      final bottomInset = viewPadding.bottom > 4 ? viewPadding.bottom : 8.0;
+      final leftInset = viewPadding.left > 8 ? viewPadding.left : 10.0;
+      final rightInset = viewPadding.right > 8 ? viewPadding.right : 10.0;
+
+      return MobileEdgeSwipeBack(
+        onBack: () => Navigator.of(context).pop(),
+        child: Scaffold(
+          backgroundColor: Colors.black,
+          resizeToAvoidBottomInset: false,
+          body: MediaQuery.removePadding(
+            context: context,
+            removeTop: true,
+            removeBottom: true,
+            removeLeft: true,
+            removeRight: true,
+            child: Stack(
+              fit: StackFit.expand,
               children: [
-                Container(
-                  height: 46,
-                  padding:
-                      EdgeInsets.symmetric(horizontal: isMobileDialog ? 6 : 12),
-                  decoration: BoxDecoration(
-                    color: VideoPlatformTheme.bgElevated,
-                    border: Border(
-                      bottom:
-                          BorderSide(color: VideoPlatformTheme.borderSubtle),
-                    ),
-                  ),
-                  child: Row(
-                    children: [
-                      if (isMobileDialog)
-                        IconButton(
-                          visualDensity: VisualDensity.compact,
-                          icon: const Icon(
-                            Icons.arrow_back_ios_new_rounded,
-                            size: 17,
-                          ),
-                          onPressed: () => Navigator.of(context).pop(),
-                        ),
-                      Expanded(
-                        child: Text(
-                          widget.title,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            fontSize: 13.5,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ),
-                      InkWell(
-                        borderRadius: BorderRadius.circular(12),
-                        onTap: () {
-                          setState(() {
-                            _fitMode = _fitMode == 'fit' ? 'cover' : 'fit';
-                          });
-                        },
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 6,
-                            vertical: 4,
-                          ),
-                          child: Text(
-                            _fitMode == 'cover' ? '铺满' : '适应',
-                            style: TextStyle(
-                              fontSize: 12,
-                              fontWeight: FontWeight.w600,
-                              color: _fitMode == 'cover'
-                                  ? VideoPlatformTheme.accent
-                                  : VideoPlatformTheme.textSecondary,
-                            ),
-                          ),
-                        ),
-                      ),
-                      if (Platform.isAndroid || Platform.isIOS)
-                        IconButton(
-                          tooltip: '横竖屏切换',
-                          visualDensity: VisualDensity.compact,
-                          icon: const Icon(
-                            Icons.screen_rotation_rounded,
-                            size: 17,
-                          ),
-                          onPressed: _toggleOrientation,
-                        ),
-                      if (widget.onEnterMiniPlayer != null)
-                        isMobileDialog
-                            ? IconButton(
-                                tooltip: '小窗播放',
-                                visualDensity: VisualDensity.compact,
-                                onPressed: () {
-                                  final pos = _player.state.position.inSeconds;
-                                  Navigator.of(context).pop();
-                                  widget.onEnterMiniPlayer!(pos);
-                                },
-                                icon: const Icon(
-                                  Icons.picture_in_picture_alt_rounded,
-                                  size: 17,
-                                ),
-                              )
-                            : TextButton.icon(
-                                onPressed: () {
-                                  final pos = _player.state.position.inSeconds;
-                                  Navigator.of(context).pop();
-                                  widget.onEnterMiniPlayer!(pos);
-                                },
-                                icon: const Icon(
-                                  Icons.picture_in_picture_alt_rounded,
-                                  size: 16,
-                                ),
-                                label: const Text('小窗播放'),
-                              ),
-                      IconButton(
-                        visualDensity: VisualDensity.compact,
-                        icon: const Icon(Icons.close, size: 18),
-                        onPressed: () => Navigator.of(context).pop(),
-                      ),
-                    ],
-                  ),
+                // Layer 1: 100% Fullscreen Video Stage
+                Positioned.fill(
+                  child: _buildInteractiveVideoStage(isMobileDialog: true),
                 ),
-                Expanded(
-                  child: LayoutBuilder(
-                    builder: (context, stageConstraints) {
-                      return Video(
-                        controller: _controller,
-                        width: stageConstraints.maxWidth,
-                        height: stageConstraints.maxHeight,
-                        fit: _fitMode == 'cover'
-                            ? BoxFit.cover
-                            : BoxFit.contain,
-                        fill: Colors.black,
-                        controls: (state) => Stack(
-                          fit: StackFit.expand,
+
+                // Layer 2: Floating Top Gradient HUD
+                Positioned(
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  child: IgnorePointer(
+                    ignoring: !showHud,
+                    child: AnimatedOpacity(
+                      opacity: showHud ? 1.0 : 0.0,
+                      duration: const Duration(milliseconds: 200),
+                      child: Container(
+                        padding: EdgeInsets.fromLTRB(
+                          leftInset,
+                          topInset,
+                          rightInset,
+                          14,
+                        ),
+                        decoration: const BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                            colors: [
+                              Color(0xEB050A12),
+                              Color(0xA6050A12),
+                              Colors.transparent,
+                            ],
+                          ),
+                        ),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
                           children: [
-                            AdaptiveVideoControls(state),
-                            Positioned(
-                              top: 12,
-                              right: 12,
-                              child: VideoDownloadSpeedBadge(
-                                player: _player,
-                                compact: true,
+                            SizedBox(
+                              height: 38,
+                              child: Row(
+                                children: [
+                                  IconButton(
+                                    visualDensity: VisualDensity.compact,
+                                    icon: const Icon(
+                                      Icons.arrow_back_ios_new_rounded,
+                                      size: 18,
+                                      color: Colors.white,
+                                    ),
+                                    onPressed: () =>
+                                        Navigator.of(context).pop(),
+                                  ),
+                                  Expanded(
+                                    child: Text(
+                                      widget.title,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        fontSize: 13.5,
+                                        fontWeight: FontWeight.w700,
+                                        color: Colors.white,
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 4),
+                                  VideoDownloadSpeedBadge(
+                                    player: _player,
+                                    compact: true,
+                                  ),
+                                  if (Platform.isAndroid || Platform.isIOS)
+                                    IconButton(
+                                      tooltip: '横竖屏切换',
+                                      visualDensity: VisualDensity.compact,
+                                      icon: const Icon(
+                                        Icons.screen_rotation_rounded,
+                                        size: 18,
+                                        color: Colors.white,
+                                      ),
+                                      onPressed: _toggleOrientation,
+                                    ),
+                                  if (widget.onEnterMiniPlayer != null)
+                                    IconButton(
+                                      tooltip: '小窗播放',
+                                      visualDensity: VisualDensity.compact,
+                                      onPressed: () {
+                                        final pos =
+                                            _player.state.position.inSeconds;
+                                        Navigator.of(context).pop();
+                                        widget.onEnterMiniPlayer!(pos);
+                                      },
+                                      icon: const Icon(
+                                        Icons.picture_in_picture_alt_rounded,
+                                        size: 18,
+                                        color: Colors.white,
+                                      ),
+                                    ),
+                                  IconButton(
+                                    visualDensity: VisualDensity.compact,
+                                    icon: const Icon(
+                                      Icons.close,
+                                      size: 20,
+                                      color: Colors.white,
+                                    ),
+                                    onPressed: () =>
+                                        Navigator.of(context).pop(),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            SizedBox(
+                              height: 32,
+                              child: SingleChildScrollView(
+                                scrollDirection: Axis.horizontal,
+                                padding:
+                                    const EdgeInsets.symmetric(horizontal: 4),
+                                child: Row(
+                                  children: [
+                                    if (Platform.isAndroid) ...[
+                                      _buildExoHardwareButton(),
+                                      const SizedBox(width: 6),
+                                    ],
+                                    _buildFitModePill(),
+                                    const SizedBox(width: 6),
+                                    _buildSpeedPopupPill(),
+                                    const SizedBox(width: 6),
+                                    PlayerVolumeControl(
+                                      player: _player,
+                                      compact: true,
+                                      sliderWidth: 54,
+                                      showPercentage: false,
+                                    ),
+                                  ],
+                                ),
                               ),
                             ),
                           ],
                         ),
-                      );
-                    },
+                      ),
+                    ),
+                  ),
+                ),
+
+                // Layer 3: Mid-Left Screen Lock Button
+                Positioned(
+                  left: leftInset + 4,
+                  top: 0,
+                  bottom: 0,
+                  child: Center(
+                    child: IgnorePointer(
+                      ignoring: !_controlsVisible,
+                      child: AnimatedOpacity(
+                        opacity: _controlsVisible ? 1.0 : 0.0,
+                        duration: const Duration(milliseconds: 200),
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(22),
+                          onTap: () {
+                            setState(() {
+                              _isScreenLocked = !_isScreenLocked;
+                              _controlsVisible = true;
+                            });
+                            _scheduleOsdAutoHide();
+                          },
+                          child: Container(
+                            width: 40,
+                            height: 40,
+                            decoration: BoxDecoration(
+                              color: _isScreenLocked
+                                  ? VideoPlatformTheme.accent
+                                      .withValues(alpha: 0.88)
+                                  : const Color(0xAA060B14),
+                              shape: BoxShape.circle,
+                              border: Border.all(
+                                color: _isScreenLocked
+                                    ? Colors.white
+                                    : VideoPlatformTheme.borderStrong,
+                              ),
+                            ),
+                            child: Icon(
+                              _isScreenLocked
+                                  ? Icons.lock_rounded
+                                  : Icons.lock_open_rounded,
+                              size: 19,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+
+                // Layer 4: Floating Bottom Gradient Transport & Seek Bar
+                Positioned(
+                  bottom: 0,
+                  left: 0,
+                  right: 0,
+                  child: IgnorePointer(
+                    ignoring: !showHud,
+                    child: AnimatedOpacity(
+                      opacity: showHud ? 1.0 : 0.0,
+                      duration: const Duration(milliseconds: 200),
+                      child: Container(
+                        padding: EdgeInsets.fromLTRB(
+                          leftInset,
+                          14,
+                          rightInset,
+                          bottomInset,
+                        ),
+                        decoration: const BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.bottomCenter,
+                            end: Alignment.topCenter,
+                            colors: [
+                              Color(0xEB050A12),
+                              Color(0xA6050A12),
+                              Colors.transparent,
+                            ],
+                          ),
+                        ),
+                        child: Row(
+                          children: [
+                            IconButton(
+                              visualDensity: VisualDensity.compact,
+                              tooltip: _isPlaying ? '暂停' : '播放',
+                              onPressed: () {
+                                _player.playOrPause();
+                                _wakeControls();
+                              },
+                              icon: Icon(
+                                _isPlaying
+                                    ? Icons.pause_circle_filled_rounded
+                                    : Icons.play_circle_fill_rounded,
+                                size: 30,
+                                color: VideoPlatformTheme.accent,
+                              ),
+                            ),
+                            IconButton(
+                              visualDensity: VisualDensity.compact,
+                              tooltip: '快退 10 秒',
+                              onPressed: () => _seekRelativeSeconds(-10),
+                              icon: const Icon(
+                                Icons.replay_10_rounded,
+                                size: 20,
+                                color: Colors.white,
+                              ),
+                            ),
+                            IconButton(
+                              visualDensity: VisualDensity.compact,
+                              tooltip: '快进 10 秒',
+                              onPressed: () => _seekRelativeSeconds(10),
+                              icon: const Icon(
+                                Icons.forward_10_rounded,
+                                size: 20,
+                                color: Colors.white,
+                              ),
+                            ),
+                            const SizedBox(width: 2),
+                            Text(
+                              _formatClock(
+                                Duration(milliseconds: effectivePosMs.round()),
+                              ),
+                              style: const TextStyle(
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w600,
+                                color: Colors.white,
+                                fontFeatures: [FontFeature.tabularFigures()],
+                              ),
+                            ),
+                            Expanded(
+                              child: SliderTheme(
+                                data: SliderTheme.of(context).copyWith(
+                                  trackHeight: 3.5,
+                                  thumbShape: const RoundSliderThumbShape(
+                                    enabledThumbRadius: 6.5,
+                                  ),
+                                  overlayShape: const RoundSliderOverlayShape(
+                                    overlayRadius: 12,
+                                  ),
+                                  activeTrackColor: VideoPlatformTheme.accent,
+                                  inactiveTrackColor: Colors.white24,
+                                  thumbColor: Colors.white,
+                                ),
+                                child: Slider(
+                                  value: effectivePosMs,
+                                  min: 0.0,
+                                  max: effectiveDurMs,
+                                  onChanged: (v) {
+                                    setState(() => _scrubOverrideMs = v);
+                                    _osdHideTimer?.cancel();
+                                  },
+                                  onChangeEnd: (v) {
+                                    final target =
+                                        Duration(milliseconds: v.round());
+                                    setState(() {
+                                      _scrubOverrideMs = null;
+                                      _position = target;
+                                    });
+                                    _player.seek(target);
+                                    _scheduleOsdAutoHide();
+                                  },
+                                ),
+                              ),
+                            ),
+                            Text(
+                              _formatClock(_duration),
+                              style: const TextStyle(
+                                fontSize: 11.5,
+                                color: Colors.white70,
+                                fontFeatures: [FontFeature.tabularFigures()],
+                              ),
+                            ),
+                            const SizedBox(width: 2),
+                            IconButton(
+                              visualDensity: VisualDensity.compact,
+                              tooltip: '切换画面比例 (${_fitModeLabel()})',
+                              onPressed: _cycleFitMode,
+                              icon: Icon(
+                                _fitMode == 'fit'
+                                    ? Icons.aspect_ratio_rounded
+                                    : Icons.fit_screen_rounded,
+                                size: 20,
+                                color: _fitMode == 'fit'
+                                    ? Colors.white70
+                                    : VideoPlatformTheme.accent,
+                              ),
+                            ),
+                            if (Platform.isAndroid || Platform.isIOS)
+                              IconButton(
+                                visualDensity: VisualDensity.compact,
+                                tooltip: isLandscape ? '切换竖屏全屏' : '进入横屏全屏',
+                                onPressed: _toggleOrientation,
+                                icon: Icon(
+                                  isLandscape
+                                      ? Icons.fullscreen_exit_rounded
+                                      : Icons.fullscreen_rounded,
+                                  size: 24,
+                                  color: Colors.white,
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
                   ),
                 ),
               ],
             ),
           ),
+        ),
+      );
+    }
+
+    return Dialog(
+      backgroundColor: Colors.black,
+      insetPadding: const EdgeInsets.all(14),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(
+          maxWidth: 1200,
+          maxHeight: 820,
+        ),
+        child: Column(
+          children: [
+            Container(
+              height: 46,
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              decoration: BoxDecoration(
+                color: VideoPlatformTheme.bgElevated,
+                border: Border(
+                  bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
+                ),
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      widget.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 13.5,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  if (Platform.isAndroid) ...[
+                    _buildExoHardwareButton(),
+                    const SizedBox(width: 6),
+                  ],
+                  _buildFitModePill(),
+                  const SizedBox(width: 6),
+                  _buildSpeedPopupPill(),
+                  const SizedBox(width: 6),
+                  if (widget.onEnterMiniPlayer != null)
+                    TextButton.icon(
+                      onPressed: () {
+                        final pos = _player.state.position.inSeconds;
+                        Navigator.of(context).pop();
+                        widget.onEnterMiniPlayer!(pos);
+                      },
+                      icon: const Icon(
+                        Icons.picture_in_picture_alt_rounded,
+                        size: 16,
+                      ),
+                      label: const Text('小窗播放'),
+                    ),
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    icon: const Icon(Icons.close, size: 18),
+                    onPressed: () => Navigator.of(context).pop(),
+                  ),
+                ],
+              ),
+            ),
+            Expanded(
+              child: _buildInteractiveVideoStage(isMobileDialog: false),
+            ),
+            Container(
+              padding: const EdgeInsets.fromLTRB(14, 6, 14, 8),
+              decoration: BoxDecoration(
+                color: VideoPlatformTheme.bgElevated,
+                border: Border(
+                  top: BorderSide(color: VideoPlatformTheme.borderSubtle),
+                ),
+              ),
+              child: Row(
+                children: [
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    tooltip: _isPlaying ? '暂停' : '播放',
+                    onPressed: () {
+                      _player.playOrPause();
+                      _wakeControls();
+                    },
+                    icon: Icon(
+                      _isPlaying
+                          ? Icons.pause_circle_filled_rounded
+                          : Icons.play_circle_fill_rounded,
+                      size: 30,
+                      color: VideoPlatformTheme.accent,
+                    ),
+                  ),
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    tooltip: '快退 10 秒',
+                    onPressed: () => _seekRelativeSeconds(-10),
+                    icon: const Icon(Icons.replay_10_rounded, size: 19),
+                  ),
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    tooltip: '快进 10 秒',
+                    onPressed: () => _seekRelativeSeconds(10),
+                    icon: const Icon(Icons.forward_10_rounded, size: 19),
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    _formatClock(
+                      Duration(milliseconds: effectivePosMs.round()),
+                    ),
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: VideoPlatformTheme.textPrimary,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                  Expanded(
+                    child: SliderTheme(
+                      data: SliderTheme.of(context).copyWith(
+                        trackHeight: 3.5,
+                        thumbShape: const RoundSliderThumbShape(
+                          enabledThumbRadius: 6.5,
+                        ),
+                        overlayShape: const RoundSliderOverlayShape(
+                          overlayRadius: 12,
+                        ),
+                        activeTrackColor: VideoPlatformTheme.accent,
+                        inactiveTrackColor: VideoPlatformTheme.borderStrong,
+                        thumbColor: Colors.white,
+                      ),
+                      child: Slider(
+                        value: effectivePosMs,
+                        min: 0.0,
+                        max: effectiveDurMs,
+                        onChanged: (v) {
+                          setState(() => _scrubOverrideMs = v);
+                          _osdHideTimer?.cancel();
+                        },
+                        onChangeEnd: (v) {
+                          final target = Duration(milliseconds: v.round());
+                          setState(() {
+                            _scrubOverrideMs = null;
+                            _position = target;
+                          });
+                          _player.seek(target);
+                          _scheduleOsdAutoHide();
+                        },
+                      ),
+                    ),
+                  ),
+                  Text(
+                    _formatClock(_duration),
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: VideoPlatformTheme.textSecondary,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
         ),
       ),
     );

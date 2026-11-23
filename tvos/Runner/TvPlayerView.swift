@@ -2445,7 +2445,9 @@ struct TvPlayerModalView: View {
           }
         }
         return
-      } else if eff == .proxyNode && baseTargetUrl.contains("/api/telegram/") {
+      } else if baseTargetUrl.contains("/api/telegram/")
+          || baseTargetUrl.contains("/api/files/open")
+          || baseTargetUrl.contains("/api/files/download") {
         let proxiedMp4 = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
           remoteUrl: baseTargetUrl,
           headers: request.headers
@@ -2483,7 +2485,7 @@ struct TvPlayerModalView: View {
     }
     let asset = AVURLAsset(url: url, options: options)
     let item = AVPlayerItem(asset: asset)
-    item.preferredForwardBufferDuration = request.isLive ? 2.5 : 45
+    item.preferredForwardBufferDuration = request.isLive ? 2.5 : 30
 
     player.replaceCurrentItem(with: item)
     player.automaticallyWaitsToMinimizeStalling = true
@@ -2491,7 +2493,8 @@ struct TvPlayerModalView: View {
     if initialSeek > 1 && !request.isLive {
       didPerformResumeSeek = true
       let target = CMTime(seconds: initialSeek, preferredTimescale: 600)
-      player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak player] _ in
+      let fastTol = CMTime(seconds: 1.0, preferredTimescale: 600)
+      player.seek(to: target, toleranceBefore: fastTol, toleranceAfter: fastTol) { [weak player] _ in
         player?.playImmediately(atRate: playbackRate)
       }
     } else if request.isLive {
