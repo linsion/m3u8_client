@@ -3586,6 +3586,11 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
       maxBytes: Int,
       continuation: CheckedContinuation<(Data, HTTPURLResponse)?, Error>
     )
+    case rangeBlock(
+      startOffset: Int64,
+      expectedBytes: Int,
+      continuation: CheckedContinuation<Data?, Never>
+    )
     case continuousRange(
       conn: NWConnection,
       continuation: CheckedContinuation<Bool, Never>
@@ -3627,6 +3632,41 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
         let task = session.dataTask(with: request)
         let ctx = TaskContext(mode: .headerProbe(maxBytes: maxBytes, continuation: cont))
         ctx.buffer.reserveCapacity(min(maxBytes, 524288))
+        lock.lock()
+        contexts[task.taskIdentifier] = ctx
+        lock.unlock()
+        taskBox.lock()
+        createdTask = task
+        taskBox.unlock()
+        task.resume()
+      }
+    } onCancel: {
+      taskBox.lock()
+      let t = createdTask
+      taskBox.unlock()
+      t?.cancel()
+    }
+  }
+
+  func fetchRangeBlock(
+    request: URLRequest,
+    session: URLSession,
+    startOffset: Int64,
+    expectedBytes: Int
+  ) async -> Data? {
+    let taskBox = NSLock()
+    var createdTask: URLSessionDataTask?
+    return await withTaskCancellationHandler {
+      await withCheckedContinuation { (cont: CheckedContinuation<Data?, Never>) in
+        let task = session.dataTask(with: request)
+        let ctx = TaskContext(
+          mode: .rangeBlock(
+            startOffset: startOffset,
+            expectedBytes: expectedBytes,
+            continuation: cont
+          )
+        )
+        ctx.buffer.reserveCapacity(min(expectedBytes, 4_194_304))
         lock.lock()
         contexts[task.taskIdentifier] = ctx
         lock.unlock()
@@ -3717,6 +3757,12 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
         cont.resume(with: res)
       } else if let http = ctx.httpResponse, !ctx.buffer.isEmpty {
         cont.resume(returning: (ctx.buffer, http))
+      } else {
+        cont.resume(returning: nil)
+      }
+    case .rangeBlock(_, let expectedBytes, let cont):
+      if ctx.buffer.count == expectedBytes {
+        cont.resume(returning: ctx.buffer)
       } else {
         cont.resume(returning: nil)
       }
@@ -3817,6 +3863,18 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
       lock.unlock()
       completionHandler(.allow)
 
+    case .rangeBlock(let startOffset, _, _):
+      let contentRange = http.value(forHTTPHeaderField: "Content-Range") ?? http.value(forHTTPHeaderField: "content-range") ?? ""
+      guard http.statusCode == 206,
+            contentRange.isEmpty || contentRange.lowercased().hasPrefix("bytes \(startOffset)-") else {
+        lock.unlock()
+        finishContext(taskId: taskId)
+        completionHandler(.cancel)
+        return
+      }
+      lock.unlock()
+      completionHandler(.allow)
+
     case .continuousRange:
       guard http.statusCode == 206 || http.statusCode == 200 else {
         lock.unlock()
@@ -3889,6 +3947,22 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
       }
       lock.unlock()
 
+    case .rangeBlock(_, let expectedBytes, _):
+      let remaining = expectedBytes - ctx.buffer.count
+      if remaining > 0 {
+        if data.count <= remaining {
+          ctx.buffer.append(data)
+        } else {
+          ctx.buffer.append(data.subdata(in: 0..<remaining))
+        }
+      }
+      if ctx.buffer.count >= expectedBytes {
+        lock.unlock()
+        finishContext(taskId: taskId)
+        return
+      }
+      lock.unlock()
+
     case .continuousRange(let conn, _), .passthrough(let conn, _, _):
       ctx.didTransferAnyBytes = true
       ctx.pendingSendBytes += data.count
@@ -3939,6 +4013,8 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
       } else {
         finishContext(taskId: taskId, headerResult: .success(nil))
       }
+    case .rangeBlock:
+      finishContext(taskId: taskId)
     case .continuousRange:
       finishContext(taskId: taskId, streamSuccess: error == nil && didTransfer)
     case .passthrough:
@@ -3973,10 +4049,10 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
   private var tgVideoMetaCache: [String: (totalSize: Int64, contentType: String, headerChunk: Data, stripPrefixBytes: Int)] = [:]
   private var tgMetaOrder: [String] = []
   private var tgMetaInFlight: [String: Task<(totalSize: Int64, contentType: String, headerChunk: Data, stripPrefixBytes: Int)?, Never>] = [:]
-  private static let tgBlockSize: Int64 = 2_097_152 // 2 MB block size -> high sustained throughput across parallel workers
-  private static let tgMaxCachedBlocks: Int = 48 // 48 x 2 MB = 96 MB shared in-memory LRU stitch cache
-  private static let tgMaxConcurrentPrefetchPerUrl = 6
-  private static let tgLookaheadBlocks = 12
+  private static let tgBlockSize: Int64 = 2_097_152 // 2 MB block size -> 8 parallel workers = 16-40+ MB/s sustained throughput
+  private static let tgMaxCachedBlocks: Int = 64 // 64 x 2 MB = 128 MB shared in-memory LRU stitch cache
+  private static let tgMaxConcurrentPrefetchPerUrl = 8
+  private static let tgLookaheadBlocks = 16
   private var tgBlockCache: [String: Data] = [:]
   private var tgBlockOrder: [String] = []
   private var tgInFlightBlocks: [String: Task<Data?, Never>] = [:]
@@ -4064,7 +4140,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     let streamCfg = URLSessionConfiguration.ephemeral
     streamCfg.timeoutIntervalForRequest = 25
     streamCfg.timeoutIntervalForResource = 28800
-    streamCfg.httpMaximumConnectionsPerHost = 16
+    streamCfg.httpMaximumConnectionsPerHost = 32
     streamCfg.httpShouldSetCookies = false
     streamCfg.requestCachePolicy = .reloadIgnoringLocalCacheData
     self.directStreamSession = URLSession(
@@ -4641,21 +4717,19 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       let fallbackSessionRef = self.directUrlSession
       let storeRef = self.store
 
-      // Lookahead prefetch the next 3 VOD / 115 HLS .ts segments concurrently while serving the current segment
-      let lookaheadUrls = await store.nextVodSegmentsToPrefetch(after: targetUrl, count: 3, gen: activeGen)
-      if !lookaheadUrls.isEmpty {
-        Task.detached(priority: .utility) {
-          for nextUrl in lookaheadUrls {
-            if Task.isCancelled { break }
-            if await storeRef.cachedData(for: nextUrl, gen: activeGen) != nil { continue }
-            _ = await storeRef.fetchOrJoinSegment(url: nextUrl, gen: activeGen) { u, h in
-              await Self.downloadSegmentMultiRange(
-                urlStr: u,
-                headers: h,
-                session: sessionRef,
-                fallbackDirectSession: fallbackSessionRef
-              )
-            }
+      // Lookahead prefetch the next 5 VOD / 115 / AList HLS .ts segments IN PARALLEL across 5 connections!
+      let lookaheadUrls = await store.nextVodSegmentsToPrefetch(after: targetUrl, count: 5, gen: activeGen)
+      for nextUrl in lookaheadUrls {
+        Task.detached(priority: .userInitiated) {
+          if Task.isCancelled { return }
+          if await storeRef.cachedData(for: nextUrl, gen: activeGen) != nil { return }
+          _ = await storeRef.fetchOrJoinSegment(url: nextUrl, gen: activeGen) { u, h in
+            await Self.downloadSegmentMultiRange(
+              urlStr: u,
+              headers: h,
+              session: sessionRef,
+              fallbackDirectSession: fallbackSessionRef
+            )
           }
         }
       }
@@ -4962,7 +5036,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       return
     }
 
-    let prefetch = allowParallelLookahead && contentLen > Self.tgBlockSize * 2
+    let prefetch = allowParallelLookahead && reqEnd >= 65536
     let reader = UUID()
     if prefetch { beginTelegramPlaybackRead(targetUrl: targetUrl, reader: reader) }
     defer {
@@ -4985,7 +5059,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       return
     }
 
-    // Stream the requested range from the shared block cache.
+    // Stream the requested range from the shared 8-worker parallel block cache.
     let hdrLines = [
       "HTTP/1.1 \(isPartial ? "206 Partial Content" : "200 OK")",
       "Content-Type: \(meta.contentType)",
@@ -5011,34 +5085,6 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
         return
       }
       cursor = cachedEnd + 1
-    }
-
-    // High-speed continuous HTTP 206 streaming for 115 Cloud Drive, AList, WebDAV, and domestic/local direct streams:
-    // Streams directly over a persistent TCP connection via `URLSessionDataDelegate` (64-256 KB kernel buffers)
-    // instead of slicing into thousands of 2 MB sub-requests that trigger 115 CDN / AList FUSE rate-limiting!
-    let useContinuousDirectStream = (isForceDirectTarget(targetUrl) || Self.isDomesticOrLocalUrl(targetUrl))
-      && !meta.contentType.hasPrefix("audio/")
-      && (reqEnd - cursor + 1) >= 262144
-    if cursor <= reqEnd && useContinuousDirectStream {
-      let upStart = cursor + Int64(meta.stripPrefixBytes)
-      let upEnd = reqEnd + Int64(meta.stripPrefixBytes)
-      var streamReq = URLRequest(url: u)
-      streamReq.httpMethod = "GET"
-      streamReq.timeoutInterval = 25.0
-      for (k, v) in hdrs where !v.isEmpty {
-        streamReq.setValue(v, forHTTPHeaderField: k)
-      }
-      streamReq.setValue("bytes=\(upStart)-\(upEnd)", forHTTPHeaderField: "Range")
-      streamReq.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-      _ = await TvContinuousStreamSessionDelegate.shared.streamRangeToConnection(
-        conn: conn,
-        request: streamReq,
-        session: directStreamSession
-      )
-      conn.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
-        conn.cancel()
-      })
-      return
     }
 
     let blockSize = Self.tgBlockSize
@@ -5108,25 +5154,28 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     defer { tgLock.unlock() }
     if tgHeadersByUrl[targetUrl] != nil {
       tgPlaybackReaderByUrl[targetUrl] = reader
+      tgActiveBackgroundUrl = targetUrl
+      tgLastAccessByUrl[targetUrl] = Date()
     }
   }
 
   private func finishTelegramPlaybackRead(targetUrl: String, reader: UUID) {
+    // Do NOT cancel in-flight prefetch tasks or clear `tgActiveBackgroundUrl` when an individual Range request completes!
+    // AVPlayer frequently issues consecutive or overlapping bounded Range requests (`bytes=0-2097151`, `bytes=2097152-4194303`),
+    // so keeping the 8 background prefetch workers running across consecutive Range requests ensures uninterrupted 16-40+ MB/s throughput!
     tgLock.lock()
-    defer { tgLock.unlock() }
-    guard tgPlaybackReaderByUrl[targetUrl] == reader else { return }
-    tgPlaybackReaderByUrl.removeValue(forKey: targetUrl)
-    if tgActiveBackgroundUrl == targetUrl { tgActiveBackgroundUrl = "" }
-    for (key, task) in tgInFlightBlocks where key.hasPrefix("\(targetUrl)#") && tgInFlightIsPrefetch[key] == true {
-      task.cancel()
+    if tgPlaybackReaderByUrl[targetUrl] == reader {
+      tgLastAccessByUrl[targetUrl] = Date()
     }
+    tgLock.unlock()
   }
 
   private func updateTelegramPlayhead(targetUrl: String, blockIndex: Int64, reader: UUID) -> Bool {
     let prefix = "\(targetUrl)#"
     tgLock.lock()
     defer { tgLock.unlock() }
-    guard tgPlaybackReaderByUrl[targetUrl] == reader else { return false }
+    guard tgHeadersByUrl[targetUrl] != nil else { return false }
+    tgPlaybackReaderByUrl[targetUrl] = reader
     tgActiveBackgroundUrl = targetUrl
     tgLastAccessByUrl[targetUrl] = Date()
     tgPlayheadBlockByUrl[targetUrl] = blockIndex
@@ -5150,7 +5199,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       let preferDirectAt = tgPreferDirectByUrl[targetUrl]
       tgLock.unlock()
       if let ts = preferDirectAt, Date().timeIntervalSince(ts) < 300 {
-        return directUrlSession
+        return directStreamSession
       }
     }
     return urlSession
@@ -5170,7 +5219,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     tgLock.unlock()
   }
 
-  /// Keeps a bounded window of completed blocks ahead of the playhead.
+  /// Keeps a bounded window of completed blocks ahead of the playhead using 8 parallel workers.
   private func pumpTelegramSlidingWindow(
     targetUrl: String,
     url: URL,
@@ -5178,9 +5227,8 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
   ) {
     let blockSize = Self.tgBlockSize
     let maxBlockIndex = max(0, (meta.totalSize - 1) / blockSize)
-    let isDomestic = Self.isDomesticOrLocalUrl(targetUrl)
-    let maxWorkersForTarget = isDomestic ? 2 : Self.tgMaxConcurrentPrefetchPerUrl
-    let lookaheadForTarget = isDomestic ? 3 : Self.tgLookaheadBlocks
+    let maxWorkersForTarget = Self.tgMaxConcurrentPrefetchPerUrl
+    let lookaheadForTarget = Self.tgLookaheadBlocks
 
     tgLock.lock()
     guard tgActiveBackgroundUrl == targetUrl else {
@@ -5204,25 +5252,17 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     if !isPlayheadReady && playhead <= maxBlockIndex {
       candidates.append(playhead)
     }
-    if playhead + 1 <= maxBlockIndex {
-      candidates.append(playhead + 1)
-    }
-    // While the active playhead block is still downloading, limit background concurrency to 1 extra block (`playhead + 1`)
-    // so the playhead block finishes with maximum bandwidth; once playhead is cached, unleash parallel workers across the lookahead window!
-    let maxWorkersNow = isPlayheadReady ? maxWorkersForTarget : min(2, maxWorkersForTarget)
-    if isPlayheadReady {
-      if !isDomestic && playhead <= 1 && maxBlockIndex > playhead + 1 {
-        candidates.append(maxBlockIndex)
-      }
-      if lookaheadForTarget >= 2 {
-        for offset in 2...lookaheadForTarget {
-          let idx = playhead + Int64(offset)
-          if idx <= maxBlockIndex && idx != maxBlockIndex {
-            candidates.append(idx)
-          }
-        }
+    for offset in 1...lookaheadForTarget {
+      let idx = playhead + Int64(offset)
+      if idx <= maxBlockIndex {
+        candidates.append(idx)
       }
     }
+    if isPlayheadReady && playhead <= 1 && maxBlockIndex > playhead + Int64(lookaheadForTarget) {
+      candidates.append(maxBlockIndex)
+    }
+    // Launch 4 parallel workers immediately even while playhead is downloading, and all 8 workers once playhead is ready!
+    let maxWorkersNow = isPlayheadReady ? maxWorkersForTarget : min(4, maxWorkersForTarget)
 
     var blocksToLaunch: [Int64] = []
     for idx in candidates {
@@ -5437,14 +5477,26 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       if Task.isCancelled { return nil }
       var req = URLRequest(url: url)
       req.httpMethod = "GET"
-      req.timeoutInterval = (attempt == 0 && primarySession !== directUrlSession) ? 7.5 : 18.0
+      req.timeoutInterval = (attempt == 0 && primarySession !== directUrlSession && primarySession !== directStreamSession) ? 7.5 : 18.0
       for (k, v) in headers where !v.isEmpty {
         req.setValue(v, forHTTPHeaderField: k)
       }
       req.setValue("bytes=\(start)-\(end)", forHTTPHeaderField: "Range")
       req.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-      let sess = attempt == 0 ? primarySession : directUrlSession
-      if let (d, r) = try? await sess.data(for: req),
+      let sess = attempt == 0 ? primarySession : directStreamSession
+      if sess === directStreamSession {
+        if let d = await TvContinuousStreamSessionDelegate.shared.fetchRangeBlock(
+          request: req,
+          session: sess,
+          startOffset: start,
+          expectedBytes: expected
+        ), d.count == expected {
+          if attempt > 0 && primarySession !== directStreamSession {
+            markTelegramUrlPreferDirect(targetUrl)
+          }
+          return d
+        }
+      } else if let (d, r) = try? await sess.data(for: req),
          let h = r as? HTTPURLResponse,
          h.statusCode == 206,
          h.value(forHTTPHeaderField: "Content-Range")?.hasPrefix("bytes \(start)-\(end)/") == true,
@@ -5455,7 +5507,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
         }
         TvNetworkSpeedMonitor.shared.recordDownstreamBytes(d.count)
         return d
-      } else if attempt == 0 && primarySession !== directUrlSession {
+      } else if attempt == 0 && primarySession !== directUrlSession && primarySession !== directStreamSession {
         markTelegramUrlPreferDirect(targetUrl)
       }
       try? await Task.sleep(nanoseconds: UInt64((attempt + 1) * 180_000_000))
@@ -5782,23 +5834,27 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       await store.registerVodSegments(allVodUrls, forGen: activeGen)
       await store.setCachedVodPlaylist(rewritten, forGen: activeGen)
 
-      // Immediately prefetch the first 3 VOD / 115 HLS segments so AVPlayer starts playback at 0ms without segment wait
-      let initialVodPrefetch = Array(allVodUrls.prefix(3))
+      // Immediately prefetch the first 4 VOD / 115 / AList HLS segments IN PARALLEL so AVPlayer starts playback at 0ms with 4x bandwidth
+      let initialVodPrefetch = Array(allVodUrls.prefix(4))
       if !initialVodPrefetch.isEmpty {
         let sessionRef = self.preferredSession(for: activeStreamUrl)
         let fallbackSessionRef = self.directUrlSession
         let storeRef = self.store
         let pTask = Task {
-          for segUrl in initialVodPrefetch {
-            if Task.isCancelled { break }
-            if await storeRef.cachedData(for: segUrl, gen: activeGen) != nil { continue }
-            _ = await storeRef.fetchOrJoinSegment(url: segUrl, gen: activeGen) { u, h in
-              await Self.downloadSegmentMultiRange(
-                urlStr: u,
-                headers: h,
-                session: sessionRef,
-                fallbackDirectSession: fallbackSessionRef
-              )
+          await withTaskGroup(of: Void.self) { group in
+            for segUrl in initialVodPrefetch {
+              group.addTask {
+                if Task.isCancelled { return }
+                if await storeRef.cachedData(for: segUrl, gen: activeGen) != nil { return }
+                _ = await storeRef.fetchOrJoinSegment(url: segUrl, gen: activeGen) { u, h in
+                  await Self.downloadSegmentMultiRange(
+                    urlStr: u,
+                    headers: h,
+                    session: sessionRef,
+                    fallbackDirectSession: fallbackSessionRef
+                  )
+                }
+              }
             }
           }
         }
