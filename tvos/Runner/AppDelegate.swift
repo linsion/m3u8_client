@@ -71,8 +71,11 @@ final class TvInteractiveWindow: UIWindow {
 
   override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
     super.didUpdateFocus(in: context, with: coordinator)
-    lastTouchActivityTime = CACurrentMediaTime()
-    onRemoteActivity?()
+    // NOTE: Do NOT call `onRemoteActivity?()` here!
+    // `sendEvent(_:)` above already captures every real physical Siri Remote button press (`UIPressesEvent`)
+    // and touch gesture (`event.type == .touches`). Firing `onRemoteActivity` inside `didUpdateFocus`
+    // caused programmatic SwiftUI focus transitions (when player controls auto-hide and focus shifts to
+    // `.showControlsStage`) to immediately wake the controls back up in an infinite flicker loop!
     let prevView = context.previouslyFocusedView
     let nextView = context.nextFocusedView
     applyDarkFocusStyleNearFocusedViews(prevView: prevView, nextView: nextView)
@@ -3925,10 +3928,10 @@ struct TvLiveSectionView: View {
         let latestActivity = max(lastInteractionAt, appState.lastRemoteActivityAt)
         if appState.liveFullscreenControlsVisible && now.timeIntervalSince(latestActivity) >= 3.5 {
           lastAutoHideAt = now
+          appState.lastControlsManualHideAt = now
           withAnimation(.easeInOut(duration: 0.25)) {
             appState.liveFullscreenControlsVisible = false
           }
-          focusedLiveTarget = .videoWindowStage
         }
       }
     }

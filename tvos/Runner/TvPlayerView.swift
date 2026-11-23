@@ -2100,8 +2100,12 @@ struct TvPlayerModalView: View {
       }
       wakeUpControls()
     }
-    .onChange(of: focusedField) { _ in
-      lastInteractionAt = Date()
+    .onChange(of: focusedField) { newFocus in
+      if appState.playerControlsVisible
+          && newFocus != .showControlsStage
+          && Date().timeIntervalSince(lastAutoHideAt) > 0.8 {
+        lastInteractionAt = Date()
+      }
     }
     .onChange(of: appState.remoteActivityTick) { _ in
       wakeUpControls()
@@ -2114,7 +2118,9 @@ struct TvPlayerModalView: View {
           focusedField = request.isLive ? .playPause : .scrubber
         }
       } else {
-        lastAutoHideAt = Date()
+        let hideNow = Date()
+        lastAutoHideAt = hideNow
+        appState.lastControlsManualHideAt = hideNow
         appState.isPlayerScrubberFocused = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
           focusedField = .showControlsStage
@@ -2257,10 +2263,10 @@ struct TvPlayerModalView: View {
           && !appState.is115Accelerating
           && now.timeIntervalSince(latestActivity) >= 3.5 {
         lastAutoHideAt = now
+        appState.lastControlsManualHideAt = now
         withAnimation(.easeInOut(duration: 0.25)) {
           appState.playerControlsVisible = false
         }
-        focusedField = .showControlsStage
       }
     }
     .sheet(isPresented: $show115LoginSheet) {
@@ -3565,8 +3571,12 @@ struct TvTelegramGalleryModalView: View {
       appState.isPlayerScrubberFocused = (galleryFocus == .scrubber || galleryFocus == .restoreControls || galleryFocus == nil)
       wakeUpGalleryControls()
     }
-    .onChange(of: galleryFocus) { _ in
-      lastInteractionAt = Date()
+    .onChange(of: galleryFocus) { newFocus in
+      if appState.galleryControlsVisible
+          && newFocus != .restoreControls
+          && Date().timeIntervalSince(lastAutoHideAt) > 0.8 {
+        lastInteractionAt = Date()
+      }
     }
     .onChange(of: appState.remoteActivityTick) { _ in
       wakeUpGalleryControls()
@@ -3580,7 +3590,9 @@ struct TvTelegramGalleryModalView: View {
           galleryFocus = isVid ? .scrubber : .prevItem
         }
       } else {
-        lastAutoHideAt = Date()
+        let hideNow = Date()
+        lastAutoHideAt = hideNow
+        appState.lastControlsManualHideAt = hideNow
         appState.isPlayerScrubberFocused = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
           galleryFocus = .restoreControls
@@ -3636,10 +3648,10 @@ struct TvTelegramGalleryModalView: View {
           && !appState.is115Accelerating
           && now.timeIntervalSince(latestActivity) >= 3.5 {
         lastAutoHideAt = now
+        appState.lastControlsManualHideAt = now
         withAnimation(.easeInOut(duration: 0.25)) {
           appState.galleryControlsVisible = false
         }
-        galleryFocus = .restoreControls
       }
     }
     .sheet(isPresented: $show115LoginSheet) {

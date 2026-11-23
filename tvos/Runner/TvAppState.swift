@@ -201,7 +201,7 @@ final class TvAppState: ObservableObject {
 
   func registerRemoteInteraction() {
     let now = Date()
-    guard now.timeIntervalSince(lastControlsManualHideAt) > 0.45 else { return }
+    guard now.timeIntervalSince(lastControlsManualHideAt) > 0.75 else { return }
     lastRemoteActivityAt = now
     // Only broadcast a @Published state change when a fullscreen player's controls are hidden and need waking up.
     // Never fire objectWillChange during normal scrolling/focus navigation in VOD, Live Guide, or Telegram!

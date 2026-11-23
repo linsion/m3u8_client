@@ -2146,6 +2146,7 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
   private var mkvVideoFrameDurationMs: Int64 = 42
   private var mkvNextMonotonicDtsMs: Int64 = -1
   private var mkvMaxObservedPtsMs: Int64 = 0
+  private var mkvNeedsKeyframeAfterFlush: Bool = false
   private var mkvRawCodecPrivate: Data = Data()
   private var mkvVideoContentCompPrefix: Data = Data()
   private var mkvAudioContentCompPrefix: Data = Data()
@@ -2341,6 +2342,7 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
     mkvVideoFrameDurationMs = 42
     mkvNextMonotonicDtsMs = -1
     mkvMaxObservedPtsMs = 0
+    mkvNeedsKeyframeAfterFlush = false
     mkvRawCodecPrivate.removeAll()
     mkvCuePoints.removeAll()
     mkvVideoContentCompPrefix.removeAll()
@@ -3829,14 +3831,29 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
         localBlock0 = b1
         return b1.data
       }
-      guard let fetched = await TvLocalHlsProxyServer.shared.fetchMediaBlockForEngine(
-        targetKey: targetKey,
-        remoteUrl: remoteUrl,
-        headers: headers,
-        blockIndex: idx,
-        meta: meta,
-        reader: reader
-      ), !fetched.isEmpty else {
+      var fetchedBlock: Data? = nil
+      for retry in 0..<4 {
+        if Task.isCancelled { return nil }
+        self.lock.lock()
+        let stoppedNow = self.isStopped
+        self.lock.unlock()
+        if stoppedNow { return nil }
+        if let f = await TvLocalHlsProxyServer.shared.fetchMediaBlockForEngine(
+          targetKey: targetKey,
+          remoteUrl: remoteUrl,
+          headers: headers,
+          blockIndex: idx,
+          meta: meta,
+          reader: reader
+        ), !f.isEmpty {
+          fetchedBlock = f
+          break
+        }
+        if retry < 3 {
+          try? await Task.sleep(nanoseconds: UInt64((retry + 1) * 250_000_000))
+        }
+      }
+      guard let fetched = fetchedBlock else {
         return nil
       }
       localBlock1 = localBlock0
@@ -4130,17 +4147,20 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
             // Watchdog: if `synchronizer.currentTime()` hasn't moved while frames are queued ahead (e.g. `audioRenderer` stalled),
             // flush `audioRenderer` and re-kick `synchronizer.setRate` so video playback never deadlocks at 3.5s!
             let stalledClock = abs(curSyncSec - prevPos) < 0.01 && (Double(maxQueuedPtsMs) / 1000.0) > curSyncSec + 2.0
-            if stalledClock || audioRenderer.status == .failed {
+            if stalledClock || audioRenderer.status == .failed || displayLayer.status == .failed {
               if audioRenderer.status == .failed {
                 audioRenderer.flush()
+              }
+              if displayLayer.status == .failed {
+                displayLayer.flush()
               }
               let resumeTime = CMTime(value: max(0, Int64(curSyncSec * 1000.0)), timescale: 1000)
               synchronizer.setRate(rate, time: resumeTime)
             }
           }
           let aheadSec = (Double(maxQueuedPtsMs) / 1000.0) - curSyncSec
-          if aheadSec > 3.5 && aheadSec < 30.0 {
-            try? await Task.sleep(nanoseconds: 20_000_000)
+          if aheadSec > 3.5 && aheadSec < 600.0 {
+            try? await Task.sleep(nanoseconds: 25_000_000)
             continue
           }
         }
@@ -4599,21 +4619,26 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
       sampleBufferOut: &sampleBuf
     ) == noErr, let sb = sampleBuf else { return }
 
-    if !isKeyframe,
-       let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: true),
-       CFArrayGetCount(attachments) > 0 {
-      let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
-      CFDictionarySetValue(
-        dict,
-        Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(),
-        Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
-      )
-    }
+      if !isKeyframe && !mkvNeedsKeyframeAfterFlush,
+         let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: true),
+         CFArrayGetCount(attachments) > 0 {
+        let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+        CFDictionarySetValue(
+          dict,
+          Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(),
+          Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+        )
+      }
 
-    if displayLayer.status == .failed {
-      displayLayer.flush()
-    }
-    displayLayer.enqueue(sb)
+      if displayLayer.status == .failed {
+        displayLayer.flush()
+        mkvNeedsKeyframeAfterFlush = true
+      }
+      if mkvNeedsKeyframeAfterFlush {
+        guard isKeyframe else { return }
+        mkvNeedsKeyframeAfterFlush = false
+      }
+      displayLayer.enqueue(sb)
     if displayLayer.status == .failed && isKeyframe && !mkvRawCodecPrivate.isEmpty {
       displayLayer.flush()
       if let rawFmt = Self.createVideoFormatDescFromRawExtensionAtom(
@@ -5546,6 +5571,8 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
     var isFinished = false
     var didTransferAnyBytes = false
     var emittedSliceCount: Int = 0
+    var isExtractingSlices = false
+    var pendingCompletion = false
 
     init(mode: Mode) {
       self.mode = mode
@@ -6044,6 +6071,11 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
 
     case .multiBlockStream(_, let sliceLengths, let onSliceReady, _):
       ctx.buffer.append(data)
+      if ctx.isExtractingSlices {
+        lock.unlock()
+        return
+      }
+      ctx.isExtractingSlices = true
       while ctx.emittedSliceCount < sliceLengths.count {
         let need = sliceLengths[ctx.emittedSliceCount]
         if ctx.buffer.count < need {
@@ -6062,6 +6094,7 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
           return
         }
         if reachedAll {
+          finishContext(key: key)
           return
         }
         lock.lock()
@@ -6070,7 +6103,12 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
           return
         }
       }
+      ctx.isExtractingSlices = false
+      let shouldFinishNow = ctx.pendingCompletion || ctx.emittedSliceCount >= sliceLengths.count
       lock.unlock()
+      if shouldFinishNow {
+        finishContext(key: key)
+      }
 
     case .fullSegment:
       ctx.buffer.append(data)
@@ -6111,6 +6149,11 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
     let key = SessionTaskKey(sessionId: ObjectIdentifier(session), taskId: task.taskIdentifier)
     lock.lock()
     guard let ctx = contexts[key], !ctx.isFinished else {
+      lock.unlock()
+      return
+    }
+    if ctx.isExtractingSlices {
+      ctx.pendingCompletion = true
       lock.unlock()
       return
     }
@@ -6213,11 +6256,11 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
 
   private static let tgBlockSize: Int64 = 4_194_304 // 4 MB block slice size
   static var engineBlockSize: Int64 { tgBlockSize }
-  private static let tgMaxCachedBlocks: Int = 216 // 216 x 4 MB = 864 MB shared in-memory ring cache on Apple TV 4K
+  private static let tgMaxCachedBlocks: Int = 160 // 160 x 4 MB = 640 MB shared in-memory ring cache on Apple TV 4K (safe 256 MB headroom above 96-block lookahead!)
   private static let tgBatchBlocksPerStream: Int64 = 16 // 16 x 4 MB = 64 MB continuous stream per HTTP request (zero per-block reconnect overhead!)
   private static let tgMaxConcurrentPrefetchPerUrl = 4
   private static let tgDomesticConcurrentPrefetchPerUrl = 4
-  private static let tgLookaheadBlocks = 192 // 192 x 4 MB = 768 MB continuous forward lookahead window (never stops after 64 MB!)
+  private static let tgLookaheadBlocks = 96 // 96 x 4 MB = 384 MB continuous forward lookahead window (always fits inside 640 MB ring cache with 64-block eviction margin!)
   private var tgBlockCache: [String: Data] = [:]
   private var tgBlockOrder: [String] = []
   private var tgInFlightBlocks: [String: Task<Data?, Never>] = [:]
@@ -7915,16 +7958,11 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     let effectiveUrl = resolvedCdnUrl(for: targetUrl, fallback: url)
 
     tgLock.lock()
-    guard tgActiveBackgroundUrl == targetUrl else {
+    guard tgActiveBackgroundUrl == targetUrl, tgHeadersByUrl[targetUrl] != nil else {
       tgLock.unlock()
       return
     }
     let now = Date()
-    let lastAccess = tgLastAccessByUrl[targetUrl] ?? .distantPast
-    guard now.timeIntervalSince(lastAccess) < 60.0 else {
-      tgLock.unlock()
-      return
-    }
     let playhead = tgPlayheadBlockByUrl[targetUrl] ?? 0
     let tailProbe = tgTailProbeBlockByUrl[targetUrl]
     let activeReaderBlocks = (tgActiveReadersByUrl[targetUrl] ?? [:])
@@ -7943,7 +7981,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       return tgBlockCache[key] == nil && tgInFlightBlocks[key] == nil && tgInFlightWaiters[key] == nil
     }
 
-    func tryClaimContiguousBatch(from anchor: Int64, maxSpan: Int64, maxBlocksInBatch: Int64) -> (Int64, Int64)? {
+    func tryClaimContiguousBatch(from anchor: Int64, maxSpan: Int64, maxBlocksInBatch: Int64, requireMinBatchAfterFarOffset: Bool = false) -> (Int64, Int64)? {
       let limit = min(maxBlockIndex, anchor + maxSpan)
       var cur = max(0, anchor)
       while cur <= limit {
@@ -7953,6 +7991,13 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
           let maxE = min(limit, s + maxBlocksInBatch - 1)
           while e + 1 <= maxE && isBlockAvailableToClaim(e + 1) {
             e += 1
+          }
+          // When >128 MB (`32 blocks`) ahead of `anchor` is already cached, wait until at least 8 blocks (`32 MB`)
+          // are available to claim (or we reach `maxBlockIndex`) so workers always stream full 32 MB–64 MB continuous
+          // batches instead of firing 1-block micro-requests every 2 seconds as the playhead advances!
+          if requireMinBatchAfterFarOffset && s > anchor + 32 && (e - s + 1) < 8 && e < maxBlockIndex {
+            cur = e + 1
+            continue
           }
           for b in s...e {
             reservedInThisPass.insert(b)
@@ -7967,11 +8012,16 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     var activeCount = tgActivePrefetchCountByUrl[targetUrl] ?? 0
     var slotSeed: Int64 = playhead + Int64(activeCount)
 
-    // 1. Primary forward continuous stream batches from `playhead` across the 768 MB lookahead window
+    // 1. Primary forward continuous stream batches from `playhead` across the 384 MB lookahead window
     while activeCount < maxWorkersForTarget {
       var claimed: (Int64, Int64)? = nil
-      // First ensure the immediate playhead window (`playhead ... playhead + 15`) is claimed
-      claimed = tryClaimContiguousBatch(from: playhead, maxSpan: lookaheadForTarget, maxBlocksInBatch: Self.tgBatchBlocksPerStream)
+      // First ensure the immediate playhead window (`playhead ... playhead + 96`) is claimed
+      claimed = tryClaimContiguousBatch(
+        from: playhead,
+        maxSpan: lookaheadForTarget,
+        maxBlocksInBatch: Self.tgBatchBlocksPerStream,
+        requireMinBatchAfterFarOffset: true
+      )
       if claimed == nil {
         for rBlock in activeReaderBlocks where rBlock != playhead {
           if let hit = tryClaimContiguousBatch(from: rBlock, maxSpan: 15, maxBlocksInBatch: 8) {
@@ -8192,6 +8242,14 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
           }) {
             let evictedKey = tgBlockOrder.remove(at: playedIdx)
             tgBlockCache.removeValue(forKey: evictedKey)
+          } else if let furthestIdx = tgBlockOrder.enumerated().max(by: { a, b in
+            let aBlk = Int64(a.element.dropFirst(prefix.count)) ?? -1
+            let bBlk = Int64(b.element.dropFirst(prefix.count)) ?? -1
+            return aBlk < bBlk
+          })?.offset {
+            // Never evict `curPlayhead + 1` via `removeFirst()`! Always evict the block furthest in the future (`max blockIndex`).
+            let evictedKey = tgBlockOrder.remove(at: furthestIdx)
+            tgBlockCache.removeValue(forKey: evictedKey)
           } else {
             let evictedKey = tgBlockOrder.removeFirst()
             tgBlockCache.removeValue(forKey: evictedKey)
@@ -8309,8 +8367,15 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
             guard $0.hasPrefix(prefix), let bIdx = Int64($0.dropFirst(prefix.count)) else { return false }
             return bIdx < curPlayhead - 2
           }) {
-            // 2. Evict already-played blocks (`bIdx < curPlayhead - 2`) so future prefetched blocks in the 768 MB lookahead window are never evicted!
+            // 2. Evict already-played blocks (`bIdx < curPlayhead - 2`) so future prefetched blocks in the lookahead window are never evicted!
             let evictedKey = tgBlockOrder.remove(at: playedIdx)
+            tgBlockCache.removeValue(forKey: evictedKey)
+          } else if let furthestIdx = tgBlockOrder.enumerated().max(by: { a, b in
+            let aBlk = Int64(a.element.dropFirst(prefix.count)) ?? -1
+            let bBlk = Int64(b.element.dropFirst(prefix.count)) ?? -1
+            return aBlk < bBlk
+          })?.offset {
+            let evictedKey = tgBlockOrder.remove(at: furthestIdx)
             tgBlockCache.removeValue(forKey: evictedKey)
           } else {
             let evictedKey = tgBlockOrder.removeFirst()
