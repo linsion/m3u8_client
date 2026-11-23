@@ -1941,6 +1941,7 @@ actor TvHlsSegmentCacheActor {
   private var slidingWindow: [SegmentEntry] = []
   private var vodSegmentUrls: [String] = []
   private var vodSegmentIndexByUrl: [String: Int] = [:]
+  private var vodPlayheadIndex: Int = 0
   private var nextSeqNumber: Int = 1
   private var prefetchTask: Task<Void, Never>? = nil
   private var cachedRewrittenVodPlaylist: String? = nil
@@ -1955,6 +1956,7 @@ actor TvHlsSegmentCacheActor {
     slidingWindow.removeAll()
     vodSegmentUrls.removeAll()
     vodSegmentIndexByUrl.removeAll()
+    vodPlayheadIndex = 0
     cachedRewrittenVodPlaylist = nil
     nextSeqNumber = 1
     generation &+= 1
@@ -1989,6 +1991,7 @@ actor TvHlsSegmentCacheActor {
   func registerVodSegments(_ urls: [String], forGen gen: Int) {
     guard gen == generation else { return }
     vodSegmentUrls = urls
+    vodPlayheadIndex = 0
     var indexMap: [String: Int] = [:]
     indexMap.reserveCapacity(urls.count)
     for (idx, u) in urls.enumerated() where indexMap[u] == nil {
@@ -1997,18 +2000,27 @@ actor TvHlsSegmentCacheActor {
     vodSegmentIndexByUrl = indexMap
   }
 
-  func nextVodSegmentsToPrefetch(after url: String, count: Int, gen: Int) -> [String] {
-    guard gen == generation,
-          count > 0,
-          let idx = vodSegmentIndexByUrl[url] else { return [] }
-    let start = idx + 1
+  func nextVodSegmentsToPrefetch(
+    after url: String? = nil,
+    maxInFlight: Int = 16,
+    lookahead: Int = 48,
+    gen: Int
+  ) -> [String] {
+    guard gen == generation, !vodSegmentUrls.isEmpty else { return [] }
+    if let u = url, let idx = vodSegmentIndexByUrl[u] {
+      vodPlayheadIndex = idx
+    }
+    let availableSlots = max(0, maxInFlight - inFlight.count)
+    guard availableSlots > 0 else { return [] }
+    let start = max(0, vodPlayheadIndex)
     guard start < vodSegmentUrls.count else { return [] }
-    let end = min(vodSegmentUrls.count, start + count)
+    let end = min(vodSegmentUrls.count, start + lookahead)
     var out: [String] = []
     for i in start..<end {
       let candidate = vodSegmentUrls[i]
       if cache[candidate] == nil && inFlight[candidate] == nil {
         out.append(candidate)
+        if out.count >= availableSlots { break }
       }
     }
     return out
@@ -2062,7 +2074,7 @@ actor TvHlsSegmentCacheActor {
     guard gen == generation, let valid = data, !valid.isEmpty else { return data }
     cache[url] = valid
     cacheOrder.append(url)
-    if cacheOrder.count > 24 {
+    if cacheOrder.count > 96 {
       let old = cacheOrder.removeFirst()
       cache.removeValue(forKey: old)
     }
@@ -3591,6 +3603,9 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
       expectedBytes: Int,
       continuation: CheckedContinuation<Data?, Never>
     )
+    case fullSegment(
+      continuation: CheckedContinuation<Data?, Never>
+    )
     case continuousRange(
       conn: NWConnection,
       continuation: CheckedContinuation<Bool, Never>
@@ -3667,6 +3682,33 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
           )
         )
         ctx.buffer.reserveCapacity(min(expectedBytes, 4_194_304))
+        lock.lock()
+        contexts[task.taskIdentifier] = ctx
+        lock.unlock()
+        taskBox.lock()
+        createdTask = task
+        taskBox.unlock()
+        task.resume()
+      }
+    } onCancel: {
+      taskBox.lock()
+      let t = createdTask
+      taskBox.unlock()
+      t?.cancel()
+    }
+  }
+
+  func fetchSegmentData(
+    request: URLRequest,
+    session: URLSession
+  ) async -> Data? {
+    let taskBox = NSLock()
+    var createdTask: URLSessionDataTask?
+    return await withTaskCancellationHandler {
+      await withCheckedContinuation { (cont: CheckedContinuation<Data?, Never>) in
+        let task = session.dataTask(with: request)
+        let ctx = TaskContext(mode: .fullSegment(continuation: cont))
+        ctx.buffer.reserveCapacity(1_048_576)
         lock.lock()
         contexts[task.taskIdentifier] = ctx
         lock.unlock()
@@ -3766,6 +3808,12 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
       } else {
         cont.resume(returning: nil)
       }
+    case .fullSegment(let cont):
+      if !ctx.buffer.isEmpty {
+        cont.resume(returning: ctx.buffer)
+      } else {
+        cont.resume(returning: nil)
+      }
     case .continuousRange(_, let cont):
       cont.resume(returning: streamSuccess ?? ctx.didTransferAnyBytes)
     case .passthrough(let conn, _, let cont):
@@ -3796,9 +3844,9 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
   ) {
     var redirected = request
     if let orig = task.originalRequest {
+      // Unconditionally preserve User-Agent (e.g. 115Browser/AList UA), Range, and Accept-Encoding across cross-domain 301/302 redirects!
       for headerName in ["User-Agent", "Range", "Accept-Encoding"] {
-        if redirected.value(forHTTPHeaderField: headerName) == nil,
-           let val = orig.value(forHTTPHeaderField: headerName), !val.isEmpty {
+        if let val = orig.value(forHTTPHeaderField: headerName), !val.isEmpty {
           redirected.setValue(val, forHTTPHeaderField: headerName)
         }
       }
@@ -3867,6 +3915,16 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
       let contentRange = http.value(forHTTPHeaderField: "Content-Range") ?? http.value(forHTTPHeaderField: "content-range") ?? ""
       guard http.statusCode == 206,
             contentRange.isEmpty || contentRange.lowercased().hasPrefix("bytes \(startOffset)-") else {
+        lock.unlock()
+        finishContext(taskId: taskId)
+        completionHandler(.cancel)
+        return
+      }
+      lock.unlock()
+      completionHandler(.allow)
+
+    case .fullSegment:
+      guard (200..<300).contains(http.statusCode) else {
         lock.unlock()
         finishContext(taskId: taskId)
         completionHandler(.cancel)
@@ -3963,6 +4021,10 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
       }
       lock.unlock()
 
+    case .fullSegment:
+      ctx.buffer.append(data)
+      lock.unlock()
+
     case .continuousRange(let conn, _), .passthrough(let conn, _, _):
       ctx.didTransferAnyBytes = true
       ctx.pendingSendBytes += data.count
@@ -4013,7 +4075,7 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
       } else {
         finishContext(taskId: taskId, headerResult: .success(nil))
       }
-    case .rangeBlock:
+    case .rangeBlock, .fullSegment:
       finishContext(taskId: taskId)
     case .continuousRange:
       finishContext(taskId: taskId, streamSuccess: error == nil && didTransfer)
@@ -4043,16 +4105,17 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
   private var tgHeadersByUrl: [String: [String: String]] = [:]
   private var tgHeaderOrder: [String] = []
   private var tgForceDirectUrls = Set<String>()
+  private var tgResolvedCdnUrlByUrl: [String: URL] = [:]
   private var tgPlaybackReaderByUrl: [String: UUID] = [:]
   private var tgRangeUnsupported = Set<String>()
   private var tgPassthroughTasks: [String: [UUID: Task<Bool, Never>]] = [:]
   private var tgVideoMetaCache: [String: (totalSize: Int64, contentType: String, headerChunk: Data, stripPrefixBytes: Int)] = [:]
   private var tgMetaOrder: [String] = []
   private var tgMetaInFlight: [String: Task<(totalSize: Int64, contentType: String, headerChunk: Data, stripPrefixBytes: Int)?, Never>] = [:]
-  private static let tgBlockSize: Int64 = 2_097_152 // 2 MB block size -> 8 parallel workers = 16-40+ MB/s sustained throughput
-  private static let tgMaxCachedBlocks: Int = 64 // 64 x 2 MB = 128 MB shared in-memory LRU stitch cache
-  private static let tgMaxConcurrentPrefetchPerUrl = 8
-  private static let tgLookaheadBlocks = 16
+  private static let tgBlockSize: Int64 = 1_048_576 // 1 MB block size -> 24 parallel workers = 48-120+ MB/s full-line saturation
+  private static let tgMaxCachedBlocks: Int = 256 // 256 x 1 MB = 256 MB shared in-memory LRU stitch cache
+  private static let tgMaxConcurrentPrefetchPerUrl = 24
+  private static let tgLookaheadBlocks = 96
   private var tgBlockCache: [String: Data] = [:]
   private var tgBlockOrder: [String] = []
   private var tgInFlightBlocks: [String: Task<Data?, Never>] = [:]
@@ -4130,9 +4193,9 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
 
   private init() {
     let cfg = URLSessionConfiguration.ephemeral
-    cfg.timeoutIntervalForRequest = 15
+    cfg.timeoutIntervalForRequest = 18
     cfg.timeoutIntervalForResource = 180
-    cfg.httpMaximumConnectionsPerHost = 32
+    cfg.httpMaximumConnectionsPerHost = 64
     cfg.httpShouldSetCookies = false
     cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
     self.directUrlSession = URLSession(configuration: cfg, delegate: InsecureSessionDelegate(), delegateQueue: nil)
@@ -4140,7 +4203,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     let streamCfg = URLSessionConfiguration.ephemeral
     streamCfg.timeoutIntervalForRequest = 25
     streamCfg.timeoutIntervalForResource = 28800
-    streamCfg.httpMaximumConnectionsPerHost = 32
+    streamCfg.httpMaximumConnectionsPerHost = 64
     streamCfg.httpShouldSetCookies = false
     streamCfg.requestCachePolicy = .reloadIgnoringLocalCacheData
     self.directStreamSession = URLSession(
@@ -4253,7 +4316,8 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     return "http://127.0.0.1:\(port)/flv_live.m3u8?gen=\(gen)"
   }
 
-  /// Creates a relay URL scoped to one playback and its authentication headers.
+  /// Creates a relay URL scoped to one playback and its authentication headers,
+  /// and immediately pre-starts the 24-worker parallel Range block prefetcher at `t = 0ms`!
   func prepareTelegramVideoProxyUrl(
     remoteUrl: String,
     headers: [String: String],
@@ -4264,35 +4328,37 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     guard port > 0 else { return remoteUrl }
     let playbackId = UUID().uuidString
     let key = "\(remoteUrl)#\(playbackId)"
-    var cleanHeaders = headers.filter { !$0.value.isEmpty }
+    var cleanHeaders: [String: String] = [:]
+    for (k, v) in headers {
+      let trimmedVal = v.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !trimmedVal.isEmpty else { continue }
+      switch k.lowercased() {
+      case "user-agent": cleanHeaders["User-Agent"] = trimmedVal
+      case "cookie": cleanHeaders["Cookie"] = trimmedVal
+      case "referer": cleanHeaders["Referer"] = trimmedVal
+      case "origin": cleanHeaders["Origin"] = trimmedVal
+      case "authorization": cleanHeaders["Authorization"] = trimmedVal
+      default: cleanHeaders[k] = trimmedVal
+      }
+    }
     let lowerUrl = remoteUrl.lowercased()
     if lowerUrl.contains("115cdn") || lowerUrl.contains("115.com") || lowerUrl.contains("115vod") {
-      let full115Cookie = TvM115AuthCookieStore.shared.cookieHeader(forUrl: remoteUrl)
-      if !full115Cookie.isEmpty {
-        cleanHeaders["Cookie"] = full115Cookie
+      // IMPORTANT: Only fill in Apple TV's local 115 cookie if the caller (e.g. AList `/api/fs/get`) did not already supply its own bound `Cookie`!
+      if cleanHeaders["Cookie"] == nil {
+        let full115Cookie = TvM115AuthCookieStore.shared.cookieHeader(forUrl: remoteUrl)
+        if !full115Cookie.isEmpty {
+          cleanHeaders["Cookie"] = full115Cookie
+        }
       }
-      if cleanHeaders["User-Agent"] == nil && cleanHeaders["user-agent"] == nil {
+      if cleanHeaders["User-Agent"] == nil {
         cleanHeaders["User-Agent"] = TvM115AuthCookieStore.browserUserAgent
       }
-      if cleanHeaders["Referer"] == nil && cleanHeaders["referer"] == nil {
+      if cleanHeaders["Referer"] == nil {
         cleanHeaders["Referer"] = "https://115.com/"
       }
-    } else if forceDirectConnection && cleanHeaders["User-Agent"] == nil && cleanHeaders["user-agent"] == nil {
+    } else if forceDirectConnection && cleanHeaders["User-Agent"] == nil {
       cleanHeaders["User-Agent"] = TvM115AuthCookieStore.browserUserAgent
     }
-    tgLock.lock()
-    tgHeadersByUrl[key] = cleanHeaders
-    if forceDirectConnection || Self.isDomesticOrLocalUrl(remoteUrl) {
-      tgForceDirectUrls.insert(key)
-    }
-    tgHeaderOrder.append(key)
-    while tgHeaderOrder.count > 64,
-          let index = tgHeaderOrder.firstIndex(where: { tgVideoMetaCache[$0] == nil && tgMetaInFlight[$0] == nil }) {
-      let evicted = tgHeaderOrder.remove(at: index)
-      tgHeadersByUrl.removeValue(forKey: evicted)
-      tgForceDirectUrls.remove(evicted)
-    }
-    tgLock.unlock()
     var cleanExt = extHint.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     if cleanExt.isEmpty {
       let pathExt = ((URL(string: remoteUrl)?.path ?? "") as NSString).pathExtension.lowercased()
@@ -4303,10 +4369,50 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     if cleanExt.isEmpty || !cleanExt.hasPrefix(".") {
       cleanExt = cleanExt.isEmpty ? ".mp4" : ".\(cleanExt)"
     }
+    let reqPath = "/tg_video\(cleanExt)"
+
+    tgLock.lock()
+    tgHeadersByUrl[key] = cleanHeaders
+    if forceDirectConnection || Self.isDomesticOrLocalUrl(remoteUrl) {
+      tgForceDirectUrls.insert(key)
+    }
+    tgActiveBackgroundUrl = key
+    tgPlayheadBlockByUrl[key] = 0
+    tgLastAccessByUrl[key] = Date()
+    tgHeaderOrder.append(key)
+    while tgHeaderOrder.count > 64,
+          let index = tgHeaderOrder.firstIndex(where: { tgVideoMetaCache[$0] == nil && tgMetaInFlight[$0] == nil }) {
+      let evicted = tgHeaderOrder.remove(at: index)
+      tgHeadersByUrl.removeValue(forKey: evicted)
+      tgForceDirectUrls.remove(evicted)
+      tgResolvedCdnUrlByUrl.removeValue(forKey: evicted)
+    }
+    tgLock.unlock()
+
+    // Pre-start the 512 KB header probe + 24-worker parallel block prefetcher immediately (before AVPlayer even sends its first request!)
+    let isAudioExt = [".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".ape", ".wma", ".aiff"].contains(cleanExt)
+    if !isAudioExt, let targetU = URL(string: remoteUrl) {
+      Task.detached(priority: .userInitiated) { [weak self] in
+        guard let self = self else { return }
+        if let meta = await self.ensureTelegramVideoMeta(targetUrl: key, url: targetU, requestPath: reqPath),
+           meta.totalSize > 0,
+           !meta.contentType.hasPrefix("audio/") {
+          let effectiveUrl = self.resolvedCdnUrl(for: key, fallback: targetU)
+          self.pumpTelegramSlidingWindow(targetUrl: key, url: effectiveUrl, meta: meta)
+        }
+      }
+    }
+
     var allowed = CharacterSet.urlQueryAllowed
     allowed.remove(charactersIn: "&+=?#")
     let enc = remoteUrl.addingPercentEncoding(withAllowedCharacters: allowed) ?? remoteUrl
-    return "http://127.0.0.1:\(port)/tg_video\(cleanExt)?u=\(enc)&playback=\(playbackId)"
+    return "http://127.0.0.1:\(port)\(reqPath)?u=\(enc)&playback=\(playbackId)"
+  }
+
+  private func resolvedCdnUrl(for targetUrl: String, fallback: URL) -> URL {
+    tgLock.lock()
+    defer { tgLock.unlock() }
+    return tgResolvedCdnUrlByUrl[targetUrl] ?? fallback
   }
 
   func releaseTelegramVideoProxyUrl(_ url: URL) {
@@ -4319,6 +4425,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     tgLock.lock()
     tgHeadersByUrl.removeValue(forKey: key)
     tgForceDirectUrls.remove(key)
+    tgResolvedCdnUrlByUrl.removeValue(forKey: key)
     tgHeaderOrder.removeAll { $0 == key }
     tgPlaybackReaderByUrl.removeValue(forKey: key)
     tgRangeUnsupported.remove(key)
@@ -4715,24 +4822,9 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       let activeGen = genParam ?? cfg.gen
       let sessionRef = self.preferredSession(for: targetUrl)
       let fallbackSessionRef = self.directUrlSession
-      let storeRef = self.store
 
-      // Lookahead prefetch the next 5 VOD / 115 / AList HLS .ts segments IN PARALLEL across 5 connections!
-      let lookaheadUrls = await store.nextVodSegmentsToPrefetch(after: targetUrl, count: 5, gen: activeGen)
-      for nextUrl in lookaheadUrls {
-        Task.detached(priority: .userInitiated) {
-          if Task.isCancelled { return }
-          if await storeRef.cachedData(for: nextUrl, gen: activeGen) != nil { return }
-          _ = await storeRef.fetchOrJoinSegment(url: nextUrl, gen: activeGen) { u, h in
-            await Self.downloadSegmentMultiRange(
-              urlStr: u,
-              headers: h,
-              session: sessionRef,
-              fallbackDirectSession: fallbackSessionRef
-            )
-          }
-        }
-      }
+      // Trigger self-driving 16-worker parallel VOD/115/AList .ts segment prefetcher across the next 48 segments!
+      pumpVodSegmentPrefetch(afterUrl: targetUrl, activeGen: activeGen)
 
       let data = await store.fetchOrJoinSegment(url: targetUrl, gen: activeGen) { urlStr, hdrs in
         await Self.downloadSegmentMultiRange(
@@ -4742,6 +4834,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
           fallbackDirectSession: fallbackSessionRef
         )
       }
+      pumpVodSegmentPrefetch(afterUrl: nil, activeGen: activeGen)
       guard let fullData = data, !fullData.isEmpty else {
         sendResponse(conn: conn, status: "502 Bad Gateway", contentType: "text/plain", body: Data(), isHead: method == "HEAD")
         return
@@ -4789,7 +4882,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     sendResponse(conn: conn, status: "404 Not Found", contentType: "text/plain", body: Data(), isHead: method == "HEAD")
   }
 
-  /// Deduplicated 512 KB (`bytes=0-524287`) initial header + metadata probe for Telegram / 115 media streams.
+  /// Deduplicated 512 KB (`bytes=0-524287`) initial header + metadata probe for Telegram / 115 / AList media streams.
   private func ensureTelegramVideoMeta(
     targetUrl: String,
     url: URL,
@@ -4804,20 +4897,27 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
           if Task.isCancelled { return nil }
           var req = URLRequest(url: url)
           req.httpMethod = "GET"
-          req.timeoutInterval = (attempt == 0 && primarySession !== self.directUrlSession) ? 7.5 : 15.0
+          req.timeoutInterval = (attempt == 0 && primarySession !== self.directUrlSession && primarySession !== self.directStreamSession) ? 7.5 : 15.0
           for (k, v) in hdrs where !v.isEmpty {
             req.setValue(v, forHTTPHeaderField: k)
           }
           // Probe first 512 KB (`bytes=0-524287`) with exclusive bandwidth so startup & MP4 header parsing complete fast
           req.setValue("bytes=0-524287", forHTTPHeaderField: "Range")
-          let sess = attempt == 0 ? primarySession : self.directUrlSession
+          let sess = attempt == 0 ? primarySession : self.directStreamSession
           do {
             guard let (d, h) = try await Self.readMediaHeader(req, session: sess),
                   !d.isEmpty else { continue }
             if attempt > 0 {
               self.markTelegramUrlPreferDirect(targetUrl)
             }
-            TvNetworkSpeedMonitor.shared.recordDownstreamBytes(d.count)
+            if let finalCdnUrl = h.url, finalCdnUrl != url {
+              self.tgLock.lock()
+              self.tgResolvedCdnUrlByUrl[targetUrl] = finalCdnUrl
+              self.tgLock.unlock()
+            }
+            if sess !== self.directStreamSession {
+              TvNetworkSpeedMonitor.shared.recordDownstreamBytes(d.count)
+            }
             let rawCt = (h.value(forHTTPHeaderField: "Content-Type") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             let ct: String
             if rawCt.isEmpty || rawCt.lowercased().contains("octet-stream") || rawCt.lowercased().contains("force-download") {
@@ -4853,7 +4953,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
             self.markMediaRangeUnsupported(targetUrl)
             return nil
           } catch {
-            if attempt == 0 && primarySession !== self.directUrlSession {
+            if attempt == 0 && primarySession !== self.directUrlSession && primarySession !== self.directStreamSession {
               self.markTelegramUrlPreferDirect(targetUrl)
             }
           }
@@ -4974,7 +5074,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     tgLock.unlock()
   }
 
-  /// Reads bounded byte ranges and prefetches ahead of the current playback position.
+  /// Reads bounded byte ranges and prefetches ahead of the current playback position using 24 parallel 1 MB workers.
   private func streamTelegramVideoChunked(
     targetUrl: String,
     url u: URL,
@@ -5007,6 +5107,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       return
     }
 
+    let effectiveUrl = resolvedCdnUrl(for: targetUrl, fallback: u)
     let allowParallelLookahead = !meta.contentType.hasPrefix("audio/")
 
     var reqStart: Int64 = 0
@@ -5036,15 +5137,19 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       return
     }
 
-    let prefetch = allowParallelLookahead && reqEnd >= 65536
+    let prefetch = allowParallelLookahead
     let reader = UUID()
     if prefetch { beginTelegramPlaybackRead(targetUrl: targetUrl, reader: reader) }
     defer {
       if prefetch { finishTelegramPlaybackRead(targetUrl: targetUrl, reader: reader) }
     }
 
-    // 2. Fast-path: serve small header/moov probes directly from cached 512 KB headerChunk in 0ms
+    // 2. Fast-path: serve small header/moov probes directly from cached 512 KB headerChunk in 0ms,
+    // while immediately pumping the 24-worker sliding window in the background!
     if reqEnd < Int64(meta.headerChunk.count) {
+      if prefetch {
+        pumpTelegramSlidingWindow(targetUrl: targetUrl, url: effectiveUrl, meta: meta)
+      }
       let slice = meta.headerChunk.subdata(in: Int(reqStart)..<(Int(reqEnd) + 1))
       sendResponse(
         conn: conn,
@@ -5059,7 +5164,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       return
     }
 
-    // Stream the requested range from the shared 8-worker parallel block cache.
+    // Stream the requested range from the shared 24-worker parallel block cache.
     let hdrLines = [
       "HTTP/1.1 \(isPartial ? "206 Partial Content" : "200 OK")",
       "Content-Type: \(meta.contentType)",
@@ -5088,18 +5193,19 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     }
 
     let blockSize = Self.tgBlockSize
+    let maxBlockIndex = max(0, (meta.totalSize - 1) / blockSize)
     while cursor <= reqEnd {
       let blockIndex = cursor / blockSize
       let blockStart = blockIndex * blockSize
       let blockEnd = min(meta.totalSize - 1, blockStart + blockSize - 1)
 
-      if prefetch && updateTelegramPlayhead(targetUrl: targetUrl, blockIndex: blockIndex, reader: reader) {
-        pumpTelegramSlidingWindow(targetUrl: targetUrl, url: u, meta: meta)
+      if prefetch && updateTelegramPlayhead(targetUrl: targetUrl, blockIndex: blockIndex, maxBlockIndex: maxBlockIndex, reader: reader) {
+        pumpTelegramSlidingWindow(targetUrl: targetUrl, url: effectiveUrl, meta: meta)
       }
 
       guard let blockData = await getOrFetchTelegramBlock(
         targetUrl: targetUrl,
-        url: u,
+        url: effectiveUrl,
         headers: hdrs,
         blockIndex: blockIndex,
         meta: meta,
@@ -5110,7 +5216,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       }
 
       if prefetch {
-        pumpTelegramSlidingWindow(targetUrl: targetUrl, url: u, meta: meta)
+        pumpTelegramSlidingWindow(targetUrl: targetUrl, url: effectiveUrl, meta: meta)
       }
 
       let sliceStart = Int(max(0, cursor - blockStart))
@@ -5161,8 +5267,6 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
 
   private func finishTelegramPlaybackRead(targetUrl: String, reader: UUID) {
     // Do NOT cancel in-flight prefetch tasks or clear `tgActiveBackgroundUrl` when an individual Range request completes!
-    // AVPlayer frequently issues consecutive or overlapping bounded Range requests (`bytes=0-2097151`, `bytes=2097152-4194303`),
-    // so keeping the 8 background prefetch workers running across consecutive Range requests ensures uninterrupted 16-40+ MB/s throughput!
     tgLock.lock()
     if tgPlaybackReaderByUrl[targetUrl] == reader {
       tgLastAccessByUrl[targetUrl] = Date()
@@ -5170,7 +5274,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     tgLock.unlock()
   }
 
-  private func updateTelegramPlayhead(targetUrl: String, blockIndex: Int64, reader: UUID) -> Bool {
+  private func updateTelegramPlayhead(targetUrl: String, blockIndex: Int64, maxBlockIndex: Int64, reader: UUID) -> Bool {
     let prefix = "\(targetUrl)#"
     tgLock.lock()
     defer { tgLock.unlock() }
@@ -5178,12 +5282,26 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     tgPlaybackReaderByUrl[targetUrl] = reader
     tgActiveBackgroundUrl = targetUrl
     tgLastAccessByUrl[targetUrl] = Date()
-    tgPlayheadBlockByUrl[targetUrl] = blockIndex
+
+    let currentPlayhead = tgPlayheadBlockByUrl[targetUrl] ?? 0
+    // Protect against AVPlayer's parallel tail metadata (`moov` / `Cues`) probe at the end of the file:
+    // If AVPlayer briefly reads the last 8 blocks of the file while playback is near the beginning/middle,
+    // do NOT overwrite `tgPlayheadBlockByUrl` to the end of the file and do NOT cancel any in-flight prefetch workers!
+    let isTailMetadataProbe = maxBlockIndex > 16
+      && blockIndex >= max(4, maxBlockIndex - 8)
+      && currentPlayhead < maxBlockIndex - 16
+    if !isTailMetadataProbe {
+      tgPlayheadBlockByUrl[targetUrl] = blockIndex
+    }
+
+    let isLargeUserSeek = !isTailMetadataProbe && abs(blockIndex - currentPlayhead) > 24
     for (key, task) in tgInFlightBlocks where tgInFlightIsPrefetch[key] == true {
       if !key.hasPrefix(prefix) {
         task.cancel()
-      } else if let index = Int64(key.dropFirst(prefix.count)),
-                index < blockIndex || index > blockIndex + Int64(Self.tgLookaheadBlocks) {
+      } else if isLargeUserSeek,
+                let index = Int64(key.dropFirst(prefix.count)),
+                index < maxBlockIndex - 6,
+                (index < blockIndex - 2 || index > blockIndex + Int64(Self.tgLookaheadBlocks)) {
         task.cancel()
       }
     }
@@ -5191,7 +5309,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
   }
 
   private func preferredTelegramOrMediaSession(for targetUrl: String) -> URLSession {
-    if isForceDirectTarget(targetUrl) || Self.isDomesticOrLocalUrl(targetUrl) {
+    if isForceDirectTarget(targetUrl) || Self.isDomesticOrLocalUrl(targetUrl) || !TvLocalProxyTunnelServer.shared.isProxyActive {
       return directStreamSession
     }
     if targetUrl.contains("/api/telegram/") || targetUrl.contains("/api/files/") {
@@ -5219,7 +5337,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     tgLock.unlock()
   }
 
-  /// Keeps a bounded window of completed blocks ahead of the playhead using 8 parallel workers.
+  /// Keeps a 96 MB window of completed 1 MB blocks ahead of the playhead using 24 parallel workers.
   private func pumpTelegramSlidingWindow(
     targetUrl: String,
     url: URL,
@@ -5229,6 +5347,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     let maxBlockIndex = max(0, (meta.totalSize - 1) / blockSize)
     let maxWorkersForTarget = Self.tgMaxConcurrentPrefetchPerUrl
     let lookaheadForTarget = Self.tgLookaheadBlocks
+    let effectiveUrl = resolvedCdnUrl(for: targetUrl, fallback: url)
 
     tgLock.lock()
     guard tgActiveBackgroundUrl == targetUrl else {
@@ -5236,15 +5355,13 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       return
     }
     let lastAccess = tgLastAccessByUrl[targetUrl] ?? .distantPast
-    guard Date().timeIntervalSince(lastAccess) < 35.0 else {
+    guard Date().timeIntervalSince(lastAccess) < 60.0 else {
       tgLock.unlock()
       return
     }
     let playhead = tgPlayheadBlockByUrl[targetUrl] ?? 0
     let hdrs = tgHeadersByUrl[targetUrl] ?? [:]
 
-    // Completed blocks remain in the bounded LRU across playhead changes.
-    // MP4 audio and video may be read from distant offsets in the same file.
     let playheadKey = "\(targetUrl)#\(playhead)"
     let isPlayheadReady = tgBlockCache[playheadKey] != nil
 
@@ -5252,17 +5369,27 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     if !isPlayheadReady && playhead <= maxBlockIndex {
       candidates.append(playhead)
     }
-    for offset in 1...lookaheadForTarget {
+    // Pre-fetch the first 4 MB AND the final 2 MB (`moov` / `Cues`) immediately at startup so both header and tail probes hit RAM at 0ms!
+    for offset in 1...min(4, lookaheadForTarget) {
       let idx = playhead + Int64(offset)
       if idx <= maxBlockIndex {
         candidates.append(idx)
       }
     }
-    if isPlayheadReady && playhead <= 1 && maxBlockIndex > playhead + Int64(lookaheadForTarget) {
+    if playhead <= 2 && maxBlockIndex > 6 {
       candidates.append(maxBlockIndex)
+      candidates.append(maxBlockIndex - 1)
     }
-    // Launch 4 parallel workers immediately even while playhead is downloading, and all 8 workers once playhead is ready!
-    let maxWorkersNow = isPlayheadReady ? maxWorkersForTarget : min(4, maxWorkersForTarget)
+    if lookaheadForTarget > 4 {
+      for offset in 5...lookaheadForTarget {
+        let idx = playhead + Int64(offset)
+        if idx <= maxBlockIndex {
+          candidates.append(idx)
+        }
+      }
+    }
+    // Unleash all 24 parallel workers immediately from t = 0ms to saturate maximum network bandwidth!
+    let maxWorkersNow = maxWorkersForTarget
 
     var blocksToLaunch: [Int64] = []
     for idx in candidates {
@@ -5278,11 +5405,11 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     tgLock.unlock()
 
     for idx in blocksToLaunch {
-      Task.detached(priority: idx <= playhead + 1 ? .userInitiated : .utility) { [weak self] in
+      Task.detached(priority: idx <= playhead + 3 ? .userInitiated : .utility) { [weak self] in
         guard let self = self else { return }
         _ = await self.getOrFetchTelegramBlock(
           targetUrl: targetUrl,
-          url: url,
+          url: effectiveUrl,
           headers: hdrs,
           blockIndex: idx,
           meta: meta,
@@ -5371,7 +5498,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     }
     tgLock.unlock()
 
-    // Self-driving continuation: immediately launch the next 2 MB block in the lookahead window!
+    // Self-driving continuation: immediately launch the next 1 MB block in the 96 MB lookahead window!
     if shouldPump && !meta.contentType.hasPrefix("audio/") {
       pumpTelegramSlidingWindow(targetUrl: targetUrl, url: url, meta: meta)
     }
@@ -5390,6 +5517,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     let logicalStart = blockIndex * blockSize
     let logicalEnd = min(meta.totalSize - 1, logicalStart + blockSize - 1)
     guard logicalStart <= logicalEnd else { return nil }
+    let effectiveUrl = resolvedCdnUrl(for: targetUrl, fallback: url)
 
     let key = "\(targetUrl)#\(blockIndex)"
     let state = lookupOrRegisterTelegramBlockFetch(
@@ -5404,7 +5532,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
           self.completeTelegramBlockFetch(
             key: key,
             targetUrl: targetUrl,
-            url: url,
+            url: effectiveUrl,
             meta: meta,
             isPrefetch: isPrefetch,
             result: Task.isCancelled ? nil : fetchedResult
@@ -5423,7 +5551,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
           let remEnd = logicalEnd + prefixOffset
           guard let tailData = await self.fetchTelegramRangeChunk(
             targetUrl: targetUrl,
-            url: url,
+            url: effectiveUrl,
             headers: headers,
             start: remStart,
             end: remEnd
@@ -5441,7 +5569,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
         let upEnd = logicalEnd + prefixOffset
         fetchedResult = await self.fetchTelegramRangeChunk(
           targetUrl: targetUrl,
-          url: url,
+          url: effectiveUrl,
           headers: headers,
           start: upStart,
           end: upEnd
@@ -5458,7 +5586,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     }
     let result = await fetchTask.value
     if result == nil && !isPrefetch && retryCancelledPrefetch && fetchTask.isCancelled {
-      return await getOrFetchTelegramBlock(targetUrl: targetUrl, url: url, headers: headers,
+      return await getOrFetchTelegramBlock(targetUrl: targetUrl, url: effectiveUrl, headers: headers,
         blockIndex: blockIndex, meta: meta, isPrefetch: false, retryCancelledPrefetch: false)
     }
     return result
@@ -5473,9 +5601,11 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
   ) async -> Data? {
     let expected = Int(end - start + 1)
     let primarySession = preferredTelegramOrMediaSession(for: targetUrl)
+    let cdnUrl = resolvedCdnUrl(for: targetUrl, fallback: url)
     for attempt in 0..<4 {
       if Task.isCancelled { return nil }
-      var req = URLRequest(url: url)
+      let reqUrl = (attempt <= 1) ? cdnUrl : url
+      var req = URLRequest(url: reqUrl)
       req.httpMethod = "GET"
       req.timeoutInterval = (attempt == 0 && primarySession !== directUrlSession && primarySession !== directStreamSession) ? 7.5 : 18.0
       for (k, v) in headers where !v.isEmpty {
@@ -5510,7 +5640,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       } else if attempt == 0 && primarySession !== directUrlSession && primarySession !== directStreamSession {
         markTelegramUrlPreferDirect(targetUrl)
       }
-      try? await Task.sleep(nanoseconds: UInt64((attempt + 1) * 180_000_000))
+      try? await Task.sleep(nanoseconds: UInt64((attempt + 1) * 150_000_000))
     }
     return nil
   }
@@ -5834,32 +5964,8 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       await store.registerVodSegments(allVodUrls, forGen: activeGen)
       await store.setCachedVodPlaylist(rewritten, forGen: activeGen)
 
-      // Immediately prefetch the first 4 VOD / 115 / AList HLS segments IN PARALLEL so AVPlayer starts playback at 0ms with 4x bandwidth
-      let initialVodPrefetch = Array(allVodUrls.prefix(4))
-      if !initialVodPrefetch.isEmpty {
-        let sessionRef = self.preferredSession(for: activeStreamUrl)
-        let fallbackSessionRef = self.directUrlSession
-        let storeRef = self.store
-        let pTask = Task {
-          await withTaskGroup(of: Void.self) { group in
-            for segUrl in initialVodPrefetch {
-              group.addTask {
-                if Task.isCancelled { return }
-                if await storeRef.cachedData(for: segUrl, gen: activeGen) != nil { return }
-                _ = await storeRef.fetchOrJoinSegment(url: segUrl, gen: activeGen) { u, h in
-                  await Self.downloadSegmentMultiRange(
-                    urlStr: u,
-                    headers: h,
-                    session: sessionRef,
-                    fallbackDirectSession: fallbackSessionRef
-                  )
-                }
-              }
-            }
-          }
-        }
-        await store.setPrefetchTask(pTask, forGen: activeGen)
-      }
+      // Immediately unleash the self-driving 16-worker parallel VOD/115/AList .ts segment prefetcher across the first 48 segments!
+      pumpVodSegmentPrefetch(afterUrl: nil, activeGen: activeGen)
       return rewritten
     }
 
@@ -5883,7 +5989,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       headerLines.append("http://127.0.0.1:\(localPort)/seg.ts?gen=\(activeGen)&u=\(enc)")
     }
 
-    // Sequentially prefetch up to the first 3 segments so 100% of multi-range bandwidth goes to the current segment first
+    // Prefetch up to the first 3 live segments in parallel
     let urlsToPrefetch = Array(window.prefix(3).map { $0.absoluteUrl })
     let sessionRef = self.preferredSession(for: activeStreamUrl)
     let fallbackSessionRef = self.directUrlSession
@@ -5907,6 +6013,37 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     return headerLines.joined(separator: "\n") + "\n"
   }
 
+  /// Self-driving 16-worker parallel `.ts` segment prefetcher that keeps up to 48 segments ahead of the playhead cached in RAM.
+  private func pumpVodSegmentPrefetch(afterUrl: String?, activeGen: Int) {
+    let storeRef = self.store
+    let fallbackSessionRef = self.directUrlSession
+    Task.detached(priority: .userInitiated) { [weak self] in
+      guard let self = self else { return }
+      let nextUrls = await storeRef.nextVodSegmentsToPrefetch(
+        after: afterUrl,
+        maxInFlight: 16,
+        lookahead: 48,
+        gen: activeGen
+      )
+      for segUrl in nextUrls {
+        let sessionRef = self.preferredSession(for: segUrl)
+        Task.detached(priority: .userInitiated) { [weak self] in
+          if Task.isCancelled { return }
+          if await storeRef.cachedData(for: segUrl, gen: activeGen) != nil { return }
+          _ = await storeRef.fetchOrJoinSegment(url: segUrl, gen: activeGen) { u, h in
+            await Self.downloadSegmentMultiRange(
+              urlStr: u,
+              headers: h,
+              session: sessionRef,
+              fallbackDirectSession: fallbackSessionRef
+            )
+          }
+          self?.pumpVodSegmentPrefetch(afterUrl: nil, activeGen: activeGen)
+        }
+      }
+    }
+  }
+
   private func fetchRawPlaylist(urlStr: String, headers: [String: String]) async -> (text: String, finalUrl: URL)? {
     var effectiveUrlStr = urlStr
     var logicalFinalUrl = URL(string: urlStr)
@@ -5923,8 +6060,9 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     guard let u = URL(string: effectiveUrlStr),
           let logicalBase = logicalFinalUrl else { return nil }
 
+    // ONLY use server proxy if the URL was explicitly a `/api/vod/proxy` server relay URL chosen by the user!
     if preferServerProxyFirst {
-      if let srvReq = Self.buildServerProxyFallbackRequest(targetUrl: effectiveUrlStr, headers: headers, timeout: 7.5),
+      if let srvReq = Self.buildServerProxyFallbackRequest(targetUrl: effectiveUrlStr, headers: headers, timeout: 8.5),
          let (data, resp) = try? await directUrlSession.data(for: srvReq),
          let http = resp as? HTTPURLResponse,
          (200..<300).contains(http.statusCode),
@@ -5937,61 +6075,40 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
 
     var req = URLRequest(url: u)
     req.httpMethod = "GET"
-    req.timeoutInterval = 4.8
+    req.timeoutInterval = 8.0
     for (k, v) in headers where !v.isEmpty {
       req.setValue(v, forHTTPHeaderField: k)
     }
     let sess = preferredSession(for: effectiveUrlStr)
-    let skipDirect = (sess === directUrlSession) && Self.isHostMarkedDirectFailed(u)
-    if !skipDirect {
-      if let (data, resp) = try? await sess.data(for: req),
-         let http = resp as? HTTPURLResponse,
-         (200..<300).contains(http.statusCode),
-         let finalUrl = resp.url,
-         let text = String(data: data, encoding: .utf8),
-         text.contains("#EXTM3U") {
-        if sess === directUrlSession {
-          Self.clearHostDirectFailed(u)
-        }
-        TvNetworkSpeedMonitor.shared.recordDownstreamBytes(data.count)
-        return (text, finalUrl)
-      }
-      if sess === directUrlSession {
-        Self.markHostDirectFailed(u)
-      }
+    if let (data, resp) = try? await sess.data(for: req),
+       let http = resp as? HTTPURLResponse,
+       (200..<300).contains(http.statusCode),
+       let finalUrl = resp.url,
+       let text = String(data: data, encoding: .utf8),
+       text.contains("#EXTM3U") {
+      TvNetworkSpeedMonitor.shared.recordDownstreamBytes(data.count)
+      return (text, finalUrl)
     }
     // If proxy node failed or blocked the VOD CDN, immediately fall back to directUrlSession
-    if sess !== directUrlSession && !Self.isHostMarkedDirectFailed(u) {
+    if sess !== directUrlSession {
       var directReq = req
-      directReq.timeoutInterval = 4.8
+      directReq.timeoutInterval = 8.0
       if let (data, resp) = try? await directUrlSession.data(for: directReq),
          let http = resp as? HTTPURLResponse,
          (200..<300).contains(http.statusCode),
          let finalUrl = resp.url,
          let text = String(data: data, encoding: .utf8),
          text.contains("#EXTM3U") {
-        Self.clearHostDirectFailed(u)
         TvNetworkSpeedMonitor.shared.recordDownstreamBytes(data.count)
         return (text, finalUrl)
       }
-      Self.markHostDirectFailed(u)
-    }
-    // Fallback to backend server `/api/vod/proxy` when direct/proxy is geo-blocked or SSL-reset (e.g. ukzyvod3.ukubf5.com 403 or tsbfask.com:65)
-    if let srvReq = Self.buildServerProxyFallbackRequest(targetUrl: effectiveUrlStr, headers: headers, timeout: 8.5),
-       let (data, resp) = try? await directUrlSession.data(for: srvReq),
-       let http = resp as? HTTPURLResponse,
-       (200..<300).contains(http.statusCode),
-       let text = String(data: data, encoding: .utf8),
-       text.contains("#EXTM3U") {
-      TvNetworkSpeedMonitor.shared.recordDownstreamBytes(data.count)
-      return (text, logicalBase)
     }
     return nil
   }
 
   /// Downloads a `.ts` segment using 8 parallel HTTP Range requests (`HTTP 206 Partial Content`) when supported on throttled overseas IPTV CDNs,
-  /// while using a direct single-connection GET for domestic 115 / LAN servers that disallow multi-range splitting,
-  /// and falling back to `fallbackDirectSession` or backend `/api/vod/proxy` if direct/proxy times out or is blocked by the CDN.
+  /// or via `directStreamSession` (`TvContinuousStreamSessionDelegate`) with real-time packet-level speed metering and 302 redirect header preservation.
+  /// Never automatically falls back to `/api/vod/proxy` server relay!
   private static func downloadSegmentMultiRange(
     urlStr: String,
     headers: [String: String],
@@ -6000,15 +6117,15 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
   ) async -> Data? {
     guard let u = URL(string: urlStr) else { return nil }
     let directSession = fallbackDirectSession ?? session
+    let streamSession = TvLocalHlsProxyServer.shared.directStreamSession
 
-    // Domestic cloud drives (115) & local LAN servers (or when proxy is disabled) are already fast on a single connection and reject 8-way Range splitting on .ts segments
     if TvLocalProxyTunnelServer.shared.isProxyActive && !isDomesticOrLocalUrl(urlStr) {
       var totalLength = 0
       var supportsRange = false
       do {
         var headReq = URLRequest(url: u)
         headReq.httpMethod = "HEAD"
-        headReq.timeoutInterval = 2.2
+        headReq.timeoutInterval = 2.5
         for (k, v) in headers where !v.isEmpty {
           headReq.setValue(v, forHTTPHeaderField: k)
         }
@@ -6033,7 +6150,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
                 if Task.isCancelled { return nil }
                 var rReq = URLRequest(url: u)
                 rReq.httpMethod = "GET"
-                rReq.timeoutInterval = attempt == 0 ? 4.5 : 6.0
+                rReq.timeoutInterval = attempt == 0 ? 5.5 : 8.0
                 for (k, v) in headers where !v.isEmpty {
                   rReq.setValue(v, forHTTPHeaderField: k)
                 }
@@ -6072,52 +6189,35 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       }
     }
 
-    // Standard single-connection GET (skip direct if this host already failed direct connection)
     var getReq = URLRequest(url: u)
     getReq.httpMethod = "GET"
-    getReq.timeoutInterval = 4.8
+    getReq.timeoutInterval = 18.0
     for (k, v) in headers where !v.isEmpty {
       getReq.setValue(v, forHTTPHeaderField: k)
     }
-    let skipPrimaryDirect = (session === directSession) && isHostMarkedDirectFailed(u)
-    if !skipPrimaryDirect {
+
+    if session === directSession {
+      if let d = await TvContinuousStreamSessionDelegate.shared.fetchSegmentData(
+        request: getReq,
+        session: streamSession
+      ), !d.isEmpty {
+        return stripDisguisedTsImageHeader(d)
+      }
+    } else {
       if let (d, r) = try? await session.data(for: getReq),
          let h = r as? HTTPURLResponse,
          (200..<300).contains(h.statusCode),
          !d.isEmpty {
-        if session === directSession {
-          clearHostDirectFailed(u)
-        }
         TvNetworkSpeedMonitor.shared.recordDownstreamBytes(d.count)
         return stripDisguisedTsImageHeader(d)
       }
-      if session === directSession {
-        markHostDirectFailed(u)
-      }
     }
 
-    // Fallback to direct connection if proxy tunnel timed out or was rejected by the video CDN
-    if let fbSess = fallbackDirectSession, fbSess !== session, !isHostMarkedDirectFailed(u) {
-      var directReq = getReq
-      directReq.timeoutInterval = 4.8
-      if let (d, r) = try? await fbSess.data(for: directReq),
-         let h = r as? HTTPURLResponse,
-         (200..<300).contains(h.statusCode),
-         !d.isEmpty {
-        clearHostDirectFailed(u)
-        TvNetworkSpeedMonitor.shared.recordDownstreamBytes(d.count)
-        return stripDisguisedTsImageHeader(d)
-      }
-      markHostDirectFailed(u)
-    }
-
-    // Fallback to backend server `/api/vod/proxy` when direct/proxy is blocked or SSL-reset (e.g. tsbfask.com:65 or ukzyvod3.ukubf5.com)
-    if let srvReq = buildServerProxyFallbackRequest(targetUrl: urlStr, headers: headers, timeout: 9.0),
-       let (d, r) = try? await directSession.data(for: srvReq),
-       let h = r as? HTTPURLResponse,
-       (200..<300).contains(h.statusCode),
-       !d.isEmpty {
-      TvNetworkSpeedMonitor.shared.recordDownstreamBytes(d.count)
+    // Fallback to direct streaming session if proxy tunnel timed out or was rejected by the video CDN
+    if let d = await TvContinuousStreamSessionDelegate.shared.fetchSegmentData(
+      request: getReq,
+      session: streamSession
+    ), !d.isEmpty {
       return stripDisguisedTsImageHeader(d)
     }
     return nil
@@ -10879,15 +10979,17 @@ final class TvRemoteStorageClient: @unchecked Sendable {
 
   private init() {
     let cfg = URLSessionConfiguration.ephemeral
-    cfg.timeoutIntervalForRequest = 20
+    cfg.timeoutIntervalForRequest = 30
     cfg.timeoutIntervalForResource = 120
     self.session = URLSession(configuration: cfg, delegate: InsecureSessionDelegate(), delegateQueue: nil)
   }
 
   static func normalizePath(_ raw: String) -> String {
-    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    if trimmed.isEmpty || trimmed == "/" { return "/" }
-    var p = trimmed.hasPrefix("/") ? trimmed : "/\(trimmed)"
+    let noNewlines = raw.trimmingCharacters(in: .newlines)
+    let checkTrimmed = noNewlines.trimmingCharacters(in: .whitespaces)
+    if checkTrimmed.isEmpty || checkTrimmed == "/" { return "/" }
+    // Preserve trailing spaces inside folder names when the path already starts with "/"
+    var p = noNewlines.hasPrefix("/") ? noNewlines : "/\(checkTrimmed)"
     while p.count > 1 && p.hasSuffix("/") {
       p.removeLast()
     }
@@ -10897,8 +10999,10 @@ final class TvRemoteStorageClient: @unchecked Sendable {
   static func parentPath(of path: String) -> String {
     let norm = normalizePath(path)
     if norm == "/" { return "" }
-    let parent = (norm as NSString).deletingLastPathComponent
-    return parent.isEmpty ? "/" : parent
+    guard let lastSlash = norm.lastIndex(of: "/"), lastSlash != norm.startIndex else {
+      return "/"
+    }
+    return String(norm[..<lastSlash])
   }
 
   static func joinPath(_ dir: String, _ name: String) -> String {
@@ -10908,6 +11012,20 @@ final class TvRemoteStorageClient: @unchecked Sendable {
       return "/\(cleanName)"
     }
     return "\(normDir)/\(cleanName)"
+  }
+
+  static func encodeUrlPathSegments(_ path: String) -> String {
+    let norm = normalizePath(path)
+    if norm == "/" { return "/" }
+    var segAllowed = CharacterSet.urlPathAllowed
+    segAllowed.remove(charactersIn: "/&+=?;#@[]")
+    let parts = norm.split(separator: "/", omittingEmptySubsequences: false).map { seg -> String in
+      let s = String(seg)
+      if s.isEmpty { return "" }
+      return s.addingPercentEncoding(withAllowedCharacters: segAllowed) ?? s
+    }
+    let joined = parts.joined(separator: "/")
+    return joined.hasPrefix("/") ? joined : "/\(joined)"
   }
 
   private static func cleanBaseUrl(_ raw: String) -> String {
@@ -10954,8 +11072,8 @@ final class TvRemoteStorageClient: @unchecked Sendable {
     }
     var req = URLRequest(url: loginUrl)
     req.httpMethod = "POST"
-    req.timeoutInterval = 15
-    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.timeoutInterval = 20
+    req.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
     req.httpBody = try JSONSerialization.data(withJSONObject: [
       "username": user,
       "password": pass
@@ -10984,34 +11102,43 @@ final class TvRemoteStorageClient: @unchecked Sendable {
     guard let url = URL(string: "\(base)\(endpointPath)") else {
       throw NSError(domain: "TvAList", code: -1, userInfo: [NSLocalizedDescriptionKey: "无效的 AList 接口地址"])
     }
-    let token = try await resolveAlistToken(for: mount)
-    var req = URLRequest(url: url)
-    req.httpMethod = "POST"
-    req.timeoutInterval = 20
-    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    if !token.isEmpty {
-      req.setValue(token, forHTTPHeaderField: "Authorization")
-    }
-    req.httpBody = try JSONSerialization.data(withJSONObject: body)
-    let (data, _) = try await session.data(for: req)
-    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-      throw NSError(domain: "TvAList", code: -2, userInfo: [NSLocalizedDescriptionKey: "无法解析 AList JSON 响应"])
-    }
-    let code = TvApiClient.intValue(root["code"], fallback: 200)
-    if code == 401 && (!mount.username.isEmpty || !mount.password.isEmpty) {
-      let freshToken = try await resolveAlistToken(for: mount, forceRefresh: true)
-      var retryReq = req
-      retryReq.setValue(freshToken, forHTTPHeaderField: "Authorization")
-      let (retryData, _) = try await session.data(for: retryReq)
-      if let retryRoot = try? JSONSerialization.jsonObject(with: retryData) as? [String: Any] {
-        return retryRoot
+    var lastError: Error? = nil
+    for attempt in 0..<2 {
+      do {
+        let token = try await resolveAlistToken(for: mount, forceRefresh: attempt > 0)
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 30
+        req.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        if !token.isEmpty {
+          req.setValue(token, forHTTPHeaderField: "Authorization")
+        }
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, resp) = try await session.data(for: req)
+        let httpCode = (resp as? HTTPURLResponse)?.statusCode ?? 200
+        if (httpCode == 401 || httpCode == 403) && attempt == 0 && (!mount.username.isEmpty || !mount.password.isEmpty) {
+          continue
+        }
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+          throw NSError(domain: "TvAList", code: -2, userInfo: [NSLocalizedDescriptionKey: "无法解析 AList JSON 响应"])
+        }
+        let code = TvApiClient.intValue(root["code"], fallback: 200)
+        if (code == 401 || code == 403) && attempt == 0 && (!mount.username.isEmpty || !mount.password.isEmpty) {
+          continue
+        }
+        if code != 200 {
+          let msg = TvApiClient.stringValue(root["message"], fallback: "AList 请求失败 (\(code))")
+          throw NSError(domain: "TvAList", code: code, userInfo: [NSLocalizedDescriptionKey: msg])
+        }
+        return root
+      } catch {
+        lastError = error
+        if (error as NSError).domain == "TvAList" {
+          throw error
+        }
       }
     }
-    if code != 200 {
-      let msg = TvApiClient.stringValue(root["message"], fallback: "AList 请求失败 (\(code))")
-      throw NSError(domain: "TvAList", code: code, userInfo: [NSLocalizedDescriptionKey: msg])
-    }
-    return root
+    throw lastError ?? NSError(domain: "TvAList", code: -3, userInfo: [NSLocalizedDescriptionKey: "AList 网络请求失败"])
   }
 
   func listAlistDirectory(
@@ -11023,44 +11150,86 @@ final class TvRemoteStorageClient: @unchecked Sendable {
     let effectivePath = path.isEmpty ? Self.normalizePath(mount.rootPath) : Self.normalizePath(path)
     let safePage = max(1, page)
     let safePerPage = max(50, min(500, perPage))
-    let root = try await alistJsonRequest(
-      mount: mount,
-      endpointPath: "/api/fs/list",
-      body: [
-        "path": effectivePath,
-        "password": "",
-        "page": safePage,
-        "per_page": safePerPage,
-        "refresh": false
-      ]
-    )
-    let dataDict = (root["data"] as? [String: Any]) ?? [:]
-    let rawContent = (dataDict["content"] as? [Any])?.compactMap { $0 as? [String: Any] } ?? []
+    var root: [String: Any]
+    do {
+      root = try await alistJsonRequest(
+        mount: mount,
+        endpointPath: "/api/fs/list",
+        body: [
+          "path": effectivePath,
+          "password": "",
+          "page": safePage,
+          "per_page": safePerPage,
+          "refresh": false
+        ]
+      )
+    } catch {
+      // Fallback for AList / OpenList drivers that reject pagination (`per_page > 0`)
+      root = try await alistJsonRequest(
+        mount: mount,
+        endpointPath: "/api/fs/list",
+        body: [
+          "path": effectivePath,
+          "password": "",
+          "page": 1,
+          "per_page": 0,
+          "refresh": true
+        ]
+      )
+    }
+    var dataDict = (root["data"] as? [String: Any]) ?? [:]
+    var rawContent = (dataDict["content"] as? [Any])?.compactMap { $0 as? [String: Any] } ?? []
+    // If an uncached cloud folder (115 / Aliyun / Baidu / PikPak / Quark / SMB) returned null/empty content with `refresh: false`,
+    // automatically retry once with `refresh: true, per_page: 0` so AList forces the storage driver to populate the directory!
+    if rawContent.isEmpty && safePage == 1 {
+      if let refreshedRoot = try? await alistJsonRequest(
+        mount: mount,
+        endpointPath: "/api/fs/list",
+        body: [
+          "path": effectivePath,
+          "password": "",
+          "page": 1,
+          "per_page": 0,
+          "refresh": true
+        ]
+      ) {
+        let refreshedData = (refreshedRoot["data"] as? [String: Any]) ?? [:]
+        let refreshedContent = (refreshedData["content"] as? [Any])?.compactMap { $0 as? [String: Any] } ?? []
+        if !refreshedContent.isEmpty {
+          dataDict = refreshedData
+          rawContent = refreshedContent
+        }
+      }
+    }
     let totalRemote = TvApiClient.intValue(dataDict["total"], fallback: rawContent.count)
     let base = Self.cleanBaseUrl(mount.baseUrl)
     var entries: [TvFileEntry] = []
-    entries.reserveCapacity(min(rawContent.count, safePerPage))
+    var seenPaths = Set<String>()
+    entries.reserveCapacity(rawContent.count)
 
-    for item in rawContent.prefix(safePerPage) {
-      let name = TvApiClient.stringValue(item["name"])
-      guard !name.isEmpty else { continue }
+    for item in rawContent {
+      let rawName = TvApiClient.stringValue(item["name"]).trimmingCharacters(in: .newlines)
+      guard !rawName.isEmpty else { continue }
       let isDir = (item["is_dir"] as? Bool) == true
+        || TvApiClient.intValue(item["is_dir"], fallback: 0) == 1
+        || TvApiClient.stringValue(item["is_dir"]).lowercased() == "true"
       let sizeStr = TvApiClient.stringValue(item["size"], fallback: "0")
       let size = Int64(sizeStr) ?? Int64(TvApiClient.intValue(item["size"], fallback: 0))
       let rawMod = TvApiClient.stringValue(item["modified"])
       let modTime = rawMod.count > 16 ? String(rawMod.prefix(16)).replacingOccurrences(of: "T", with: " ") : rawMod
       let sign = TvApiClient.stringValue(item["sign"])
       let thumb = TvApiClient.stringValue(item["thumb"])
-      let itemPath = Self.joinPath(effectivePath, name)
-      let ext = isDir ? "" : ".\((name as NSString).pathExtension.lowercased())"
+      let itemPath = Self.joinPath(effectivePath, rawName)
+      guard seenPaths.insert(itemPath).inserted else { continue }
+      let ext = isDir ? "" : ".\((rawName as NSString).pathExtension.lowercased())"
       var directDownload = ""
       if !isDir {
-        let encodedPath = itemPath.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? itemPath
+        let encodedPath = Self.encodeUrlPathSegments(itemPath)
         directDownload = sign.isEmpty ? "\(base)/d\(encodedPath)" : "\(base)/d\(encodedPath)?sign=\(sign)"
       }
       entries.append(
         TvFileEntry(
-          name: name,
+          name: rawName,
           path: itemPath,
           size: size,
           modTime: modTime,
@@ -11110,7 +11279,7 @@ final class TvRemoteStorageClient: @unchecked Sendable {
     let sign = TvApiClient.stringValue(dataDict["sign"])
     let base = Self.cleanBaseUrl(mount.baseUrl)
     let norm = Self.normalizePath(path)
-    let encodedPath = norm.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? norm
+    let encodedPath = Self.encodeUrlPathSegments(norm)
     let alistProxyUrl: String = {
       if !sign.isEmpty {
         return "\(base)/d\(encodedPath)?sign=\(sign)"
@@ -11124,28 +11293,38 @@ final class TvRemoteStorageClient: @unchecked Sendable {
     var extractedHeaders: [String: String] = [:]
     if let hDict = (dataDict["header"] as? [String: Any]) ?? (dataDict["headers"] as? [String: Any]) {
       for (k, v) in hDict {
+        let canonicalKey: String = {
+          switch k.lowercased() {
+          case "user-agent": return "User-Agent"
+          case "cookie": return "Cookie"
+          case "referer": return "Referer"
+          case "origin": return "Origin"
+          case "authorization": return "Authorization"
+          default: return k
+          }
+        }()
         if let arr = v as? [Any], !arr.isEmpty {
-          let sep = k.lowercased() == "cookie" ? "; " : ", "
+          let sep = canonicalKey == "Cookie" ? "; " : ", "
           let sv = arr.map { TvApiClient.stringValue($0).trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
             .joined(separator: sep)
-          if !sv.isEmpty { extractedHeaders[k] = sv }
+          if !sv.isEmpty { extractedHeaders[canonicalKey] = sv }
         } else {
-          let sv = TvApiClient.stringValue(v)
-          if !sv.isEmpty { extractedHeaders[k] = sv }
+          let sv = TvApiClient.stringValue(v).trimmingCharacters(in: .whitespacesAndNewlines)
+          if !sv.isEmpty { extractedHeaders[canonicalKey] = sv }
         }
       }
     }
 
     let primaryUrl = rawUrl.hasPrefix("http") ? rawUrl : alistProxyUrl
-    if extractedHeaders["User-Agent"] == nil && extractedHeaders["user-agent"] == nil {
+    if extractedHeaders["User-Agent"] == nil {
       extractedHeaders["User-Agent"] = TvLocal115DirectClient.browserUserAgent
     }
     if primaryUrl.lowercased().contains("115cdn") || primaryUrl.lowercased().contains("115.com") {
-      if extractedHeaders["Referer"] == nil && extractedHeaders["referer"] == nil {
+      if extractedHeaders["Referer"] == nil {
         extractedHeaders["Referer"] = "https://115.com/"
       }
-      if extractedHeaders["Cookie"] == nil && extractedHeaders["cookie"] == nil {
+      if extractedHeaders["Cookie"] == nil {
         let ck = TvM115AuthCookieStore.shared.cookieHeader(forUrl: primaryUrl)
         if !ck.isEmpty {
           extractedHeaders["Cookie"] = ck

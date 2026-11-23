@@ -8258,10 +8258,16 @@ struct TvMediaLibrarySectionView: View {
 
           // 6. Main File & Folder Browser Area (Direct Click to Open/Play, Long-Press Context Menu, List or Grid)
           mainFileBrowserContent(theme: theme)
+            .id("media_browser_anchor")
             .focusSection()
         }
         .padding(.horizontal, 52)
         .padding(.vertical, 18)
+      }
+      .onChange(of: appState.fileListing.path) { _ in
+        withAnimation(.easeInOut(duration: 0.2)) {
+          scrollProxy.scrollTo("media_top_anchor", anchor: .top)
+        }
       }
       .onChange(of: appState.pageScrollToTopTrigger) { _ in
         focusedMediaTop = true
@@ -8877,12 +8883,20 @@ struct TvMediaLibrarySectionView: View {
     let mount = appState.activeStorageMount
 
     if appState.isLoadingFiles {
-      VStack(spacing: 14) {
+      VStack(spacing: 16) {
         ProgressView()
           .scaleEffect(1.3)
         Text("正在读取「\(mount.name)」目录内容...")
           .font(.system(size: 17, weight: .medium))
           .foregroundColor(.white.opacity(0.75))
+        if canNavigateUp {
+          Button {
+            navigateUp()
+          } label: {
+            Label("返回上级目录", systemImage: "arrow.turn.left.up")
+          }
+          .buttonStyle(TvApplePillButtonStyle(compact: true))
+        }
       }
       .frame(maxWidth: .infinity, minHeight: 380)
     } else if mount.kind == .cloud115 && !TvLocal115DirectClient.shared.hasLocalCookie {
@@ -8919,18 +8933,32 @@ struct TvMediaLibrarySectionView: View {
         Image(systemName: appState.fileManagerError != nil ? "exclamationmark.triangle.fill" : "folder.badge.questionmark")
           .font(.system(size: 46))
           .foregroundColor(appState.fileManagerError != nil ? .orange : .white.opacity(0.45))
-        Text(appState.fileManagerError ?? "当前目录为空")
+        let hasHiddenByFilter = !appState.fileListing.entries.isEmpty && (appState.fileCategoryFilter != .all || !appState.fileSearchKeyword.isEmpty)
+        Text(
+          appState.fileManagerError
+            ?? (hasHiddenByFilter ? "当前筛选条件下无匹配文件（该目录共 \(appState.fileListing.entries.count) 项）" : "当前目录为空")
+        )
           .font(.system(size: 18, weight: .semibold))
           .foregroundColor(.white.opacity(0.85))
           .multilineTextAlignment(.center)
         HStack(spacing: 14) {
+          if hasHiddenByFilter {
+            Button {
+              appState.fileCategoryFilter = .all
+              appState.fileSearchKeyword = ""
+            } label: {
+              Label("显示全部 \(appState.fileListing.entries.count) 项文件", systemImage: "line.3.horizontal.decrease.circle")
+            }
+            .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+          }
+
           if canNavigateUp {
             Button {
               navigateUp()
             } label: {
               Label("返回上级目录", systemImage: "arrow.turn.left.up")
             }
-            .buttonStyle(TvApplePillButtonStyle(isPrimary: true, compact: true))
+            .buttonStyle(TvApplePillButtonStyle(isPrimary: !hasHiddenByFilter, compact: true))
           }
 
           if mount.kind == .cloud115 {
@@ -9055,9 +9083,10 @@ struct TvMediaLibrarySectionView: View {
 
         paginationFooterBar(totalLoaded: entries.count, visibleCount: visibleEntries.count, theme: theme)
       }
+      .id("grid_\(mount.id)_\(appState.fileListing.path)")
     } else {
-      // Standard List View Mode — Windowed rendering (`visibleEntries`) prevents tvOS Focus Engine hang/crash on massive AList/115 folders!
-      LazyVStack(spacing: 8) {
+      // Standard List View Mode — Eager VStack over windowed `visibleEntries` (`prefix(80)`) prevents tvOS LazyVStack blank-viewport culling bugs on subfolder entry!
+      VStack(spacing: 8) {
         if canNavigateUp {
           Button {
             navigateUp()
@@ -9155,6 +9184,7 @@ struct TvMediaLibrarySectionView: View {
 
         paginationFooterBar(totalLoaded: entries.count, visibleCount: visibleEntries.count, theme: theme)
       }
+      .id("list_\(mount.id)_\(appState.fileListing.path)")
     }
   }
 

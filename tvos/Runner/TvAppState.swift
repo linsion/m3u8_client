@@ -591,8 +591,8 @@ final class TvAppState: ObservableObject {
 
     var defaultRules: [TvRequestScenario: TvScenarioRuleConfig] = [
       .vodApi: TvScenarioRuleConfig(scenario: .vodApi, mode: .direct),
-      .vodStream: TvScenarioRuleConfig(scenario: .vodStream, mode: savedVodRoute == .serverRelay ? .serverRelay : .direct),
-      .liveStream: TvScenarioRuleConfig(scenario: .liveStream, mode: savedLiveRoute == .serverRelay ? .serverRelay : .direct),
+      .vodStream: TvScenarioRuleConfig(scenario: .vodStream, mode: .direct),
+      .liveStream: TvScenarioRuleConfig(scenario: .liveStream, mode: .direct),
       .telegram: TvScenarioRuleConfig(scenario: .telegram, mode: .proxyNode),
       .backendApi: TvScenarioRuleConfig(scenario: .backendApi, mode: .direct),
       .externalWeb: TvScenarioRuleConfig(scenario: .externalWeb, mode: .smartAuto),
@@ -620,6 +620,10 @@ final class TvAppState: ObservableObject {
       self.storageMounts = builtInMounts + filteredCustom
     } else {
       self.storageMounts = builtInMounts
+    }
+    if let savedMountId = UserDefaults.standard.string(forKey: "tv_active_storage_mount_id_v1"),
+       self.storageMounts.contains(where: { $0.id == savedMountId }) {
+      self.activeStorageMountId = savedMountId
     }
     if let savedFavPaths = UserDefaults.standard.stringArray(forKey: "tv_file_fav_paths_v1") {
       self.fileFavoritePaths = savedFavPaths
@@ -1324,7 +1328,11 @@ final class TvAppState: ObservableObject {
       await loadLiveSources()
       await loadTelegramAccounts()
       await refreshDownloadTasks()
-      await loadFiles(path: "")
+      if self.fileListing.entries.isEmpty && !self.isLoadingFiles {
+        let mount = self.activeStorageMount
+        let initPath = mount.kind == .cloud115 ? "0" : (mount.kind == .server ? "" : mount.rootPath)
+        await loadFiles(path: initPath)
+      }
       await refresh115Status()
       if self.subscriptionNodes.isEmpty {
         await refreshAllSubscriptions(silent: true)
@@ -1628,7 +1636,7 @@ final class TvAppState: ObservableObject {
 
     activateScenarioProxyTunnel(for: .vodStream)
     let effRoute = resolveEffectiveRoute(for: .vodStream)
-    let forceRelay = (effRoute == .serverRelay) || !preferDirectPlayback
+    let forceRelay = (effRoute == .serverRelay)
     let resolved = await api.resolvePlayback(
       source: source,
       playFrom: group.name,
@@ -3126,6 +3134,7 @@ final class TvAppState: ObservableObject {
     guard let mount = storageMounts.first(where: { $0.id == mountId }) else { return }
     loadFilesGeneration &+= 1
     activeStorageMountId = mount.id
+    defaults.set(mount.id, forKey: "tv_active_storage_mount_id_v1")
     fileMultiSelectMode = false
     fileSelectedPaths.removeAll()
     fileSearchKeyword = ""
@@ -3251,6 +3260,9 @@ final class TvAppState: ObservableObject {
     let mount = activeStorageMount
     let reqMountId = mount.id
 
+    if path != fileListing.path && !fileSearchKeyword.isEmpty {
+      fileSearchKeyword = ""
+    }
     isLoadingFiles = true
     fileManagerError = nil
     visibleFileLimit = 80
@@ -3310,11 +3322,16 @@ final class TvAppState: ObservableObject {
       guard reqGen == self.loadFilesGeneration, reqMountId == self.activeStorageMountId else { return }
       self.fileListing = listing
       self.recomputeDisplayedFileEntries()
+      // If a previous category filter (e.g. Audio/Image) hides every item in the newly entered directory, auto-reset filter to `.all` so the folder never appears blank!
+      if self.displayedFileEntries.isEmpty && !listing.entries.isEmpty && self.fileCategoryFilter != .all {
+        self.fileCategoryFilter = .all
+      }
     } catch {
       guard reqGen == self.loadFilesGeneration, reqMountId == self.activeStorageMountId else { return }
       let fallbackPath = mount.kind == .cloud115 ? ((path.isEmpty || path == "/") ? "0" : path) : path
       let fallbackRoot = mount.kind == .cloud115 ? "0" : mount.rootPath
-      self.fileListing = TvFileListing(path: fallbackPath, parent: "", root: fallbackRoot, entries: [])
+      let fallbackParent = mount.kind == .cloud115 ? "0" : TvRemoteStorageClient.parentPath(of: fallbackPath)
+      self.fileListing = TvFileListing(path: fallbackPath, parent: fallbackParent, root: fallbackRoot, entries: [])
       self.recomputeDisplayedFileEntries()
       self.fileManagerError = error.localizedDescription
       self.showToast("⚠️ 读取目录失败：\(error.localizedDescription)")
@@ -3639,19 +3656,14 @@ final class TvAppState: ObservableObject {
               resolvedUrl: hlsPreview.url,
               headers: playHeaders
             ) ?? hlsPreview.url
-            backupUrl = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
-              remoteUrl: info.url,
-              headers: info.headers,
-              extHint: ext.isEmpty ? ".mp4" : ext,
-              forceDirectConnection: true
-            )
+            backupUrl = primaryUrl
           } else if info.url.lowercased().contains(".m3u8") {
             primaryUrl = await TvLocalHlsProxyServer.shared.prepareProxyPlaylistUrl(
               gatewayUrl: info.url,
               resolvedUrl: info.url,
               headers: playHeaders
             ) ?? info.url
-            backupUrl = info.url
+            backupUrl = primaryUrl
           } else {
             primaryUrl = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
               remoteUrl: info.url,
@@ -3659,13 +3671,7 @@ final class TvAppState: ObservableObject {
               extHint: ext.isEmpty ? ".mp4" : ext,
               forceDirectConnection: true
             )
-            let rawBackup = info.alistProxyUrl != info.url ? info.alistProxyUrl : info.url
-            backupUrl = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
-              remoteUrl: rawBackup,
-              headers: playHeaders,
-              extHint: ext.isEmpty ? ".mp4" : ext,
-              forceDirectConnection: true
-            )
+            backupUrl = primaryUrl
           }
 
           self.playerControlsVisible = true
@@ -7382,16 +7388,16 @@ final class TvAppState: ObservableObject {
     }
     scenarioRules[scenario] = current
 
-    // Keep legacy route mode properties synchronized
+    // Keep legacy route mode properties synchronized (only set `.serverRelay` when explicitly requested!)
     switch scenario {
     case .vodStream:
-      vodRouteMode = (current.mode == .direct) ? .direct : .serverRelay
+      vodRouteMode = (current.mode == .serverRelay) ? .serverRelay : .direct
       defaults.set(vodRouteMode.rawValue, forKey: "tv_route_vod")
     case .liveStream:
-      liveRouteMode = (current.mode == .direct) ? .direct : .serverRelay
+      liveRouteMode = (current.mode == .serverRelay) ? .serverRelay : .direct
       defaults.set(liveRouteMode.rawValue, forKey: "tv_route_live")
     case .telegram:
-      telegramRouteMode = (current.mode == .direct) ? .direct : .serverRelay
+      telegramRouteMode = (current.mode == .serverRelay) ? .serverRelay : .direct
       defaults.set(telegramRouteMode.rawValue, forKey: "tv_route_tg")
     default:
       break
@@ -7412,13 +7418,16 @@ final class TvAppState: ObservableObject {
       scenarioRules[.externalWeb] = TvScenarioRuleConfig(scenario: .externalWeb, mode: .smartAuto)
       vodRouteMode = .direct
       liveRouteMode = .direct
-      telegramRouteMode = .serverRelay
+      telegramRouteMode = .direct
       showToast("🚀 已应用「推荐智能分流」：海外/TG 走代理 · 国内点播/直播直连")
 
     case "follow_global":
       for sc in TvRequestScenario.allCases {
         scenarioRules[sc] = TvScenarioRuleConfig(scenario: sc, mode: .followGlobal)
       }
+      vodRouteMode = .direct
+      liveRouteMode = .direct
+      telegramRouteMode = .direct
       showToast("🔄 已将全部 6 个场景设为「跟随全局开关」")
 
     case "telegram_only":
@@ -7429,7 +7438,7 @@ final class TvAppState: ObservableObject {
       }
       vodRouteMode = .direct
       liveRouteMode = .direct
-      telegramRouteMode = .serverRelay
+      telegramRouteMode = .direct
       showToast("✈️ 已设为「仅 Telegram 与订阅走代理」")
 
     case "all_proxy":
@@ -7437,9 +7446,9 @@ final class TvAppState: ObservableObject {
       for sc in TvRequestScenario.allCases {
         scenarioRules[sc] = TvScenarioRuleConfig(scenario: sc, mode: sc == .backendApi ? .direct : .proxyNode)
       }
-      vodRouteMode = .serverRelay
-      liveRouteMode = .serverRelay
-      telegramRouteMode = .serverRelay
+      vodRouteMode = .direct
+      liveRouteMode = .direct
+      telegramRouteMode = .direct
       showToast("🌐 已开启「全场景走代理节点」")
 
     case "server_relay":

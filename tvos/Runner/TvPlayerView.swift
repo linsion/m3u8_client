@@ -2183,15 +2183,17 @@ struct TvPlayerModalView: View {
             startPlayerItem(urlStr: next115, resumeAt: positionSec, overrideHeaders: active115Headers)
           } else if !didFallbackToProxy,
              !request.backupProxyUrl.isEmpty,
-             request.backupProxyUrl != request.streamUrl {
+             request.backupProxyUrl != request.streamUrl,
+             !request.backupProxyUrl.contains("/api/vod/proxy") {
+            // Only fall back to a non-server-relay backup stream (e.g., local 127.0.0.1 multi-thread proxy fallback); NEVER auto-switch to server relay!
             didFallbackToProxy = true
-            usingServerProxy = true
-            loadCurrentStream(forceProxy: true, resumeAt: positionSec)
+            usingServerProxy = false
+            startPlayerItem(urlStr: request.backupProxyUrl, resumeAt: positionSec)
           } else {
             isBuffering = false
           }
         default:
-          let timeoutLimit: TimeInterval = request.isLive ? 12.0 : 10.0
+          let timeoutLimit: TimeInterval = 18.0
           if using115Direct,
              !fallback115StreamUrl.isEmpty,
              fallback115StreamUrl != active115StreamUrl,
@@ -2200,13 +2202,6 @@ struct TvPlayerModalView: View {
             fallback115StreamUrl = ""
             active115StreamUrl = next115
             startPlayerItem(urlStr: next115, resumeAt: positionSec, overrideHeaders: active115Headers)
-          } else if !didFallbackToProxy,
-             !request.backupProxyUrl.isEmpty,
-             request.backupProxyUrl != request.streamUrl,
-             now.timeIntervalSince(streamStartedAt) >= timeoutLimit {
-            didFallbackToProxy = true
-            usingServerProxy = true
-            loadCurrentStream(forceProxy: true, resumeAt: positionSec)
           }
         }
       }
@@ -2485,7 +2480,7 @@ struct TvPlayerModalView: View {
     }
     let asset = AVURLAsset(url: url, options: options)
     let item = AVPlayerItem(asset: asset)
-    item.preferredForwardBufferDuration = request.isLive ? 2.5 : 30
+    item.preferredForwardBufferDuration = request.isLive ? 2.5 : 120
 
     player.replaceCurrentItem(with: item)
     player.automaticallyWaitsToMinimizeStalling = true
