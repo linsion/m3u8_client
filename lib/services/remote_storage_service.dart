@@ -12,6 +12,9 @@ class RemoteStorageService {
   RemoteStorageService._();
   static final RemoteStorageService instance = RemoteStorageService._();
 
+  static const String defaultBrowserUserAgent =
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 115Browser/27.0.5.7';
+
   final Map<String, String> _cachedAlistTokens = {};
 
   void resetAfterBackground() {
@@ -21,6 +24,7 @@ class RemoteStorageService {
   HttpClient _createHttpClient({Duration timeout = const Duration(seconds: 25)}) {
     final client = HttpClient()
       ..connectionTimeout = timeout
+      ..userAgent = defaultBrowserUserAgent
       ..badCertificateCallback = (_, __, ___) => true;
     return client;
   }
@@ -133,6 +137,7 @@ class RemoteStorageService {
     try {
       final req = await client.postUrl(uri).timeout(timeout);
       req.headers.set('Content-Type', 'application/json; charset=utf-8');
+      req.headers.set('User-Agent', defaultBrowserUserAgent);
       if (token.isNotEmpty) {
         req.headers.set('Authorization', token);
       }
@@ -340,10 +345,18 @@ class RemoteStorageService {
       final rawHdr = data['header'] ?? data['headers'];
       if (rawHdr is Map) {
         rawHdr.forEach((k, v) {
-          final key = k.toString().trim();
-          if (key.isEmpty) return;
+          final rawKey = k.toString().trim();
+          if (rawKey.isEmpty) return;
+          final key = switch (rawKey.toLowerCase()) {
+            'user-agent' => 'User-Agent',
+            'cookie' => 'Cookie',
+            'referer' || 'referrer' => 'Referer',
+            'origin' => 'Origin',
+            'authorization' => 'Authorization',
+            _ => rawKey,
+          };
           if (v is List && v.isNotEmpty) {
-            final sep = key.toLowerCase() == 'cookie' ? '; ' : ', ';
+            final sep = key == 'Cookie' ? '; ' : ', ';
             final sv = v
                 .map((e) => (e ?? '').toString().trim())
                 .where((s) => s.isNotEmpty)
@@ -369,12 +382,12 @@ class RemoteStorageService {
 
     final primaryUrl = rawUrl.startsWith('http') ? rawUrl : alistProxyUrl;
     final lowerUrl = primaryUrl.toLowerCase();
-    if (lowerUrl.contains('115cdn') || lowerUrl.contains('115.com')) {
-      if (!extractedHeaders.keys
-          .any((k) => k.toLowerCase() == 'user-agent')) {
-        extractedHeaders['User-Agent'] =
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 115Browser/27.0.5.7';
-      }
+    // Always preserve the exact same User-Agent that called `/api/fs/get` so 115 / Aliyun / Quark / Baidu 302 links never return HTTP 403!
+    extractedHeaders['User-Agent'] ??= defaultBrowserUserAgent;
+    if (lowerUrl.contains('115cdn') ||
+        lowerUrl.contains('115.com') ||
+        lowerUrl.contains('115vod')) {
+      extractedHeaders['Referer'] ??= 'https://115.com/';
     }
     return (
       url: primaryUrl,

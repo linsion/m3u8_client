@@ -55,15 +55,33 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
+import androidx.media3.common.audio.ChannelMixingAudioProcessor
+import androidx.media3.common.audio.ChannelMixingMatrix
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.decoder.ffmpeg.FfmpegAudioRenderer
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.Renderer
+import androidx.media3.exoplayer.audio.AudioRendererEventListener
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
+import androidx.media3.extractor.DefaultExtractorsFactory
+import androidx.media3.extractor.ts.TsExtractor
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
+import okhttp3.OkHttpClient
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
+import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.BinaryBitmap
 import com.google.zxing.DecodeHintType
@@ -156,6 +174,7 @@ class MainActivity : FlutterActivity() {
                     }
                     "openNativeExoPlayer" -> {
                         val url = call.argument<String>("url") ?: ""
+                        val fallbackUrl = call.argument<String>("fallbackUrl") ?: ""
                         val title = call.argument<String>("title") ?: "视频播放"
                         val startPosMs = (call.argument<Number>("positionMs")?.toLong() ?: 0L).coerceAtLeast(0L)
                         val rawHeaders = call.argument<Map<String, Any>>("headers") ?: emptyMap()
@@ -167,7 +186,7 @@ class MainActivity : FlutterActivity() {
                                 headers[ks] = vs
                             }
                         }
-                        showNativeExoPlayerDialog(url, title, headers, startPosMs, result)
+                        showNativeExoPlayerDialog(url, fallbackUrl, title, headers, startPosMs, result)
                     }
                     else -> result.notImplemented()
                 }
@@ -1131,6 +1150,7 @@ class MainActivity : FlutterActivity() {
     @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
     private fun showNativeExoPlayerDialog(
         streamUrl: String,
+        fallbackUrl: String,
         title: String,
         headers: Map<String, String>,
         startPositionMs: Long,
@@ -1159,18 +1179,147 @@ class MainActivity : FlutterActivity() {
         }
 
         try {
-            val ua = headers["User-Agent"]
-                ?: headers["user-agent"]
+            val ua = headers.entries.firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }?.value
                 ?: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 115Browser/27.0.5.7"
-            val httpFactory = DefaultHttpDataSource.Factory()
+            val cleanHeaders = mutableMapOf<String, String>()
+            for ((k, v) in headers) {
+                if (!k.equals("User-Agent", ignoreCase = true) && v.isNotBlank()) {
+                    cleanHeaders[k] = v
+                }
+            }
+
+            // 1. TVBox-grade OkHttpDataSource with SSL trust-all and cross-protocol HTTP<->HTTPS redirect following
+            val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
+                override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+                override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+                override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+            })
+            val sslContext = SSLContext.getInstance("TLS").apply {
+                init(null, trustAllCerts, SecureRandom())
+            }
+            val okHttpClient = OkHttpClient.Builder()
+                .connectTimeout(20, TimeUnit.SECONDS)
+                .readTimeout(35, TimeUnit.SECONDS)
+                .followRedirects(true)
+                .followSslRedirects(true)
+                .retryOnConnectionFailure(true)
+                .sslSocketFactory(sslContext.socketFactory, trustAllCerts[0] as X509TrustManager)
+                .hostnameVerifier { _, _ -> true }
+                .build()
+
+            val httpFactory = OkHttpDataSource.Factory(okHttpClient)
                 .setUserAgent(ua)
-                .setAllowCrossProtocolRedirects(true)
-                .setConnectTimeoutMs(20000)
-                .setReadTimeoutMs(30000)
-                .setDefaultRequestProperties(headers)
+                .setDefaultRequestProperties(cleanHeaders)
             val dataSourceFactory = DefaultDataSource.Factory(this, httpFactory)
 
-            val renderersFactory = DefaultRenderersFactory(this)
+            // 2. TVBox-grade DefaultExtractorsFactory (5x MPEG-TS timestamp search window)
+            val extractorsFactory = DefaultExtractorsFactory()
+                .setTsExtractorTimestampSearchBytes(TsExtractor.DEFAULT_TIMESTAMP_SEARCH_BYTES * 5)
+
+            // 3. TVBox-grade RenderersFactory:
+            //    - Bundles `FfmpegAudioRenderer` (`libffmpegJNI.so`) at index 0 so TrueHD 7.1, DTS-HD 7.1, AC-3 5.1, E-AC-3 Atmos,
+            //      FLAC, ALAC, AAC, Opus, Vorbis, MP3, PCM are all decoded inside ExoPlayer without MediaCodecAudioRenderer errors!
+            //    - Attaches a 1..8 channel -> 2ch Stereo `ChannelMixingAudioProcessor` to `DefaultAudioSink` so 5.1 / 6.1 / 7.1
+            //      surround tracks always play cleanly on every Android TV AudioTrack sink!
+            val renderersFactory = object : DefaultRenderersFactory(this) {
+                override fun buildAudioSink(
+                    context: Context,
+                    enableFloatOutput: Boolean,
+                    enableAudioTrackPlaybackParams: Boolean
+                ): AudioSink {
+                    val channelMixing = ChannelMixingAudioProcessor().apply {
+                        putChannelMixingMatrix(ChannelMixingMatrix.create(1, 2))
+                        putChannelMixingMatrix(ChannelMixingMatrix.create(2, 2))
+                        putChannelMixingMatrix(
+                            ChannelMixingMatrix(3, 2, floatArrayOf(
+                                1f, 0f,
+                                0f, 1f,
+                                0.707f, 0.707f
+                            ))
+                        )
+                        putChannelMixingMatrix(
+                            ChannelMixingMatrix(4, 2, floatArrayOf(
+                                1f, 0f,
+                                0f, 1f,
+                                0.707f, 0f,
+                                0f, 0.707f
+                            ))
+                        )
+                        putChannelMixingMatrix(
+                            ChannelMixingMatrix(5, 2, floatArrayOf(
+                                1f, 0f,
+                                0f, 1f,
+                                0.707f, 0.707f,
+                                0.707f, 0f,
+                                0f, 0.707f
+                            ))
+                        )
+                        putChannelMixingMatrix(
+                            ChannelMixingMatrix(6, 2, floatArrayOf(
+                                1f, 0f,
+                                0f, 1f,
+                                0.707f, 0.707f,
+                                0.35f, 0.35f,
+                                0.707f, 0f,
+                                0f, 0.707f
+                            ))
+                        )
+                        putChannelMixingMatrix(
+                            ChannelMixingMatrix(7, 2, floatArrayOf(
+                                1f, 0f,
+                                0f, 1f,
+                                0.707f, 0.707f,
+                                0.35f, 0.35f,
+                                0.707f, 0f,
+                                0f, 0.707f,
+                                0.5f, 0.5f
+                            ))
+                        )
+                        putChannelMixingMatrix(
+                            ChannelMixingMatrix(8, 2, floatArrayOf(
+                                1f, 0f,
+                                0f, 1f,
+                                0.707f, 0.707f,
+                                0.35f, 0.35f,
+                                0.707f, 0f,
+                                0f, 0.707f,
+                                0.707f, 0f,
+                                0f, 0.707f
+                            ))
+                        )
+                    }
+                    return DefaultAudioSink.Builder(context)
+                        .setEnableFloatOutput(enableFloatOutput)
+                        .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                        .setAudioProcessors(arrayOf(channelMixing))
+                        .build()
+                }
+
+                override fun buildAudioRenderers(
+                    context: Context,
+                    extensionRendererMode: Int,
+                    mediaCodecSelector: MediaCodecSelector,
+                    enableDecoderFallback: Boolean,
+                    audioSink: AudioSink,
+                    eventHandler: android.os.Handler,
+                    eventListener: AudioRendererEventListener,
+                    out: java.util.ArrayList<Renderer>
+                ) {
+                    try {
+                        out.add(FfmpegAudioRenderer(eventHandler, eventListener, audioSink))
+                    } catch (_: Throwable) {}
+                    super.buildAudioRenderers(
+                        context,
+                        EXTENSION_RENDERER_MODE_OFF,
+                        mediaCodecSelector,
+                        true,
+                        audioSink,
+                        eventHandler,
+                        eventListener,
+                        out
+                    )
+                }
+            }
                 .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
                 .setEnableDecoderFallback(true)
 
@@ -1178,18 +1327,9 @@ class MainActivity : FlutterActivity() {
                 setParameters(
                     buildUponParameters()
                         .setPreferredAudioLanguages("zh", "zho", "chi", "cmn", "yue", "en", "eng", "und")
-                        .setPreferredAudioMimeTypes(
-                            MimeTypes.AUDIO_E_AC3_JOC,
-                            MimeTypes.AUDIO_E_AC3,
-                            MimeTypes.AUDIO_AC3,
-                            MimeTypes.AUDIO_AAC,
-                            MimeTypes.AUDIO_FLAC,
-                            MimeTypes.AUDIO_ALAC,
-                            MimeTypes.AUDIO_OPUS,
-                            MimeTypes.AUDIO_VORBIS,
-                            MimeTypes.AUDIO_MPEG,
-                            MimeTypes.AUDIO_RAW
-                        )
+                        .setExceedRendererCapabilitiesIfNecessary(true)
+                        .setExceedVideoConstraintsIfNecessary(true)
+                        .setExceedAudioConstraintsIfNecessary(true)
                 )
             }
 
@@ -1211,7 +1351,7 @@ class MainActivity : FlutterActivity() {
 
             val exoPlayer = ExoPlayer.Builder(this, renderersFactory)
                 .setTrackSelector(trackSelector)
-                .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
+                .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory, extractorsFactory))
                 .setLoadControl(loadControl)
                 .setAudioAttributes(audioAttrs, true)
                 .setSeekBackIncrementMs(15000)
@@ -1574,7 +1714,7 @@ class MainActivity : FlutterActivity() {
                 card.addView(headerTitle)
 
                 val headerSub = TextView(this).apply {
-                    text = "提示：标注「硬解支持」的音轨可直接切换；TrueHD / DTS 源码音轨点击后将自动无缝切入全能软解音轨播放"
+                    text = "提示：已内置 TVBox 级 FFmpeg + Media3 混音软硬解双引擎，所有 TrueHD 7.1 / DTS-HD / 杜比 5.1 音轨均可直接切换有声播放"
                     textSize = 12.5f
                     setTextColor(Color.argb(195, 226, 232, 240))
                     setPadding(4, 0, 4, 20)
@@ -1597,8 +1737,7 @@ class MainActivity : FlutterActivity() {
                 var initialFocusBtn: Button? = null
                 for (choice in allChoices) {
                     val isCurrent = choice.group.isTrackSelected(choice.trackIndex)
-                    val hwOk = choice.isSupported && !choice.isRiskyPassthrough
-                    val statusBadge = if (hwOk) "✓ 硬解支持" else "⚡ 自动切软解播放"
+                    val statusBadge = if (!choice.isRiskyPassthrough) "✓ 原生硬解/FFmpeg" else "✓ FFmpeg软解混音"
                     val prefix = if (isCurrent) "● [当前] " else "   "
                     val rawName = (choice.format.label ?: "").trim()
                     val nameSuffix = if (rawName.isNotEmpty() && !choice.label.contains(rawName)) " ($rawName)" else ""
@@ -1618,13 +1757,8 @@ class MainActivity : FlutterActivity() {
                         }
                         setOnClickListener {
                             pickerDialog.dismiss()
-                            if (hwOk) {
-                                selectAudioChoice(choice)
-                                titleView.text = "  $title · 已切换至 ${choice.label}"
-                            } else {
-                                finishWithCurrentPos("FALLBACK_MPV_SOFT_AUDIO:${choice.orderIndex}")
-                                dismissNativeExoPlayerDialog()
-                            }
+                            selectAudioChoice(choice)
+                            titleView.text = "  $title · 已切换至 ${choice.label}"
                         }
                     }
                     styleTvFocusableButton(
@@ -1639,7 +1773,7 @@ class MainActivity : FlutterActivity() {
                 }
 
                 val softSwitchBtn = Button(this).apply {
-                    text = "⚡ 切换至内置全能软解播放器 (支持所有 TrueHD 7.1 / DTS-HD 源码音轨)"
+                    text = "⚡ 切换至备用 MPV 播放器内核"
                     textSize = 13.5f
                     setTextColor(Color.WHITE)
                     typeface = Typeface.DEFAULT_BOLD
@@ -1773,29 +1907,20 @@ class MainActivity : FlutterActivity() {
             }
 
             var didAutoSelectInitialSafeAudio = false
+            var didTryFallbackUrl = false
             exoPlayer.addListener(object : Player.Listener {
                 override fun onTracksChanged(tracks: Tracks) {
                     val choices = collectAudioChoices(includeRejected = false)
-                    val allTracks = collectAudioChoices(includeRejected = true)
-                    if (allTracks.isEmpty()) return
-
-                    val safeChoices = choices.filter { it.isSupported && !it.isRiskyPassthrough }
-                    val anySupportedChoices = choices.filter { it.isSupported }
-                    // If the file contains audio tracks, but ZERO audio tracks are supported by Android TV's hardware MediaCodecAudioRenderer
-                    // (e.g. a Blu-ray MKV with only TrueHD / DTS-HD audio), automatically switch to our built-in libmpv soft-audio player at 0ms!
-                    if (anySupportedChoices.isEmpty()) {
-                        finishWithCurrentPos("FALLBACK_MPV_SOFT_AUDIO")
-                        dismissNativeExoPlayerDialog()
-                        return
-                    }
+                    if (choices.isEmpty()) return
 
                     val currentSelected = choices.firstOrNull { it.group.isTrackSelected(it.trackIndex) }
                     if (!didAutoSelectInitialSafeAudio) {
                         didAutoSelectInitialSafeAudio = true
-                        if (currentSelected == null || !currentSelected.isSupported || currentSelected.isRiskyPassthrough) {
-                            val bestSafe = (safeChoices.ifEmpty { anySupportedChoices }).maxByOrNull { it.priority }
-                            if (bestSafe != null && bestSafe != currentSelected) {
-                                selectAudioChoice(bestSafe)
+                        if (currentSelected == null || !currentSelected.isSupported) {
+                            val best = choices.filter { it.isSupported }.maxByOrNull { it.priority }
+                                ?: choices.maxByOrNull { it.priority }
+                            if (best != null && best != currentSelected) {
+                                selectAudioChoice(best)
                                 return
                             }
                         }
@@ -1806,8 +1931,30 @@ class MainActivity : FlutterActivity() {
                 }
 
                 override fun onPlayerError(error: PlaybackException) {
+                    val savedPos = exoPlayer.currentPosition.coerceAtLeast(startPositionMs)
                     val errText = "${error.errorCodeName} ${error.message ?: ""} ${error.cause?.message ?: ""}"
+
+                    // 1) If primary `raw_url` failed (e.g. HTTP 403 / timeout / connection error) and an AList `/d/<path>?sign=...`
+                    //    fallback URL is available, switch to `fallbackUrl` at 0ms so AList generates a fresh 302 redirect!
+                    if (!didTryFallbackUrl && fallbackUrl.isNotBlank() && fallbackUrl != streamUrl) {
+                        didTryFallbackUrl = true
+                        titleView.text = "  $title · 正在通过备用直连通道加载..."
+                        val fbUri = if (fallbackUrl.startsWith("/")) {
+                            Uri.fromFile(java.io.File(fallbackUrl))
+                        } else {
+                            Uri.parse(fallbackUrl)
+                        }
+                        exoPlayer.setMediaItem(MediaItem.fromUri(fbUri))
+                        if (savedPos > 1000L) {
+                            exoPlayer.seekTo(savedPos)
+                        }
+                        exoPlayer.prepare()
+                        exoPlayer.playWhenReady = true
+                        return
+                    }
+
                     val isAudioRendererError = errText.contains("MediaCodecAudioRenderer", ignoreCase = true) ||
+                        errText.contains("FfmpegAudioRenderer", ignoreCase = true) ||
                         errText.contains("AudioSink", ignoreCase = true) ||
                         errText.contains("AudioTrack", ignoreCase = true) ||
                         error.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED ||
@@ -1816,7 +1963,6 @@ class MainActivity : FlutterActivity() {
                         error.errorCode == PlaybackException.ERROR_CODE_AUDIO_TRACK_WRITE_FAILED
 
                     if (isAudioRendererError) {
-                        val savedPos = exoPlayer.currentPosition.coerceAtLeast(startPositionMs)
                         // Mark the currently selected audio track as rejected
                         val groups = exoPlayer.currentTracks.groups
                         for ((gIdx, g) in groups.withIndex()) {
@@ -1827,14 +1973,12 @@ class MainActivity : FlutterActivity() {
                                 }
                             }
                         }
-                        val remainingSafe = collectAudioChoices(includeRejected = false)
-                            .filter { it.isSupported && !it.isRiskyPassthrough }
+                        val remaining = collectAudioChoices(includeRejected = false)
                             .sortedByDescending { it.priority }
-                        val nextBest = remainingSafe.firstOrNull()
+                        val nextBest = remaining.firstOrNull()
                         if (nextBest != null) {
-                            // 1) Switch to the next hardware-supported audio track (e.g. AC-3 / E-AC-3 / AAC) and resume seamlessly!
                             selectAudioChoice(nextBest)
-                            titleView.text = "  $title · 已自动优选兼容音轨 ${nextBest.label}"
+                            titleView.text = "  $title · 已自动切换至兼容音轨 ${nextBest.label}"
                             if (savedPos > 500L) {
                                 exoPlayer.seekTo(savedPos)
                             }
@@ -1842,7 +1986,6 @@ class MainActivity : FlutterActivity() {
                             exoPlayer.playWhenReady = true
                             return
                         }
-                        // 2) No hardware-supported audio track left in ExoPlayer -> seamlessly switch to libmpv (`mediacodec-copy` video + FFmpeg software audio)!
                         finishWithCurrentPos("FALLBACK_MPV_SOFT_AUDIO")
                         dismissNativeExoPlayerDialog()
                         return

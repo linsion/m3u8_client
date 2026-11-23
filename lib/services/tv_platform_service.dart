@@ -71,6 +71,7 @@ class TvPlatformService {
   static Future<({int positionMs, String? error})> openNativeExoPlayer({
     required String streamUrl,
     required String title,
+    String fallbackUrl = '',
     Map<String, String> headers = const {},
     int startPositionMs = 0,
   }) async {
@@ -83,6 +84,7 @@ class TvPlatformService {
         'openNativeExoPlayer',
         {
           'url': streamUrl,
+          'fallbackUrl': fallbackUrl,
           'title': title,
           'headers': headers,
           'positionMs': startPositionMs,

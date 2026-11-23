@@ -419,7 +419,7 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
   // Direct Click & Media Resolution Across All 5 Storage Sources
   // ===========================================================================
 
-  Future<({String url, Map<String, String> headers, String subtitle})>
+  Future<({String url, String fallbackUrl, Map<String, String> headers, String subtitle})>
       _resolveEntryEndpoint(FileEntry entry) async {
     final mount = _mounts.where((m) => m.id == entry.mountId).firstOrNull ??
         _activeMount;
@@ -427,6 +427,7 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
       case StorageSourceKind.server:
         return (
           url: widget.appState.api.buildFileStreamUrl(entry.path),
+          fallbackUrl: '',
           headers: widget.appState.api.authHeaders,
           subtitle: '流光服务端 · ${entry.formattedSize}',
         );
@@ -438,6 +439,7 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
         );
         return (
           url: info.url,
+          fallbackUrl: info.alistProxyUrl != info.url ? info.alistProxyUrl : '',
           headers: info.headers,
           subtitle: '${mount.name} · ${entry.formattedSize}',
         );
@@ -448,6 +450,7 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
         final headers = RemoteStorageService.instance.webdavAuthHeaders(mount);
         return (
           url: url,
+          fallbackUrl: '',
           headers: headers,
           subtitle: '${mount.name} · ${entry.formattedSize}',
         );
@@ -459,6 +462,7 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
         );
         return (
           url: url,
+          fallbackUrl: '',
           headers: const <String, String>{},
           subtitle: '${mount.name} (SMB) · ${entry.formattedSize}',
         );
@@ -478,12 +482,14 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
             Local115DirectService.instance.requestHeadersForUrl(directUrl);
         return (
           url: directUrl,
+          fallbackUrl: '',
           headers: headers,
           subtitle: '115 网盘原画直连 · ${entry.formattedSize}',
         );
       case StorageSourceKind.localCache:
         return (
           url: entry.path,
+          fallbackUrl: '',
           headers: const <String, String>{},
           subtitle: '本机离线目录 · ${entry.formattedSize}',
         );
@@ -572,20 +578,24 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
         final resolved = initial115 == null
             ? await _resolveEntryEndpoint(entry)
             : (
-              url: initial115.proxyStreamUrl,
-              headers: initial115.playbackHeaders,
+              url: initial115.directCdnUrl.isNotEmpty
+                  ? initial115.directCdnUrl
+                  : initial115.proxyStreamUrl,
+              fallbackUrl: initial115.proxyStreamUrl != initial115.directCdnUrl
+                  ? initial115.proxyStreamUrl
+                  : '',
+              headers: initial115.headers,
               subtitle: '115 网盘 · ${entry.formattedSize}',
             );
         if (!mounted) return;
-        // On Android / Android TV, automatically use the embedded zero-copy AndroidX Media3 ExoPlayer
-        // (`SurfaceView` hardware renderer) for ultra-large files (>= 8 GB Blu-ray remuxes / 4K ISO / MKV / MP4).
+        // On Android / Android TV, always use the TVBox-grade AndroidX Media3 ExoPlayer
+        // (`SurfaceView` hardware video + `FfmpegAudioRenderer` all-format audio + `OkHttpDataSource`) by default!
         Duration? initialSeekPos;
         int? initialAudioTrackOrderIdx;
-        if (!inMiniPlayer &&
-            Platform.isAndroid &&
-            entry.size >= 8 * 1024 * 1024 * 1024) {
+        if (!inMiniPlayer && Platform.isAndroid) {
           final exoRes = await TvPlatformService.openNativeExoPlayer(
             streamUrl: resolved.url,
+            fallbackUrl: resolved.fallbackUrl,
             title: entry.name,
             headers: resolved.headers,
           );
@@ -4829,7 +4839,30 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
       ),
     );
     _playbackErrors = _player.stream.error.listen((message) {
-      if (message.trim().isNotEmpty) unawaited(_handlePlaybackError());
+      final clean = message.trim();
+      if (clean.isEmpty) return;
+      final hasStarted = _position > Duration.zero ||
+          _duration > Duration.zero ||
+          (_player.state.width ?? 0) > 0 ||
+          (_player.state.height ?? 0) > 0;
+      if (hasStarted) return;
+      final lower = clean.toLowerCase();
+      final isNonFatal = lower.contains('error while decoding') ||
+          lower.contains('decoding frame') ||
+          lower.contains('co located pocs') ||
+          lower.contains('reference picture missing') ||
+          lower.contains('non-existing pps') ||
+          lower.contains('non-existing sps') ||
+          lower.contains('concealing') ||
+          lower.contains('packet corrupt') ||
+          lower.contains('no frame!') ||
+          lower.contains('discarding') ||
+          lower.contains('overread') ||
+          lower.contains('loading aborted') ||
+          lower.contains('operation was aborted') ||
+          lower.contains('audio device underrun');
+      if (isNonFatal) return;
+      unawaited(_handlePlaybackError());
     });
     _posSub = _player.stream.position.listen((pos) {
       if (!mounted) return;
@@ -4928,6 +4961,20 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
 
   Future<void> _openActiveStream({Duration? position}) async {
     unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
+    try {
+      final dynamic platform = _player.platform;
+      final ua = _activeHeaders['User-Agent'] ??
+          _activeHeaders['user-agent'] ??
+          RemoteStorageService.defaultBrowserUserAgent;
+      await platform.setProperty('user-agent', ua);
+      final referer = _activeHeaders['Referer'] ??
+          _activeHeaders['referer'] ??
+          _activeHeaders['Referrer'] ??
+          '';
+      if (referer.isNotEmpty) {
+        await platform.setProperty('referrer', referer);
+      }
+    } catch (_) {}
     await _player.open(
       Media(_activeUrl, httpHeaders: _activeHeaders, start: position),
       play: true,
