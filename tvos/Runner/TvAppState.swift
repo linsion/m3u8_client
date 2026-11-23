@@ -3543,7 +3543,8 @@ final class TvAppState: ObservableObject {
             primaryStream = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
               remoteUrl: dir,
               headers: hdrs,
-              extHint: ext
+              extHint: ext,
+              forceDirectConnection: true
             )
             backupStream = dir
           }
@@ -3560,12 +3561,13 @@ final class TvAppState: ObservableObject {
               primaryStream = phls
               backupStream = dir
             } else {
-              primaryStream = dir
-              backupStream = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
+              primaryStream = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
                 remoteUrl: dir,
                 headers: hdrs,
-                extHint: ext.isEmpty ? ".mp4" : ext
+                extHint: ext.isEmpty ? ".mp4" : ext,
+                forceDirectConnection: true
               )
+              backupStream = dir
             }
           } else if let hls = await TvLocal115DirectClient.shared.resolvePickcodeHlsM3u8Url(pickcode: entry.pickcode115),
                     !hls.isEmpty {
@@ -3608,15 +3610,63 @@ final class TvAppState: ObservableObject {
       do {
         if entry.sourceKind == .alist {
           let mount = self.storageMounts.first(where: { $0.id == entry.mountId }) ?? self.activeStorageMount
-          let info = try await TvRemoteStorageClient.shared.resolveAlistStreamInfo(
+          let ext = entry.normalizedExt
+          let isNonMp4Container = [".mkv", ".avi", ".rmvb", ".wmv", ".ts", ".webm", ".iso"].contains(ext)
+
+          async let infoTask = TvRemoteStorageClient.shared.resolveAlistStreamInfo(
             mount: mount,
             path: entry.path,
             fallbackUrl: entry.rawDownloadUrl
           )
+          var previewHls: (url: String, headers: [String: String])? = nil
+          if isNonMp4Container {
+            previewHls = await TvRemoteStorageClient.shared.resolveAlistVideoPreviewHlsUrl(
+              mount: mount,
+              path: entry.path
+            )
+          }
+          let info = try await infoTask
           guard !info.url.isEmpty else { return }
-          let primaryUrl = info.url
-          let backupUrl = info.alistProxyUrl != info.url ? info.alistProxyUrl : info.url
-          let playHeaders = info.headers
+
+          var primaryUrl = ""
+          var backupUrl = ""
+          var playHeaders = info.headers
+
+          if let hlsPreview = previewHls, !hlsPreview.url.isEmpty {
+            for (k, v) in hlsPreview.headers { playHeaders[k] = v }
+            primaryUrl = await TvLocalHlsProxyServer.shared.prepareProxyPlaylistUrl(
+              gatewayUrl: hlsPreview.url,
+              resolvedUrl: hlsPreview.url,
+              headers: playHeaders
+            ) ?? hlsPreview.url
+            backupUrl = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
+              remoteUrl: info.url,
+              headers: info.headers,
+              extHint: ext.isEmpty ? ".mp4" : ext,
+              forceDirectConnection: true
+            )
+          } else if info.url.lowercased().contains(".m3u8") {
+            primaryUrl = await TvLocalHlsProxyServer.shared.prepareProxyPlaylistUrl(
+              gatewayUrl: info.url,
+              resolvedUrl: info.url,
+              headers: playHeaders
+            ) ?? info.url
+            backupUrl = info.url
+          } else {
+            primaryUrl = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
+              remoteUrl: info.url,
+              headers: playHeaders,
+              extHint: ext.isEmpty ? ".mp4" : ext,
+              forceDirectConnection: true
+            )
+            let rawBackup = info.alistProxyUrl != info.url ? info.alistProxyUrl : info.url
+            backupUrl = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
+              remoteUrl: rawBackup,
+              headers: playHeaders,
+              extHint: ext.isEmpty ? ".mp4" : ext,
+              forceDirectConnection: true
+            )
+          }
 
           self.playerControlsVisible = true
           self.playerShowEpisodeDrawer = false
@@ -3640,7 +3690,18 @@ final class TvAppState: ObservableObject {
 
         let resolved = try await self.resolveFileStreamEndpoint(entry)
         guard !resolved.url.isEmpty else { return }
-        let streamUrl = resolved.url
+        let ext = entry.normalizedExt
+        let shouldProxyDirect = !resolved.url.contains("127.0.0.1:")
+          && !resolved.url.hasPrefix("file://")
+          && !resolved.url.lowercased().contains(".m3u8")
+        let streamUrl = shouldProxyDirect
+          ? TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
+              remoteUrl: resolved.url,
+              headers: resolved.headers,
+              extHint: ext.isEmpty ? ".mp4" : ext,
+              forceDirectConnection: true
+            )
+          : resolved.url
         let backupUrl = resolved.url
         self.playerControlsVisible = true
         self.playerShowEpisodeDrawer = false

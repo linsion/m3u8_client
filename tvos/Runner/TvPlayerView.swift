@@ -2366,12 +2366,12 @@ struct TvPlayerModalView: View {
       headers: request.headers
     ) { proxyStreamUrl, directCdnUrl, headers115, _ in
       let savedPos = self.positionSec
-      let primary115Url = directCdnUrl.isEmpty ? proxyStreamUrl : directCdnUrl
+      let primary115Url = proxyStreamUrl.isEmpty ? directCdnUrl : proxyStreamUrl
       self.using115Direct = true
       self.active115StreamUrl = primary115Url
-      self.fallback115StreamUrl = (proxyStreamUrl != primary115Url) ? proxyStreamUrl : ""
+      self.fallback115StreamUrl = (directCdnUrl != primary115Url) ? directCdnUrl : ""
       self.active115Headers = headers115
-      self.startPlayerItem(urlStr: primary115Url, resumeAt: savedPos, overrideHeaders: headers115, fallbackDirect115Url: proxyStreamUrl)
+      self.startPlayerItem(urlStr: primary115Url, resumeAt: savedPos, overrideHeaders: headers115, fallbackDirect115Url: directCdnUrl)
     }
   }
 
@@ -2559,23 +2559,23 @@ struct TvPlayerModalView: View {
         let deltaBuf = max(0, bufEnd - prevBufferedEnd)
         prevBufferedEnd = bufEnd
         var liveMeasured = max(proxyRate, accessRate)
-        if liveMeasured <= 0 && (self.userWantsToPlay || self.isBuffering) {
+        if liveMeasured <= 0 && self.userWantsToPlay && (deltaBuf > 0.08 || sec > 0.5) {
           let w = curItem.presentationSize.width
           let baseStreamRate = mediaRate > 16384
             ? mediaRate
-            : (w >= 1920 ? 420 * 1024.0 : (w >= 1280 ? 260 * 1024.0 : 190 * 1024.0))
+            : (w >= 1920 ? 550 * 1024.0 : (w >= 1280 ? 320 * 1024.0 : 220 * 1024.0))
           let nowTick = Int64(Date().timeIntervalSince1970 * 1000)
-          let wave = 0.86 + Double((nowTick / 500) % 7) * 0.04
+          let wave = 0.88 + Double((nowTick / 500) % 7) * 0.04
           if deltaBuf > 0.12 {
-            liveMeasured = min(max(deltaBuf / 0.5, 0.5), 6.0) * baseStreamRate * wave
-          } else if sec > 0 || bufEnd > 0 || self.isBuffering {
-            liveMeasured = baseStreamRate * 0.85 * wave
+            liveMeasured = min(max(deltaBuf / 0.5, 0.8), 12.0) * baseStreamRate * wave
+          } else if sec > 0.5 && !self.isBuffering {
+            liveMeasured = baseStreamRate * 0.90 * wave
           }
         }
         if liveMeasured > 0 {
           let prev = self.appState.latestMeasuredSpeedBytesPerSec
-          self.appState.latestMeasuredSpeedBytesPerSec = prev <= 1024 ? liveMeasured : (prev * 0.45 + liveMeasured * 0.55)
-        } else if !self.userWantsToPlay {
+          self.appState.latestMeasuredSpeedBytesPerSec = prev <= 1024 ? liveMeasured : (prev * 0.35 + liveMeasured * 0.65)
+        } else {
           self.appState.latestMeasuredSpeedBytesPerSec = 0
         }
 
