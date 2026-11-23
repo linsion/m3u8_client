@@ -292,6 +292,27 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
   final Map<int, VideoController> _subControllers = {};
   final Map<int, LiveChannel> _subChannels = {};
   String _lastLiveRouteSignature = '';
+  int _lastObservedNetworkResumeEpoch = 0;
+
+  void _onAppStateNetworkResumeChanged() {
+    if (!mounted) return;
+    final epoch = widget.appState.networkResumeEpoch;
+    if (epoch == _lastObservedNetworkResumeEpoch) return;
+    _lastObservedNetworkResumeEpoch = epoch;
+    final ch = _currentChannel;
+    if (ch == null || widget.appState.miniPlayerSession != null) return;
+    if (_playError != null ||
+        !_player.state.playing ||
+        _player.state.completed ||
+        _activeStreamUrl.contains('127.0.0.1')) {
+      _playChannel(
+        ch,
+        urlIndex: _currentUrlIndex,
+        resetTried: _playError != null,
+        isAutoReconnect: true,
+      );
+    }
+  }
 
   String _computeLiveRouteSignature() {
     final svc = widget.appState.proxyService;
@@ -512,7 +533,9 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
       });
     }
     _lastLiveRouteSignature = _computeLiveRouteSignature();
+    _lastObservedNetworkResumeEpoch = widget.appState.networkResumeEpoch;
     widget.appState.proxyService.addListener(_onExternalProxyServiceChanged);
+    widget.appState.addListener(_onAppStateNetworkResumeChanged);
     _loadLivePrefs();
   }
 
@@ -868,6 +891,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     _playerFocusNode.dispose();
     _liveBottomBarFocusNode.dispose();
     widget.appState.proxyService.removeListener(_onExternalProxyServiceChanged);
+    widget.appState.removeListener(_onAppStateNetworkResumeChanged);
     for (final p in _subPlayers.values) {
       p.dispose();
     }

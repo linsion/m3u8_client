@@ -168,6 +168,50 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
   bool _isVerticalVolumeDragging = false;
   double _volumePercent = 100.0;
   String _lastVodRouteSignature = '';
+  int _lastObservedNetworkResumeEpoch = 0;
+
+  void _onAppStateNetworkResumeChanged() {
+    if (!mounted) return;
+    final epoch = widget.appState.networkResumeEpoch;
+    if (epoch == _lastObservedNetworkResumeEpoch) return;
+    _lastObservedNetworkResumeEpoch = epoch;
+    if (_detailError != null && !_isLoadingDetail) {
+      _loadDetail();
+      return;
+    }
+    final ep = _currentEpisode;
+    final resolved = _resolvedPlayback;
+    if (ep == null || _isResolvingPlay || _using115Direct) return;
+    final curSec = _player.state.position.inSeconds > 2
+        ? _player.state.position.inSeconds.toDouble()
+        : (_lastValidPosition.inSeconds > 2
+              ? _lastValidPosition.inSeconds.toDouble()
+              : _pendingSeekSeconds);
+    if (_playError != null ||
+        _player.state.completed ||
+        (_activeStreamUrl.contains('127.0.0.1') && !_player.state.playing)) {
+      if (curSec > 2) {
+        _pendingSeekSeconds = curSec;
+        _hasAppliedInitialSeek = false;
+      }
+      if (resolved != null && _playError == null) {
+        unawaited(
+          _openResolvedStream(
+            resolved,
+            forceProxy: _useServerProxy,
+            attemptId: _playAttemptSessionId,
+            autoplay: _player.state.playing,
+          ),
+        );
+      } else {
+        _selectAndPlayEpisode(
+          ep,
+          resumeSeconds: curSec,
+          resetTriedLines: _playError != null,
+        );
+      }
+    }
+  }
 
   String _computeVodRouteSignature() {
     final svc = widget.appState.proxyService;
@@ -514,7 +558,9 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     });
 
     _lastVodRouteSignature = _computeVodRouteSignature();
+    _lastObservedNetworkResumeEpoch = widget.appState.networkResumeEpoch;
     widget.appState.proxyService.addListener(_onExternalProxyServiceChanged);
+    widget.appState.addListener(_onAppStateNetworkResumeChanged);
     _loadDetail();
   }
 
@@ -720,6 +766,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     _episodeSearchCtrl.dispose();
     _syncHistoryNow();
     widget.appState.proxyService.removeListener(_onExternalProxyServiceChanged);
+    widget.appState.removeListener(_onAppStateNetworkResumeChanged);
     _positionSub?.cancel();
     _completedSub?.cancel();
     _errorSub?.cancel();

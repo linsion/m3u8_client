@@ -202,7 +202,18 @@ class SmbClientService {
       _proxyPort = srv.port;
       srv.listen(
         _handleProxyHttpRequest,
-        onError: (_) {},
+        onError: (_) {
+          if (identical(_proxyServer, srv)) {
+            _proxyServer = null;
+            _proxyPort = 0;
+          }
+        },
+        onDone: () {
+          if (identical(_proxyServer, srv)) {
+            _proxyServer = null;
+            _proxyPort = 0;
+          }
+        },
       );
       completer.complete(_proxyPort);
       return _proxyPort;
@@ -210,6 +221,34 @@ class SmbClientService {
       _startingServer = null;
       completer.completeError(e);
       rethrow;
+    }
+  }
+
+  /// Verifies that the local SMB HTTP Range gateway (`127.0.0.1:<port>`) is alive
+  /// when returning from background or OS sleep, restarting it if needed.
+  Future<void> resetAllSessions() async {
+    final srv = _proxyServer;
+    final port = _proxyPort;
+    if (srv == null || port <= 0) return;
+    try {
+      final probe = await Socket.connect(
+        InternetAddress.loopbackIPv4,
+        port,
+        timeout: const Duration(milliseconds: 250),
+      );
+      probe.destroy();
+    } catch (_) {
+      if (identical(_proxyServer, srv)) {
+        _proxyServer = null;
+        _proxyPort = 0;
+        _startingServer = null;
+      }
+      try {
+        await srv.close(force: true);
+      } catch (_) {}
+      if (_registeredMounts.isNotEmpty) {
+        unawaited(_ensureProxyServerStarted().catchError((_) => 0));
+      }
     }
   }
 

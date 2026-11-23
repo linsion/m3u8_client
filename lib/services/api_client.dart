@@ -87,16 +87,43 @@ class ApiClient {
 
   /// Closes pooled keep-alive sockets (so no requests linger on an old proxy node
   /// or stay proxied after turning off the proxy) and creates fresh [HttpClient]s.
-  void resetHttpClientPool() {
+  void resetHttpClientPool({
+    bool forceClose = false,
+    bool clearTransientCaches = false,
+  }) {
+    if (clearTransientCaches) {
+      _redirectUrlCache.clear();
+      _dohHostCache.clear();
+    }
     final oldIo = _ioHttpClient;
     final oldRaw = _rawHttpClient;
     _initHttpClients();
     try {
-      oldIo?.close(force: false);
+      oldIo?.close(force: forceClose);
     } catch (_) {}
     try {
-      oldRaw.close(force: false);
+      oldRaw.close(force: forceClose);
     } catch (_) {}
+  }
+
+  static bool _isRecoverableNetworkError(Object error) {
+    return error is SocketException ||
+        error is HttpException ||
+        error is HandshakeException ||
+        error is TlsException ||
+        error is http.ClientException ||
+        error is TimeoutException;
+  }
+
+  Future<void> _recoverNetworkPoolBeforeRetry() async {
+    resetHttpClientPool(forceClose: true, clearTransientCaches: true);
+    final svc = _proxyService;
+    if (svc != null) {
+      try {
+        await svc.ensureLocalBridgesHealthy(resetHttpClients: true);
+      } catch (_) {}
+      resetHttpClientPool(forceClose: false);
+    }
   }
 
   void attachProxyService(ProxyRoutingService service) {
@@ -275,10 +302,21 @@ class ApiClient {
     Duration timeout = const Duration(seconds: 20),
   }) async {
     final uri = _buildUri(path, query);
-    final response = await _client
-        .get(uri, headers: authHeaders)
-        .timeout(timeout);
-    return _decodeResponse(response);
+    try {
+      final response = await _client
+          .get(uri, headers: authHeaders)
+          .timeout(timeout);
+      return _decodeResponse(response);
+    } catch (e) {
+      if (_isRecoverableNetworkError(e)) {
+        await _recoverNetworkPoolBeforeRetry();
+        final response = await _client
+            .get(uri, headers: authHeaders)
+            .timeout(timeout);
+        return _decodeResponse(response);
+      }
+      rethrow;
+    }
   }
 
   Future<dynamic> _postJson(
@@ -292,14 +330,30 @@ class ApiClient {
       ...authHeaders,
       'Content-Type': 'application/json',
     };
-    final response = await _client
-        .post(
-          uri,
-          headers: headers,
-          body: body == null ? null : jsonEncode(body),
-        )
-        .timeout(timeout);
-    return _decodeResponse(response);
+    final encodedBody = body == null ? null : jsonEncode(body);
+    try {
+      final response = await _client
+          .post(
+            uri,
+            headers: headers,
+            body: encodedBody,
+          )
+          .timeout(timeout);
+      return _decodeResponse(response);
+    } catch (e) {
+      if (_isRecoverableNetworkError(e)) {
+        await _recoverNetworkPoolBeforeRetry();
+        final response = await _client
+            .post(
+              uri,
+              headers: headers,
+              body: encodedBody,
+            )
+            .timeout(timeout);
+        return _decodeResponse(response);
+      }
+      rethrow;
+    }
   }
 
   Future<dynamic> _putJson(
@@ -313,14 +367,30 @@ class ApiClient {
       ...authHeaders,
       'Content-Type': 'application/json',
     };
-    final response = await _client
-        .put(
-          uri,
-          headers: headers,
-          body: body == null ? null : jsonEncode(body),
-        )
-        .timeout(timeout);
-    return _decodeResponse(response);
+    final encodedBody = body == null ? null : jsonEncode(body);
+    try {
+      final response = await _client
+          .put(
+            uri,
+            headers: headers,
+            body: encodedBody,
+          )
+          .timeout(timeout);
+      return _decodeResponse(response);
+    } catch (e) {
+      if (_isRecoverableNetworkError(e)) {
+        await _recoverNetworkPoolBeforeRetry();
+        final response = await _client
+            .put(
+              uri,
+              headers: headers,
+              body: encodedBody,
+            )
+            .timeout(timeout);
+        return _decodeResponse(response);
+      }
+      rethrow;
+    }
   }
 
   Future<dynamic> _deleteJson(
@@ -334,13 +404,26 @@ class ApiClient {
       ...authHeaders,
       if (body != null) 'Content-Type': 'application/json',
     };
-    final request = http.Request('DELETE', uri)..headers.addAll(headers);
-    if (body != null) {
-      request.body = jsonEncode(body);
+    Future<http.Response> sendDelete() async {
+      final request = http.Request('DELETE', uri)..headers.addAll(headers);
+      if (body != null) {
+        request.body = jsonEncode(body);
+      }
+      final streamed = await _client.send(request).timeout(timeout);
+      return http.Response.fromStream(streamed);
     }
-    final streamed = await _client.send(request).timeout(timeout);
-    final response = await http.Response.fromStream(streamed);
-    return _decodeResponse(response);
+
+    try {
+      final response = await sendDelete();
+      return _decodeResponse(response);
+    } catch (e) {
+      if (_isRecoverableNetworkError(e)) {
+        await _recoverNetworkPoolBeforeRetry();
+        final response = await sendDelete();
+        return _decodeResponse(response);
+      }
+      rethrow;
+    }
   }
 
   dynamic _decodeResponse(http.Response response) {
@@ -529,16 +612,26 @@ class ApiClient {
         ...params,
       },
     );
-    final res = await _client
-        .get(
-          mergedUri,
-          headers: const {
-            'Accept': 'application/json, text/plain, */*',
-            'User-Agent':
-                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-          },
-        )
-        .timeout(timeout);
+    const reqHeaders = {
+      'Accept': 'application/json, text/plain, */*',
+      'User-Agent':
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    };
+    http.Response res;
+    try {
+      res = await _client
+          .get(mergedUri, headers: reqHeaders)
+          .timeout(timeout);
+    } catch (e) {
+      if (_isRecoverableNetworkError(e)) {
+        await _recoverNetworkPoolBeforeRetry();
+        res = await _client
+            .get(mergedUri, headers: reqHeaders)
+            .timeout(timeout);
+      } else {
+        rethrow;
+      }
+    }
     if (res.statusCode >= 200 && res.statusCode < 300) {
       final text = utf8.decode(res.bodyBytes, allowMalformed: true).trim();
       final braceIdx = text.indexOf('{');

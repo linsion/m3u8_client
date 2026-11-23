@@ -180,12 +180,18 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     final isForeground = state == AppLifecycleState.resumed;
     if (isForeground) {
       unawaited(WakelockPlus.enable().catchError((_) {}));
-    }
-    widget.appState.updateTelegramReadingContext(
-      isAppForeground: isForeground,
-    );
-    if (isForeground && widget.appState.isAuthenticated) {
-      _sniffClipboardOnResume();
+      unawaited(
+        widget.appState.handleAppLifecycleStateChanged(true),
+      );
+      if (widget.appState.isAuthenticated) {
+        _sniffClipboardOnResume();
+      }
+    } else if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached) {
+      unawaited(
+        widget.appState.handleAppLifecycleStateChanged(false),
+      );
     }
   }
 

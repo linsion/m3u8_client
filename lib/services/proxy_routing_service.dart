@@ -2766,13 +2766,68 @@ class LocalProxyTunnelBridge {
         return 0;
       }
       _serverSocket = socket;
-      socket.listen(_handleClientSocket, onError: (_) {});
+      socket.listen(
+        _handleClientSocket,
+        onError: (_) {
+          if (identical(_serverSocket, socket)) {
+            _serverSocket = null;
+          }
+        },
+        onDone: () {
+          if (identical(_serverSocket, socket)) {
+            _serverSocket = null;
+          }
+        },
+      );
       return socket.port;
     } catch (_) {
       return 0;
     } finally {
       if (generation == _listenerGeneration) _bridgeStart = null;
     }
+  }
+
+  /// Clears static host failure and DNS caches across all bridges after returning from background/sleep.
+  static void clearTransientNetworkCaches() {
+    _directFailedHostTimestamps.clear();
+    _inFlightDnsLookups.clear();
+    _realEntryIpCache.clear();
+  }
+
+  /// Verifies that the local loopback listener (`127.0.0.1:<port>`) is alive and accepting
+  /// connections, restarting it and optionally resetting pooled upstream `HttpClient`s
+  /// when returning from prolonged backgrounding or OS sleep.
+  Future<int> ensureAliveAndHealthy({bool resetHttpClients = false}) async {
+    if (resetHttpClients) {
+      resetSessionState(force: true);
+      try {
+        _directRelayHttpClient?.close(force: true);
+      } catch (_) {}
+      _directRelayHttpClient = null;
+    }
+    final currentSocket = _serverSocket;
+    final currentPort = currentSocket?.port ?? 0;
+    if (currentSocket != null && currentPort > 0) {
+      try {
+        final probe = await Socket.connect(
+          InternetAddress.loopbackIPv4,
+          currentPort,
+          timeout: const Duration(milliseconds: 250),
+        );
+        probe.destroy();
+        return currentPort;
+      } catch (_) {
+        if (identical(_serverSocket, currentSocket)) {
+          _serverSocket = null;
+        }
+        _listenerGeneration++;
+        _bridgeStart = null;
+        try {
+          await currentSocket.close();
+        } catch (_) {}
+      }
+    }
+    return ensureStarted();
   }
 
   Future<void> stop() async {
@@ -7219,10 +7274,65 @@ class ProxyRoutingService extends ChangeNotifier {
 
   void _resetAllBridgeSessionCaches({bool force = true}) {
     _ipProbeCache.clear();
+    LocalProxyTunnelBridge.clearTransientNetworkCaches();
     _localBridge.resetSessionState(force: force);
     for (final b in _nodeBridges.values) {
       b.resetSessionState(force: force);
     }
+  }
+
+  /// Ensures all local proxy/relay bridge listeners are alive and healthy,
+  /// resetting stale pooled upstream `HttpClient` sockets if [resetHttpClients] is true.
+  Future<void> ensureLocalBridgesHealthy({
+    bool resetHttpClients = true,
+  }) async {
+    if (_disposed) return;
+    if (resetHttpClients) {
+      LocalProxyTunnelBridge.clearTransientNetworkCaches();
+      _ipProbeCache.clear();
+    }
+    await _localBridge.ensureAliveAndHealthy(
+      resetHttpClients: resetHttpClients,
+    );
+    for (final b in _nodeBridges.values.toList()) {
+      await b.ensureAliveAndHealthy(resetHttpClients: resetHttpClients);
+    }
+  }
+
+  /// Recovers local proxy tunnel bridges, pooled HTTP relay sockets, and proxy node
+  /// health state when the app returns to the foreground after backgrounding or OS sleep.
+  Future<void> handleAppResumed({Duration? backgroundDuration}) async {
+    if (_disposed) return;
+    _nodeFailureStreaks.clear();
+    _ipProbeCache.clear();
+    LocalProxyTunnelBridge.clearTransientNetworkCaches();
+
+    await ensureLocalBridgesHealthy(resetHttpClients: true);
+    _configureAutoFastestTimer();
+
+    final anyScenarioNeedsBridge = _scenarioRules.values.any(
+      (r) =>
+          r.mode == ScenarioRouteMode.proxyNode ||
+          r.mode == ScenarioRouteMode.smartAuto,
+    );
+    if (_proxyEnabled || anyScenarioNeedsBridge) {
+      final current = activeNode;
+      final longBackground =
+          backgroundDuration != null && backgroundDuration.inSeconds >= 45;
+      if (current == null || !current.isReachable || longBackground) {
+        if (current != null && current.server.trim().isNotEmpty) {
+          unawaited(
+            LocalProxyTunnelBridge.resolveRealEntryIp(current.server.trim()),
+          );
+        }
+        if (current == null || !current.isReachable) {
+          unawaited(testAllNodesLatency(silent: true));
+        } else if (longBackground && !_isTestingNodes) {
+          unawaited(testSingleNodeLatency(current.id));
+        }
+      }
+    }
+    notifyListeners();
   }
 
   final Map<String, ({

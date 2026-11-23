@@ -288,9 +288,14 @@ final class TvLocalProxyTunnelServer: @unchecked Sendable {
 
   func startListenerIfNeeded() {
     lock.lock()
-    if listener != nil && port > 0 {
-      lock.unlock()
-      return
+    if let existing = listener {
+      if case .ready = existing.state, port > 0 {
+        lock.unlock()
+        return
+      }
+      existing.cancel()
+      listener = nil
+      port = 0
     }
     lock.unlock()
     do {
@@ -299,10 +304,22 @@ final class TvLocalProxyTunnelServer: @unchecked Sendable {
       let nwListener = try NWListener(using: params, on: .any)
       nwListener.stateUpdateHandler = { [weak self] state in
         guard let self else { return }
-        if case .ready = state, let p = nwListener.port?.rawValue, p > 0 {
+        switch state {
+        case .ready:
+          if let p = nwListener.port?.rawValue, p > 0 {
+            self.lock.lock()
+            self.port = p
+            self.lock.unlock()
+          }
+        case .failed, .cancelled:
           self.lock.lock()
-          self.port = p
+          if self.listener === nwListener {
+            self.port = 0
+            self.listener = nil
+          }
           self.lock.unlock()
+        default:
+          break
         }
       }
       nwListener.newConnectionHandler = { [weak self] conn in
@@ -313,6 +330,25 @@ final class TvLocalProxyTunnelServer: @unchecked Sendable {
       self.listener = nwListener
       lock.unlock()
     } catch {}
+  }
+
+  func handleEnterForeground() {
+    Self.dnsLock.lock()
+    Self.realEntryIpCache.removeAll()
+    Self.dnsLock.unlock()
+
+    lock.lock()
+    ipCache.removeAll()
+    configRevision &+= 1
+    let activeHost = activeCreds?.host ?? lastKnownCreds?.host ?? ""
+    lock.unlock()
+
+    startListenerIfNeeded()
+    if !activeHost.isEmpty {
+      queue.async {
+        _ = Self.resolveRealEntryIpSync(activeHost)
+      }
+    }
   }
 
   private func handleClientConnection(_ client: NWConnection) {
@@ -3650,7 +3686,28 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
   }
 
   func handleEnterForeground() {
-    urlSession.flush {}
+    TvLocalProxyTunnelServer.shared.handleEnterForeground()
+    sessionLock.lock()
+    cachedProxyUrlSession?.invalidateAndCancel()
+    cachedProxyUrlSession = nil
+    cachedProxyPort = 0
+    cachedProxyRevision = 0
+    sessionLock.unlock()
+
+    directUrlSession.reset {}
+    tgLock.lock()
+    for (_, task) in tgInFlightBlocks {
+      task.cancel()
+    }
+    tgInFlightBlocks.removeAll()
+    tgInFlightIsPrefetch.removeAll()
+    tgActivePrefetchCountByUrl.removeAll()
+    for (_, task) in tgMetaInFlight {
+      task.cancel()
+    }
+    tgMetaInFlight.removeAll()
+    tgLock.unlock()
+
     startListenerIfNeeded()
   }
 
@@ -5661,10 +5718,12 @@ final class TvApiClient {
   }
 
   func handleEnterForeground() {
-    session.flush {}
-    imageSession.flush {}
-    noRedirectSession.flush {}
+    redirectUrlCache.removeAll()
+    session.reset {}
+    imageSession.reset {}
+    noRedirectSession.reset {}
     TvLocalHlsProxyServer.shared.handleEnterForeground()
+    TvSmbClient.shared.handleEnterForeground()
   }
 
   static func normalizeBaseUrl(_ raw: String) -> String {
@@ -5835,7 +5894,14 @@ final class TvApiClient {
       req.setValue("application/json", forHTTPHeaderField: "Content-Type")
       req.httpBody = try JSONSerialization.data(withJSONObject: body)
     }
-    let (data, response) = try await session.data(for: req)
+    let (data, response): (Data, URLResponse)
+    do {
+      (data, response) = try await session.data(for: req)
+    } catch {
+      session.reset {}
+      TvLocalHlsProxyServer.shared.handleEnterForeground()
+      (data, response) = try await session.data(for: req)
+    }
     if let http = response as? HTTPURLResponse {
       if http.statusCode == 401 || http.statusCode == 403 {
         throw NSError(
@@ -6773,7 +6839,14 @@ final class TvApiClient {
         for (k, v) in headers where !v.trimmingCharacters(in: .whitespaces).isEmpty {
           req.setValue(v, forHTTPHeaderField: k)
         }
-        let (data, response) = try await session.data(for: req)
+        let (data, response): (Data, URLResponse)
+    do {
+      (data, response) = try await session.data(for: req)
+    } catch {
+      session.reset {}
+      TvLocalHlsProxyServer.shared.handleEnterForeground()
+      (data, response) = try await session.data(for: req)
+    }
         if let http = response as? HTTPURLResponse,
            (200..<300).contains(http.statusCode),
            let finalUrlStr = response.url?.absoluteString,
@@ -10907,9 +10980,14 @@ final class TvSmbClient: @unchecked Sendable {
 
   private func startProxyServerIfNeeded() {
     lock.lock()
-    if listener != nil && proxyPort > 0 {
-      lock.unlock()
-      return
+    if let existing = listener {
+      if case .ready = existing.state, proxyPort > 0 {
+        lock.unlock()
+        return
+      }
+      existing.cancel()
+      listener = nil
+      proxyPort = 0
     }
     lock.unlock()
 
@@ -10919,10 +10997,22 @@ final class TvSmbClient: @unchecked Sendable {
       let nwListener = try NWListener(using: params, on: .any)
       nwListener.stateUpdateHandler = { [weak self] state in
         guard let self else { return }
-        if case .ready = state, let p = nwListener.port?.rawValue, p > 0 {
+        switch state {
+        case .ready:
+          if let p = nwListener.port?.rawValue, p > 0 {
+            self.lock.lock()
+            self.proxyPort = p
+            self.lock.unlock()
+          }
+        case .failed, .cancelled:
           self.lock.lock()
-          self.proxyPort = p
+          if self.listener === nwListener {
+            self.proxyPort = 0
+            self.listener = nil
+          }
           self.lock.unlock()
+        default:
+          break
         }
       }
       nwListener.newConnectionHandler = { [weak self] conn in
@@ -10933,6 +11023,10 @@ final class TvSmbClient: @unchecked Sendable {
       self.listener = nwListener
       lock.unlock()
     } catch {}
+  }
+
+  func handleEnterForeground() {
+    startProxyServerIfNeeded()
   }
 
   private func handleProxyClient(_ client: NWConnection) {

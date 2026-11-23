@@ -8,7 +8,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/models.dart';
 import '../services/api_client.dart';
 import '../services/desktop_config_backup_service.dart';
+import '../services/local_115_direct_service.dart';
 import '../services/proxy_routing_service.dart';
+import '../services/smb_client_service.dart';
 import '../services/telegram_notification_service.dart';
 import '../services/tv_platform_service.dart';
 import '../ui/theme.dart';
@@ -247,6 +249,9 @@ class AppState extends ChangeNotifier {
   final Map<String, String> _knownTelegramChatTitles = {};
   bool _isTelegramViewActive = false;
   bool _isAppForeground = true;
+  DateTime? _lastBackgroundedAt;
+  int _networkResumeEpoch = 0;
+  int get networkResumeEpoch => _networkResumeEpoch;
   String _activeReadingTelegramAccountId = '';
   String _activeReadingTelegramPeer = '';
   bool _activeReadingAtBottom = true;
@@ -339,6 +344,58 @@ class AppState extends ChangeNotifier {
     telegramNotifications.reconcileReadingState();
     if (becameForeground || becameViewActive) {
       unawaited(telegramNotifications.refreshAccountsAndConnect());
+    }
+  }
+
+  /// Handles foreground/background transitions across all platforms.
+  /// When returning to the foreground, resets stale keep-alive HTTP socket pools,
+  /// verifies or restarts local proxy/relay listeners (`127.0.0.1:<port>`),
+  /// refreshes SMB/115 local gateways, increments [networkResumeEpoch] so active
+  /// VOD/Live players can recover stalled streams, and auto-reloads failed VOD/Live catalogs.
+  Future<void> handleAppLifecycleStateChanged(bool isForeground) async {
+    if (!isForeground) {
+      _lastBackgroundedAt ??= DateTime.now();
+      updateTelegramReadingContext(isAppForeground: false);
+      return;
+    }
+
+    final bgAt = _lastBackgroundedAt;
+    _lastBackgroundedAt = null;
+    final bgDuration =
+        bgAt != null ? DateTime.now().difference(bgAt) : Duration.zero;
+
+    api.resetHttpClientPool(forceClose: true, clearTransientCaches: true);
+    Local115DirectService.instance.resetAfterBackground(
+      clearCaches: bgDuration.inSeconds >= 25,
+    );
+    unawaited(SmbClientService.instance.resetAllSessions());
+    await proxyService.handleAppResumed(backgroundDuration: bgDuration);
+    api.resetHttpClientPool(forceClose: false);
+
+    _networkResumeEpoch++;
+    updateTelegramReadingContext(isAppForeground: true);
+    notifyListeners();
+
+    if (!_isAuthenticated || _disposed) return;
+
+    _startTasksPolling();
+    if (!_isConnecting) {
+      if (_sources.isEmpty || _connectionError != null) {
+        unawaited(connectAndBootstrap());
+      } else {
+        if ((_vodError != null || _vodItems.isEmpty) &&
+            !_isLoadingVod &&
+            !_isSearching &&
+            _selectedSource != null) {
+          unawaited(loadVodCatalog(resetCategories: _categories.isEmpty));
+        }
+        if ((_liveError != null ||
+                _liveSources.isEmpty ||
+                _liveChannels.isEmpty) &&
+            !_isLoadingLive) {
+          unawaited(loadLiveSources());
+        }
+      }
     }
   }
 

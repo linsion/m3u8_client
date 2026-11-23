@@ -102,11 +102,12 @@ final class TvAppState: ObservableObject {
 
   func handleDidBecomeActive() {
     UIApplication.shared.isIdleTimerDisabled = true
-    guard isAppInBackground else { return }
+    let wasInBackground = isAppInBackground
     isAppInBackground = false
     lastRemoteActivityAt = Date()
     api.handleEnterForeground()
     TvTelegramAvatarMemoryCache.shared.handleAppLifecycleTransition(enteringBackground: false)
+    guard wasInBackground else { return }
     // Defer media stream reconnection by 0.25s so the UI and focus system render the foreground frame in 0ms
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
       guard let self = self, !self.isAppInBackground else { return }
@@ -116,6 +117,24 @@ final class TvAppState: ObservableObject {
       }
       if self.isCloudMusicPlaying {
         self.cloudMusicPlayer?.playImmediately(atRate: self.cloudMusicSpeed)
+      }
+      guard self.isAuthenticated, !self.isBootstrapping else { return }
+      Task { @MainActor in
+        if self.vodSources.isEmpty {
+          await self.bootstrapAll()
+        } else {
+          if self.vodItems.isEmpty, !self.isLoadingVod, let src = self.selectedSource {
+            await self.loadVodList(
+              source: src,
+              page: max(1, self.currentPage),
+              categoryId: self.selectedCategoryId,
+              resetCategories: self.categories.isEmpty
+            )
+          }
+          if (self.liveSources.isEmpty || self.liveChannels.isEmpty), !self.isLoadingLive {
+            await self.loadLiveSources()
+          }
+        }
       }
     }
   }
