@@ -2909,8 +2909,7 @@ struct TvVodDetailSheetView: View {
           focusedDetailTarget = "detail_preview_window"
         }
       } else {
-        previewPlayer.pause()
-        isPreviewPlaying = false
+        cleanupPreviewPlayer()
       }
     }
     .onDisappear {
@@ -3222,8 +3221,7 @@ struct TvVodDetailSheetView: View {
         force: true
       )
     }
-    previewPlayer.pause()
-    isPreviewPlaying = false
+    cleanupPreviewPlayer()
 
     var preResolved = previewResolvedInfo
     if var info = preResolved, previewPositionSec > 5 {
@@ -3914,7 +3912,7 @@ struct TvLiveSectionView: View {
       }
     }
     .onReceive(autoHideTick) { now in
-      if appState.isAppInBackground {
+      if appState.isAppInBackground || appState.activePlayback != nil {
         if liveController.isPlaying || liveController.isBuffering {
           liveController.suspendForBackground()
         }
@@ -3933,6 +3931,15 @@ struct TvLiveSectionView: View {
             appState.liveFullscreenControlsVisible = false
           }
         }
+      }
+    }
+    .onChange(of: appState.activePlayback == nil) { isPlayerClosed in
+      if !isPlayerClosed {
+        if liveController.isPlaying || liveController.isBuffering {
+          liveController.suspendForBackground()
+        }
+      } else if appState.selectedSection == .live && !appState.isAppInBackground {
+        liveController.resumeAfterForeground(appState: appState)
       }
     }
     .onChange(of: appState.foregroundResumeTick) { _ in

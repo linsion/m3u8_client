@@ -582,12 +582,14 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
         if (!inMiniPlayer &&
             Platform.isAndroid &&
             entry.size >= 8 * 1024 * 1024 * 1024) {
-          await TvPlatformService.openNativeExoPlayer(
+          final exoRes = await TvPlatformService.openNativeExoPlayer(
             streamUrl: resolved.url,
             title: entry.name,
             headers: resolved.headers,
           );
-          return;
+          if (exoRes.error != 'FALLBACK_MPV_SOFT_AUDIO' || !mounted) {
+            return;
+          }
         }
         if (inMiniPlayer) {
           widget.appState.startMiniPlayer(
@@ -5054,6 +5056,9 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
     if (!mounted) return;
     if (res.positionMs > 1000) {
       await _player.seek(Duration(milliseconds: res.positionMs));
+    }
+    if (res.error == 'FALLBACK_MPV_SOFT_AUDIO') {
+      await _player.play();
     }
   }
 

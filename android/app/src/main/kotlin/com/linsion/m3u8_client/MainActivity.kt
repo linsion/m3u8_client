@@ -45,16 +45,22 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
+import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.Tracks
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.google.zxing.BarcodeFormat
@@ -1167,6 +1173,25 @@ class MainActivity : FlutterActivity() {
                 .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
                 .setEnableDecoderFallback(true)
 
+            val trackSelector = DefaultTrackSelector(this).apply {
+                setParameters(
+                    buildUponParameters()
+                        .setPreferredAudioLanguages("zh", "zho", "chi", "cmn", "yue", "en", "eng", "und")
+                        .setPreferredAudioMimeTypes(
+                            MimeTypes.AUDIO_E_AC3_JOC,
+                            MimeTypes.AUDIO_E_AC3,
+                            MimeTypes.AUDIO_AC3,
+                            MimeTypes.AUDIO_AAC,
+                            MimeTypes.AUDIO_FLAC,
+                            MimeTypes.AUDIO_ALAC,
+                            MimeTypes.AUDIO_OPUS,
+                            MimeTypes.AUDIO_VORBIS,
+                            MimeTypes.AUDIO_MPEG,
+                            MimeTypes.AUDIO_RAW
+                        )
+                )
+            }
+
             val loadControl = DefaultLoadControl.Builder()
                 .setBufferDurationsMs(
                     15000, // minBufferMs
@@ -1178,9 +1203,16 @@ class MainActivity : FlutterActivity() {
                 .setPrioritizeTimeOverSizeThresholds(true)
                 .build()
 
+            val audioAttrs = AudioAttributes.Builder()
+                .setUsage(C.USAGE_MEDIA)
+                .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+                .build()
+
             val exoPlayer = ExoPlayer.Builder(this, renderersFactory)
+                .setTrackSelector(trackSelector)
                 .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
                 .setLoadControl(loadControl)
+                .setAudioAttributes(audioAttrs, true)
                 .setSeekBackIncrementMs(15000)
                 .setSeekForwardIncrementMs(15000)
                 .build()
@@ -1251,6 +1283,165 @@ class MainActivity : FlutterActivity() {
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             }
             topBar.addView(titleView)
+
+            data class AudioTrackChoice(
+                val group: Tracks.Group,
+                val trackIndex: Int,
+                val format: Format,
+                val label: String,
+                val priority: Int,
+                val isSupported: Boolean
+            )
+            val rejectedAudioIds = mutableSetOf<String>()
+
+            fun formatTrackKey(fmt: Format, groupIdx: Int, trkIdx: Int): String {
+                return "${fmt.id ?: ""}_${fmt.sampleMimeType ?: ""}_${fmt.channelCount}_${fmt.language ?: ""}_${groupIdx}_$trkIdx"
+            }
+
+            fun scoreAudioFormat(fmt: Format, isSupported: Boolean): Int {
+                val mime = (fmt.sampleMimeType ?: "").lowercase()
+                val labelLower = "${fmt.label ?: ""} ${fmt.language ?: ""}".lowercase()
+                val isCommentary = labelLower.contains("commentary") || labelLower.contains("评论") || labelLower.contains("导评")
+                var score = when {
+                    mime == MimeTypes.AUDIO_E_AC3_JOC || mime == MimeTypes.AUDIO_E_AC3 -> 110
+                    mime == MimeTypes.AUDIO_AC3 -> 105
+                    mime == MimeTypes.AUDIO_AAC -> 100
+                    mime == MimeTypes.AUDIO_FLAC || mime == MimeTypes.AUDIO_ALAC -> 95
+                    mime == MimeTypes.AUDIO_OPUS || mime == MimeTypes.AUDIO_VORBIS || mime == MimeTypes.AUDIO_MPEG -> 90
+                    mime == MimeTypes.AUDIO_RAW -> 85
+                    mime.contains("dts") || mime.contains("true-hd") || mime.contains("mlp") -> 25
+                    else -> 50
+                }
+                if (isSupported) score += 200
+                if (fmt.channelCount in 2..6) score += 15
+                else if (fmt.channelCount > 6 && (mime.contains("dts") || mime.contains("true-hd"))) score -= 30
+                if (labelLower.contains("zh") || labelLower.contains("chi") || labelLower.contains("zho") || labelLower.contains("cmn") || labelLower.contains("国语") || labelLower.contains("粤语")) {
+                    score += 12
+                } else if (labelLower.contains("en") || labelLower.contains("eng")) {
+                    score += 6
+                }
+                if ((fmt.selectionFlags and C.SELECTION_FLAG_DEFAULT) != 0) score += 4
+                if (isCommentary) score -= 45
+                return score
+            }
+
+            fun buildAudioTrackLabel(fmt: Format, idx: Int): String {
+                val mime = (fmt.sampleMimeType ?: "").lowercase()
+                val codecShort = when {
+                    mime == MimeTypes.AUDIO_E_AC3_JOC -> "DD+ Atmos"
+                    mime == MimeTypes.AUDIO_E_AC3 -> "DD+"
+                    mime == MimeTypes.AUDIO_AC3 -> "AC3"
+                    mime == MimeTypes.AUDIO_AAC -> "AAC"
+                    mime == MimeTypes.AUDIO_FLAC -> "FLAC"
+                    mime == MimeTypes.AUDIO_RAW -> "PCM"
+                    mime.contains("true-hd") || mime.contains("mlp") -> "TrueHD"
+                    mime.contains("dts") -> "DTS"
+                    else -> mime.substringAfterLast("/").uppercase()
+                }
+                val chText = when (fmt.channelCount) {
+                    8 -> "7.1"
+                    6 -> "5.1"
+                    2 -> "2.0"
+                    1 -> "1.0"
+                    else -> if (fmt.channelCount > 0) "${fmt.channelCount}ch" else ""
+                }
+                val lang = (fmt.language ?: "").lowercase()
+                val langText = when {
+                    lang.startsWith("zh") || lang.startsWith("chi") || lang.startsWith("zho") || lang.startsWith("cmn") -> "中文"
+                    lang.startsWith("yue") -> "粤语"
+                    lang.startsWith("en") -> "英语"
+                    lang.startsWith("ja") || lang.startsWith("jpn") -> "日语"
+                    lang.startsWith("ko") || lang.startsWith("kor") -> "韩语"
+                    lang.startsWith("fr") -> "法语"
+                    lang.startsWith("es") || lang.startsWith("spa") -> "西语"
+                    lang.startsWith("de") || lang.startsWith("ger") -> "德语"
+                    lang.isNotBlank() && lang != "und" -> lang.uppercase()
+                    else -> "音轨${idx + 1}"
+                }
+                return listOf(langText, codecShort, chText).filter { it.isNotBlank() }.joinToString("·")
+            }
+
+            fun collectAudioChoices(): List<AudioTrackChoice> {
+                val groups = exoPlayer.currentTracks.groups
+                val list = mutableListOf<AudioTrackChoice>()
+                for ((gIdx, g) in groups.withIndex()) {
+                    if (g.type != C.TRACK_TYPE_AUDIO) continue
+                    for (tIdx in 0 until g.length) {
+                        val fmt = g.getTrackFormat(tIdx)
+                        val key = formatTrackKey(fmt, gIdx, tIdx)
+                        if (rejectedAudioIds.contains(key)) continue
+                        val supported = g.isTrackSupported(tIdx)
+                        list.add(
+                            AudioTrackChoice(
+                                group = g,
+                                trackIndex = tIdx,
+                                format = fmt,
+                                label = buildAudioTrackLabel(fmt, list.size),
+                                priority = scoreAudioFormat(fmt, supported),
+                                isSupported = supported
+                            )
+                        )
+                    }
+                }
+                return list
+            }
+
+            val audioTrackBtn = Button(this).apply {
+                text = "音轨: 自动"
+                textSize = 12.5f
+                setTextColor(Color.WHITE)
+                setBackgroundColor(Color.argb(175, 30, 58, 138))
+                setPadding(22, 8, 22, 8)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    rightMargin = 16
+                }
+            }
+            topBar.addView(audioTrackBtn)
+
+            val mpvFallbackBtn = Button(this).apply {
+                text = "切换软解音轨"
+                textSize = 12.5f
+                setTextColor(Color.WHITE)
+                setBackgroundColor(Color.argb(175, 15, 118, 110))
+                setPadding(22, 8, 22, 8)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    rightMargin = 16
+                }
+                setOnClickListener {
+                    finishWithCurrentPos("FALLBACK_MPV_SOFT_AUDIO")
+                    dismissNativeExoPlayerDialog()
+                }
+            }
+            topBar.addView(mpvFallbackBtn)
+
+            fun selectAudioChoice(choice: AudioTrackChoice) {
+                trackSelector.setParameters(
+                    trackSelector.buildUponParameters()
+                        .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
+                        .setOverrideForType(
+                            TrackSelectionOverride(choice.group.mediaTrackGroup, listOf(choice.trackIndex))
+                        )
+                )
+                audioTrackBtn.text = "音轨: ${choice.label}"
+            }
+
+            audioTrackBtn.setOnClickListener {
+                val choices = collectAudioChoices()
+                if (choices.isEmpty()) {
+                    titleView.text = "  $title (无可选硬解音轨，可点右侧「切换软解音轨」)"
+                    return@setOnClickListener
+                }
+                val curIdx = choices.indexOfFirst { it.group.isTrackSelected(it.trackIndex) }
+                val nextChoice = choices[(curIdx + 1).coerceAtLeast(0) % choices.size]
+                selectAudioChoice(nextChoice)
+                titleView.text = "  $title · 已切换至 ${nextChoice.label}"
+            }
 
             val closeBtn = Button(this).apply {
                 text = "退出全屏硬解"
@@ -1338,8 +1529,76 @@ class MainActivity : FlutterActivity() {
                 dismissNativeExoPlayerDialog()
             }
 
+            var didAutoSelectInitialSafeAudio = false
             exoPlayer.addListener(object : Player.Listener {
+                override fun onTracksChanged(tracks: Tracks) {
+                    val choices = collectAudioChoices()
+                    if (choices.isEmpty()) return
+                    val currentSelected = choices.firstOrNull { it.group.isTrackSelected(it.trackIndex) }
+                    if (!didAutoSelectInitialSafeAudio) {
+                        didAutoSelectInitialSafeAudio = true
+                        val curMime = (currentSelected?.format?.sampleMimeType ?: "").lowercase()
+                        val curCh = currentSelected?.format?.channelCount ?: 2
+                        val curIsRiskyPassthrough = curMime.contains("true-hd") ||
+                            curMime.contains("mlp") ||
+                            curMime.contains("dts") ||
+                            curCh > 6 ||
+                            currentSelected?.isSupported == false
+                        if (curIsRiskyPassthrough) {
+                            val bestSafe = choices.maxByOrNull { it.priority }
+                            if (bestSafe != null && bestSafe != currentSelected) {
+                                selectAudioChoice(bestSafe)
+                                return
+                            }
+                        }
+                    }
+                    if (currentSelected != null) {
+                        audioTrackBtn.text = "音轨: ${currentSelected.label}"
+                    }
+                }
+
                 override fun onPlayerError(error: PlaybackException) {
+                    val errText = "${error.errorCodeName} ${error.message ?: ""} ${error.cause?.message ?: ""}"
+                    val isAudioRendererError = errText.contains("MediaCodecAudioRenderer", ignoreCase = true) ||
+                        errText.contains("AudioSink", ignoreCase = true) ||
+                        errText.contains("AudioTrack", ignoreCase = true) ||
+                        error.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED ||
+                        error.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ||
+                        error.errorCode == PlaybackException.ERROR_CODE_AUDIO_TRACK_INIT_FAILED ||
+                        error.errorCode == PlaybackException.ERROR_CODE_AUDIO_TRACK_WRITE_FAILED
+
+                    if (isAudioRendererError) {
+                        val savedPos = exoPlayer.currentPosition.coerceAtLeast(startPositionMs)
+                        // Mark the currently selected audio track as rejected
+                        val groups = exoPlayer.currentTracks.groups
+                        for ((gIdx, g) in groups.withIndex()) {
+                            if (g.type != C.TRACK_TYPE_AUDIO) continue
+                            for (tIdx in 0 until g.length) {
+                                if (g.isTrackSelected(tIdx)) {
+                                    rejectedAudioIds.add(formatTrackKey(g.getTrackFormat(tIdx), gIdx, tIdx))
+                                }
+                            }
+                        }
+                        val remainingChoices = collectAudioChoices().sortedByDescending { it.priority }
+                        val nextBest = remainingChoices.firstOrNull()
+                        if (nextBest != null) {
+                            // 1) Switch to the next compatible audio track (e.g. AC-3 / E-AC-3 / AAC) and resume seamlessly!
+                            selectAudioChoice(nextBest)
+                            titleView.text = "  $title · 原音轨硬解不支持，已自动切换至 ${nextBest.label}"
+                            if (savedPos > 500L) {
+                                exoPlayer.seekTo(savedPos)
+                            }
+                            exoPlayer.prepare()
+                            exoPlayer.playWhenReady = true
+                            return
+                        }
+                        // 2) If all audio tracks in the MKV are TrueHD/DTS and unsupported by Android TV's MediaCodec AudioRenderer,
+                        // automatically fall back to our built-in libmpv (`mediacodec-copy` hardware video + FFmpeg software audio)!
+                        finishWithCurrentPos("FALLBACK_MPV_SOFT_AUDIO")
+                        dismissNativeExoPlayerDialog()
+                        return
+                    }
+
                     val errMsg = error.localizedMessage ?: "ExoPlayer 播放异常 (${error.errorCodeName})"
                     titleView.text = "  ⚠️ $errMsg"
                 }

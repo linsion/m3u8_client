@@ -2097,6 +2097,18 @@ actor TvHlsSegmentCacheActor {
 // feeding H.264/HEVC NALUs and AAC audio packets directly into tvOS hardware decoders with 0ms segment wait!
 
 final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+  private static let activeEnginesLock = NSLock()
+  private static var activeEngines = NSHashTable<TvDirectFlvHardwareEngine>.weakObjects()
+
+  static func stopAllOtherEngines(except active: TvDirectFlvHardwareEngine?) {
+    activeEnginesLock.lock()
+    let others = activeEngines.allObjects.filter { $0 !== active }
+    activeEnginesLock.unlock()
+    for engine in others {
+      engine.stop()
+    }
+  }
+
   let displayLayer = AVSampleBufferDisplayLayer()
   let audioRenderer = AVSampleBufferAudioRenderer()
   let synchronizer = AVSampleBufferRenderSynchronizer()
@@ -2131,6 +2143,7 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
   private var task: URLSessionDataTask?
   private var session: URLSession?
   private var mkvTask: Task<Void, Never>?
+  private var mkvReaderId: UUID = UUID()
   private var isMkvMode: Bool = false
   private var mkvProxyUrl: URL? = nil
   private var mkvDurationSec: Double = 0
@@ -2240,11 +2253,18 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
 
   override init() {
     super.init()
+    Self.activeEnginesLock.lock()
+    Self.activeEngines.add(self)
+    Self.activeEnginesLock.unlock()
     self.displayLayer.videoGravity = .resizeAspect
     self.audioRenderer.volume = 1.0
     self.audioRenderer.isMuted = false
     self.synchronizer.addRenderer(self.displayLayer)
     self.synchronizer.addRenderer(self.audioRenderer)
+  }
+
+  deinit {
+    stop()
   }
 
   var isActivelyPlaying: Bool {
@@ -2268,6 +2288,7 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
     serverAuthHeaders: [String: String],
     forceProxyNode: Bool = false
   ) {
+    Self.stopAllOtherEngines(except: self)
     stop()
 
     var list: [(url: URL, headers: [String: String], useProxy: Bool)] = []
@@ -3089,6 +3110,7 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
   // MARK: - 30 GB – 100 GB+ Matroska (.mkv / .webm) Direct Hardware Streaming Engine (VidHub/KSPlayer-Grade 64-Bit Virtual File Demuxer -> VideoToolbox / AudioToolbox)
 
   func startMatroska(proxyUrlStr: String, resumeAtSeconds: Double = 0, rate: Float = 1.0) {
+    Self.stopAllOtherEngines(except: self)
     stop()
     try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback, options: [.allowAirPlay])
     try? AVAudioSession.sharedInstance().setActive(true)
@@ -3110,6 +3132,7 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
     self.hasRenderedFirstVideoFrame = false
     self.lastFrameReceivedAt = Date()
     let readerId = UUID()
+    self.mkvReaderId = readerId
     let streamTask = Task.detached(priority: .userInitiated) { [weak self] () -> Void in
       await self?.runMatroskaStreamLoop(proxyUrl: proxyUrl, reader: readerId)
     }
@@ -3922,7 +3945,16 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
   }
 
   private func runMatroskaStreamLoop(proxyUrl: URL, reader: UUID) async {
-    guard let probed = await TvLocalHlsProxyServer.shared.probeMediaMetaForEngine(proxyUrl: proxyUrl) else {
+    let isCurrentTask: () -> Bool = { [weak self] in
+      guard let self = self else { return false }
+      self.lock.lock()
+      let ok = !self.isStopped && self.isMkvMode && self.mkvReaderId == reader
+      self.lock.unlock()
+      return ok
+    }
+    guard isCurrentTask(),
+          let probed = await TvLocalHlsProxyServer.shared.probeMediaMetaForEngine(proxyUrl: proxyUrl),
+          isCurrentTask() else {
       let cb = onAllCandidatesFailed
       DispatchQueue.main.async { cb?() }
       return
@@ -4180,7 +4212,7 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
       lock.lock()
       let vTrackNum = mkvVideoTrackNum
       let aTrackNum = mkvAudioTrackNum
-      if isStopped {
+      if isStopped || mkvReaderId != reader {
         lock.unlock()
         break
       }

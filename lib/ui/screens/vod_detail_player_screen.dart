@@ -3022,6 +3022,10 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                             Duration(milliseconds: res.positionMs),
                                           );
                                         }
+                                        if (res.error ==
+                                            'FALLBACK_MPV_SOFT_AUDIO') {
+                                          await _player.play();
+                                        }
                                       },
                                 icon: const Icon(
                                   Icons.bolt_rounded,
@@ -3489,6 +3493,10 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                               milliseconds: res.positionMs,
                                             ),
                                           );
+                                        }
+                                        if (res.error ==
+                                            'FALLBACK_MPV_SOFT_AUDIO') {
+                                          await _player.play();
                                         }
                                       },
                               ),
