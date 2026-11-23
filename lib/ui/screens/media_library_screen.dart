@@ -4770,15 +4770,15 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
     _player = Player(
       configuration: PlayerConfiguration(
         bufferSize: (Platform.isAndroid || Platform.isIOS)
-            ? 32 * 1024 * 1024
-            : 128 * 1024 * 1024,
+            ? 96 * 1024 * 1024
+            : 160 * 1024 * 1024,
       ),
     );
     _controller = VideoController(
       _player,
       configuration: VideoControllerConfiguration(
-        hwdec: Platform.isAndroid ? 'no' : null,
-        enableHardwareAcceleration: !Platform.isAndroid,
+        hwdec: Platform.isAndroid ? 'mediacodec-copy' : null,
+        enableHardwareAcceleration: true,
       ),
     );
     _playbackErrors = _player.stream.error.listen((message) {
@@ -4904,18 +4904,30 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
       final dynamic platform = _player.platform;
       final isMobileOrTv = Platform.isAndroid || Platform.isIOS;
       final props = <String, String>{
-        'hwdec': Platform.isAndroid ? 'no' : 'auto-safe',
+        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto-safe',
         'hwdec-codecs': 'h264,hevc,vp8,vp9,av1',
+        'vd-lavc-check-hw-profile': 'yes',
         'vd-lavc-software-fallback': 'yes',
-        'vd-lavc-threads': Platform.isAndroid ? '4' : '0',
+        'vd-lavc-dr': 'yes',
+        'vd-lavc-fast': 'yes',
+        'vd-lavc-skiploopfilter': 'nonref',
+        'vd-lavc-threads': '0',
+        'ad-lavc-threads': '0',
+        'framedrop': 'vo',
+        'demuxer-thread': 'yes',
         'cache': 'yes',
-        'cache-secs': isMobileOrTv ? '45' : '120',
+        'cache-on-disk': 'no',
+        'cache-secs': isMobileOrTv ? '90' : '180',
+        'cache-pause': 'yes',
         'cache-pause-initial': 'no',
         'cache-pause-wait': '0.8',
-        'demuxer-max-bytes': isMobileOrTv ? '50331648' : '134217728',
-        'demuxer-readahead-secs': isMobileOrTv ? '30' : '60',
-        'stream-buffer-size': '524288',
+        'demuxer-max-bytes': isMobileOrTv ? '100663296' : '201326592',
+        'demuxer-max-back-bytes': isMobileOrTv ? '25165824' : '33554432',
+        'demuxer-readahead-secs': isMobileOrTv ? '60' : '90',
+        'stream-buffer-size': '2097152',
         'tls-verify': 'no',
+        'stream-lavf-o':
+            'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=4xx,5xx,reconnect_delay_max=3',
       };
       for (final entry in props.entries) {
         await platform.setProperty(entry.key, entry.value);

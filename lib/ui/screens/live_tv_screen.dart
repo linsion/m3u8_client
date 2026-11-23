@@ -353,15 +353,15 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     _player = Player(
       configuration: PlayerConfiguration(
         bufferSize: (Platform.isAndroid || Platform.isIOS)
-            ? 32 * 1024 * 1024
+            ? 48 * 1024 * 1024
             : 64 * 1024 * 1024,
       ),
     );
     _videoController = VideoController(
       _player,
       configuration: VideoControllerConfiguration(
-        hwdec: Platform.isAndroid ? 'no' : null,
-        enableHardwareAcceleration: !Platform.isAndroid,
+        hwdec: Platform.isAndroid ? 'mediacodec-copy' : null,
+        enableHardwareAcceleration: true,
       ),
     );
     _configureLiveNativePlayer();
@@ -750,10 +750,12 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
       final dynamic platform = (targetPlayer ?? _player).platform;
       final isMobileOrTv = Platform.isAndroid || Platform.isIOS;
       final props = <String, String>{
-        'hwdec': Platform.isAndroid ? 'no' : 'auto-safe',
+        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto-safe',
         'hwdec-codecs': 'h264,hevc,vp8,vp9,av1',
         'vd-lavc-check-hw-profile': 'yes',
         'vd-lavc-software-fallback': 'yes',
+        'vd-lavc-dr': 'yes',
+        'vd-lavc-fast': 'yes',
         'cache': 'yes',
         'cache-on-disk': 'no',
         'cache-secs': isMobileOrTv ? '45' : '60',
@@ -766,7 +768,7 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
         'demuxer-readahead-secs': isMobileOrTv ? '25' : '40',
         'stream-buffer-size': isMobileOrTv ? '1048576' : '2097152',
         'framedrop': 'vo',
-        'vd-lavc-threads': Platform.isAndroid ? '4' : '0',
+        'vd-lavc-threads': '0',
         'ad-lavc-threads': '0',
         'demuxer-lavf-probesize': '524288',
         'demuxer-lavf-analyzeduration': '2.0',
@@ -985,8 +987,8 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
       _subControllers[slot] = VideoController(
         p,
         configuration: VideoControllerConfiguration(
-          hwdec: Platform.isAndroid ? 'no' : null,
-          enableHardwareAcceleration: !Platform.isAndroid,
+          hwdec: Platform.isAndroid ? 'mediacodec-copy' : null,
+          enableHardwareAcceleration: true,
         ),
       );
       unawaited(_configureLiveNativePlayer(p));

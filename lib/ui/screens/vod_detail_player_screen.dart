@@ -401,15 +401,15 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     _player = Player(
       configuration: PlayerConfiguration(
         bufferSize: (Platform.isAndroid || Platform.isIOS)
-            ? 32 * 1024 * 1024
-            : 128 * 1024 * 1024,
+            ? 96 * 1024 * 1024
+            : 160 * 1024 * 1024,
       ),
     );
     _videoController = VideoController(
       _player,
       configuration: VideoControllerConfiguration(
-        hwdec: Platform.isAndroid ? 'no' : null,
-        enableHardwareAcceleration: !Platform.isAndroid,
+        hwdec: Platform.isAndroid ? 'mediacodec-copy' : null,
+        enableHardwareAcceleration: true,
       ),
     );
     _configureVodNativePlayer();
@@ -569,23 +569,26 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       final dynamic platform = _player.platform;
       final isMobileOrTv = Platform.isAndroid || Platform.isIOS;
       final props = <String, String>{
-        'hwdec': Platform.isAndroid ? 'no' : 'auto-safe',
+        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto-safe',
         'hwdec-codecs': 'h264,hevc,vp8,vp9,av1',
         'vd-lavc-check-hw-profile': 'yes',
         'vd-lavc-software-fallback': 'yes',
+        'vd-lavc-dr': 'yes',
+        'vd-lavc-fast': 'yes',
+        'vd-lavc-skiploopfilter': 'nonref',
         'cache': 'yes',
         'cache-on-disk': 'no',
-        'cache-secs': isMobileOrTv ? '60' : '180',
+        'cache-secs': isMobileOrTv ? '90' : '180',
         'cache-pause': 'yes',
         'cache-pause-initial': 'no',
         'cache-pause-wait': '2.0',
         'demuxer-thread': 'yes',
-        'demuxer-max-bytes': isMobileOrTv ? '67108864' : '201326592',
-        'demuxer-max-back-bytes': isMobileOrTv ? '16777216' : '33554432',
-        'demuxer-readahead-secs': isMobileOrTv ? '45' : '90',
-        'stream-buffer-size': isMobileOrTv ? '1048576' : '2097152',
+        'demuxer-max-bytes': isMobileOrTv ? '100663296' : '201326592',
+        'demuxer-max-back-bytes': isMobileOrTv ? '25165824' : '33554432',
+        'demuxer-readahead-secs': isMobileOrTv ? '60' : '90',
+        'stream-buffer-size': '2097152',
         'framedrop': 'vo',
-        'vd-lavc-threads': Platform.isAndroid ? '4' : '0',
+        'vd-lavc-threads': '0',
         'ad-lavc-threads': '0',
         'demuxer-lavf-probesize': '131072',
         'demuxer-lavf-analyzeduration': '0.5',

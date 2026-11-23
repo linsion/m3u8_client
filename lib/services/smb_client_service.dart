@@ -352,18 +352,50 @@ class SmbClientService {
         int offset = start;
         int remaining = contentLength;
         final chunkSize = conn.safeReadChunkSize;
-        while (remaining > 0) {
-          final toRead = math.min(remaining, chunkSize);
-          final chunk = await conn.readFileChunk(
-            fileId: fileId,
-            offset: offset,
-            length: toRead,
-          );
-          if (chunk.isEmpty) break;
+        var clientDisconnected = false;
+        unawaited(
+          req.response.done.then<void>(
+            (_) => clientDisconnected = true,
+            onError: (Object _) => clientDisconnected = true,
+          ),
+        );
+        int pendingAheadOffset = offset;
+        Future<Uint8List>? pendingAheadRead;
+        while (remaining > 0 && !clientDisconnected) {
+          final int toRead = math.min(remaining, chunkSize);
+          final Future<Uint8List> currentRead;
+          if (pendingAheadRead != null && pendingAheadOffset == offset) {
+            currentRead = pendingAheadRead;
+            pendingAheadRead = null;
+          } else {
+            currentRead = conn.readFileChunk(
+              fileId: fileId,
+              offset: offset,
+              length: toRead,
+            );
+          }
+          final chunk = await currentRead;
+          if (chunk.isEmpty || clientDisconnected) break;
+          final nextOffset = offset + chunk.length;
+          final nextRemaining = remaining - chunk.length;
+          if (nextRemaining > 0 && !clientDisconnected) {
+            final nextToRead = math.min(nextRemaining, chunkSize);
+            pendingAheadOffset = nextOffset;
+            pendingAheadRead = conn.readFileChunk(
+              fileId: fileId,
+              offset: nextOffset,
+              length: nextToRead,
+            );
+          }
           LocalProxyTunnelBridge.recordDownstreamBytes(chunk.length);
           req.response.add(chunk);
-          offset += chunk.length;
-          remaining -= chunk.length;
+          offset = nextOffset;
+          remaining = nextRemaining;
+        }
+        if (pendingAheadRead != null) {
+          try {
+            await pendingAheadRead;
+          } catch (_) {}
         }
         await req.response.flush();
         await req.response.close();
@@ -738,6 +770,7 @@ class _Smb2Connection {
   int _sessionId = 0;
   int _treeId = 0;
   int _serverSecurityMode = 0;
+  int _serverCapabilities = 0;
   int _maxReadSize = 65536;
   int _maxWriteSize = 65536;
   Uint8List? _signingKey;
@@ -745,8 +778,11 @@ class _Smb2Connection {
   _Smb2Connection._(this.host, this.port, this._socket)
       : _reader = StreamIterator<Uint8List>(_socket);
 
-  int get safeReadChunkSize => math.min(_maxReadSize, 65536);
-  int get safeWriteChunkSize => math.min(_maxWriteSize, 65536);
+  bool get _supportsLargeMtu => (_serverCapabilities & 0x00000004) != 0;
+  int get safeReadChunkSize =>
+      math.min(_maxReadSize, _supportsLargeMtu ? 262144 : 65536);
+  int get safeWriteChunkSize =>
+      math.min(_maxWriteSize, _supportsLargeMtu ? 262144 : 65536);
 
   static Future<_Smb2Connection> connectAndAuthenticate({
     required String host,
@@ -789,11 +825,16 @@ class _Smb2Connection {
     required int command,
     required Uint8List body,
     int flags = 0,
+    int? creditChargeOverride,
     bool allowMoreProcessing = false,
     bool allowNoMoreFiles = false,
   }) async {
     while (true) {
       final msgId = _messageId++;
+      final creditCharge = creditChargeOverride ??
+          ((_supportsLargeMtu && body.length > 65536)
+              ? ((body.length - 1) ~/ 65536) + 1
+              : (command == 0 ? 0 : 1));
       final header = ByteData(64);
       // ProtocolId: \xFESMB
       header.setUint8(0, 0xFE);
@@ -801,10 +842,10 @@ class _Smb2Connection {
       header.setUint8(2, 0x4D);
       header.setUint8(3, 0x42);
       header.setUint16(4, 64, Endian.little); // StructureSize
-      header.setUint16(6, command == 0 ? 0 : 1, Endian.little); // CreditCharge
+      header.setUint16(6, creditCharge, Endian.little); // CreditCharge
       header.setUint32(8, 0, Endian.little); // Status
       header.setUint16(12, command, Endian.little); // Command
-      header.setUint16(14, 32, Endian.little); // CreditRequest
+      header.setUint16(14, 64, Endian.little); // CreditRequest
       final shouldSign = _signingKey != null &&
           _signingKey!.isNotEmpty &&
           command != 0 &&
@@ -900,7 +941,7 @@ class _Smb2Connection {
     body.setUint16(2, 2, Endian.little); // DialectCount = 2
     body.setUint16(4, 0x0001, Endian.little); // SecurityMode: Signing Enabled
     body.setUint16(6, 0, Endian.little);
-    body.setUint32(8, 0, Endian.little); // Capabilities
+    body.setUint32(8, 0x00000004, Endian.little); // Capabilities: SMB2_GLOBAL_CAP_LARGE_MTU
     // ClientGuid (16 bytes)
     for (int i = 0; i < 16; i++) {
       body.setUint8(12 + i, (i * 17 + 0x42) & 0xFF);
@@ -915,10 +956,16 @@ class _Smb2Connection {
     if (resp.length >= 64 + 48) {
       final bd = ByteData.sublistView(resp, 64);
       _serverSecurityMode = bd.getUint16(2, Endian.little);
+      final dialect = bd.getUint16(4, Endian.little);
+      final serverCaps = bd.getUint32(24, Endian.little);
+      if (dialect >= 0x0210 && (serverCaps & 0x00000004) != 0) {
+        _serverCapabilities = serverCaps;
+      }
       final maxRead = bd.getUint32(40, Endian.little);
       final maxWrite = bd.getUint32(44, Endian.little);
-      if (maxRead >= 4096) _maxReadSize = math.min(maxRead, 65536);
-      if (maxWrite >= 4096) _maxWriteSize = math.min(maxWrite, 65536);
+      final capLimit = _supportsLargeMtu ? 262144 : 65536;
+      if (maxRead >= 4096) _maxReadSize = math.min(maxRead, capLimit);
+      if (maxWrite >= 4096) _maxWriteSize = math.min(maxWrite, capLimit);
     }
   }
 
@@ -1493,9 +1540,13 @@ class _Smb2Connection {
     bd.setUint16(46, 0, Endian.little); // ReadChannelInfoLength
     body[48] = 0;
 
+    final creditCharge = (_supportsLargeMtu && length > 65536)
+        ? ((length - 1) ~/ 65536) + 1
+        : 1;
     final resp = await _sendAndReceive(
       command: 0x0008,
       body: body,
+      creditChargeOverride: creditCharge,
       allowNoMoreFiles: true,
     );
     final status = ByteData.sublistView(resp).getUint32(8, Endian.little);

@@ -15616,22 +15616,27 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
       final dynamic platform = p.platform;
       final isMobileOrTv = Platform.isAndroid || Platform.isIOS;
       final props = <String, String>{
-        'hwdec': Platform.isAndroid ? 'no' : 'auto-safe',
+        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto-safe',
         'hwdec-codecs': 'h264,hevc,vp8,vp9,av1',
+        'vd-lavc-check-hw-profile': 'yes',
         'vd-lavc-software-fallback': 'yes',
+        'vd-lavc-dr': 'yes',
+        'vd-lavc-fast': 'yes',
+        'vd-lavc-skiploopfilter': 'nonref',
         'cache': 'yes',
         'cache-on-disk': 'no',
-        'cache-secs': isMobileOrTv ? '60' : '120',
+        'cache-secs': isMobileOrTv ? '90' : '120',
         'cache-pause': 'yes',
         'cache-pause-initial': 'no',
         'cache-pause-wait': '2.5',
         'demuxer-thread': 'yes',
-        'demuxer-max-bytes': isMobileOrTv ? '67108864' : '134217728',
-        'demuxer-max-back-bytes': isMobileOrTv ? '16777216' : '33554432',
-        'demuxer-readahead-secs': isMobileOrTv ? '45' : '90',
+        'demuxer-max-bytes': isMobileOrTv ? '100663296' : '134217728',
+        'demuxer-max-back-bytes': isMobileOrTv ? '25165824' : '33554432',
+        'demuxer-readahead-secs': isMobileOrTv ? '60' : '90',
         'stream-buffer-size': '2097152',
         'demuxer-lavf-probesize': '131072',
-        'vd-lavc-threads': Platform.isAndroid ? '4' : '0',
+        'framedrop': 'vo',
+        'vd-lavc-threads': '0',
         'ad-lavc-threads': '0',
         'network-timeout': '20',
         'tls-verify': 'no',
@@ -15657,15 +15662,15 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
       final p = Player(
         configuration: PlayerConfiguration(
           bufferSize: (Platform.isAndroid || Platform.isIOS)
-              ? 24 * 1024 * 1024
+              ? 48 * 1024 * 1024
               : 64 * 1024 * 1024,
         ),
       );
       final c = VideoController(
         p,
         configuration: VideoControllerConfiguration(
-          hwdec: Platform.isAndroid ? 'no' : null,
-          enableHardwareAcceleration: !Platform.isAndroid,
+          hwdec: Platform.isAndroid ? 'mediacodec-copy' : null,
+          enableHardwareAcceleration: true,
         ),
       );
       _inlinePlayer = p;
@@ -17099,24 +17104,28 @@ class _TelegramPhotoGalleryDialogState
       final dynamic platform = p.platform;
       final isMobileOrTv = Platform.isAndroid || Platform.isIOS;
       final props = <String, String>{
-        'hwdec': Platform.isAndroid ? 'no' : 'auto-safe',
+        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto-safe',
         'hwdec-codecs': 'h264,hevc,vp8,vp9,av1',
         'vd-lavc-check-hw-profile': 'yes',
         'vd-lavc-software-fallback': 'yes',
+        'vd-lavc-dr': 'yes',
+        'vd-lavc-fast': 'yes',
+        'vd-lavc-skiploopfilter': 'nonref',
         'cache': 'yes',
         'cache-on-disk': 'no',
-        'cache-secs': isMobileOrTv ? '60' : '120',
+        'cache-secs': isMobileOrTv ? '90' : '120',
         'cache-pause': 'yes',
         'cache-pause-initial': 'no',
         'cache-pause-wait': '2.5',
         'demuxer-thread': 'yes',
-        'demuxer-max-bytes': isMobileOrTv ? '67108864' : '134217728',
-        'demuxer-max-back-bytes': isMobileOrTv ? '16777216' : '33554432',
-        'demuxer-readahead-secs': isMobileOrTv ? '45' : '90',
+        'demuxer-max-bytes': isMobileOrTv ? '100663296' : '134217728',
+        'demuxer-max-back-bytes': isMobileOrTv ? '25165824' : '33554432',
+        'demuxer-readahead-secs': isMobileOrTv ? '60' : '90',
         'stream-buffer-size': '2097152',
         'demuxer-lavf-probesize': '131072',
         'demuxer-lavf-analyzeduration': '0.5',
-        'vd-lavc-threads': Platform.isAndroid ? '4' : '0',
+        'framedrop': 'vo',
+        'vd-lavc-threads': '0',
         'ad-lavc-threads': '0',
         'network-timeout': '20',
         'tls-verify': 'no',
@@ -17172,15 +17181,15 @@ class _TelegramPhotoGalleryDialogState
         configuration: PlayerConfiguration(
           bufferSize:
               (Platform.isAndroid || Platform.isIOS)
-                  ? 32 * 1024 * 1024
+                  ? 96 * 1024 * 1024
                   : 128 * 1024 * 1024,
         ),
       );
       final c = VideoController(
         p,
         configuration: VideoControllerConfiguration(
-          hwdec: Platform.isAndroid ? 'no' : null,
-          enableHardwareAcceleration: !Platform.isAndroid,
+          hwdec: Platform.isAndroid ? 'mediacodec-copy' : null,
+          enableHardwareAcceleration: true,
         ),
       );
       _videoPlayer = p;

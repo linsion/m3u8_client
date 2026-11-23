@@ -2040,17 +2040,61 @@ class Local115DirectService extends ChangeNotifier {
         );
       } else {
         const chunkSize = 2 * 1024 * 1024;
+        int? prefetchedStart;
+        Future<
+          ({
+            Uint8List bytes,
+            int statusCode,
+            int totalSize,
+            String contentType,
+          })?
+        >? prefetchedFuture;
+
         while (cursor <= range.end && !disconnected) {
           final rawStart = cursor + meta.stripPrefixBytes;
           final rawEnd =
               min(range.end, cursor + chunkSize - 1) + meta.stripPrefixBytes;
-          final chunk = await _fetchUpstreamRangeChunk(
-            uri: uri,
-            customHeaders: headers,
-            start: rawStart,
-            end: rawEnd,
-            isCancelled: () => disconnected,
-          );
+          final Future<
+            ({
+              Uint8List bytes,
+              int statusCode,
+              int totalSize,
+              String contentType,
+            })?
+          > currentFetch;
+          if (prefetchedFuture != null && prefetchedStart == rawStart) {
+            currentFetch = prefetchedFuture;
+            prefetchedFuture = null;
+          } else {
+            currentFetch = _fetchUpstreamRangeChunk(
+              uri: uri,
+              customHeaders: headers,
+              start: rawStart,
+              end: rawEnd,
+              isCancelled: () => disconnected,
+            );
+          }
+
+          // Speculatively prefetch the next 2 MB range chunk concurrently while currentFetch is in flight
+          final nextCursor = min(range.end + 1, cursor + chunkSize);
+          if (nextCursor <= range.end &&
+              prefetchedFuture == null &&
+              !disconnected) {
+            final nextRawStart = nextCursor + meta.stripPrefixBytes;
+            final nextRawEnd =
+                min(range.end, nextCursor + chunkSize - 1) +
+                meta.stripPrefixBytes;
+            prefetchedStart = nextRawStart;
+            prefetchedFuture = _fetchUpstreamRangeChunk(
+              uri: uri,
+              customHeaders: headers,
+              start: nextRawStart,
+              end: nextRawEnd,
+              isCancelled: () => disconnected,
+            );
+          }
+
+          final chunk = await currentFetch;
           if (chunk == null ||
               chunk.totalSize != meta.totalSize + meta.stripPrefixBytes ||
               disconnected) {

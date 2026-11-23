@@ -1992,18 +1992,50 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
     _player = Player(
       configuration: PlayerConfiguration(
         bufferSize: (Platform.isAndroid || Platform.isIOS)
-            ? 32 * 1024 * 1024
-            : 64 * 1024 * 1024,
+            ? 96 * 1024 * 1024
+            : 128 * 1024 * 1024,
       ),
     );
     _controller = VideoController(
       _player,
       configuration: VideoControllerConfiguration(
-        hwdec: Platform.isAndroid ? 'no' : null,
-        enableHardwareAcceleration: !Platform.isAndroid,
+        hwdec: Platform.isAndroid ? 'mediacodec-copy' : null,
+        enableHardwareAcceleration: true,
       ),
     );
-    _player.open(
+    unawaited(_configureDownloadPlayerAndOpen());
+  }
+
+  Future<void> _configureDownloadPlayerAndOpen() async {
+    try {
+      final dynamic platform = _player.platform;
+      final isMobileOrTv = Platform.isAndroid || Platform.isIOS;
+      final props = <String, String>{
+        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto-safe',
+        'hwdec-codecs': 'h264,hevc,vp8,vp9,av1',
+        'vd-lavc-check-hw-profile': 'yes',
+        'vd-lavc-software-fallback': 'yes',
+        'vd-lavc-dr': 'yes',
+        'vd-lavc-fast': 'yes',
+        'vd-lavc-skiploopfilter': 'nonref',
+        'vd-lavc-threads': '0',
+        'ad-lavc-threads': '0',
+        'framedrop': 'vo',
+        'demuxer-thread': 'yes',
+        'cache': 'yes',
+        'cache-on-disk': 'no',
+        'cache-secs': isMobileOrTv ? '90' : '150',
+        'demuxer-max-bytes': isMobileOrTv ? '100663296' : '167772160',
+        'demuxer-readahead-secs': isMobileOrTv ? '60' : '90',
+        'stream-buffer-size': '2097152',
+        'tls-verify': 'no',
+      };
+      for (final entry in props.entries) {
+        await platform.setProperty(entry.key, entry.value);
+      }
+    } catch (_) {}
+    if (!mounted) return;
+    await _player.open(
       Media(widget.streamUrl, httpHeaders: widget.headers),
       play: true,
     );
