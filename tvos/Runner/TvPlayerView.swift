@@ -1973,6 +1973,18 @@ struct TvPlayerModalView: View {
                 }
 
                 if !request.isLive {
+                  if isUsingDirectFlvEngine && flvEngine.availableMkvAudioTracks.count > 0 {
+                    Button {
+                      if let newTitle = flvEngine.cycleMkvAudioTrack() {
+                        appState.showToast("已切换音轨：\(newTitle)")
+                      }
+                    } label: {
+                      let curTrk = flvEngine.availableMkvAudioTracks.first(where: { $0.trackNum == flvEngine.currentMkvAudioTrackNum })
+                      Label("音轨: \(curTrk?.displayTitle ?? "默认")", systemImage: "speaker.wave.2.bubble.left.fill")
+                    }
+                    .buttonStyle(TvApplePillButtonStyle(compact: true))
+                  }
+
                   Button {
                     let rates: [Float] = [0.75, 1.0, 1.25, 1.5, 2.0]
                     let idx = rates.firstIndex(of: playbackRate) ?? 1

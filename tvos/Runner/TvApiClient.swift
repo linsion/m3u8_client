@@ -2155,7 +2155,22 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
   private var mkvAudioFramesPerPacket: Int64 = 1024
   private var mkvAudioChannels: UInt32 = 2
   private var mkvAudioBitDepth: UInt32 = 16
+  struct MkvAudioTrackCandidate: Sendable {
+    let trackNum: Int
+    let codecId: String
+    let displayTitle: String
+    let language: String
+    let channels: UInt32
+    let sampleRate: Double
+    let bitDepth: UInt32
+    let codecPrivate: Data
+    let compPrefix: Data
+    let isTrueHdCore: Bool
+    let priority: Int
+  }
+
   private var mkvCuePoints: [(timeSec: Double, clusterFileOffset: Int64)] = []
+  private var mkvAudioTracks: [MkvAudioTrackCandidate] = []
   private var isStopped = true
   private var isPaused = false
 
@@ -2165,6 +2180,45 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
   var onFirstFrameRendered: (@Sendable () -> Void)?
   var onAllCandidatesFailed: (@Sendable () -> Void)?
   var onMkvProgress: (@Sendable (_ positionSec: Double, _ durationSec: Double) -> Void)?
+
+  var availableMkvAudioTracks: [MkvAudioTrackCandidate] {
+    lock.lock()
+    defer { lock.unlock() }
+    return mkvAudioTracks
+  }
+
+  var currentMkvAudioTrackNum: Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return mkvAudioTrackNum
+  }
+
+  func cycleMkvAudioTrack() -> String? {
+    lock.lock()
+    guard mkvAudioTracks.count > 1 else {
+      let onlyTitle = mkvAudioTracks.first?.displayTitle
+      lock.unlock()
+      return onlyTitle
+    }
+    let curIdx = mkvAudioTracks.firstIndex(where: { $0.trackNum == mkvAudioTrackNum }) ?? 0
+    let nextTrack = mkvAudioTracks[(curIdx + 1) % mkvAudioTracks.count]
+    mkvAudioTrackNum = nextTrack.trackNum
+    mkvAudioTrackPriority = nextTrack.priority
+    mkvAudioIsTrueHdCoreExtract = nextTrack.isTrueHdCore
+    mkvAudioContentCompPrefix = nextTrack.compPrefix
+    nextAudioSamplePts = -1
+    configureMkvAudioFormatLocked(
+      codecId: nextTrack.isTrueHdCore ? "A_AC3" : nextTrack.codecId,
+      codecPrivate: nextTrack.isTrueHdCore ? Data() : nextTrack.codecPrivate,
+      sampleRate: nextTrack.sampleRate,
+      channels: nextTrack.isTrueHdCore ? min(6, nextTrack.channels) : nextTrack.channels,
+      bitDepth: nextTrack.bitDepth
+    )
+    let title = nextTrack.displayTitle
+    lock.unlock()
+    audioRenderer.flush()
+    return title
+  }
 
   var currentDurationSec: Double {
     lock.lock()
@@ -2186,9 +2240,11 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
 
   override init() {
     super.init()
-    displayLayer.videoGravity = .resizeAspect
-    synchronizer.addRenderer(displayLayer)
-    synchronizer.addRenderer(audioRenderer)
+    self.displayLayer.videoGravity = .resizeAspect
+    self.audioRenderer.volume = 1.0
+    self.audioRenderer.isMuted = false
+    self.synchronizer.addRenderer(self.displayLayer)
+    self.synchronizer.addRenderer(self.audioRenderer)
   }
 
   var isActivelyPlaying: Bool {
@@ -2310,6 +2366,7 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
     mkvCurrentPositionSec = clamped
     mkvNextMonotonicDtsMs = -1
     mkvMaxObservedPtsMs = 0
+    nextAudioSamplePts = -1
     hasStartedSynchronizer = false
     lock.unlock()
 
@@ -2345,6 +2402,7 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
     mkvNeedsKeyframeAfterFlush = false
     mkvRawCodecPrivate.removeAll()
     mkvCuePoints.removeAll()
+    mkvAudioTracks.removeAll()
     mkvVideoContentCompPrefix.removeAll()
     mkvAudioContentCompPrefix.removeAll()
     buffer.removeAll(keepingCapacity: false)
@@ -3032,6 +3090,10 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
 
   func startMatroska(proxyUrlStr: String, resumeAtSeconds: Double = 0, rate: Float = 1.0) {
     stop()
+    try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback, options: [.allowAirPlay])
+    try? AVAudioSession.sharedInstance().setActive(true)
+    audioRenderer.volume = 1.0
+    audioRenderer.isMuted = false
     guard let proxyUrl = URL(string: proxyUrlStr) else {
       onAllCandidatesFailed?()
       return
@@ -3284,8 +3346,11 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
     var trackNum = -1
     var trackType = 0
     var codecId = ""
+    var rawTrackName = ""
     var trackName = ""
+    var trackLang = ""
     var isDefaultTrack = true
+    var isForcedTrack = false
     var codecPrivate = Data()
     var compPrefix = Data()
     var compAlgo = 3
@@ -3308,8 +3373,14 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
         trackType = Int(Self.readEbmlUInt(bytes, from: pos, length: len))
       case 0x88: // FlagDefault
         isDefaultTrack = Self.readEbmlUInt(bytes, from: pos, length: len) != 0
+      case 0x55AA: // FlagForced
+        isForcedTrack = Self.readEbmlUInt(bytes, from: pos, length: len) != 0
       case 0x536E: // Name
-        trackName = (String(bytes: bytes[pos..<(pos + len)], encoding: .utf8) ?? "").lowercased()
+        rawTrackName = (String(bytes: bytes[pos..<(pos + len)], encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        trackName = rawTrackName.lowercased()
+      case 0x22B59C, 0x22B59D: // Language / LanguageBCP47
+        let l = (String(bytes: bytes[pos..<(pos + len)], encoding: .utf8) ?? "").trimmingCharacters(in: .controlCharacters).lowercased()
+        if !l.isEmpty { trackLang = l }
       case 0x23E383: // DefaultDuration (nanoseconds per frame)
         defaultDurationNs = Int64(Self.readEbmlUInt(bytes, from: pos, length: len))
       case 0x86: // CodecID
@@ -3402,27 +3473,73 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
     } else if trackType == 2 {
       // Rank audio tracks in 50 GB 4K Blu-ray Remux .mkv files so we always pick the best Apple TV hardware-decoded track
       // (preferring primary EAC3/AC3/AAC/FLAC/ALAC/LPCM over commentary or TrueHD/DTS-HD)
-      let isCommentary = trackName.contains("commentary") || trackName.contains("评论") || trackName.contains("导评")
+      let isCommentary = trackName.contains("commentary") || trackName.contains("评论") || trackName.contains("导评") || trackName.contains("视觉障碍") || trackName.contains(" descriptive")
       var priority = 0
       var isTrueHdCore = false
-      if codecId.contains("A_EAC3") || codecId.contains("A_AC3") {
+      var shortCodec = "音频"
+      if codecId.contains("A_EAC3") {
+        priority = 105
+        shortCodec = "DD+ \(channels >= 6 ? "5.1" : "\(channels)ch")"
+      } else if codecId.contains("A_AC3") {
         priority = 100
+        shortCodec = "AC3 \(channels >= 6 ? "5.1" : "\(channels)ch")"
       } else if codecId.contains("A_AAC") {
         priority = 95
+        shortCodec = "AAC \(channels >= 6 ? "5.1" : "\(channels)ch")"
       } else if codecId.contains("A_FLAC") || codecId.contains("A_ALAC") {
         priority = 90
+        shortCodec = "FLAC \(channels)ch"
       } else if codecId.contains("A_PCM/INT/LIT") || codecId.contains("A_PCM/INT/BIG") || codecId.contains("A_PCM/FLOAT/IEEE") {
         priority = 85
+        shortCodec = "PCM \(channels)ch"
       } else if codecId.contains("A_MPEG/L3") || codecId.contains("A_MPEG/L2") || codecId.contains("A_OPUS") {
         priority = 80
+        shortCodec = codecId.contains("OPUS") ? "Opus" : "MP3"
       } else if codecId.contains("A_TRUEHD") {
         // Fallback: extract interleaved AC-3 (0x0B77) compatibility core frames if no dedicated AC3/EAC3/AAC track exists!
         priority = 25
         isTrueHdCore = true
+        shortCodec = "TrueHD核"
       }
       if priority > 0 {
         if isDefaultTrack { priority += 4 }
-        if isCommentary { priority -= 20 }
+        if isForcedTrack { priority += 2 }
+        if channels >= 6 { priority += 5 }
+        if trackLang.hasPrefix("chi") || trackLang.hasPrefix("zho") || trackLang.hasPrefix("cmn") || trackLang.hasPrefix("yue") || trackName.contains("国语") || trackName.contains("国配") || trackName.contains("粤语") {
+          priority += 6
+        } else if trackLang.hasPrefix("eng") || trackLang.isEmpty || trackLang == "und" {
+          priority += 3
+        }
+        if isCommentary { priority -= 35 }
+
+        let langBadge: String = {
+          if trackName.contains("国语") || trackName.contains("国配") || trackLang.hasPrefix("cmn") { return "国语" }
+          if trackName.contains("粤语") || trackLang.hasPrefix("yue") { return "粤语" }
+          if trackLang.hasPrefix("chi") || trackLang.hasPrefix("zho") { return "中文" }
+          if trackLang.hasPrefix("eng") { return "英语" }
+          if trackLang.hasPrefix("jpn") { return "日语" }
+          if trackLang.hasPrefix("kor") { return "韩语" }
+          if trackLang.hasPrefix("fre") || trackLang.hasPrefix("fra") { return "法语" }
+          if trackLang.hasPrefix("spa") { return "西语" }
+          if trackLang.hasPrefix("ger") || trackLang.hasPrefix("deu") { return "德语" }
+          if !trackLang.isEmpty && trackLang != "und" { return trackLang.uppercased() }
+          return "原音"
+        }()
+        let disp = "\(langBadge)·\(shortCodec)\(isCommentary ? "(评论)" : "")"
+        let cand = MkvAudioTrackCandidate(
+          trackNum: trackNum,
+          codecId: codecId,
+          displayTitle: disp,
+          language: trackLang,
+          channels: channels,
+          sampleRate: sampleRate,
+          bitDepth: bitDepth,
+          codecPrivate: codecPrivate,
+          compPrefix: validPrefix,
+          isTrueHdCore: isTrueHdCore,
+          priority: priority
+        )
+        mkvAudioTracks.append(cand)
         if priority > mkvAudioTrackPriority {
           mkvAudioTrackPriority = priority
           mkvAudioTrackNum = trackNum
@@ -4061,6 +4178,8 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
 
     while filePos < totalSize && !Task.isCancelled {
       lock.lock()
+      let vTrackNum = mkvVideoTrackNum
+      let aTrackNum = mkvAudioTrackNum
       if isStopped {
         lock.unlock()
         break
@@ -4686,8 +4805,9 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
     }
   }
 
-  /// Dynamically builds either a 3-byte `dac3` (`AC3SpecificBox`) or 5-byte `dec3` (`EC3SpecificBox`) magic cookie
-  /// from the first AC-3 / E-AC-3 (`0x0B 0x77`) syncframe so Apple TV's AudioToolbox hardware decoder starts cleanly!
+  /// Dynamically builds either an 11-byte MP4 `dac3` (`AC3SpecificBox`) or 13-byte MP4 `dec3` (`EC3SpecificBox`) atom magic cookie
+  /// (including the 8-byte `[size(4) + 'dac3'/'dec3'(4)]` MP4 box header!) from the first AC-3 / E-AC-3 (`0x0B 0x77`) syncframe.
+  /// Without the 8-byte MP4 atom header, CoreMedia sets `ChannelLayoutTag: 0xffff0000` (unknown layout), causing tvOS `AVSampleBufferAudioRenderer` to output silence!
   private static func buildAc3OrEac3FormatDescFromFrame(
     _ frame: Data,
     formatId: AudioFormatID,
@@ -4700,7 +4820,7 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
     let chTable: [UInt32] = [2, 1, 2, 3, 3, 4, 4, 5]
 
     if bsid > 10 || formatId == kAudioFormatEnhancedAC3 {
-      // E-AC-3 (`dec3` / `EC3SpecificBox`): parse `frmsiz`, `fscod`, `numblkscod`, `acmod`, `lfeon`
+      // E-AC-3 (`dec3` / `EC3SpecificBox`): 8-byte MP4 box header `[0x00,0x00,0x00,0x0D,'d','e','c','3']` + 5-byte payload = 13 bytes
       let frmsiz = ((UInt32(frame[2] & 0x07) << 8) | UInt32(frame[3]))
       let fscod = UInt32((frame[4] >> 6) & 0x03)
       let numblkscod = Int((frame[4] >> 4) & 0x03)
@@ -4715,6 +4835,8 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
       let hdr16 = UInt16((dataRate << 3) & 0xFFF8)
       let sub24: UInt32 = (fscod << 22) | (min(31, bsid) << 17) | (acmod << 9) | (lfeon << 8)
       let cookie = Data([
+        0x00, 0x00, 0x00, 0x0D,
+        0x64, 0x65, 0x63, 0x33, // 'dec3'
         UInt8((hdr16 >> 8) & 0xFF),
         UInt8(hdr16 & 0xFF),
         UInt8((sub24 >> 16) & 0xFF),
@@ -4725,7 +4847,7 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
         formatId: kAudioFormatEnhancedAC3,
         formatFlags: 0,
         sampleRate: sr,
-        channels: defaultChannels > 0 ? defaultChannels : ch,
+        channels: ch > 0 ? ch : defaultChannels,
         bitsPerChan: 0,
         bytesPerPkt: 0,
         framesPerPkt: framesPerPkt,
@@ -4736,15 +4858,29 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
       }
       return nil
     } else {
-      // Standard AC-3 (`dac3` / `AC3SpecificBox`)
+      // Standard AC-3 (`dac3` / `AC3SpecificBox`): 8-byte MP4 box header `[0x00,0x00,0x00,0x0B,'d','a','c','3']` + 3-byte payload = 11 bytes
       let fscod = UInt32((frame[4] >> 6) & 0x03)
       let frmsizecod = UInt32(frame[4] & 0x3F)
       let bsmod = UInt32(frame[5] & 0x07)
       let acmod = UInt32((frame[6] >> 5) & 0x07)
       let sr = rates[Int(min(3, fscod))]
-      let ch = min(8, chTable[Int(min(7, acmod))] + 1)
-      let dac3Val: UInt32 = (fscod << 22) | (bsid << 17) | (bsmod << 14) | (acmod << 11) | (1 << 10) | ((frmsizecod >> 1) << 5)
+      // Parse `lfeon` bit from AC-3 bit stream after `acmod` (and optional `cmixlev`/`surmixlev`/`dsurmod`)
+      var bitOffset = 56 // byte 7 bit 0 (after 16-bit syncword + 16-bit crc1 + 8-bit fscod/frmsizecod + 8-bit bsid/bsmod + 3-bit acmod = 51 bits)
+      bitOffset = 51
+      if (acmod & 0x01) != 0 && acmod != 0x01 { bitOffset += 2 } // cmixlev
+      if (acmod & 0x04) != 0 { bitOffset += 2 } // surmixlev
+      if acmod == 0x02 { bitOffset += 2 } // dsurmod
+      let lfeon: UInt32 = {
+        let byteIdx = bitOffset / 8
+        let bitInByte = 7 - (bitOffset % 8)
+        guard byteIdx < frame.count else { return (defaultChannels >= 6) ? 1 : 0 }
+        return UInt32((frame[byteIdx] >> bitInByte) & 0x01)
+      }()
+      let ch = min(8, chTable[Int(min(7, acmod))] + lfeon)
+      let dac3Val: UInt32 = (fscod << 22) | (bsid << 17) | (bsmod << 14) | (acmod << 11) | (lfeon << 10) | ((frmsizecod >> 1) << 5)
       let cookie = Data([
+        0x00, 0x00, 0x00, 0x0B,
+        0x64, 0x61, 0x63, 0x33, // 'dac3'
         UInt8((dac3Val >> 16) & 0xFF),
         UInt8((dac3Val >> 8) & 0xFF),
         UInt8(dac3Val & 0xFF)
@@ -4753,7 +4889,7 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
         formatId: kAudioFormatAC3,
         formatFlags: 0,
         sampleRate: sr,
-        channels: defaultChannels > 0 ? defaultChannels : ch,
+        channels: ch > 0 ? ch : defaultChannels,
         bitsPerChan: 0,
         bytesPerPkt: 0,
         framesPerPkt: 1536,
@@ -4790,7 +4926,18 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
     let framesPerPkt = max(1, mkvAudioFramesPerPacket)
     let bFrameReorderDelayMs = max(16, mkvVideoFrameDurationMs) * 2
     let shiftedPtsMs = basePtsMs + bFrameReorderDelayMs
-    let samplePts = ((shiftedPtsMs * sr) / 1000) + Int64(frameOffsetIndex) * framesPerPkt
+    let targetSamplePts = ((shiftedPtsMs * sr) / 1000) + Int64(frameOffsetIndex) * framesPerPkt
+    let samplePts: Int64
+    if frameOffsetIndex > 0 && nextAudioSamplePts > 0 {
+      samplePts = nextAudioSamplePts
+    } else if nextAudioSamplePts > 0 && abs(targetSamplePts - nextAudioSamplePts) <= sr / 10 {
+      // Lock to sample-accurate contiguous PTS when within 100ms of cluster/block millisecond timestamp
+      // so integer ms rounding (`256ms` vs `256.0ms`) never introduces micro-gaps or overlaps in `audioRenderer`!
+      samplePts = nextAudioSamplePts
+    } else {
+      samplePts = targetSamplePts
+    }
+    nextAudioSamplePts = samplePts + framesPerPkt
 
     var blockBuf: CMBlockBuffer? = nil
     guard CMBlockBufferCreateWithMemoryBlock(
