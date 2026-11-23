@@ -1990,7 +1990,13 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
   StreamSubscription<Duration>? _durSub;
   StreamSubscription<bool>? _playingSub;
   StreamSubscription<bool>? _bufferingSub;
+  StreamSubscription<Tracks>? _tracksSub;
+  StreamSubscription<Track>? _trackSub;
   Timer? _osdHideTimer;
+  List<AudioTrack> _audioTracks = const [];
+  AudioTrack? _activeAudioTrack;
+  List<SubtitleTrack> _subtitleTracks = const [];
+  SubtitleTrack? _activeSubtitleTrack;
   double _rate = 1.0;
   String _fitMode = 'fit'; // 'fit' (适应), 'cover' (铺满), 'fill' (拉伸)
   bool? _landscapeOverride;
@@ -1999,8 +2005,13 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
   bool _isScreenLocked = false;
   bool _isPlaying = true;
   bool _isBuffering = false;
+  bool _showRemainingTime = true;
   bool _isLongPressFastForward = false;
   bool _isHorizontalSeeking = false;
+  bool _isVerticalAdjusting = false;
+  bool _isVerticalBrightness = false;
+  double _volumePercent = 100.0;
+  double _brightnessPercent = 100.0;
   Duration _position = Duration.zero;
   Duration _duration = Duration.zero;
   Duration _seekStartPos = Duration.zero;
@@ -2064,6 +2075,28 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
         setState(() => _isBuffering = buf);
       }
     });
+    _tracksSub = _player.stream.tracks.listen((tracks) {
+      if (!mounted) return;
+      final realAudio = tracks.audio
+          .where((t) => t.id != 'auto' && t.id != 'no')
+          .toList();
+      final realSub = tracks.subtitle
+          .where((t) => t.id != 'auto' && t.id != 'no')
+          .toList();
+      setState(() {
+        _audioTracks = realAudio.isNotEmpty ? realAudio : tracks.audio;
+        _activeAudioTrack = _player.state.track.audio;
+        _subtitleTracks = realSub;
+        _activeSubtitleTrack = _player.state.track.subtitle;
+      });
+    });
+    _trackSub = _player.stream.track.listen((trk) {
+      if (!mounted) return;
+      setState(() {
+        _activeAudioTrack = trk.audio;
+        _activeSubtitleTrack = trk.subtitle;
+      });
+    });
     unawaited(_configureDownloadPlayerAndOpen());
     _scheduleOsdAutoHide();
   }
@@ -2074,6 +2107,7 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
       if (!mounted ||
           !_isPlaying ||
           _isHorizontalSeeking ||
+          _isVerticalAdjusting ||
           _scrubOverrideMs != null) {
         return;
       }
@@ -2121,6 +2155,9 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
         'cache': 'yes',
         'cache-on-disk': 'no',
         'cache-secs': isMobileOrTv ? '90' : '150',
+        'cache-pause': 'yes',
+        'cache-pause-initial': 'no',
+        'cache-pause-wait': '0.2',
         'demuxer-max-bytes': isMobileOrTv ? '100663296' : '167772160',
         'demuxer-readahead-secs': isMobileOrTv ? '60' : '90',
         'stream-buffer-size': '262144',
@@ -2141,13 +2178,29 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
           widget.headers['referer'] ??
           widget.headers['Referrer'] ??
           '';
-      if (referer.isNotEmpty) {
-        await platform.setProperty('referrer', referer);
-      }
+      await platform.setProperty('referrer', referer);
     } catch (_) {}
     if (!mounted) return;
+    final extraHeaders = <String, String>{};
+    widget.headers.forEach((k, v) {
+      final lk = k.trim().toLowerCase();
+      if (v.trim().isEmpty) return;
+      if (lk == 'user-agent' ||
+          lk == 'referer' ||
+          lk == 'referrer' ||
+          lk == 'host' ||
+          lk == 'connection' ||
+          lk == 'range' ||
+          lk == 'content-length') {
+        return;
+      }
+      extraHeaders[k] = v;
+    });
     await _player.open(
-      Media(widget.streamUrl, httpHeaders: widget.headers),
+      Media(
+        widget.streamUrl,
+        httpHeaders: extraHeaders.isEmpty ? null : extraHeaders,
+      ),
       play: true,
     );
   }
@@ -2198,9 +2251,9 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
 
   String _fitModeLabel() {
     return switch (_fitMode) {
-      'cover' => '画面:铺满',
-      'fill' => '画面:拉伸',
-      _ => '画面:适应',
+      'cover' => '铺满',
+      'fill' => '拉伸',
+      _ => '适应',
     };
   }
 
@@ -2271,7 +2324,7 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
     } else if (lang.isNotEmpty && lang != 'und') {
       parts.add(lang.toUpperCase());
     } else {
-      parts.add('音轨${index + 1}');
+      parts.add('音轨 ${index + 1}');
     }
     if (rawTitle.isNotEmpty && !parts.any((p) => rawTitle == p)) {
       parts.add(rawTitle);
@@ -2289,169 +2342,523 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
     return parts.join(' · ');
   }
 
+  String _formatSubtitleTrackTitle(SubtitleTrack t, int index) {
+    final parts = <String>[];
+    final lang = (t.language ?? '').trim().toLowerCase();
+    final rawTitle = (t.title ?? '').trim();
+    if (rawTitle.contains('简') ||
+        lang.contains('chs') ||
+        lang.contains('hans')) {
+      parts.add('简体中文');
+    } else if (rawTitle.contains('繁') ||
+        lang.contains('cht') ||
+        lang.contains('hant')) {
+      parts.add('繁体中文');
+    } else if (lang.startsWith('zh') ||
+        lang.startsWith('chi') ||
+        lang.startsWith('zho')) {
+      parts.add('中文字幕');
+    } else if (lang.startsWith('en')) {
+      parts.add('英文字幕');
+    } else if (lang.isNotEmpty && lang != 'und') {
+      parts.add(lang.toUpperCase());
+    } else {
+      parts.add('字幕 ${index + 1}');
+    }
+    if (rawTitle.isNotEmpty && !parts.any((p) => rawTitle == p)) {
+      parts.add(rawTitle);
+    }
+    final codec = (t.codec ?? '').trim();
+    if (codec.isNotEmpty) {
+      parts.add(codec.toUpperCase());
+    }
+    return parts.join(' · ');
+  }
+
   Future<void> _showAudioTrackSelectorDialog() async {
     final allTracks = _player.state.tracks.audio;
     final realTracks =
         allTracks.where((t) => t.id != 'auto' && t.id != 'no').toList();
-    final tracks = realTracks.isNotEmpty ? realTracks : allTracks;
-    await showDialog<void>(
+    final tracks = realTracks.isNotEmpty ? realTracks : _audioTracks;
+    await showModalBottomSheet<void>(
       context: context,
+      backgroundColor: const Color(0xF2101622),
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+      ),
       builder: (ctx) {
-        return StatefulBuilder(
-          builder: (ctx, setDialogState) {
-            final current = _player.state.track.audio;
-            return AlertDialog(
-              backgroundColor: VideoPlatformTheme.bgElevated,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(18),
-                side: BorderSide(
-                  color: VideoPlatformTheme.accent.withValues(alpha: 0.45),
-                ),
-              ),
-              title: Row(
+        final current = _player.state.track.audio;
+        return SafeArea(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxWidth: 620,
+              maxHeight: MediaQuery.sizeOf(ctx).height * 0.68,
+            ),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 12, 20, 16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Icon(
-                    Icons.surround_sound_rounded,
-                    color: VideoPlatformTheme.accent,
-                    size: 22,
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      '选择音轨 / 声道 (共 ${tracks.length} 条 · 全格式软解混音)',
-                      style: const TextStyle(
-                        fontSize: 15.5,
-                        fontWeight: FontWeight.w700,
+                  Center(
+                    child: Container(
+                      width: 38,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: Colors.white24,
+                        borderRadius: BorderRadius.circular(2),
                       ),
                     ),
                   ),
-                ],
-              ),
-              content: SizedBox(
-                width: 540,
-                child: tracks.isEmpty
-                    ? const Padding(
-                        padding: EdgeInsets.symmetric(vertical: 20),
-                        child: Text('当前视频仅包含默认音轨，或正在解析音轨列表...'),
-                      )
-                    : ConstrainedBox(
-                        constraints: const BoxConstraints(maxHeight: 400),
-                        child: ListView.separated(
-                          shrinkWrap: true,
-                          itemCount: tracks.length,
-                          separatorBuilder: (_, __) =>
-                              const SizedBox(height: 8),
-                          itemBuilder: (_, idx) {
-                            final t = tracks[idx];
-                            final isSelected = current.id == t.id;
-                            final label = _formatAudioTrackTitle(t, idx);
-                            return InkWell(
-                              autofocus: isSelected || idx == 0,
-                              borderRadius: BorderRadius.circular(12),
-                              onTap: () async {
-                                await _player.setAudioTrack(t);
-                                if (mounted) setState(() {});
-                                if (ctx.mounted) {
-                                  Navigator.of(ctx).pop();
-                                }
-                              },
-                              child: Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 16,
-                                  vertical: 12,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: isSelected
-                                      ? VideoPlatformTheme.accent
-                                          .withValues(alpha: 0.22)
-                                      : VideoPlatformTheme.bgCard,
-                                  borderRadius: BorderRadius.circular(12),
-                                  border: Border.all(
-                                    color: isSelected
-                                        ? VideoPlatformTheme.accent
-                                        : VideoPlatformTheme.borderSubtle,
-                                  ),
-                                ),
-                                child: Row(
-                                  children: [
-                                    Icon(
-                                      isSelected
-                                          ? Icons.check_circle_rounded
-                                          : Icons.audiotrack_rounded,
-                                      size: 19,
-                                      color: isSelected
-                                          ? VideoPlatformTheme.accent
-                                          : VideoPlatformTheme.textSecondary,
-                                    ),
-                                    const SizedBox(width: 10),
-                                    Expanded(
-                                      child: Text(
-                                        '#${idx + 1}  $label',
-                                        style: TextStyle(
-                                          fontSize: 13.5,
-                                          fontWeight: isSelected
-                                              ? FontWeight.w700
-                                              : FontWeight.w500,
-                                          color: Colors.white,
-                                        ),
-                                      ),
-                                    ),
-                                    if (isSelected)
-                                      const Text(
-                                        '当前音轨',
-                                        style: TextStyle(
-                                          fontSize: 11,
-                                          fontWeight: FontWeight.w700,
-                                          color: Colors.white,
-                                        ),
-                                      ),
-                                  ],
-                                ),
-                              ),
-                            );
-                          },
+                  const SizedBox(height: 14),
+                  Row(
+                    children: [
+                      const Icon(
+                        Icons.surround_sound_rounded,
+                        color: Color(0xFF38BDF8),
+                        size: 22,
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          '音轨 / 声道选择 (${tracks.length})',
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.white,
+                          ),
                         ),
                       ),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  if (tracks.isEmpty)
+                    const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 28),
+                      child: Center(
+                        child: Text(
+                          '当前视频仅包含默认音轨，或正在解析音轨列表...',
+                          style: TextStyle(color: Colors.white70, fontSize: 13.5),
+                        ),
+                      ),
+                    )
+                  else
+                    Flexible(
+                      child: ListView.separated(
+                        shrinkWrap: true,
+                        itemCount: tracks.length,
+                        separatorBuilder: (_, __) => const SizedBox(height: 8),
+                        itemBuilder: (_, idx) {
+                          final t = tracks[idx];
+                          final isSelected = current.id == t.id;
+                          final label = _formatAudioTrackTitle(t, idx);
+                          return InkWell(
+                            borderRadius: BorderRadius.circular(14),
+                            onTap: () async {
+                              await _player.setAudioTrack(t);
+                              if (mounted) {
+                                setState(() => _activeAudioTrack = t);
+                              }
+                              if (ctx.mounted) {
+                                Navigator.of(ctx).pop();
+                              }
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 16,
+                                vertical: 13,
+                              ),
+                              decoration: BoxDecoration(
+                                color: isSelected
+                                    ? const Color(0xFF0284C7)
+                                        .withValues(alpha: 0.28)
+                                    : Colors.white.withValues(alpha: 0.06),
+                                borderRadius: BorderRadius.circular(14),
+                                border: Border.all(
+                                  color: isSelected
+                                      ? const Color(0xFF38BDF8)
+                                      : Colors.white12,
+                                  width: isSelected ? 1.5 : 1.0,
+                                ),
+                              ),
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    isSelected
+                                        ? Icons.check_circle_rounded
+                                        : Icons.audiotrack_rounded,
+                                    size: 20,
+                                    color: isSelected
+                                        ? const Color(0xFF38BDF8)
+                                        : Colors.white54,
+                                  ),
+                                  const SizedBox(width: 12),
+                                  Expanded(
+                                    child: Text(
+                                      label,
+                                      style: TextStyle(
+                                        fontSize: 14,
+                                        fontWeight: isSelected
+                                            ? FontWeight.w700
+                                            : FontWeight.w500,
+                                        color: Colors.white,
+                                      ),
+                                    ),
+                                  ),
+                                  if (isSelected)
+                                    const Text(
+                                      '当前使用',
+                                      style: TextStyle(
+                                        fontSize: 11.5,
+                                        fontWeight: FontWeight.w700,
+                                        color: Color(0xFF38BDF8),
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                ],
               ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(ctx).pop(),
-                  child: const Text('关闭'),
-                ),
-              ],
-            );
-          },
+            ),
+          ),
         );
       },
     );
     _wakeControls();
   }
 
-  Widget _buildAudioTrackButton() {
+  Future<void> _showSubtitleSelectorSheet() async {
+    final realSubs = _player.state.tracks.subtitle
+        .where((t) => t.id != 'auto' && t.id != 'no')
+        .toList();
+    final subs = realSubs.isNotEmpty ? realSubs : _subtitleTracks;
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xF2101622),
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+      ),
+      builder: (ctx) {
+        final current = _player.state.track.subtitle;
+        final isOff = current.id == 'no';
+        return SafeArea(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxWidth: 620,
+              maxHeight: MediaQuery.sizeOf(ctx).height * 0.68,
+            ),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 12, 20, 16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Center(
+                    child: Container(
+                      width: 38,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: Colors.white24,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  Row(
+                    children: [
+                      const Icon(
+                        Icons.subtitles_rounded,
+                        color: Color(0xFF38BDF8),
+                        size: 22,
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          '内嵌字幕选择 (${subs.length})',
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  Flexible(
+                    child: ListView(
+                      shrinkWrap: true,
+                      children: [
+                        InkWell(
+                          borderRadius: BorderRadius.circular(14),
+                          onTap: () async {
+                            await _player.setSubtitleTrack(SubtitleTrack.no());
+                            if (mounted) {
+                              setState(
+                                () => _activeSubtitleTrack = SubtitleTrack.no(),
+                              );
+                            }
+                            if (ctx.mounted) Navigator.of(ctx).pop();
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                              vertical: 13,
+                            ),
+                            decoration: BoxDecoration(
+                              color: isOff
+                                  ? const Color(0xFF0284C7)
+                                      .withValues(alpha: 0.28)
+                                  : Colors.white.withValues(alpha: 0.06),
+                              borderRadius: BorderRadius.circular(14),
+                              border: Border.all(
+                                color: isOff
+                                    ? const Color(0xFF38BDF8)
+                                    : Colors.white12,
+                              ),
+                            ),
+                            child: Row(
+                              children: [
+                                Icon(
+                                  isOff
+                                      ? Icons.check_circle_rounded
+                                      : Icons.subtitles_off_outlined,
+                                  size: 20,
+                                  color: isOff
+                                      ? const Color(0xFF38BDF8)
+                                      : Colors.white54,
+                                ),
+                                const SizedBox(width: 12),
+                                const Expanded(
+                                  child: Text(
+                                    '关闭字幕',
+                                    style: TextStyle(
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.w600,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        for (var idx = 0; idx < subs.length; idx++) ...[
+                          const SizedBox(height: 8),
+                          Builder(
+                            builder: (_) {
+                              final t = subs[idx];
+                              final isSelected = !isOff && current.id == t.id;
+                              final label = _formatSubtitleTrackTitle(t, idx);
+                              return InkWell(
+                                borderRadius: BorderRadius.circular(14),
+                                onTap: () async {
+                                  await _player.setSubtitleTrack(t);
+                                  if (mounted) {
+                                    setState(() => _activeSubtitleTrack = t);
+                                  }
+                                  if (ctx.mounted) Navigator.of(ctx).pop();
+                                },
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 16,
+                                    vertical: 13,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: isSelected
+                                        ? const Color(0xFF0284C7)
+                                            .withValues(alpha: 0.28)
+                                        : Colors.white.withValues(alpha: 0.06),
+                                    borderRadius: BorderRadius.circular(14),
+                                    border: Border.all(
+                                      color: isSelected
+                                          ? const Color(0xFF38BDF8)
+                                          : Colors.white12,
+                                      width: isSelected ? 1.5 : 1.0,
+                                    ),
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      Icon(
+                                        isSelected
+                                            ? Icons.check_circle_rounded
+                                            : Icons.closed_caption_outlined,
+                                        size: 20,
+                                        color: isSelected
+                                            ? const Color(0xFF38BDF8)
+                                            : Colors.white54,
+                                      ),
+                                      const SizedBox(width: 12),
+                                      Expanded(
+                                        child: Text(
+                                          label,
+                                          style: TextStyle(
+                                            fontSize: 14,
+                                            fontWeight: isSelected
+                                                ? FontWeight.w700
+                                                : FontWeight.w500,
+                                            color: Colors.white,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+    _wakeControls();
+  }
+
+  Future<void> _showSpeedSelectorSheet() async {
+    const speeds = <double>[0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0];
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xF2101622),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(
+                  child: Container(
+                    width: 38,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: Colors.white24,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                const Row(
+                  children: [
+                    Icon(
+                      Icons.speed_rounded,
+                      color: Color(0xFF38BDF8),
+                      size: 22,
+                    ),
+                    SizedBox(width: 10),
+                    Text(
+                      '倍速播放 (长按画面可临时 3.0x 快进)',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 10,
+                  children: speeds.map((spd) {
+                    final selected = (_rate - spd).abs() < 0.01;
+                    return InkWell(
+                      borderRadius: BorderRadius.circular(14),
+                      onTap: () {
+                        setState(() => _rate = spd);
+                        _player.setRate(spd);
+                        Navigator.of(ctx).pop();
+                      },
+                      child: Container(
+                        width: 92,
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(
+                          color: selected
+                              ? const Color(0xFF0284C7)
+                              : Colors.white.withValues(alpha: 0.08),
+                          borderRadius: BorderRadius.circular(14),
+                          border: Border.all(
+                            color: selected
+                                ? const Color(0xFF7DD3FC)
+                                : Colors.white12,
+                            width: selected ? 1.5 : 1.0,
+                          ),
+                        ),
+                        child: Text(
+                          spd == 1.0 ? '1.0x 正常' : '${spd}x',
+                          style: TextStyle(
+                            fontSize: 13.5,
+                            fontWeight:
+                                selected ? FontWeight.w700 : FontWeight.w500,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ),
+                    );
+                  }).toList(),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+    _wakeControls();
+  }
+
+  Widget _buildVidHubActionChip({
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+    bool highlighted = false,
+  }) {
     return InkWell(
-      borderRadius: BorderRadius.circular(12),
-      onTap: _showAudioTrackSelectorDialog,
+      borderRadius: BorderRadius.circular(18),
+      onTap: onTap,
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
         decoration: BoxDecoration(
-          color: const Color(0xFF1E3A8A).withValues(alpha: 0.55),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: const Color(0xFF60A5FA)),
+          color: highlighted
+              ? const Color(0xFF0284C7).withValues(alpha: 0.34)
+              : Colors.white.withValues(alpha: 0.11),
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(
+            color: highlighted
+                ? const Color(0xFF38BDF8)
+                : Colors.white.withValues(alpha: 0.16),
+          ),
         ),
-        child: const Row(
+        child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(
-              Icons.surround_sound_rounded,
-              size: 14,
-              color: Color(0xFF93C5FD),
+              icon,
+              size: 16,
+              color: highlighted ? const Color(0xFF7DD3FC) : Colors.white,
             ),
-            SizedBox(width: 4),
+            const SizedBox(width: 5),
             Text(
-              '音轨 ▾',
+              label,
               style: TextStyle(
-                fontSize: 11.5,
-                fontWeight: FontWeight.w700,
+                fontSize: 12.5,
+                fontWeight: highlighted ? FontWeight.w700 : FontWeight.w600,
                 color: Colors.white,
               ),
             ),
@@ -2461,114 +2868,28 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
     );
   }
 
-  Widget _buildExoHardwareButton() {
-    if (!Platform.isAndroid) return const SizedBox.shrink();
-    return InkWell(
-      borderRadius: BorderRadius.circular(12),
-      onTap: _openInEmbeddedExoPlayer,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-        decoration: BoxDecoration(
-          color: const Color(0xFF0284C7).withValues(alpha: 0.22),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: const Color(0xFF38BDF8)),
-        ),
-        child: const Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.bolt_rounded, size: 14, color: Color(0xFF38BDF8)),
-            SizedBox(width: 3),
-            Text(
-              'Exo硬解',
-              style: TextStyle(
-                fontSize: 11.5,
-                fontWeight: FontWeight.w700,
-                color: Color(0xFF38BDF8),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
+  String _resolutionBadgeText() {
+    final w = _player.state.width ?? 0;
+    final h = _player.state.height ?? 0;
+    final maxDim = w > h ? w : h;
+    if (maxDim >= 3600) return '4K UHD';
+    if (maxDim >= 2400) return '2K QHD';
+    if (maxDim >= 1800) return '1080P';
+    if (maxDim >= 1200) return '720P';
+    return '';
   }
 
-  Widget _buildFitModePill() {
-    final isFull = _fitMode != 'fit';
-    return InkWell(
-      borderRadius: BorderRadius.circular(12),
-      onTap: _cycleFitMode,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-        decoration: BoxDecoration(
-          color: isFull
-              ? VideoPlatformTheme.accent.withValues(alpha: 0.22)
-              : VideoPlatformTheme.bgCard.withValues(alpha: 0.85),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(
-            color: isFull
-                ? VideoPlatformTheme.accent
-                : VideoPlatformTheme.borderSubtle,
-          ),
-        ),
-        child: Text(
-          _fitModeLabel(),
-          style: TextStyle(
-            fontSize: 11.5,
-            fontWeight: FontWeight.w600,
-            color: isFull
-                ? VideoPlatformTheme.accent
-                : VideoPlatformTheme.textPrimary,
-          ),
-        ),
-      ),
-    );
-  }
+  Widget _buildInteractiveVideoStage() {
+    final showCenterTransport = _controlsVisible &&
+        !_isScreenLocked &&
+        !_isBuffering &&
+        !_isHorizontalSeeking &&
+        !_isVerticalAdjusting;
 
-  Widget _buildSpeedPopupPill() {
-    return PopupMenuButton<double>(
-      tooltip: '倍速播放',
-      initialValue: _rate,
-      onSelected: (r) {
-        setState(() => _rate = r);
-        _player.setRate(r);
-        _wakeControls();
-      },
-      itemBuilder: (_) => const [
-        PopupMenuItem(value: 0.75, child: Text('0.75x')),
-        PopupMenuItem(value: 1.0, child: Text('1.0x 正常')),
-        PopupMenuItem(value: 1.25, child: Text('1.25x')),
-        PopupMenuItem(value: 1.5, child: Text('1.5x')),
-        PopupMenuItem(value: 2.0, child: Text('2.0x')),
-        PopupMenuItem(value: 3.0, child: Text('3.0x')),
-      ],
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-        decoration: BoxDecoration(
-          color: _rate != 1.0
-              ? VideoPlatformTheme.accent.withValues(alpha: 0.18)
-              : VideoPlatformTheme.bgCard,
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(
-            color: _rate != 1.0
-                ? VideoPlatformTheme.accent
-                : VideoPlatformTheme.borderSubtle,
-          ),
-        ),
-        child: Text(
-          '倍速 ${_rate}x',
-          style: TextStyle(
-            fontSize: 11.5,
-            fontWeight: FontWeight.w700,
-            color: VideoPlatformTheme.accent,
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildInteractiveVideoStage({required bool isMobileDialog}) {
     return LayoutBuilder(
       builder: (context, stageConstraints) {
+        final stageW = stageConstraints.maxWidth.clamp(220.0, 1920.0);
+        final stageH = stageConstraints.maxHeight.clamp(180.0, 1200.0);
         return GestureDetector(
           behavior: HitTestBehavior.opaque,
           onTap: () {
@@ -2600,6 +2921,35 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
             setState(() => _isLongPressFastForward = false);
             _player.setRate(_rate);
           },
+          onVerticalDragStart: (details) {
+            if (_isScreenLocked) return;
+            if (details.localPosition.dx <= 36.0 ||
+                details.localPosition.dx >= stageW - 36.0) {
+              return;
+            }
+            setState(() {
+              _isVerticalAdjusting = true;
+              _isVerticalBrightness = details.localPosition.dx < stageW * 0.5;
+            });
+          },
+          onVerticalDragUpdate: (details) {
+            if (!_isVerticalAdjusting || _isScreenLocked) return;
+            final delta = (-details.delta.dy / stageH) * 130.0;
+            if (_isVerticalBrightness) {
+              setState(() {
+                _brightnessPercent =
+                    (_brightnessPercent + delta).clamp(10.0, 100.0);
+              });
+            } else {
+              final nextVol = (_volumePercent + delta).clamp(0.0, 100.0);
+              setState(() => _volumePercent = nextVol);
+              _player.setVolume(nextVol);
+            }
+          },
+          onVerticalDragEnd: (_) {
+            if (!_isVerticalAdjusting) return;
+            setState(() => _isVerticalAdjusting = false);
+          },
           onHorizontalDragStart: (details) {
             if (_isScreenLocked) return;
             if (details.globalPosition.dx <= 36.0) return;
@@ -2611,7 +2961,6 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
           },
           onHorizontalDragUpdate: (details) {
             if (!_isHorizontalSeeking || _isScreenLocked) return;
-            final stageW = stageConstraints.maxWidth.clamp(220.0, 1920.0);
             final maxSec = _duration.inSeconds > 0 ? _duration.inSeconds : 300;
             final spanSec = maxSec.clamp(60, 240);
             final deltaMs =
@@ -2645,49 +2994,49 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
                 resumeUponEnteringForegroundMode: true,
                 controls: NoVideoControls,
               ),
-              if (!isMobileDialog)
-                Positioned(
-                  top: 12,
-                  right: 12,
-                  child: VideoDownloadSpeedBadge(
-                    player: _player,
-                    compact: true,
+              if (_brightnessPercent < 99.0)
+                IgnorePointer(
+                  child: Container(
+                    color: Colors.black.withValues(
+                      alpha: ((100.0 - _brightnessPercent) / 115.0)
+                          .clamp(0.0, 0.78),
+                    ),
                   ),
                 ),
               if (_isLongPressFastForward)
                 Positioned(
-                  top: isMobileDialog ? 64 : 14,
+                  top: 68,
                   left: 0,
                   right: 0,
                   child: Center(
                     child: IgnorePointer(
                       child: Container(
                         padding: const EdgeInsets.symmetric(
-                          horizontal: 14,
-                          vertical: 6,
+                          horizontal: 16,
+                          vertical: 7,
                         ),
                         decoration: BoxDecoration(
-                          color: const Color(0xDD0D1824),
-                          borderRadius: BorderRadius.circular(20),
+                          color: const Color(0xE60B111E),
+                          borderRadius: BorderRadius.circular(22),
                           border: Border.all(
-                            color: VideoPlatformTheme.accent,
+                            color: const Color(0xFF38BDF8),
                           ),
                         ),
-                        child: Row(
+                        child: const Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
                             Icon(
-                              Icons.bolt_rounded,
-                              size: 16,
-                              color: VideoPlatformTheme.accent,
+                              Icons.fast_forward_rounded,
+                              size: 17,
+                              color: Color(0xFF38BDF8),
                             ),
-                            const SizedBox(width: 4),
-                            const Text(
-                              '3.0x 倍速快进中 (松手恢复)',
+                            SizedBox(width: 6),
+                            Text(
+                              '3.0x 倍速快进中',
                               style: TextStyle(
                                 color: Colors.white,
-                                fontSize: 12.5,
-                                fontWeight: FontWeight.w600,
+                                fontSize: 13,
+                                fontWeight: FontWeight.w700,
                               ),
                             ),
                           ],
@@ -2696,40 +3045,100 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
                     ),
                   ),
                 ),
-              if (_isHorizontalSeeking)
+              if (_isVerticalAdjusting)
+                Center(
+                  child: IgnorePointer(
+                    child: Container(
+                      width: 175,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 18,
+                        vertical: 14,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xE60B111E),
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(color: Colors.white24),
+                      ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(
+                                _isVerticalBrightness
+                                    ? Icons.wb_sunny_rounded
+                                    : (_volumePercent <= 0
+                                        ? Icons.volume_off_rounded
+                                        : Icons.volume_up_rounded),
+                                color: const Color(0xFF38BDF8),
+                                size: 20,
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                _isVerticalBrightness
+                                    ? '亮度 ${_brightnessPercent.round()}%'
+                                    : '音量 ${_volumePercent.round()}%',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 10),
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(4),
+                            child: LinearProgressIndicator(
+                              value: (_isVerticalBrightness
+                                      ? _brightnessPercent
+                                      : _volumePercent) /
+                                  100.0,
+                              minHeight: 5,
+                              backgroundColor: Colors.white24,
+                              valueColor: const AlwaysStoppedAnimation<Color>(
+                                Color(0xFF38BDF8),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                )
+              else if (_isHorizontalSeeking)
                 Center(
                   child: IgnorePointer(
                     child: Container(
                       padding: const EdgeInsets.symmetric(
-                        horizontal: 18,
-                        vertical: 10,
+                        horizontal: 22,
+                        vertical: 14,
                       ),
                       decoration: BoxDecoration(
-                        color: const Color(0xE0090E14),
-                        borderRadius: BorderRadius.circular(14),
-                        border: Border.all(
-                          color: VideoPlatformTheme.accent,
-                          width: 1.4,
-                        ),
+                        color: const Color(0xE60B111E),
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(color: Colors.white24),
                       ),
                       child: Column(
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           Text(
-                            '${_seekPreviewPos >= _seekStartPos ? "⏩ 快进" : "⏪ 快退"}  ${_formatClock(_seekPreviewPos)} / ${_formatClock(_duration)}',
+                            '${_seekPreviewPos >= _seekStartPos ? "⏩" : "⏪"}  ${_formatClock(_seekPreviewPos)} / ${_formatClock(_duration)}',
                             style: const TextStyle(
                               color: Colors.white,
-                              fontSize: 15,
-                              fontWeight: FontWeight.w700,
+                              fontSize: 17,
+                              fontWeight: FontWeight.w800,
+                              fontFeatures: [FontFeature.tabularFigures()],
                             ),
                           ),
-                          const SizedBox(height: 3),
+                          const SizedBox(height: 4),
                           Text(
                             '${(_seekPreviewPos.inSeconds - _seekStartPos.inSeconds) >= 0 ? "+" : ""}${_seekPreviewPos.inSeconds - _seekStartPos.inSeconds} 秒',
-                            style: TextStyle(
-                              color: VideoPlatformTheme.accent,
-                              fontSize: 12,
-                              fontWeight: FontWeight.w600,
+                            style: const TextStyle(
+                              color: Color(0xFF38BDF8),
+                              fontSize: 12.5,
+                              fontWeight: FontWeight.w700,
                             ),
                           ),
                         ],
@@ -2741,43 +3150,114 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
                 Center(
                   child: IgnorePointer(
                     child: Container(
-                      padding: const EdgeInsets.all(14),
-                      decoration: BoxDecoration(
-                        color: Colors.black54,
-                        borderRadius: BorderRadius.circular(14),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 22,
+                        vertical: 16,
                       ),
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2.6,
-                        color: VideoPlatformTheme.accent,
+                      decoration: BoxDecoration(
+                        color: const Color(0xD90B111E),
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(color: Colors.white12),
+                      ),
+                      child: const Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          SizedBox(
+                            width: 30,
+                            height: 30,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2.8,
+                              color: Color(0xFF38BDF8),
+                            ),
+                          ),
+                          SizedBox(height: 10),
+                          Text(
+                            '正在加载视频流...',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                   ),
                 )
-              else if (!_isPlaying && !_isScreenLocked)
+              else if (showCenterTransport)
                 Center(
-                  child: GestureDetector(
-                    onTap: () {
-                      _player.play();
-                      _wakeControls();
-                    },
-                    child: Container(
-                      width: 64,
-                      height: 64,
-                      decoration: BoxDecoration(
-                        color: const Color(0xAA090E14),
-                        shape: BoxShape.circle,
-                        border: Border.all(
-                          color: VideoPlatformTheme.accent,
-                          width: 2.0,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      GestureDetector(
+                        onTap: () => _seekRelativeSeconds(-10),
+                        child: Container(
+                          width: 48,
+                          height: 48,
+                          decoration: BoxDecoration(
+                            color: const Color(0xA60B111E),
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: Colors.white.withValues(alpha: 0.22),
+                            ),
+                          ),
+                          alignment: Alignment.center,
+                          child: const Icon(
+                            Icons.replay_10_rounded,
+                            color: Colors.white,
+                            size: 26,
+                          ),
                         ),
                       ),
-                      alignment: Alignment.center,
-                      child: const Icon(
-                        Icons.play_arrow_rounded,
-                        color: Colors.white,
-                        size: 40,
+                      const SizedBox(width: 36),
+                      GestureDetector(
+                        onTap: () {
+                          _player.playOrPause();
+                          _wakeControls();
+                        },
+                        child: Container(
+                          width: 66,
+                          height: 66,
+                          decoration: BoxDecoration(
+                            color: const Color(0xBF0B111E),
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: Colors.white.withValues(alpha: 0.35),
+                              width: 1.5,
+                            ),
+                          ),
+                          alignment: Alignment.center,
+                          child: Icon(
+                            _isPlaying
+                                ? Icons.pause_rounded
+                                : Icons.play_arrow_rounded,
+                            color: Colors.white,
+                            size: 40,
+                          ),
+                        ),
                       ),
-                    ),
+                      const SizedBox(width: 36),
+                      GestureDetector(
+                        onTap: () => _seekRelativeSeconds(10),
+                        child: Container(
+                          width: 48,
+                          height: 48,
+                          decoration: BoxDecoration(
+                            color: const Color(0xA60B111E),
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: Colors.white.withValues(alpha: 0.22),
+                            ),
+                          ),
+                          alignment: Alignment.center,
+                          child: const Icon(
+                            Icons.forward_10_rounded,
+                            color: Colors.white,
+                            size: 26,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
             ],
@@ -2794,6 +3274,8 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
     _durSub?.cancel();
     _playingSub?.cancel();
     _bufferingSub?.cancel();
+    _tracksSub?.cancel();
+    _trackSub?.cancel();
     if (Platform.isAndroid || Platform.isIOS) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
       if (_didChangeOrientation) {
@@ -2808,7 +3290,6 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
   Widget build(BuildContext context) {
     final mqSize = MediaQuery.sizeOf(context);
     final viewPadding = MediaQuery.viewPaddingOf(context);
-    final isMobileDialog = mqSize.shortestSide < 600 || mqSize.width < 760;
     final isLandscape =
         _landscapeOverride ?? (mqSize.width > mqSize.height);
     final effectiveDurMs = _duration.inMilliseconds > 0
@@ -2819,542 +3300,491 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
     final effectivePosMs = (_scrubOverrideMs ??
             _position.inMilliseconds.toDouble())
         .clamp(0.0, effectiveDurMs);
+    final remainingDur = Duration(
+      milliseconds:
+          (effectiveDurMs - effectivePosMs).round().clamp(0, 359999000),
+    );
 
-    if (isMobileDialog) {
-      final showHud = _controlsVisible && !_isScreenLocked;
-      final topInset = viewPadding.top > 4 ? viewPadding.top : 8.0;
-      final bottomInset = viewPadding.bottom > 4 ? viewPadding.bottom : 8.0;
-      final leftInset = viewPadding.left > 8 ? viewPadding.left : 10.0;
-      final rightInset = viewPadding.right > 8 ? viewPadding.right : 10.0;
+    final showHud = _controlsVisible && !_isScreenLocked;
+    final topInset = viewPadding.top > 6 ? viewPadding.top : 12.0;
+    final bottomInset = viewPadding.bottom > 6 ? viewPadding.bottom : 12.0;
+    final leftInset = viewPadding.left > 12 ? viewPadding.left : 16.0;
+    final rightInset = viewPadding.right > 12 ? viewPadding.right : 16.0;
 
-      return MobileEdgeSwipeBack(
-        onBack: () => Navigator.of(context).pop(),
-        child: Scaffold(
-          backgroundColor: Colors.black,
-          resizeToAvoidBottomInset: false,
-          body: MediaQuery.removePadding(
-            context: context,
-            removeTop: true,
-            removeBottom: true,
-            removeLeft: true,
-            removeRight: true,
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                // Layer 1: 100% Fullscreen Video Stage
-                Positioned.fill(
-                  child: _buildInteractiveVideoStage(isMobileDialog: true),
-                ),
+    final realAudio = _player.state.tracks.audio
+        .where((t) => t.id != 'auto' && t.id != 'no')
+        .toList();
+    final tracks = realAudio.isNotEmpty ? realAudio : _audioTracks;
+    final activeAudio = _activeAudioTrack ?? _player.state.track.audio;
+    final activeAudioIdx = tracks.indexWhere((t) => t.id == activeAudio.id);
+    final audioChipLabel = activeAudioIdx >= 0
+        ? '音轨 ${activeAudioIdx + 1}/${tracks.length}'
+        : (tracks.isNotEmpty ? '音轨 (${tracks.length})' : '音轨');
 
-                // Layer 2: Floating Top Gradient HUD
-                Positioned(
-                  top: 0,
-                  left: 0,
-                  right: 0,
-                  child: IgnorePointer(
-                    ignoring: !showHud,
-                    child: AnimatedOpacity(
-                      opacity: showHud ? 1.0 : 0.0,
-                      duration: const Duration(milliseconds: 200),
-                      child: Container(
-                        padding: EdgeInsets.fromLTRB(
-                          leftInset,
-                          topInset,
-                          rightInset,
-                          14,
-                        ),
-                        decoration: const BoxDecoration(
-                          gradient: LinearGradient(
-                            begin: Alignment.topCenter,
-                            end: Alignment.bottomCenter,
-                            colors: [
-                              Color(0xEB050A12),
-                              Color(0xA6050A12),
-                              Colors.transparent,
-                            ],
-                          ),
-                        ),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            SizedBox(
-                              height: 38,
-                              child: Row(
-                                children: [
-                                  IconButton(
-                                    visualDensity: VisualDensity.compact,
-                                    icon: const Icon(
-                                      Icons.arrow_back_ios_new_rounded,
-                                      size: 18,
-                                      color: Colors.white,
-                                    ),
-                                    onPressed: () =>
-                                        Navigator.of(context).pop(),
-                                  ),
-                                  Expanded(
-                                    child: Text(
-                                      widget.title,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
-                                        fontSize: 13.5,
-                                        fontWeight: FontWeight.w700,
-                                        color: Colors.white,
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 4),
-                                  VideoDownloadSpeedBadge(
-                                    player: _player,
-                                    compact: true,
-                                  ),
-                                  if (Platform.isAndroid || Platform.isIOS)
-                                    IconButton(
-                                      tooltip: '横竖屏切换',
-                                      visualDensity: VisualDensity.compact,
-                                      icon: const Icon(
-                                        Icons.screen_rotation_rounded,
-                                        size: 18,
-                                        color: Colors.white,
-                                      ),
-                                      onPressed: _toggleOrientation,
-                                    ),
-                                  if (widget.onEnterMiniPlayer != null)
-                                    IconButton(
-                                      tooltip: '小窗播放',
-                                      visualDensity: VisualDensity.compact,
-                                      onPressed: () {
-                                        final pos =
-                                            _player.state.position.inSeconds;
-                                        Navigator.of(context).pop();
-                                        widget.onEnterMiniPlayer!(pos);
-                                      },
-                                      icon: const Icon(
-                                        Icons.picture_in_picture_alt_rounded,
-                                        size: 18,
-                                        color: Colors.white,
-                                      ),
-                                    ),
-                                  IconButton(
-                                    visualDensity: VisualDensity.compact,
-                                    icon: const Icon(
-                                      Icons.close,
-                                      size: 20,
-                                      color: Colors.white,
-                                    ),
-                                    onPressed: () =>
-                                        Navigator.of(context).pop(),
-                                  ),
-                                ],
-                              ),
-                            ),
-                            const SizedBox(height: 2),
-                            SizedBox(
-                              height: 32,
-                              child: SingleChildScrollView(
-                                scrollDirection: Axis.horizontal,
-                                padding:
-                                    const EdgeInsets.symmetric(horizontal: 4),
-                                child: Row(
-                                  children: [
-                                    if (Platform.isAndroid) ...[
-                                      _buildExoHardwareButton(),
-                                      const SizedBox(width: 6),
-                                    ],
-                                    _buildAudioTrackButton(),
-                                    const SizedBox(width: 6),
-                                    _buildFitModePill(),
-                                    const SizedBox(width: 6),
-                                    _buildSpeedPopupPill(),
-                                    const SizedBox(width: 6),
-                                    PlayerVolumeControl(
-                                      player: _player,
-                                      compact: true,
-                                      sliderWidth: 54,
-                                      showPercentage: false,
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
+    final realSubs = _player.state.tracks.subtitle
+        .where((t) => t.id != 'auto' && t.id != 'no')
+        .toList();
+    final subs = realSubs.isNotEmpty ? realSubs : _subtitleTracks;
+    final activeSub = _activeSubtitleTrack ?? _player.state.track.subtitle;
+    final hasActiveSub = activeSub.id != 'no' &&
+        activeSub.id != 'auto' &&
+        subs.any((s) => s.id == activeSub.id);
+    final subChipLabel = hasActiveSub
+        ? '字幕 开启'
+        : (subs.isNotEmpty ? '字幕 (${subs.length})' : '字幕');
+
+    final resBadge = _resolutionBadgeText();
+
+    return MobileEdgeSwipeBack(
+      onBack: () => Navigator.of(context).pop(),
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        resizeToAvoidBottomInset: false,
+        body: MediaQuery.removePadding(
+          context: context,
+          removeTop: true,
+          removeBottom: true,
+          removeLeft: true,
+          removeRight: true,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              // Layer 1: 100% Fullscreen Video Stage
+              Positioned.fill(
+                child: _buildInteractiveVideoStage(),
+              ),
+
+              // Layer 2: VidHub Clean Single-Row Top Bar
+              Positioned(
+                top: 0,
+                left: 0,
+                right: 0,
+                child: IgnorePointer(
+                  ignoring: !showHud,
+                  child: AnimatedOpacity(
+                    opacity: showHud ? 1.0 : 0.0,
+                    duration: const Duration(milliseconds: 180),
+                    child: Container(
+                      padding: EdgeInsets.fromLTRB(
+                        leftInset,
+                        topInset,
+                        rightInset,
+                        18,
+                      ),
+                      decoration: const BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.topCenter,
+                          end: Alignment.bottomCenter,
+                          colors: [
+                            Color(0xD904070D),
+                            Color(0x8004070D),
+                            Colors.transparent,
                           ],
                         ),
                       ),
-                    ),
-                  ),
-                ),
-
-                // Layer 3: Mid-Left Screen Lock Button
-                Positioned(
-                  left: leftInset + 4,
-                  top: 0,
-                  bottom: 0,
-                  child: Center(
-                    child: IgnorePointer(
-                      ignoring: !_controlsVisible,
-                      child: AnimatedOpacity(
-                        opacity: _controlsVisible ? 1.0 : 0.0,
-                        duration: const Duration(milliseconds: 200),
-                        child: InkWell(
-                          borderRadius: BorderRadius.circular(22),
-                          onTap: () {
-                            setState(() {
-                              _isScreenLocked = !_isScreenLocked;
-                              _controlsVisible = true;
-                            });
-                            _scheduleOsdAutoHide();
-                          },
-                          child: Container(
-                            width: 40,
-                            height: 40,
-                            decoration: BoxDecoration(
-                              color: _isScreenLocked
-                                  ? VideoPlatformTheme.accent
-                                      .withValues(alpha: 0.88)
-                                  : const Color(0xAA060B14),
-                              shape: BoxShape.circle,
-                              border: Border.all(
-                                color: _isScreenLocked
-                                    ? Colors.white
-                                    : VideoPlatformTheme.borderStrong,
+                      child: Row(
+                        children: [
+                          InkWell(
+                            borderRadius: BorderRadius.circular(20),
+                            onTap: () => Navigator.of(context).pop(),
+                            child: Container(
+                              width: 36,
+                              height: 36,
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: 0.12),
+                                shape: BoxShape.circle,
+                              ),
+                              alignment: Alignment.center,
+                              child: const Icon(
+                                Icons.arrow_back_ios_new_rounded,
+                                size: 17,
+                                color: Colors.white,
                               ),
                             ),
-                            child: Icon(
-                              _isScreenLocked
-                                  ? Icons.lock_rounded
-                                  : Icons.lock_open_rounded,
-                              size: 19,
-                              color: Colors.white,
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Row(
+                              children: [
+                                Flexible(
+                                  child: Text(
+                                    widget.title,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.w700,
+                                      color: Colors.white,
+                                      letterSpacing: 0.2,
+                                    ),
+                                  ),
+                                ),
+                                if (resBadge.isNotEmpty) ...[
+                                  const SizedBox(width: 8),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 6,
+                                      vertical: 2,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: const Color(0xFF38BDF8)
+                                          .withValues(alpha: 0.22),
+                                      borderRadius: BorderRadius.circular(5),
+                                      border: Border.all(
+                                        color: const Color(0xFF38BDF8)
+                                            .withValues(alpha: 0.6),
+                                      ),
+                                    ),
+                                    child: Text(
+                                      resBadge,
+                                      style: const TextStyle(
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.w800,
+                                        color: Color(0xFF7DD3FC),
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ],
                             ),
                           ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-
-                // Layer 4: Floating Bottom Gradient Transport & Seek Bar
-                Positioned(
-                  bottom: 0,
-                  left: 0,
-                  right: 0,
-                  child: IgnorePointer(
-                    ignoring: !showHud,
-                    child: AnimatedOpacity(
-                      opacity: showHud ? 1.0 : 0.0,
-                      duration: const Duration(milliseconds: 200),
-                      child: Container(
-                        padding: EdgeInsets.fromLTRB(
-                          leftInset,
-                          14,
-                          rightInset,
-                          bottomInset,
-                        ),
-                        decoration: const BoxDecoration(
-                          gradient: LinearGradient(
-                            begin: Alignment.bottomCenter,
-                            end: Alignment.topCenter,
-                            colors: [
-                              Color(0xEB050A12),
-                              Color(0xA6050A12),
-                              Colors.transparent,
-                            ],
+                          const SizedBox(width: 8),
+                          VideoDownloadSpeedBadge(
+                            player: _player,
+                            compact: true,
                           ),
-                        ),
-                        child: Row(
-                          children: [
-                            IconButton(
-                              visualDensity: VisualDensity.compact,
-                              tooltip: _isPlaying ? '暂停' : '播放',
-                              onPressed: () {
-                                _player.playOrPause();
-                                _wakeControls();
+                          if (widget.onEnterMiniPlayer != null) ...[
+                            const SizedBox(width: 8),
+                            InkWell(
+                              borderRadius: BorderRadius.circular(20),
+                              onTap: () {
+                                final pos =
+                                    _player.state.position.inSeconds;
+                                Navigator.of(context).pop();
+                                widget.onEnterMiniPlayer!(pos);
                               },
-                              icon: Icon(
-                                _isPlaying
-                                    ? Icons.pause_circle_filled_rounded
-                                    : Icons.play_circle_fill_rounded,
-                                size: 30,
-                                color: VideoPlatformTheme.accent,
-                              ),
-                            ),
-                            IconButton(
-                              visualDensity: VisualDensity.compact,
-                              tooltip: '快退 10 秒',
-                              onPressed: () => _seekRelativeSeconds(-10),
-                              icon: const Icon(
-                                Icons.replay_10_rounded,
-                                size: 20,
-                                color: Colors.white,
-                              ),
-                            ),
-                            IconButton(
-                              visualDensity: VisualDensity.compact,
-                              tooltip: '快进 10 秒',
-                              onPressed: () => _seekRelativeSeconds(10),
-                              icon: const Icon(
-                                Icons.forward_10_rounded,
-                                size: 20,
-                                color: Colors.white,
-                              ),
-                            ),
-                            const SizedBox(width: 2),
-                            Text(
-                              _formatClock(
-                                Duration(milliseconds: effectivePosMs.round()),
-                              ),
-                              style: const TextStyle(
-                                fontSize: 11.5,
-                                fontWeight: FontWeight.w600,
-                                color: Colors.white,
-                                fontFeatures: [FontFeature.tabularFigures()],
-                              ),
-                            ),
-                            Expanded(
-                              child: SliderTheme(
-                                data: SliderTheme.of(context).copyWith(
-                                  trackHeight: 3.5,
-                                  thumbShape: const RoundSliderThumbShape(
-                                    enabledThumbRadius: 6.5,
-                                  ),
-                                  overlayShape: const RoundSliderOverlayShape(
-                                    overlayRadius: 12,
-                                  ),
-                                  activeTrackColor: VideoPlatformTheme.accent,
-                                  inactiveTrackColor: Colors.white24,
-                                  thumbColor: Colors.white,
+                              child: Container(
+                                width: 34,
+                                height: 34,
+                                decoration: BoxDecoration(
+                                  color: Colors.white.withValues(alpha: 0.12),
+                                  shape: BoxShape.circle,
                                 ),
-                                child: Slider(
-                                  value: effectivePosMs,
-                                  min: 0.0,
-                                  max: effectiveDurMs,
-                                  onChanged: (v) {
-                                    setState(() => _scrubOverrideMs = v);
-                                    _osdHideTimer?.cancel();
-                                  },
-                                  onChangeEnd: (v) {
-                                    final target =
-                                        Duration(milliseconds: v.round());
-                                    setState(() {
-                                      _scrubOverrideMs = null;
-                                      _position = target;
-                                    });
-                                    _player.seek(target);
-                                    _scheduleOsdAutoHide();
-                                  },
-                                ),
-                              ),
-                            ),
-                            Text(
-                              _formatClock(_duration),
-                              style: const TextStyle(
-                                fontSize: 11.5,
-                                color: Colors.white70,
-                                fontFeatures: [FontFeature.tabularFigures()],
-                              ),
-                            ),
-                            const SizedBox(width: 2),
-                            IconButton(
-                              visualDensity: VisualDensity.compact,
-                              tooltip: '切换画面比例 (${_fitModeLabel()})',
-                              onPressed: _cycleFitMode,
-                              icon: Icon(
-                                _fitMode == 'fit'
-                                    ? Icons.aspect_ratio_rounded
-                                    : Icons.fit_screen_rounded,
-                                size: 20,
-                                color: _fitMode == 'fit'
-                                    ? Colors.white70
-                                    : VideoPlatformTheme.accent,
-                              ),
-                            ),
-                            if (Platform.isAndroid || Platform.isIOS)
-                              IconButton(
-                                visualDensity: VisualDensity.compact,
-                                tooltip: isLandscape ? '切换竖屏全屏' : '进入横屏全屏',
-                                onPressed: _toggleOrientation,
-                                icon: Icon(
-                                  isLandscape
-                                      ? Icons.fullscreen_exit_rounded
-                                      : Icons.fullscreen_rounded,
-                                  size: 24,
+                                alignment: Alignment.center,
+                                child: const Icon(
+                                  Icons.picture_in_picture_alt_rounded,
+                                  size: 17,
                                   color: Colors.white,
                                 ),
                               ),
+                            ),
+                          ],
+                          if (Platform.isAndroid || Platform.isIOS) ...[
+                            const SizedBox(width: 8),
+                            InkWell(
+                              borderRadius: BorderRadius.circular(20),
+                              onTap: _toggleOrientation,
+                              child: Container(
+                                width: 34,
+                                height: 34,
+                                decoration: BoxDecoration(
+                                  color: Colors.white.withValues(alpha: 0.12),
+                                  shape: BoxShape.circle,
+                                ),
+                                alignment: Alignment.center,
+                                child: const Icon(
+                                  Icons.screen_rotation_rounded,
+                                  size: 17,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+
+              // Layer 3: Mid-Left Screen Lock Button
+              Positioned(
+                left: leftInset,
+                top: 0,
+                bottom: 0,
+                child: Center(
+                  child: IgnorePointer(
+                    ignoring: !_controlsVisible,
+                    child: AnimatedOpacity(
+                      opacity: _controlsVisible ? 1.0 : 0.0,
+                      duration: const Duration(milliseconds: 180),
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(22),
+                        onTap: () {
+                          setState(() {
+                            _isScreenLocked = !_isScreenLocked;
+                            _controlsVisible = true;
+                          });
+                          _scheduleOsdAutoHide();
+                        },
+                        child: Container(
+                          width: 42,
+                          height: 42,
+                          decoration: BoxDecoration(
+                            color: _isScreenLocked
+                                ? const Color(0xFF0284C7)
+                                : const Color(0xA60B111E),
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: _isScreenLocked
+                                  ? Colors.white
+                                  : Colors.white24,
+                            ),
+                          ),
+                          child: Icon(
+                            _isScreenLocked
+                                ? Icons.lock_rounded
+                                : Icons.lock_open_rounded,
+                            size: 19,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+
+              // Layer 4: VidHub Two-Tier Bottom Control Bar
+              Positioned(
+                bottom: 0,
+                left: 0,
+                right: 0,
+                child: IgnorePointer(
+                  ignoring: !showHud,
+                  child: AnimatedOpacity(
+                    opacity: showHud ? 1.0 : 0.0,
+                    duration: const Duration(milliseconds: 180),
+                    child: Container(
+                      padding: EdgeInsets.fromLTRB(
+                        leftInset,
+                        20,
+                        rightInset,
+                        bottomInset,
+                      ),
+                      decoration: const BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.bottomCenter,
+                          end: Alignment.topCenter,
+                          colors: [
+                            Color(0xE604070D),
+                            Color(0x9904070D),
+                            Colors.transparent,
                           ],
                         ),
                       ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          // Tier 1: Full-Width Timeline Scrubber Row
+                          Row(
+                            children: [
+                              Text(
+                                _formatClock(
+                                  Duration(
+                                    milliseconds: effectivePosMs.round(),
+                                  ),
+                                ),
+                                style: const TextStyle(
+                                  fontSize: 12.5,
+                                  fontWeight: FontWeight.w700,
+                                  color: Colors.white,
+                                  fontFeatures: [FontFeature.tabularFigures()],
+                                ),
+                              ),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: SliderTheme(
+                                  data: SliderTheme.of(context).copyWith(
+                                    trackHeight: 4.0,
+                                    thumbShape: const RoundSliderThumbShape(
+                                      enabledThumbRadius: 7.5,
+                                    ),
+                                    overlayShape: const RoundSliderOverlayShape(
+                                      overlayRadius: 14,
+                                    ),
+                                    activeTrackColor: const Color(0xFF38BDF8),
+                                    inactiveTrackColor:
+                                        Colors.white.withValues(alpha: 0.24),
+                                    thumbColor: Colors.white,
+                                  ),
+                                  child: Slider(
+                                    value: effectivePosMs,
+                                    min: 0.0,
+                                    max: effectiveDurMs,
+                                    onChanged: (v) {
+                                      setState(() => _scrubOverrideMs = v);
+                                      _osdHideTimer?.cancel();
+                                    },
+                                    onChangeEnd: (v) {
+                                      final target =
+                                          Duration(milliseconds: v.round());
+                                      setState(() {
+                                        _scrubOverrideMs = null;
+                                        _position = target;
+                                      });
+                                      _player.seek(target);
+                                      _scheduleOsdAutoHide();
+                                    },
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 6),
+                              GestureDetector(
+                                onTap: () {
+                                  setState(
+                                    () => _showRemainingTime =
+                                        !_showRemainingTime,
+                                  );
+                                  _wakeControls();
+                                },
+                                child: Text(
+                                  _showRemainingTime &&
+                                          _duration.inSeconds > 0
+                                      ? '-${_formatClock(remainingDur)}'
+                                      : _formatClock(_duration),
+                                  style: const TextStyle(
+                                    fontSize: 12.5,
+                                    fontWeight: FontWeight.w600,
+                                    color: Colors.white70,
+                                    fontFeatures: [
+                                      FontFeature.tabularFigures(),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 4),
+                          // Tier 2: VidHub Feature Controls Strip
+                          Row(
+                            children: [
+                              InkWell(
+                                borderRadius: BorderRadius.circular(20),
+                                onTap: () {
+                                  _player.playOrPause();
+                                  _wakeControls();
+                                },
+                                child: Padding(
+                                  padding: const EdgeInsets.all(6),
+                                  child: Icon(
+                                    _isPlaying
+                                        ? Icons.pause_rounded
+                                        : Icons.play_arrow_rounded,
+                                    size: 26,
+                                    color: Colors.white,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 4),
+                              InkWell(
+                                borderRadius: BorderRadius.circular(20),
+                                onTap: () => _seekRelativeSeconds(-10),
+                                child: const Padding(
+                                  padding: EdgeInsets.all(6),
+                                  child: Icon(
+                                    Icons.replay_10_rounded,
+                                    size: 22,
+                                    color: Colors.white70,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 2),
+                              InkWell(
+                                borderRadius: BorderRadius.circular(20),
+                                onTap: () => _seekRelativeSeconds(10),
+                                child: const Padding(
+                                  padding: EdgeInsets.all(6),
+                                  child: Icon(
+                                    Icons.forward_10_rounded,
+                                    size: 22,
+                                    color: Colors.white70,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Align(
+                                  alignment: Alignment.centerRight,
+                                  child: SingleChildScrollView(
+                                    scrollDirection: Axis.horizontal,
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        _buildVidHubActionChip(
+                                          icon: Icons.surround_sound_rounded,
+                                          label: audioChipLabel,
+                                          highlighted: tracks.length > 1,
+                                          onTap: _showAudioTrackSelectorDialog,
+                                        ),
+                                        const SizedBox(width: 8),
+                                        _buildVidHubActionChip(
+                                          icon: Icons.subtitles_outlined,
+                                          label: subChipLabel,
+                                          highlighted: hasActiveSub,
+                                          onTap: _showSubtitleSelectorSheet,
+                                        ),
+                                        const SizedBox(width: 8),
+                                        _buildVidHubActionChip(
+                                          icon: Icons.speed_rounded,
+                                          label: _rate == 1.0
+                                              ? '倍速'
+                                              : '${_rate}x',
+                                          highlighted: _rate != 1.0,
+                                          onTap: _showSpeedSelectorSheet,
+                                        ),
+                                        const SizedBox(width: 8),
+                                        _buildVidHubActionChip(
+                                          icon: Icons.aspect_ratio_rounded,
+                                          label: _fitModeLabel(),
+                                          highlighted: _fitMode != 'fit',
+                                          onTap: _cycleFitMode,
+                                        ),
+                                        if (Platform.isAndroid) ...[
+                                          const SizedBox(width: 8),
+                                          _buildVidHubActionChip(
+                                            icon: Icons.bolt_rounded,
+                                            label: 'Exo硬解',
+                                            highlighted: true,
+                                            onTap: _openInEmbeddedExoPlayer,
+                                          ),
+                                        ],
+                                        if (Platform.isAndroid ||
+                                            Platform.isIOS) ...[
+                                          const SizedBox(width: 8),
+                                          _buildVidHubActionChip(
+                                            icon: isLandscape
+                                                ? Icons.stay_current_portrait_rounded
+                                                : Icons.stay_current_landscape_rounded,
+                                            label: isLandscape ? '竖屏' : '横屏',
+                                            onTap: _toggleOrientation,
+                                          ),
+                                        ],
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
                     ),
                   ),
                 ),
-              ],
-            ),
+              ),
+            ],
           ),
-        ),
-      );
-    }
-
-    return Dialog(
-      backgroundColor: Colors.black,
-      insetPadding: const EdgeInsets.all(14),
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(
-          maxWidth: 1200,
-          maxHeight: 820,
-        ),
-        child: Column(
-          children: [
-            Container(
-              height: 46,
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              decoration: BoxDecoration(
-                color: VideoPlatformTheme.bgElevated,
-                border: Border(
-                  bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
-                ),
-              ),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      widget.title,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 13.5,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ),
-                  if (Platform.isAndroid) ...[
-                    _buildExoHardwareButton(),
-                    const SizedBox(width: 6),
-                  ],
-                  _buildAudioTrackButton(),
-                  const SizedBox(width: 6),
-                  _buildFitModePill(),
-                  const SizedBox(width: 6),
-                  _buildSpeedPopupPill(),
-                  const SizedBox(width: 6),
-                  if (widget.onEnterMiniPlayer != null)
-                    TextButton.icon(
-                      onPressed: () {
-                        final pos = _player.state.position.inSeconds;
-                        Navigator.of(context).pop();
-                        widget.onEnterMiniPlayer!(pos);
-                      },
-                      icon: const Icon(
-                        Icons.picture_in_picture_alt_rounded,
-                        size: 16,
-                      ),
-                      label: const Text('小窗播放'),
-                    ),
-                  IconButton(
-                    visualDensity: VisualDensity.compact,
-                    icon: const Icon(Icons.close, size: 18),
-                    onPressed: () => Navigator.of(context).pop(),
-                  ),
-                ],
-              ),
-            ),
-            Expanded(
-              child: _buildInteractiveVideoStage(isMobileDialog: false),
-            ),
-            Container(
-              padding: const EdgeInsets.fromLTRB(14, 6, 14, 8),
-              decoration: BoxDecoration(
-                color: VideoPlatformTheme.bgElevated,
-                border: Border(
-                  top: BorderSide(color: VideoPlatformTheme.borderSubtle),
-                ),
-              ),
-              child: Row(
-                children: [
-                  IconButton(
-                    visualDensity: VisualDensity.compact,
-                    tooltip: _isPlaying ? '暂停' : '播放',
-                    onPressed: () {
-                      _player.playOrPause();
-                      _wakeControls();
-                    },
-                    icon: Icon(
-                      _isPlaying
-                          ? Icons.pause_circle_filled_rounded
-                          : Icons.play_circle_fill_rounded,
-                      size: 30,
-                      color: VideoPlatformTheme.accent,
-                    ),
-                  ),
-                  IconButton(
-                    visualDensity: VisualDensity.compact,
-                    tooltip: '快退 10 秒',
-                    onPressed: () => _seekRelativeSeconds(-10),
-                    icon: const Icon(Icons.replay_10_rounded, size: 19),
-                  ),
-                  IconButton(
-                    visualDensity: VisualDensity.compact,
-                    tooltip: '快进 10 秒',
-                    onPressed: () => _seekRelativeSeconds(10),
-                    icon: const Icon(Icons.forward_10_rounded, size: 19),
-                  ),
-                  const SizedBox(width: 4),
-                  Text(
-                    _formatClock(
-                      Duration(milliseconds: effectivePosMs.round()),
-                    ),
-                    style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.w600,
-                      color: VideoPlatformTheme.textPrimary,
-                      fontFeatures: const [FontFeature.tabularFigures()],
-                    ),
-                  ),
-                  Expanded(
-                    child: SliderTheme(
-                      data: SliderTheme.of(context).copyWith(
-                        trackHeight: 3.5,
-                        thumbShape: const RoundSliderThumbShape(
-                          enabledThumbRadius: 6.5,
-                        ),
-                        overlayShape: const RoundSliderOverlayShape(
-                          overlayRadius: 12,
-                        ),
-                        activeTrackColor: VideoPlatformTheme.accent,
-                        inactiveTrackColor: VideoPlatformTheme.borderStrong,
-                        thumbColor: Colors.white,
-                      ),
-                      child: Slider(
-                        value: effectivePosMs,
-                        min: 0.0,
-                        max: effectiveDurMs,
-                        onChanged: (v) {
-                          setState(() => _scrubOverrideMs = v);
-                          _osdHideTimer?.cancel();
-                        },
-                        onChangeEnd: (v) {
-                          final target = Duration(milliseconds: v.round());
-                          setState(() {
-                            _scrubOverrideMs = null;
-                            _position = target;
-                          });
-                          _player.seek(target);
-                          _scheduleOsdAutoHide();
-                        },
-                      ),
-                    ),
-                  ),
-                  Text(
-                    _formatClock(_duration),
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: VideoPlatformTheme.textSecondary,
-                      fontFeatures: const [FontFeature.tabularFigures()],
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
         ),
       ),
     );

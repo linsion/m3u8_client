@@ -1616,10 +1616,28 @@ struct TvPlayerModalView: View {
           // 2. Top Floating Glass Header Bar (.focusSection() so pressing Up from bottom bar reaches it)
           HStack(spacing: 14) {
             VStack(alignment: .leading, spacing: 3) {
-              Text(request.title)
-                .font(.system(size: 24, weight: .bold))
-                .foregroundColor(.white)
-                .lineLimit(1)
+              HStack(spacing: 10) {
+                Text(request.title)
+                  .font(.system(size: 24, weight: .bold))
+                  .foregroundColor(.white)
+                  .lineLimit(1)
+                let pSize = player.currentItem?.presentationSize ?? .zero
+                let longEdge = max(pSize.width, pSize.height)
+                if longEdge >= 1100 {
+                  let resBadge = longEdge >= 3200 ? "4K UHD" : (longEdge >= 2200 ? "2K QHD" : (longEdge >= 1700 ? "1080P" : "720P"))
+                  Text(resBadge)
+                    .font(.system(size: 13, weight: .heavy, design: .monospaced))
+                    .foregroundColor(Color(red: 0.35, green: 0.78, blue: 1.0))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 3)
+                    .background(Color(red: 0.16, green: 0.58, blue: 0.96).opacity(0.24))
+                    .overlay(
+                      RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .stroke(Color(red: 0.35, green: 0.78, blue: 1.0).opacity(0.75), lineWidth: 1)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+              }
               Text(request.subtitle)
                 .font(.system(size: 16, weight: .medium))
                 .foregroundColor(.white.opacity(0.70))
@@ -1845,10 +1863,10 @@ struct TvPlayerModalView: View {
                   }
                   .frame(height: 26)
 
-                  Text(formatClock(durationSec))
-                    .font(.system(size: 20, weight: .medium, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.75))
-                    .frame(width: 92, alignment: .trailing)
+                  Text(durationSec > 0 ? "-\(formatClock(max(0, durationSec - positionSec))) / \(formatClock(durationSec))" : formatClock(durationSec))
+                    .font(.system(size: 18, weight: .medium, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.78))
+                    .frame(minWidth: 168, alignment: .trailing)
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)
@@ -3392,10 +3410,10 @@ struct TvTelegramGalleryModalView: View {
                     }
                     .frame(height: 26)
 
-                    Text(formatClock(durationSec))
-                      .font(.system(size: 20, weight: .medium, design: .monospaced))
+                    Text(durationSec > 0 ? "-\(formatClock(max(0, durationSec - positionSec))) / \(formatClock(durationSec))" : formatClock(durationSec))
+                      .font(.system(size: 18, weight: .medium, design: .monospaced))
                       .foregroundColor(.white.opacity(0.78))
-                      .frame(width: 82, alignment: .trailing)
+                      .frame(minWidth: 164, alignment: .trailing)
                   }
                   .padding(.horizontal, 12)
                   .padding(.vertical, 6)

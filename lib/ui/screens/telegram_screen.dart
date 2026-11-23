@@ -16756,6 +16756,11 @@ class _TelegramPhotoGalleryDialogState
   double _volume = 100.0;
   double _preMuteVolume = 100.0;
   bool _isGalleryHorizontalSeeking = false;
+  bool _isGalleryVerticalDragging = false;
+  bool _isGalleryBrightness = false;
+  double _galleryBrightnessPercent = 100.0;
+  bool _isGalleryLongPressFastForward = false;
+  bool _showGalleryRemainingTime = true;
   Duration _gallerySeekStartPos = Duration.zero;
   Duration _gallerySeekPreviewPos = Duration.zero;
   Duration? _gallerySliderPreviewPos;
@@ -17699,6 +17704,197 @@ class _TelegramPhotoGalleryDialogState
     return h > 0 ? '$h:$m:$s' : '$m:$s';
   }
 
+  Future<void> _showGalleryAudioSubtitleSelectorSheet() async {
+    final player = _videoPlayer;
+    if (player == null) return;
+    final audioTracks = player.state.tracks.audio
+        .where((t) => t.id != 'auto' && t.id != 'no')
+        .toList();
+    final subTracks = player.state.tracks.subtitle
+        .where((t) => t.id != 'auto' && t.id != 'no')
+        .toList();
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xF2101622),
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+      ),
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setSheetState) {
+            final curAudio = player.state.track.audio;
+            final curSub = player.state.track.subtitle;
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(18, 12, 18, 18),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Center(
+                      child: Container(
+                        width: 38,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: Colors.white24,
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        const Icon(
+                          Icons.surround_sound_rounded,
+                          color: Color(0xFF5EB5F7),
+                          size: 20,
+                        ),
+                        const SizedBox(width: 8),
+                        const Expanded(
+                          child: Text(
+                            '音轨与字幕选择',
+                            style: TextStyle(
+                              fontSize: 15.5,
+                              fontWeight: FontWeight.w700,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          onPressed: () => Navigator.of(ctx).pop(),
+                          icon: const Icon(
+                            Icons.close_rounded,
+                            color: Colors.white70,
+                            size: 20,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    const Text(
+                      '音轨 / 声道',
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white70,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    if (audioTracks.isEmpty)
+                      const Text(
+                        '当前视频流仅包含默认音轨',
+                        style: TextStyle(fontSize: 12, color: Colors.white54),
+                      )
+                    else
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          for (int i = 0; i < audioTracks.length; i++)
+                            Builder(
+                              builder: (_) {
+                                final t = audioTracks[i];
+                                final isSelected = curAudio.id == t.id;
+                                final label = [
+                                  if ((t.title ?? '').trim().isNotEmpty)
+                                    t.title!.trim(),
+                                  if ((t.language ?? '').trim().isNotEmpty)
+                                    t.language!.trim().toUpperCase(),
+                                  if ((t.codec ?? '').trim().isNotEmpty)
+                                    t.codec!.trim().toUpperCase(),
+                                ].where((s) => s.isNotEmpty).join(' · ');
+                                return ChoiceChip(
+                                  label: Text(
+                                    label.isNotEmpty
+                                        ? '#${i + 1} $label'
+                                        : '音轨 ${i + 1}',
+                                  ),
+                                  selected: isSelected,
+                                  selectedColor: const Color(0xFF3E99EE),
+                                  labelStyle: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 12,
+                                  ),
+                                  onSelected: (_) async {
+                                    await player.setAudioTrack(t);
+                                    setSheetState(() {});
+                                  },
+                                );
+                              },
+                            ),
+                        ],
+                      ),
+                    const SizedBox(height: 14),
+                    const Text(
+                      '内嵌字幕',
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white70,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        ChoiceChip(
+                          label: const Text('关闭字幕'),
+                          selected: curSub.id == 'no',
+                          selectedColor: const Color(0xFF3E99EE),
+                          labelStyle: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 12,
+                          ),
+                          onSelected: (_) async {
+                            await player.setSubtitleTrack(SubtitleTrack.no());
+                            setSheetState(() {});
+                          },
+                        ),
+                        for (int i = 0; i < subTracks.length; i++)
+                          Builder(
+                            builder: (_) {
+                              final t = subTracks[i];
+                              final isSelected = curSub.id == t.id;
+                              final label = [
+                                if ((t.title ?? '').trim().isNotEmpty)
+                                  t.title!.trim(),
+                                if ((t.language ?? '').trim().isNotEmpty)
+                                  t.language!.trim().toUpperCase(),
+                              ].where((s) => s.isNotEmpty).join(' · ');
+                              return ChoiceChip(
+                                label: Text(
+                                  label.isNotEmpty
+                                      ? '#${i + 1} $label'
+                                      : '字幕 ${i + 1}',
+                                ),
+                                selected: isSelected,
+                                selectedColor: const Color(0xFF3E99EE),
+                                labelStyle: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 12,
+                                ),
+                                onSelected: (_) async {
+                                  await player.setSubtitleTrack(t);
+                                  setSheetState(() {});
+                                },
+                              );
+                            },
+                          ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
   FocusNode? _neighborInChain(
     List<FocusNode> chain,
     FocusNode node,
@@ -18160,6 +18356,64 @@ class _TelegramPhotoGalleryDialogState
                           }
                         },
                         onDoubleTap: () => _toggleGalleryPlayback(),
+                        onVerticalDragStart: (details) {
+                          if (details.globalPosition.dx <= 40.0) return;
+                          if (_videoPlayer == null) return;
+                          final screenW = MediaQuery.sizeOf(context).width;
+                          setState(() {
+                            _isGalleryVerticalDragging = true;
+                            _isGalleryBrightness =
+                                details.localPosition.dx < (screenW * 0.5);
+                          });
+                        },
+                        onVerticalDragUpdate: (details) {
+                          if (!_isGalleryVerticalDragging ||
+                              _videoPlayer == null) {
+                            return;
+                          }
+                          final screenH = MediaQuery.sizeOf(context)
+                              .height
+                              .clamp(240.0, 1200.0);
+                          final delta = (-details.delta.dy / screenH) * 120.0;
+                          if (_isGalleryBrightness) {
+                            setState(() {
+                              _galleryBrightnessPercent =
+                                  (_galleryBrightnessPercent + delta)
+                                      .clamp(15.0, 100.0);
+                            });
+                          } else {
+                            final nextVol =
+                                (_volume + delta).clamp(0.0, 100.0);
+                            setState(() {
+                              _volume = nextVol;
+                              _isMuted = nextVol <= 0.5;
+                            });
+                            _videoPlayer?.setVolume(nextVol);
+                          }
+                        },
+                        onVerticalDragEnd: (_) {
+                          if (!_isGalleryVerticalDragging) return;
+                          setState(() => _isGalleryVerticalDragging = false);
+                        },
+                        onLongPressStart: (_) {
+                          if (_videoPlayer == null) return;
+                          setState(() => _isGalleryLongPressFastForward = true);
+                          _videoPlayer?.setRate(3.0);
+                        },
+                        onLongPressEnd: (_) {
+                          if (!_isGalleryLongPressFastForward) return;
+                          setState(
+                            () => _isGalleryLongPressFastForward = false,
+                          );
+                          _videoPlayer?.setRate(_playbackSpeed);
+                        },
+                        onLongPressCancel: () {
+                          if (!_isGalleryLongPressFastForward) return;
+                          setState(
+                            () => _isGalleryLongPressFastForward = false,
+                          );
+                          _videoPlayer?.setRate(_playbackSpeed);
+                        },
                         onHorizontalDragStart: (details) {
                           if (details.globalPosition.dx <= 40.0) return;
                           if (_videoPlayer == null) return;
@@ -18243,6 +18497,121 @@ class _TelegramPhotoGalleryDialogState
                                   controls: NoVideoControls,
                                 );
                               },
+                            ),
+                          if (_galleryBrightnessPercent < 99.5)
+                            IgnorePointer(
+                              child: Container(
+                                color: Colors.black.withValues(
+                                  alpha: ((100.0 - _galleryBrightnessPercent) /
+                                          115.0)
+                                      .clamp(0.0, 0.75),
+                                ),
+                              ),
+                            ),
+                          if (_isGalleryLongPressFastForward)
+                            Positioned(
+                              top: 56,
+                              child: IgnorePointer(
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 14,
+                                    vertical: 6,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xE00B121A),
+                                    borderRadius: BorderRadius.circular(20),
+                                    border: Border.all(
+                                      color: const Color(0xFF5EB5F7),
+                                    ),
+                                  ),
+                                  child: const Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(
+                                        Icons.bolt_rounded,
+                                        size: 16,
+                                        color: Color(0xFF5EB5F7),
+                                      ),
+                                      SizedBox(width: 4),
+                                      Text(
+                                        '3.0x 倍速快进中 (松手恢复)',
+                                        style: TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 12.5,
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ),
+                          if (_isGalleryVerticalDragging &&
+                              !_isGalleryHorizontalSeeking)
+                            IgnorePointer(
+                              child: Container(
+                                width: 164,
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 16,
+                                  vertical: 11,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xE00B121A),
+                                  borderRadius: BorderRadius.circular(14),
+                                  border: Border.all(
+                                    color: const Color(0xFF5EB5F7),
+                                    width: 1.2,
+                                  ),
+                                ),
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(
+                                          _isGalleryBrightness
+                                              ? Icons.wb_sunny_rounded
+                                              : (_volume <= 0.5
+                                                  ? Icons.volume_off_rounded
+                                                  : Icons.volume_up_rounded),
+                                          color: _isGalleryBrightness
+                                              ? const Color(0xFFFACC15)
+                                              : const Color(0xFF5EB5F7),
+                                          size: 20,
+                                        ),
+                                        const SizedBox(width: 8),
+                                        Text(
+                                          _isGalleryBrightness
+                                              ? '亮度 ${_galleryBrightnessPercent.round()}%'
+                                              : '音量 ${_volume.round()}%',
+                                          style: const TextStyle(
+                                            color: Colors.white,
+                                            fontSize: 14,
+                                            fontWeight: FontWeight.w700,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    const SizedBox(height: 8),
+                                    ClipRRect(
+                                      borderRadius: BorderRadius.circular(4),
+                                      child: LinearProgressIndicator(
+                                        minHeight: 4.5,
+                                        value: ((_isGalleryBrightness
+                                                    ? _galleryBrightnessPercent
+                                                    : _volume) /
+                                                100.0)
+                                            .clamp(0.0, 1.0),
+                                        backgroundColor: Colors.white24,
+                                        color: _isGalleryBrightness
+                                            ? const Color(0xFFFACC15)
+                                            : const Color(0xFF5EB5F7),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
                             ),
                           if (_isGalleryHorizontalSeeking)
                             Container(
@@ -19242,14 +19611,25 @@ class _TelegramPhotoGalleryDialogState
                                               ),
                                             ),
                                           ),
-                                          Text(
-                                            _fmtClock(_videoDuration),
-                                            style: const TextStyle(
-                                              color: Colors.white70,
-                                              fontSize: 12,
-                                              fontFeatures: [
-                                                ui.FontFeature.tabularFigures(),
-                                              ],
+                                          GestureDetector(
+                                            onTap: () => setState(
+                                              () => _showGalleryRemainingTime =
+                                                  !_showGalleryRemainingTime,
+                                            ),
+                                            child: Text(
+                                              _showGalleryRemainingTime &&
+                                                      _videoDuration.inSeconds >
+                                                          0
+                                                  ? '-${_fmtClock(Duration(seconds: (_videoDuration.inSeconds - _videoPosition.inSeconds).clamp(0, _videoDuration.inSeconds)))}'
+                                                  : _fmtClock(_videoDuration),
+                                              style: const TextStyle(
+                                                color: Colors.white70,
+                                                fontSize: 12,
+                                                fontFeatures: [
+                                                  ui.FontFeature
+                                                      .tabularFigures(),
+                                                ],
+                                              ),
                                             ),
                                           ),
                                           if (isScrubFocused &&
@@ -19396,6 +19776,13 @@ class _TelegramPhotoGalleryDialogState
                                           ),
                                         ),
                                       ],
+                                      const SizedBox(width: 6),
+                                      _buildGalleryTvIconButton(
+                                        icon: Icons.surround_sound_rounded,
+                                        label: '音轨/字幕',
+                                        onTap:
+                                            _showGalleryAudioSubtitleSelectorSheet,
+                                      ),
                                       const SizedBox(width: 6),
                                       _buildGalleryTvIconButton(
                                         focusNode: _speedFocusNode,

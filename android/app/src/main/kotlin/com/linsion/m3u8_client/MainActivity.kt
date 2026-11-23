@@ -1695,6 +1695,27 @@ class MainActivity : FlutterActivity() {
             )
             actionsRow.addView(audioTrackBtn)
 
+            val subtitleTrackBtn = Button(this).apply {
+                id = View.generateViewId()
+                text = "💬 字幕 ▾"
+                textSize = btnTextSize
+                setTextColor(Color.WHITE)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(btnHPadding, btnVPadding, btnHPadding, btnVPadding)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    rightMargin = btnMargin
+                }
+            }
+            styleTvFocusableButton(
+                btn = subtitleTrackBtn,
+                normalBgColor = Color.argb(215, 30, 41, 59),
+                focusedBgColor = Color.rgb(2, 132, 199)
+            )
+            actionsRow.addView(subtitleTrackBtn)
+
             val aspectRatioBtn = Button(this).apply {
                 id = View.generateViewId()
                 text = "📺 比例:适应"
@@ -1833,12 +1854,213 @@ class MainActivity : FlutterActivity() {
             actionsRow.addView(closeBtn)
 
             // Explicit D-Pad focus graph between top bar buttons and PlayerView
-            val topButtons = listOfNotNull(audioTrackBtn, aspectRatioBtn, speedBtn, orientationBtn, mpvFallbackBtn, closeBtn)
+            val topButtons = listOfNotNull(audioTrackBtn, subtitleTrackBtn, aspectRatioBtn, speedBtn, orientationBtn, mpvFallbackBtn, closeBtn)
             for (i in topButtons.indices) {
                 val btn = topButtons[i]
                 btn.nextFocusLeftId = if (i > 0) topButtons[i - 1].id else btn.id
                 btn.nextFocusRightId = if (i < topButtons.lastIndex) topButtons[i + 1].id else btn.id
                 btn.nextFocusDownId = playerView.id
+            }
+
+            data class SubtitleTrackChoice(
+                val orderIndex: Int,
+                val group: Tracks.Group,
+                val trackIndex: Int,
+                val format: Format,
+                val label: String
+            )
+
+            fun buildSubtitleTrackLabel(fmt: Format, idx: Int): String {
+                val lang = (fmt.language ?: "").lowercase()
+                val rawLabel = (fmt.label ?: "").trim()
+                val langText = when {
+                    rawLabel.contains("简") || lang.contains("hans") || lang == "chs" || lang == "zh-cn" -> "简体中文"
+                    rawLabel.contains("繁") || lang.contains("hant") || lang == "cht" || lang == "zh-tw" || lang == "zh-hk" -> "繁体中文"
+                    lang.startsWith("zh") || lang.startsWith("chi") || lang.startsWith("zho") -> "中文"
+                    lang.startsWith("en") -> "英语"
+                    lang.startsWith("ja") || lang.startsWith("jpn") -> "日语"
+                    lang.startsWith("ko") || lang.startsWith("kor") -> "韩语"
+                    lang.isNotBlank() && lang != "und" -> lang.uppercase()
+                    else -> "字幕${idx + 1}"
+                }
+                val mimeShort = (fmt.sampleMimeType ?: "").substringAfterLast("/").uppercase()
+                return listOf(langText, rawLabel.takeIf { it.isNotEmpty() && it != langText } ?: "", mimeShort)
+                    .filter { it.isNotBlank() }
+                    .joinToString(" · ")
+            }
+
+            fun collectSubtitleChoices(): List<SubtitleTrackChoice> {
+                val groups = exoPlayer.currentTracks.groups
+                val list = mutableListOf<SubtitleTrackChoice>()
+                for (g in groups) {
+                    if (g.type != C.TRACK_TYPE_TEXT) continue
+                    for (tIdx in 0 until g.length) {
+                        val fmt = g.getTrackFormat(tIdx)
+                        list.add(
+                            SubtitleTrackChoice(
+                                orderIndex = list.size,
+                                group = g,
+                                trackIndex = tIdx,
+                                format = fmt,
+                                label = buildSubtitleTrackLabel(fmt, list.size)
+                            )
+                        )
+                    }
+                }
+                return list
+            }
+
+            var isSubtitleDisabled = false
+
+            fun showSubtitleTrackListDialog() {
+                val subChoices = collectSubtitleChoices()
+                val dm = resources.displayMetrics
+                val dialogW = (dm.widthPixels * 0.88f).toInt().coerceAtMost(760)
+                val listMaxH = (dm.heightPixels * 0.54f).toInt().coerceIn(220, 500)
+
+                val pickerDialog = Dialog(this, android.R.style.Theme_Translucent_NoTitleBar_Fullscreen)
+                val overlayRoot = FrameLayout(this).apply {
+                    setBackgroundColor(Color.argb(190, 0, 0, 0))
+                    setOnClickListener { pickerDialog.dismiss() }
+                }
+                val card = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(if (isTv) 38 else 26, if (isTv) 30 else 24, if (isTv) 38 else 26, if (isTv) 30 else 24)
+                    clipChildren = false
+                    clipToPadding = false
+                    background = GradientDrawable().apply {
+                        shape = GradientDrawable.RECTANGLE
+                        cornerRadius = 26f
+                        setColor(Color.rgb(15, 23, 42))
+                        setStroke(2, Color.argb(110, 56, 189, 248))
+                    }
+                    layoutParams = FrameLayout.LayoutParams(
+                        dialogW,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        Gravity.CENTER
+                    )
+                    isClickable = true
+                }
+                val headerTitle = TextView(this).apply {
+                    text = "字幕选择 (${subChoices.size} 条内嵌字幕)"
+                    textSize = if (isTv) 17.5f else 15.5f
+                    setTextColor(Color.WHITE)
+                    typeface = Typeface.DEFAULT_BOLD
+                    setPadding(4, 0, 4, 14)
+                }
+                card.addView(headerTitle)
+
+                val scrollView = android.widget.ScrollView(this).apply {
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    )
+                }
+                val listLayout = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    clipChildren = false
+                    clipToPadding = false
+                    setPadding(4, 4, 4, 4)
+                }
+
+                var initialFocusBtn: Button? = null
+                val offBtn = Button(this).apply {
+                    text = (if (isSubtitleDisabled) "● [当前]  " else "    ") + "关闭字幕"
+                    textSize = if (isTv) 14f else 13f
+                    setTextColor(Color.WHITE)
+                    typeface = if (isSubtitleDisabled) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+                    gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                    setPadding(24, 14, 24, 14)
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        bottomMargin = 10
+                    }
+                    setOnClickListener {
+                        pickerDialog.dismiss()
+                        isSubtitleDisabled = true
+                        trackSelector.setParameters(
+                            trackSelector.buildUponParameters()
+                                .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+                                .clearOverridesOfType(C.TRACK_TYPE_TEXT)
+                        )
+                        subtitleTrackBtn.text = "💬 字幕:关 ▾"
+                    }
+                }
+                styleTvFocusableButton(
+                    btn = offBtn,
+                    normalBgColor = if (isSubtitleDisabled) Color.argb(230, 30, 64, 175) else Color.argb(210, 30, 41, 59),
+                    focusedBgColor = Color.rgb(2, 132, 199)
+                )
+                initialFocusBtn = offBtn
+                listLayout.addView(offBtn)
+
+                if (subChoices.isEmpty()) {
+                    val emptyHint = TextView(this).apply {
+                        text = "当前视频流未检测到内嵌字幕轨道（可在返回 MPV 播放器后加载本地 .srt/.ass 外挂字幕）"
+                        textSize = 12.5f
+                        setTextColor(Color.argb(190, 226, 232, 240))
+                        setPadding(8, 12, 8, 12)
+                    }
+                    listLayout.addView(emptyHint)
+                } else {
+                    for (sub in subChoices) {
+                        val isCurrent = !isSubtitleDisabled && sub.group.isTrackSelected(sub.trackIndex)
+                        val itemBtn = Button(this).apply {
+                            text = (if (isCurrent) "● [当前]  " else "    ") + "#${sub.orderIndex + 1}  ${sub.label}"
+                            textSize = if (isTv) 14f else 13f
+                            setTextColor(Color.WHITE)
+                            typeface = if (isCurrent) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+                            gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                            setPadding(24, 14, 24, 14)
+                            layoutParams = LinearLayout.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                ViewGroup.LayoutParams.WRAP_CONTENT
+                            ).apply {
+                                bottomMargin = 10
+                            }
+                            setOnClickListener {
+                                pickerDialog.dismiss()
+                                isSubtitleDisabled = false
+                                trackSelector.setParameters(
+                                    trackSelector.buildUponParameters()
+                                        .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                                        .setOverrideForType(
+                                            TrackSelectionOverride(sub.group.mediaTrackGroup, listOf(sub.trackIndex))
+                                        )
+                                )
+                                subtitleTrackBtn.text = "💬 ${sub.label.substringBefore(" · ")} ▾"
+                            }
+                        }
+                        styleTvFocusableButton(
+                            btn = itemBtn,
+                            normalBgColor = if (isCurrent) Color.argb(230, 30, 64, 175) else Color.argb(210, 30, 41, 59),
+                            focusedBgColor = Color.rgb(2, 132, 199)
+                        )
+                        if (isCurrent) {
+                            initialFocusBtn = itemBtn
+                        }
+                        listLayout.addView(itemBtn)
+                    }
+                }
+
+                scrollView.addView(listLayout)
+                if (subChoices.size > 4) {
+                    scrollView.layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        listMaxH
+                    )
+                }
+                card.addView(scrollView)
+                overlayRoot.addView(card)
+                pickerDialog.setContentView(overlayRoot)
+                pickerDialog.show()
+                initialFocusBtn?.post { initialFocusBtn?.requestFocus() }
+            }
+
+            subtitleTrackBtn.setOnClickListener {
+                showSubtitleTrackListDialog()
             }
 
             fun showSpeedListDialog() {
@@ -2093,13 +2315,20 @@ class MainActivity : FlutterActivity() {
                 }
             )
 
-            // Mobile Touch Gestures on PlayerView:
+            // Mobile Touch Gestures on PlayerView (VidHub Style):
             // - Double-tap: toggle Play/Pause
             // - Long-press: temporary 3.0x fast-forward (release to restore normalPlaybackSpeed)
             // - Horizontal drag: scrub progress with live timestamp preview badge
+            // - Left-half vertical drag: adjust Screen Brightness (☀️ 亮度)
+            // - Right-half vertical drag: adjust Audio Volume (🔊 音量)
             var isTouchHorizontalSeeking = false
+            var isTouchVerticalDragging = false
+            var isTouchBrightness = false
             var touchSeekStartMs = 0L
             var touchSeekPreviewMs = 0L
+            var touchStartBrightness = 0.85f
+            var touchStartVolumeRatio = 0.75f
+            val audioMgr = getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
             val touchGestureDetector = GestureDetector(
                 this,
                 object : GestureDetector.SimpleOnGestureListener() {
@@ -2123,7 +2352,7 @@ class MainActivity : FlutterActivity() {
                     }
 
                     override fun onLongPress(e: MotionEvent) {
-                        if (isTouchHorizontalSeeking) return
+                        if (isTouchHorizontalSeeking || isTouchVerticalDragging) return
                         isLongPressFastForward = true
                         exoPlayer.setPlaybackSpeed(3.0f)
                         gestureHudBadge.text = "⚡ 3.0x 倍速快进中 (松手恢复)"
@@ -2139,17 +2368,29 @@ class MainActivity : FlutterActivity() {
                         if (e1 == null || isLongPressFastForward) return false
                         val totalDx = e2.x - e1.x
                         val totalDy = e2.y - e1.y
-                        if (!isTouchHorizontalSeeking) {
+                        val viewW = playerView.width.coerceAtLeast(320).toFloat()
+                        val viewH = playerView.height.coerceAtLeast(240).toFloat()
+                        if (!isTouchHorizontalSeeking && !isTouchVerticalDragging) {
                             if (e1.x <= 48f) return false
-                            if (kotlin.math.abs(totalDx) > 36f && kotlin.math.abs(totalDx) > kotlin.math.abs(totalDy) * 1.5f) {
+                            if (kotlin.math.abs(totalDx) > 36f && kotlin.math.abs(totalDx) > kotlin.math.abs(totalDy) * 1.4f) {
                                 isTouchHorizontalSeeking = true
                                 touchSeekStartMs = exoPlayer.currentPosition.coerceAtLeast(0L)
                                 touchSeekPreviewMs = touchSeekStartMs
+                            } else if (kotlin.math.abs(totalDy) > 36f && kotlin.math.abs(totalDy) > kotlin.math.abs(totalDx) * 1.4f) {
+                                isTouchVerticalDragging = true
+                                isTouchBrightness = e1.x < (viewW * 0.5f)
+                                if (isTouchBrightness) {
+                                    val curB = dialog.window?.attributes?.screenBrightness ?: -1f
+                                    touchStartBrightness = if (curB in 0.05f..1.0f) curB else 0.8f
+                                } else if (audioMgr != null) {
+                                    val maxV = audioMgr.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                                    val curV = audioMgr.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)
+                                    touchStartVolumeRatio = (curV.toFloat() / maxV.toFloat()).coerceIn(0f, 1f)
+                                }
                             }
                         }
                         if (isTouchHorizontalSeeking) {
                             val durMs = exoPlayer.duration.takeIf { it > 0L } ?: 3600_000L
-                            val viewW = playerView.width.coerceAtLeast(320).toFloat()
                             val spanMs = durMs.coerceIn(90_000L, 300_000L)
                             val deltaMs = ((totalDx / viewW) * spanMs).toLong()
                             touchSeekPreviewMs = (touchSeekStartMs + deltaMs).coerceIn(0L, durMs)
@@ -2158,6 +2399,29 @@ class MainActivity : FlutterActivity() {
                             val dirIcon = if (diffSec >= 0L) "⏩ 快进" else "⏪ 快退"
                             gestureHudBadge.text = "$dirIcon  ${formatClockMs(touchSeekPreviewMs)} / ${formatClockMs(durMs)} ($sign${diffSec}秒)"
                             gestureHudBadge.visibility = View.VISIBLE
+                            return true
+                        }
+                        if (isTouchVerticalDragging) {
+                            val deltaRatio = (-totalDy / viewH) * 1.25f
+                            if (isTouchBrightness) {
+                                val nextB = (touchStartBrightness + deltaRatio).coerceIn(0.08f, 1.0f)
+                                dialog.window?.let { win ->
+                                    val lp = win.attributes
+                                    lp.screenBrightness = nextB
+                                    win.attributes = lp
+                                }
+                                val pct = (nextB * 100f).toInt().coerceIn(8, 100)
+                                gestureHudBadge.text = "☀️ 亮度 $pct%"
+                                gestureHudBadge.visibility = View.VISIBLE
+                            } else if (audioMgr != null) {
+                                val maxV = audioMgr.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                                val nextRatio = (touchStartVolumeRatio + deltaRatio).coerceIn(0f, 1f)
+                                val targetVol = (nextRatio * maxV).toInt().coerceIn(0, maxV)
+                                audioMgr.setStreamVolume(android.media.AudioManager.STREAM_MUSIC, targetVol, 0)
+                                val pct = (nextRatio * 100f).toInt().coerceIn(0, 100)
+                                gestureHudBadge.text = "🔊 音量 $pct%"
+                                gestureHudBadge.visibility = View.VISIBLE
+                            }
                             return true
                         }
                         return false
@@ -2178,6 +2442,10 @@ class MainActivity : FlutterActivity() {
                         gestureHudBadge.visibility = View.GONE
                         exoPlayer.seekTo(touchSeekPreviewMs)
                         playerView.showController()
+                    }
+                    if (isTouchVerticalDragging) {
+                        isTouchVerticalDragging = false
+                        gestureHudBadge.visibility = View.GONE
                     }
                 }
                 handled
@@ -2299,7 +2567,33 @@ class MainActivity : FlutterActivity() {
             var didAutoSelectInitialSafeAudio = false
             var didTryFallbackUrl = false
             exoPlayer.addListener(object : Player.Listener {
+                override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                    val w = videoSize.width
+                    val h = videoSize.height
+                    if (w > 0 && h > 0) {
+                        val longEdge = kotlin.math.max(w, h)
+                        val resTag = when {
+                            longEdge >= 3200 -> "4K UHD"
+                            longEdge >= 2200 -> "2K QHD"
+                            longEdge >= 1700 -> "1080P"
+                            longEdge >= 1100 -> "720P"
+                            else -> "${w}x$h"
+                        }
+                        badgeView.text = if (isTv) "$resTag · Exo硬解" else "$resTag · Exo"
+                    }
+                }
+
                 override fun onTracksChanged(tracks: Tracks) {
+                    val subChoices = collectSubtitleChoices()
+                    if (!isSubtitleDisabled) {
+                        val activeSub = subChoices.firstOrNull { it.group.isTrackSelected(it.trackIndex) }
+                        if (activeSub != null) {
+                            subtitleTrackBtn.text = "💬 ${activeSub.label.substringBefore(" · ")} ▾"
+                        } else if (subChoices.isNotEmpty()) {
+                            subtitleTrackBtn.text = "💬 字幕(${subChoices.size}) ▾"
+                        }
+                    }
+
                     val choices = collectAudioChoices(includeRejected = false)
                     if (choices.isEmpty()) return
 

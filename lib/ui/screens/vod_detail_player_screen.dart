@@ -166,7 +166,11 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
   DateTime _lastHistorySync = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime? _lastBackHandledAt;
   bool _isVerticalVolumeDragging = false;
+  bool _isVerticalBrightness = false;
   double _volumePercent = 100.0;
+  double _brightnessPercent = 100.0;
+  bool _showRemainingTime = true;
+  bool _isFullscreenLocked = false;
   String _lastVodRouteSignature = '';
   int _lastObservedNetworkResumeEpoch = 0;
 
@@ -707,53 +711,131 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     return parts.join(' · ');
   }
 
+  String? _videoQualityBadge() {
+    if (_videoWidth <= 0 || _videoHeight <= 0) return null;
+    final longEdge = math.max(_videoWidth, _videoHeight);
+    if (longEdge >= 3200) return '4K UHD';
+    if (longEdge >= 2200) return '2K QHD';
+    if (longEdge >= 1700) return '1080P';
+    if (longEdge >= 1100) return '720P';
+    return '${_videoWidth}x$_videoHeight';
+  }
+
+  String _formatSubtitleTrackLabel(SubtitleTrack t, int index) {
+    final parts = <String>[];
+    final lang = (t.language ?? '').trim().toLowerCase();
+    final rawTitle = (t.title ?? '').trim();
+    if (rawTitle.contains('简') ||
+        lang.contains('hans') ||
+        lang == 'chs' ||
+        lang == 'zh-cn') {
+      parts.add('简体中文');
+    } else if (rawTitle.contains('繁') ||
+        lang.contains('hant') ||
+        lang == 'cht' ||
+        lang == 'zh-tw' ||
+        lang == 'zh-hk') {
+      parts.add('繁体中文');
+    } else if (lang.startsWith('zh') ||
+        lang.startsWith('chi') ||
+        lang.startsWith('zho')) {
+      parts.add('中文');
+    } else if (lang.startsWith('en')) {
+      parts.add('英语');
+    } else if (lang.startsWith('ja') || lang.startsWith('jpn')) {
+      parts.add('日语');
+    } else if (lang.startsWith('ko') || lang.startsWith('kor')) {
+      parts.add('韩语');
+    } else if (lang.isNotEmpty && lang != 'und') {
+      parts.add(lang.toUpperCase());
+    } else {
+      parts.add('字幕${index + 1}');
+    }
+    if (rawTitle.isNotEmpty && !parts.any((p) => rawTitle == p)) {
+      parts.add(rawTitle);
+    }
+    final codec = (t.codec ?? '').trim();
+    if (codec.isNotEmpty) {
+      parts.add(codec.toUpperCase());
+    }
+    return parts.join(' · ');
+  }
+
   Future<void> _showVodAudioTrackSelectorDialog() async {
     final allTracks = _player.state.tracks.audio;
     final realTracks =
         allTracks.where((t) => t.id != 'auto' && t.id != 'no').toList();
     final tracks = realTracks.isNotEmpty ? realTracks : allTracks;
-    await showDialog<void>(
+    await showModalBottomSheet<void>(
       context: context,
+      backgroundColor: const Color(0xF2101622),
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+      ),
       builder: (ctx) {
         return StatefulBuilder(
           builder: (ctx, setDialogState) {
             final current = _player.state.track.audio;
-            return AlertDialog(
-              backgroundColor: VideoPlatformTheme.bgElevated,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(18),
-                side: BorderSide(
-                  color: VideoPlatformTheme.accent.withValues(alpha: 0.45),
-                ),
-              ),
-              title: Row(
-                children: [
-                  Icon(
-                    Icons.surround_sound_rounded,
-                    color: VideoPlatformTheme.accent,
-                    size: 22,
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      '选择音轨 / 声道 (共 ${tracks.length} 条 · 全格式软解混音)',
-                      style: const TextStyle(
-                        fontSize: 15.5,
-                        fontWeight: FontWeight.w700,
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(18, 12, 18, 18),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Center(
+                      child: Container(
+                        width: 38,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: Colors.white24,
+                          borderRadius: BorderRadius.circular(2),
+                        ),
                       ),
                     ),
-                  ),
-                ],
-              ),
-              content: SizedBox(
-                width: 540,
-                child: tracks.isEmpty
-                    ? const Padding(
-                        padding: EdgeInsets.symmetric(vertical: 20),
-                        child: Text('当前视频流仅包含默认音轨，或正在解析音轨列表...'),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Icon(
+                          Icons.surround_sound_rounded,
+                          color: VideoPlatformTheme.accent,
+                          size: 21,
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            '音轨与多声道选择 (${tracks.length})',
+                            style: const TextStyle(
+                              fontSize: 15.5,
+                              fontWeight: FontWeight.w700,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          onPressed: () => Navigator.of(ctx).pop(),
+                          icon: const Icon(
+                            Icons.close_rounded,
+                            color: Colors.white70,
+                            size: 20,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    if (tracks.isEmpty)
+                      const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 22),
+                        child: Text(
+                          '当前视频流仅包含默认音轨，或正在解析音轨列表...',
+                          style: TextStyle(color: Colors.white70, fontSize: 13),
+                        ),
                       )
-                    : ConstrainedBox(
-                        constraints: const BoxConstraints(maxHeight: 400),
+                    else
+                      ConstrainedBox(
+                        constraints: const BoxConstraints(maxHeight: 340),
                         child: ListView.separated(
                           shrinkWrap: true,
                           itemCount: tracks.length,
@@ -791,8 +873,8 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                         duration:
                                             const Duration(milliseconds: 120),
                                         padding: const EdgeInsets.symmetric(
-                                          horizontal: 16,
-                                          vertical: 12,
+                                          horizontal: 15,
+                                          vertical: 11,
                                         ),
                                         decoration: BoxDecoration(
                                           color: isFocused
@@ -800,7 +882,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                               : (isSelected
                                                   ? VideoPlatformTheme.accent
                                                       .withValues(alpha: 0.22)
-                                                  : VideoPlatformTheme.bgCard),
+                                                  : const Color(0xFF172030)),
                                           borderRadius:
                                               BorderRadius.circular(12),
                                           border: Border.all(
@@ -808,9 +890,8 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                                 ? const Color(0xFFFFE066)
                                                 : (isSelected
                                                     ? VideoPlatformTheme.accent
-                                                    : VideoPlatformTheme
-                                                        .borderSubtle),
-                                            width: isFocused ? 2.6 : 1.2,
+                                                    : Colors.white12),
+                                            width: isFocused ? 2.4 : 1.2,
                                           ),
                                         ),
                                         child: Row(
@@ -822,8 +903,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                               size: 19,
                                               color: isFocused || isSelected
                                                   ? Colors.white
-                                                  : VideoPlatformTheme
-                                                      .textSecondary,
+                                                  : Colors.white70,
                                             ),
                                             const SizedBox(width: 10),
                                             Expanded(
@@ -871,15 +951,322 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                           },
                         ),
                       ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(ctx).pop(),
-                  child: const Text('关闭'),
+                  ],
                 ),
-              ],
+              ),
             );
           },
+        );
+      },
+    );
+  }
+
+  Future<void> _showVodSubtitleSelectorSheet() async {
+    final allSubs = _player.state.tracks.subtitle;
+    final realSubs =
+        allSubs.where((t) => t.id != 'auto' && t.id != 'no').toList();
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xF2101622),
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+      ),
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setSheetState) {
+            final current = _player.state.track.subtitle;
+            final isOff = current.id == 'no';
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(18, 12, 18, 18),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Center(
+                      child: Container(
+                        width: 38,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: Colors.white24,
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Icon(
+                          Icons.subtitles_rounded,
+                          color: VideoPlatformTheme.accent,
+                          size: 21,
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            '字幕选择 (${realSubs.length} 条内嵌字幕)',
+                            style: const TextStyle(
+                              fontSize: 15.5,
+                              fontWeight: FontWeight.w700,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ),
+                        TextButton.icon(
+                          onPressed: () {
+                            Navigator.of(ctx).pop();
+                            _showExternalSubtitleDialog();
+                          },
+                          icon: const Icon(
+                            Icons.folder_open_rounded,
+                            size: 15,
+                          ),
+                          label: Text(
+                            _externalSubtitleName != null
+                                ? '外挂: $_externalSubtitleName'
+                                : '加载外挂字幕...',
+                            style: const TextStyle(fontSize: 12),
+                          ),
+                        ),
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          onPressed: () => Navigator.of(ctx).pop(),
+                          icon: const Icon(
+                            Icons.close_rounded,
+                            color: Colors.white70,
+                            size: 20,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxHeight: 320),
+                      child: ListView(
+                        shrinkWrap: true,
+                        children: [
+                          InkWell(
+                            borderRadius: BorderRadius.circular(12),
+                            onTap: () async {
+                              await _player.setSubtitleTrack(SubtitleTrack.no());
+                              if (mounted) {
+                                setState(() => _externalSubtitleName = null);
+                              }
+                              if (ctx.mounted) Navigator.of(ctx).pop();
+                              _showAdToast('已关闭字幕');
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 15,
+                                vertical: 11,
+                              ),
+                              decoration: BoxDecoration(
+                                color: isOff
+                                    ? VideoPlatformTheme.accent
+                                        .withValues(alpha: 0.22)
+                                    : const Color(0xFF172030),
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(
+                                  color: isOff
+                                      ? VideoPlatformTheme.accent
+                                      : Colors.white12,
+                                ),
+                              ),
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    isOff
+                                        ? Icons.check_circle_rounded
+                                        : Icons.subtitles_off_rounded,
+                                    size: 18,
+                                    color:
+                                        isOff ? Colors.white : Colors.white70,
+                                  ),
+                                  const SizedBox(width: 10),
+                                  const Expanded(
+                                    child: Text(
+                                      '关闭字幕',
+                                      style: TextStyle(
+                                        fontSize: 13.5,
+                                        fontWeight: FontWeight.w600,
+                                        color: Colors.white,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                          for (int idx = 0; idx < realSubs.length; idx++) ...[
+                            const SizedBox(height: 8),
+                            Builder(
+                              builder: (_) {
+                                final t = realSubs[idx];
+                                final isSelected = current.id == t.id;
+                                final label =
+                                    _formatSubtitleTrackLabel(t, idx);
+                                return InkWell(
+                                  autofocus: isSelected,
+                                  borderRadius: BorderRadius.circular(12),
+                                  onTap: () async {
+                                    await _player.setSubtitleTrack(t);
+                                    if (mounted) setState(() {});
+                                    if (ctx.mounted) Navigator.of(ctx).pop();
+                                    _showAdToast('已切换至字幕：$label');
+                                  },
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 15,
+                                      vertical: 11,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: isSelected
+                                          ? VideoPlatformTheme.accent
+                                              .withValues(alpha: 0.22)
+                                          : const Color(0xFF172030),
+                                      borderRadius: BorderRadius.circular(12),
+                                      border: Border.all(
+                                        color: isSelected
+                                            ? VideoPlatformTheme.accent
+                                            : Colors.white12,
+                                      ),
+                                    ),
+                                    child: Row(
+                                      children: [
+                                        Icon(
+                                          isSelected
+                                              ? Icons.check_circle_rounded
+                                              : Icons.closed_caption_rounded,
+                                          size: 18,
+                                          color: isSelected
+                                              ? Colors.white
+                                              : Colors.white70,
+                                        ),
+                                        const SizedBox(width: 10),
+                                        Expanded(
+                                          child: Text(
+                                            '#${idx + 1}  $label',
+                                            style: TextStyle(
+                                              fontSize: 13.5,
+                                              fontWeight: isSelected
+                                                  ? FontWeight.w700
+                                                  : FontWeight.w500,
+                                              color: Colors.white,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                );
+                              },
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _showVodSpeedSelectorSheet() async {
+    const speeds = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0];
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xF2101622),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(18, 12, 18, 22),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(
+                  child: Container(
+                    width: 38,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: Colors.white24,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Icon(
+                      Icons.speed_rounded,
+                      color: VideoPlatformTheme.accent,
+                      size: 20,
+                    ),
+                    const SizedBox(width: 8),
+                    const Text(
+                      '播放倍速',
+                      style: TextStyle(
+                        fontSize: 15.5,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 10,
+                  children: [
+                    for (final s in speeds)
+                      InkWell(
+                        borderRadius: BorderRadius.circular(12),
+                        onTap: () {
+                          setState(() => _playbackSpeed = s);
+                          _player.setRate(s);
+                          Navigator.of(ctx).pop();
+                          _showAdToast('播放速度：${s}x');
+                        },
+                        child: Container(
+                          width: 78,
+                          height: 42,
+                          alignment: Alignment.center,
+                          decoration: BoxDecoration(
+                            color: _playbackSpeed == s
+                                ? VideoPlatformTheme.accent
+                                : const Color(0xFF172030),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                              color: _playbackSpeed == s
+                                  ? Colors.white
+                                  : Colors.white12,
+                            ),
+                          ),
+                          child: Text(
+                            '${s}x',
+                            style: TextStyle(
+                              fontSize: 13.5,
+                              fontWeight: _playbackSpeed == s
+                                  ? FontWeight.w800
+                                  : FontWeight.w600,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ],
+            ),
+          ),
         );
       },
     );
@@ -3366,7 +3753,8 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                               fullBleed: true,
                               isFullscreen: true,
                             ),
-                            if (_fullscreenControlsVisible)
+                            if (_fullscreenControlsVisible &&
+                                !_isFullscreenLocked)
                               Positioned(
                                 left: 0,
                                 right: 0,
@@ -3718,6 +4106,13 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                               label: '音轨/声道',
                               tooltip: '弹出列表选择音轨与声道',
                               onPressed: _showVodAudioTrackSelectorDialog,
+                            ),
+                            const SizedBox(width: 10),
+                            _buildTvFocusableControlBtn(
+                              icon: Icons.subtitles_rounded,
+                              label: '字幕',
+                              tooltip: '弹出列表选择内嵌或外挂字幕',
+                              onPressed: _showVodSubtitleSelectorSheet,
                             ),
                             if (hasMultipleEps) ...[
                               const SizedBox(width: 10),
@@ -4506,13 +4901,26 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                   ),
                                 ),
                               ),
-                              Text(
-                                _formatDurationLabel(
-                                  rawDur.inSeconds > 0 ? rawDur.inSeconds : 0,
+                              GestureDetector(
+                                onTap: () => setState(
+                                  () => _showRemainingTime =
+                                      !_showRemainingTime,
                                 ),
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: VideoPlatformTheme.textSecondary,
+                                child: Text(
+                                  _showRemainingTime && rawDur.inSeconds > 0
+                                      ? '-${_formatDurationLabel((rawDur.inSeconds - curSec.round()).clamp(0, rawDur.inSeconds))}'
+                                      : _formatDurationLabel(
+                                          rawDur.inSeconds > 0
+                                              ? rawDur.inSeconds
+                                              : 0,
+                                        ),
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: VideoPlatformTheme.textSecondary,
+                                    fontFeatures: const [
+                                      FontFeature.tabularFigures(),
+                                    ],
+                                  ),
                                 ),
                               ),
                               const SizedBox(width: 8),
@@ -4645,6 +5053,25 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                 label: '音轨',
                                 tooltip: '弹出列表选择音轨与声道',
                                 onPressed: _showVodAudioTrackSelectorDialog,
+                              ),
+                              const SizedBox(width: 8),
+                              _buildTvFocusableControlBtn(
+                                icon: Icons.subtitles_rounded,
+                                label: '字幕',
+                                tooltip: '弹出列表选择内嵌或外挂字幕',
+                                isPrimary: _externalSubtitleName != null ||
+                                    _player.state.track.subtitle.id != 'no',
+                                onPressed: _showVodSubtitleSelectorSheet,
+                              ),
+                              const SizedBox(width: 8),
+                              _buildTvFocusableControlBtn(
+                                icon: Icons.speed_rounded,
+                                label: _playbackSpeed == 1.0
+                                    ? '倍速'
+                                    : '${_playbackSpeed}x',
+                                tooltip: '选择播放倍速 (0.5x ~ 3.0x)',
+                                isPrimary: _playbackSpeed != 1.0,
+                                onPressed: _showVodSpeedSelectorSheet,
                               ),
                               if (Platform.isAndroid) ...[
                                 const SizedBox(width: 8),
@@ -4833,27 +5260,41 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                   _player.playOrPause();
                 }
               },
-        onDoubleTap: () => _player.playOrPause(),
+        onDoubleTap: () {
+          if (isFullscreen && _isFullscreenLocked) return;
+          _player.playOrPause();
+        },
         onVerticalDragStart: (details) {
+          if (isFullscreen && _isFullscreenLocked) return;
           if (details.globalPosition.dx <= 40.0) return;
           if (_currentEpisode == null || _isResolvingPlay) return;
-          setState(() => _isVerticalVolumeDragging = true);
+          final isLeftHalf = details.localPosition.dx < (screenSize.width * 0.5);
+          setState(() {
+            _isVerticalVolumeDragging = true;
+            _isVerticalBrightness = isLeftHalf;
+          });
         },
         onVerticalDragUpdate: (details) {
           if (!_isVerticalVolumeDragging) return;
           final stageH = isFullscreen
               ? screenSize.height.clamp(240.0, 1200.0)
               : mobileStageHeight;
-          final deltaVol = (-details.delta.dy / stageH) * 120.0;
-          final nextVol = (_volumePercent + deltaVol).clamp(0.0, 100.0);
-          setState(() => _volumePercent = nextVol);
-          _player.setVolume(nextVol);
+          final delta = (-details.delta.dy / stageH) * 120.0;
+          if (_isVerticalBrightness) {
+            final nextB = (_brightnessPercent + delta).clamp(15.0, 100.0);
+            setState(() => _brightnessPercent = nextB);
+          } else {
+            final nextVol = (_volumePercent + delta).clamp(0.0, 100.0);
+            setState(() => _volumePercent = nextVol);
+            _player.setVolume(nextVol);
+          }
         },
         onVerticalDragEnd: (_) {
           if (!_isVerticalVolumeDragging) return;
           setState(() => _isVerticalVolumeDragging = false);
         },
         onHorizontalDragStart: (details) {
+          if (isFullscreen && _isFullscreenLocked) return;
           // Reserve left-edge swipe (dx <= 40) for mobile swipe-back gesture!
           if (details.globalPosition.dx <= 40.0) return;
           if (_currentEpisode == null || _isResolvingPlay) return;
@@ -4891,6 +5332,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
           _player.seek(Duration(seconds: targetSec));
         },
         onLongPressStart: (_) {
+          if (isFullscreen && _isFullscreenLocked) return;
           if (_currentEpisode == null || _isResolvingPlay) return;
           setState(() => _isLongPressFastForward = true);
           _player.setRate(3.0);
@@ -4921,6 +5363,11 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                   (_videoWidth > 0 && _videoHeight > 0
                       ? _videoWidth / _videoHeight
                       : null);
+              final showStageOsd = isFullscreen
+                  ? (_fullscreenControlsVisible && !_isFullscreenLocked)
+                  : (!widget.appState.tvMode &&
+                      (!isMobilePortrait || _mobileStageOsdVisible));
+              final qualityBadge = _videoQualityBadge();
               return Stack(
                 fit: StackFit.expand,
                 children: [
@@ -4936,6 +5383,15 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                     pauseUponEnteringBackgroundMode: false,
                     resumeUponEnteringForegroundMode: true,
                   ),
+                  if (_brightnessPercent < 99.5)
+                    IgnorePointer(
+                      child: Container(
+                        color: Colors.black.withValues(
+                          alpha: ((100.0 - _brightnessPercent) / 115.0)
+                              .clamp(0.0, 0.75),
+                        ),
+                      ),
+                    ),
               if (_isHorizontalSeeking)
                 Center(
                   child: IgnorePointer(
@@ -4981,9 +5437,10 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                 Center(
                   child: IgnorePointer(
                     child: Container(
+                      width: 164,
                       padding: const EdgeInsets.symmetric(
-                        horizontal: 18,
-                        vertical: 10,
+                        horizontal: 16,
+                        vertical: 11,
                       ),
                       decoration: BoxDecoration(
                         color: const Color(0xE0090E14),
@@ -4993,25 +5450,52 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                           width: 1.4,
                         ),
                       ),
-                      child: Row(
+                      child: Column(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Icon(
-                            _volumePercent <= 0
-                                ? Icons.volume_off_rounded
-                                : (_volumePercent < 50
-                                    ? Icons.volume_down_rounded
-                                    : Icons.volume_up_rounded),
-                            color: VideoPlatformTheme.accent,
-                            size: 20,
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                _isVerticalBrightness
+                                    ? Icons.wb_sunny_rounded
+                                    : (_volumePercent <= 0
+                                        ? Icons.volume_off_rounded
+                                        : (_volumePercent < 50
+                                            ? Icons.volume_down_rounded
+                                            : Icons.volume_up_rounded)),
+                                color: _isVerticalBrightness
+                                    ? const Color(0xFFFACC15)
+                                    : VideoPlatformTheme.accent,
+                                size: 20,
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                _isVerticalBrightness
+                                    ? '亮度 ${_brightnessPercent.round()}%'
+                                    : '音量 ${_volumePercent.round()}%',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ],
                           ),
-                          const SizedBox(width: 8),
-                          Text(
-                            '音量 ${_volumePercent.round()}%',
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 14,
-                              fontWeight: FontWeight.w700,
+                          const SizedBox(height: 8),
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(4),
+                            child: LinearProgressIndicator(
+                              minHeight: 4.5,
+                              value: ((_isVerticalBrightness
+                                          ? _brightnessPercent
+                                          : _volumePercent) /
+                                      100.0)
+                                  .clamp(0.0, 1.0),
+                              backgroundColor: Colors.white24,
+                              color: _isVerticalBrightness
+                                  ? const Color(0xFFFACC15)
+                                  : VideoPlatformTheme.accent,
                             ),
                           ),
                         ],
@@ -5019,6 +5503,48 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                     ),
                   ),
                 ),
+              // Fullscreen Mid-Left Screen Lock Button (VidHub style)
+              if (isFullscreen && _fullscreenControlsVisible)
+                Positioned(
+                  left: 16,
+                  top: 0,
+                  bottom: 0,
+                  child: Center(
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(22),
+                      onTap: () {
+                        setState(
+                          () => _isFullscreenLocked = !_isFullscreenLocked,
+                        );
+                        _pokeFullscreenControls();
+                      },
+                      child: Container(
+                        width: 42,
+                        height: 42,
+                        decoration: BoxDecoration(
+                          color: _isFullscreenLocked
+                              ? VideoPlatformTheme.accent
+                                  .withValues(alpha: 0.88)
+                              : const Color(0xA6000000),
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: _isFullscreenLocked
+                                ? Colors.white
+                                : Colors.white24,
+                          ),
+                        ),
+                        child: Icon(
+                          _isFullscreenLocked
+                              ? Icons.lock_rounded
+                              : Icons.lock_open_rounded,
+                          color: Colors.white,
+                          size: 20,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              // VidHub Center Transport Buttons (⏪ 15s, ▶/⏸, ⏩ 15s)
               if (!_isHorizontalSeeking &&
                   !_isVerticalVolumeDragging &&
                   !_isLoadingDetail &&
@@ -5026,34 +5552,89 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                   _hasRenderedFirstFrame &&
                   !_player.state.buffering &&
                   _playError == null &&
-                  _currentEpisode != null)
+                  _currentEpisode != null &&
+                  !(isFullscreen && _isFullscreenLocked))
                 StreamBuilder<bool>(
                   stream: _player.stream.playing,
                   initialData: _player.state.playing,
                   builder: (_, playSnap) {
                     final isPlaying = playSnap.data ?? false;
-                    if (isPlaying) return const SizedBox.shrink();
+                    if (isPlaying && !showStageOsd) {
+                      return const SizedBox.shrink();
+                    }
                     return Center(
-                      child: GestureDetector(
-                        onTap: () => _player.play(),
-                        child: Container(
-                          width: 62,
-                          height: 62,
-                          decoration: BoxDecoration(
-                            color: const Color(0xAA090E14),
-                            shape: BoxShape.circle,
-                            border: Border.all(
-                              color: VideoPlatformTheme.accent,
-                              width: 2.0,
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (showStageOsd) ...[
+                            GestureDetector(
+                              onTap: () => _rewindSeconds(15),
+                              child: Container(
+                                width: 46,
+                                height: 46,
+                                decoration: BoxDecoration(
+                                  color: const Color(0x99090E14),
+                                  shape: BoxShape.circle,
+                                  border: Border.all(color: Colors.white24),
+                                ),
+                                alignment: Alignment.center,
+                                child: const Icon(
+                                  Icons.replay_10_rounded,
+                                  color: Colors.white,
+                                  size: 25,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 28),
+                          ],
+                          GestureDetector(
+                            onTap: () => _player.playOrPause(),
+                            child: Container(
+                              width: 62,
+                              height: 62,
+                              decoration: BoxDecoration(
+                                color: const Color(0xB8090E14),
+                                shape: BoxShape.circle,
+                                border: Border.all(
+                                  color: VideoPlatformTheme.accent,
+                                  width: 2.0,
+                                ),
+                              ),
+                              alignment: Alignment.center,
+                              child: Icon(
+                                isPlaying
+                                    ? Icons.pause_rounded
+                                    : Icons.play_arrow_rounded,
+                                color: Colors.white,
+                                size: 36,
+                              ),
                             ),
                           ),
-                          alignment: Alignment.center,
-                          child: const Icon(
-                            Icons.play_arrow_rounded,
-                            color: Colors.white,
-                            size: 38,
-                          ),
-                        ),
+                          if (showStageOsd) ...[
+                            const SizedBox(width: 28),
+                            GestureDetector(
+                              onTap: () => _skipForwardSeconds(
+                                15,
+                                customReason: '已快进 15s',
+                              ),
+                              child: Container(
+                                width: 46,
+                                height: 46,
+                                decoration: BoxDecoration(
+                                  color: const Color(0x99090E14),
+                                  shape: BoxShape.circle,
+                                  border: Border.all(color: Colors.white24),
+                                ),
+                                alignment: Alignment.center,
+                                child: const Icon(
+                                  Icons.forward_10_rounded,
+                                  color: Colors.white,
+                                  size: 25,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ],
                       ),
                     );
                   },
@@ -5141,24 +5722,15 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
             // Floating movable / hideable / closable download speed badge on VOD stage
             if (_currentEpisode != null)
               Positioned(
-                top: (isFullscreen
-                        ? _fullscreenControlsVisible
-                        : (!widget.appState.tvMode &&
-                            (!isMobilePortrait || _mobileStageOsdVisible)))
-                    ? 50
-                    : 10,
+                top: showStageOsd ? 50 : 10,
                 right: 12,
                 child: VideoDownloadSpeedBadge(
                   player: _player,
                   compact: true,
                 ),
               ),
-            // Floating proxy node selector + download speed HUD + quick "跳过广告" pill on video stage
-            // Hidden in fullscreen mode, TV preview window, or mobile portrait unless controls are woken up!
-            if (isFullscreen
-                ? _fullscreenControlsVisible
-                : (!widget.appState.tvMode &&
-                    (!isMobilePortrait || _mobileStageOsdVisible)))
+            // VidHub-style Clean Top Bar on Video Stage
+            if (showStageOsd)
               Positioned(
                 top: 10,
                 left: 10,
@@ -5184,12 +5756,12 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                           child: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              Icon(
-                                Icons.fullscreen_exit_rounded,
-                                size: 16,
-                                color: VideoPlatformTheme.accent,
+                              const Icon(
+                                Icons.arrow_back_ios_new_rounded,
+                                size: 14,
+                                color: Colors.white,
                               ),
-                              const SizedBox(width: 4),
+                              const SizedBox(width: 6),
                               ConstrainedBox(
                                 constraints:
                                     const BoxConstraints(maxWidth: 240),
@@ -5203,12 +5775,61 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                   overflow: TextOverflow.ellipsis,
                                   style: const TextStyle(
                                     color: Colors.white,
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.w600,
+                                    fontSize: 12.5,
+                                    fontWeight: FontWeight.w700,
                                   ),
                                 ),
                               ),
+                              if (qualityBadge != null) ...[
+                                const SizedBox(width: 6),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 6,
+                                    vertical: 1.5,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: VideoPlatformTheme.accent
+                                        .withValues(alpha: 0.22),
+                                    borderRadius: BorderRadius.circular(5),
+                                    border: Border.all(
+                                      color: VideoPlatformTheme.accent
+                                          .withValues(alpha: 0.65),
+                                    ),
+                                  ),
+                                  child: Text(
+                                    qualityBadge,
+                                    style: TextStyle(
+                                      color: VideoPlatformTheme.accent,
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                  ),
+                                ),
+                              ],
                             ],
+                          ),
+                        ),
+                      )
+                    else if (qualityBadge != null)
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 7,
+                          vertical: 2.5,
+                        ),
+                        decoration: BoxDecoration(
+                          color: const Color(0xBB090E14),
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(
+                            color: VideoPlatformTheme.accent
+                                .withValues(alpha: 0.6),
+                          ),
+                        ),
+                        child: Text(
+                          qualityBadge,
+                          style: TextStyle(
+                            color: VideoPlatformTheme.accent,
+                            fontSize: 10.5,
+                            fontWeight: FontWeight.w800,
                           ),
                         ),
                       ),
@@ -5753,13 +6374,25 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                             ),
                           ),
                         ),
-                        Text(
-                          _formatDurationLabel(
-                            rawDur.inSeconds > 0 ? rawDur.inSeconds : 0,
+                        GestureDetector(
+                          onTap: () => setState(
+                            () => _showRemainingTime = !_showRemainingTime,
                           ),
-                          style: TextStyle(
-                            fontSize: 11,
-                            color: VideoPlatformTheme.textMuted,
+                          child: Text(
+                            _showRemainingTime && rawDur.inSeconds > 0
+                                ? '-${_formatDurationLabel((rawDur.inSeconds - curSec.round()).clamp(0, rawDur.inSeconds))}'
+                                : _formatDurationLabel(
+                                    rawDur.inSeconds > 0
+                                        ? rawDur.inSeconds
+                                        : 0,
+                                  ),
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: VideoPlatformTheme.textMuted,
+                              fontFeatures: const [
+                                FontFeature.tabularFigures(),
+                              ],
+                            ),
                           ),
                         ),
                       ],
@@ -5899,6 +6532,44 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                           ),
                         ),
                         const SizedBox(width: 4),
+                        // Subtitle pop-up list pill
+                        InkWell(
+                          borderRadius: BorderRadius.circular(12),
+                          onTap: _showVodSubtitleSelectorSheet,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 7,
+                              vertical: 4,
+                            ),
+                            decoration: BoxDecoration(
+                              color: VideoPlatformTheme.bgCard,
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: VideoPlatformTheme.borderSubtle,
+                              ),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  Icons.subtitles_rounded,
+                                  size: 13,
+                                  color: VideoPlatformTheme.accent,
+                                ),
+                                const SizedBox(width: 2),
+                                Text(
+                                  '字幕',
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                    color: VideoPlatformTheme.textSecondary,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 4),
                         // Aspect ratio / Fit-Cover quick toggle pill
                         InkWell(
                           borderRadius: BorderRadius.circular(12),
@@ -5937,22 +6608,10 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                           ),
                         ),
                         const SizedBox(width: 5),
-                        // Speed selector pill
-                        PopupMenuButton<double>(
-                          tooltip: '倍速播放',
-                          initialValue: _playbackSpeed,
-                          onSelected: (speed) {
-                            setState(() => _playbackSpeed = speed);
-                            _player.setRate(speed);
-                          },
-                          itemBuilder: (_) => const [
-                            PopupMenuItem(value: 0.75, child: Text('0.75x')),
-                            PopupMenuItem(value: 1.0, child: Text('1.0x 正常')),
-                            PopupMenuItem(value: 1.25, child: Text('1.25x')),
-                            PopupMenuItem(value: 1.5, child: Text('1.5x')),
-                            PopupMenuItem(value: 2.0, child: Text('2.0x')),
-                            PopupMenuItem(value: 3.0, child: Text('3.0x 极速')),
-                          ],
+                        // Speed selector pill (VidHub sheet)
+                        InkWell(
+                          borderRadius: BorderRadius.circular(12),
+                          onTap: _showVodSpeedSelectorSheet,
                           child: Container(
                             padding: const EdgeInsets.symmetric(
                               horizontal: 8,
@@ -6111,6 +6770,14 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
             label: '音轨/声道',
             highlighted: true,
             onTap: _showVodAudioTrackSelectorDialog,
+          ),
+          const SizedBox(width: 8),
+          buildActionPill(
+            icon: Icons.subtitles_rounded,
+            label: '字幕',
+            highlighted: _externalSubtitleName != null ||
+                _player.state.track.subtitle.id != 'no',
+            onTap: _showVodSubtitleSelectorSheet,
           ),
           const SizedBox(width: 8),
           buildActionPill(
