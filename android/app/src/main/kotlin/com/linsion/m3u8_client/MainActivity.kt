@@ -1674,9 +1674,44 @@ class MainActivity : FlutterActivity() {
             val btnTextSize = if (isTv) 12.5f else 11.5f
             val btnMargin = if (isTv) 14 else 10
 
+            var isExoAudioMuted = false
+            var exoSavedVolume = 1.0f
+            val volumeBtn = Button(this).apply {
+                id = View.generateViewId()
+                text = "🔊 声音:100%"
+                textSize = btnTextSize
+                setTextColor(Color.WHITE)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(btnHPadding, btnVPadding, btnHPadding, btnVPadding)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    rightMargin = btnMargin
+                }
+                setOnClickListener {
+                    isExoAudioMuted = !isExoAudioMuted
+                    if (isExoAudioMuted) {
+                        exoSavedVolume = exoPlayer.volume.takeIf { it > 0.05f } ?: 1.0f
+                        exoPlayer.volume = 0f
+                        text = "🔇 已静音"
+                    } else {
+                        exoPlayer.volume = exoSavedVolume
+                        text = "🔊 声音:100%"
+                    }
+                    playerView.showController()
+                }
+            }
+            styleTvFocusableButton(
+                btn = volumeBtn,
+                normalBgColor = Color.argb(215, 30, 41, 59),
+                focusedBgColor = Color.rgb(2, 132, 199)
+            )
+            actionsRow.addView(volumeBtn)
+
             val audioTrackBtn = Button(this).apply {
                 id = View.generateViewId()
-                text = "🔊 音轨: 自动 ▾"
+                text = "🔊 音轨/声道: 自动 ▾"
                 textSize = btnTextSize
                 setTextColor(Color.WHITE)
                 typeface = Typeface.DEFAULT_BOLD
@@ -1854,7 +1889,7 @@ class MainActivity : FlutterActivity() {
             actionsRow.addView(closeBtn)
 
             // Explicit D-Pad focus graph between top bar buttons and PlayerView
-            val topButtons = listOfNotNull(audioTrackBtn, subtitleTrackBtn, aspectRatioBtn, speedBtn, orientationBtn, mpvFallbackBtn, closeBtn)
+            val topButtons = listOfNotNull(volumeBtn, audioTrackBtn, subtitleTrackBtn, aspectRatioBtn, speedBtn, orientationBtn, mpvFallbackBtn, closeBtn)
             for (i in topButtons.indices) {
                 val btn = topButtons[i]
                 btn.nextFocusLeftId = if (i > 0) topButtons[i - 1].id else btn.id

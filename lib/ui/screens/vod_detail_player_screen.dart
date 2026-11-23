@@ -123,6 +123,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
 
   // Audio track, Sleep timer & AB Repeat
   String? _selectedAudioTrackLabel;
+  String _vodAudioChannelMode = 'stereo';
   int _sleepTimerMinutes = 0; // 0: off, -1: pause after episode, >0: minutes
   Timer? _sleepTimer;
   double? _abPointASeconds;
@@ -598,8 +599,14 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         'framedrop': 'vo',
         'vd-lavc-threads': '0',
         'ad-lavc-threads': '0',
+        'aid': 'auto',
+        'sid': 'auto',
+        'mute': 'no',
+        'volume': '100',
         'ad-lavc-downmix': 'yes',
         'audio-channels': 'stereo',
+        'audio-normalize-downmix': 'yes',
+        'audio-spdif': '',
         'hr-seek-framedrop': 'yes',
         'network-timeout': '15',
         'tls-verify': 'no',
@@ -761,6 +768,46 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     return parts.join(' · ');
   }
 
+  Future<void> _applyVodAudioChannelMode(String mode) async {
+    setState(() => _vodAudioChannelMode = mode);
+    try {
+      final dynamic platform = _player.platform;
+      switch (mode) {
+        case 'left':
+          await platform.setProperty('audio-channels', 'stereo');
+          await platform.setProperty(
+            'af',
+            'lavfi=[pan=stereo|c0=c0|c1=c0]',
+          );
+          break;
+        case 'right':
+          await platform.setProperty('audio-channels', 'stereo');
+          await platform.setProperty(
+            'af',
+            'lavfi=[pan=stereo|c0=c1|c1=c1]',
+          );
+          break;
+        case 'boost':
+          await platform.setProperty('audio-channels', 'stereo');
+          await platform.setProperty(
+            'af',
+            'lavfi=[volume=1.8]',
+          );
+          break;
+        case 'native':
+          await platform.setProperty('af', '');
+          await platform.setProperty('audio-channels', 'auto-safe');
+          break;
+        case 'stereo':
+        default:
+          await platform.setProperty('af', '');
+          await platform.setProperty('ad-lavc-downmix', 'yes');
+          await platform.setProperty('audio-channels', 'stereo');
+          break;
+      }
+    } catch (_) {}
+  }
+
   Future<void> _showVodAudioTrackSelectorDialog() async {
     final allTracks = _player.state.tracks.audio;
     final realTracks =
@@ -805,7 +852,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                         const SizedBox(width: 8),
                         Expanded(
                           child: Text(
-                            '音轨与多声道选择 (${tracks.length})',
+                            '声音 · 声道与音轨选择 (${tracks.length})',
                             style: const TextStyle(
                               fontSize: 15.5,
                               fontWeight: FontWeight.w700,
@@ -823,6 +870,73 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                           ),
                         ),
                       ],
+                    ),
+                    const SizedBox(height: 10),
+                    const Text(
+                      '声道输出模式',
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white70,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        for (final item in const [
+                          ('stereo', '立体声混音 (推荐)'),
+                          ('left', '左声道单音'),
+                          ('right', '右声道单音'),
+                          ('boost', '人声/音量增强'),
+                          ('native', '原生多声道'),
+                        ])
+                          InkWell(
+                            borderRadius: BorderRadius.circular(10),
+                            onTap: () async {
+                              await _applyVodAudioChannelMode(item.$1);
+                              setDialogState(() {});
+                              _showAdToast('声道模式：${item.$2}');
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 12,
+                                vertical: 7,
+                              ),
+                              decoration: BoxDecoration(
+                                color: _vodAudioChannelMode == item.$1
+                                    ? VideoPlatformTheme.accent
+                                    : const Color(0xFF172030),
+                                borderRadius: BorderRadius.circular(10),
+                                border: Border.all(
+                                  color: _vodAudioChannelMode == item.$1
+                                      ? Colors.white
+                                      : Colors.white12,
+                                ),
+                              ),
+                              child: Text(
+                                item.$2,
+                                style: TextStyle(
+                                  fontSize: 12.5,
+                                  fontWeight: _vodAudioChannelMode == item.$1
+                                      ? FontWeight.w700
+                                      : FontWeight.w500,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    const Text(
+                      '音频轨道列表',
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white70,
+                      ),
                     ),
                     const SizedBox(height: 8),
                     if (tracks.isEmpty)
@@ -3731,41 +3845,44 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                       }
                       return KeyEventResult.ignored;
                     },
-                    child: GestureDetector(
-                      behavior: HitTestBehavior.translucent,
-                      onTap: () {
-                        if (_fullscreenControlsVisible) {
-                          _fullscreenControlsTimer?.cancel();
-                          setState(() => _fullscreenControlsVisible = false);
-                          _fullscreenStageFocusNode.requestFocus();
-                        } else {
-                          _pokeFullscreenControls(focusBar: true);
-                        }
-                      },
-                      child: Container(
-                        color: Colors.black,
-                        width: double.infinity,
-                        height: double.infinity,
-                        child: Stack(
-                          fit: StackFit.expand,
-                          children: [
-                            _buildVideoPlayerStage(
-                              fullBleed: true,
-                              isFullscreen: true,
-                            ),
-                            if (_fullscreenControlsVisible &&
-                                !_isFullscreenLocked)
-                              Positioned(
-                                left: 0,
-                                right: 0,
-                                bottom: 0,
-                                child: FocusTraversalGroup(
-                                  child: _buildInteractiveProgressBar(
-                                    isFullscreen: true,
+                    child: MouseRegion(
+                      onHover: (_) => _pokeFullscreenControls(),
+                      child: GestureDetector(
+                        behavior: HitTestBehavior.translucent,
+                        onTap: () {
+                          if (_fullscreenControlsVisible) {
+                            _fullscreenControlsTimer?.cancel();
+                            setState(() => _fullscreenControlsVisible = false);
+                            _fullscreenStageFocusNode.requestFocus();
+                          } else {
+                            _pokeFullscreenControls(focusBar: true);
+                          }
+                        },
+                        child: Container(
+                          color: Colors.black,
+                          width: double.infinity,
+                          height: double.infinity,
+                          child: Stack(
+                            fit: StackFit.expand,
+                            children: [
+                              _buildVideoPlayerStage(
+                                fullBleed: true,
+                                isFullscreen: true,
+                              ),
+                              if (_fullscreenControlsVisible &&
+                                  !_isFullscreenLocked)
+                                Positioned(
+                                  left: 0,
+                                  right: 0,
+                                  bottom: 0,
+                                  child: FocusTraversalGroup(
+                                    child: _buildInteractiveProgressBar(
+                                      isFullscreen: true,
+                                    ),
                                   ),
                                 ),
-                              ),
-                          ],
+                            ],
+                          ),
                         ),
                       ),
                     ),

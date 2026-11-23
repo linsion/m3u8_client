@@ -745,17 +745,28 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
     );
   }
 
+  String _liveAudioChannelMode = 'stereo';
+
   Future<void> _configureLiveNativePlayer([Player? targetPlayer]) async {
     try {
       final dynamic platform = (targetPlayer ?? _player).platform;
       final isMobileOrTv = Platform.isAndroid || Platform.isIOS;
       final props = <String, String>{
+        'aid': 'auto',
+        'sid': 'auto',
+        'mute': 'no',
+        'volume': '100',
         'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto-safe',
         'hwdec-codecs': 'h264,hevc,vp8,vp9,av1',
         'vd-lavc-check-hw-profile': 'yes',
         'vd-lavc-software-fallback': 'yes',
         'vd-lavc-dr': 'yes',
         'vd-lavc-fast': 'yes',
+        // Downmix 5.1/7.1 TrueHD/EAC3/DTS live streams to stereo to prevent silent output
+        'ad-lavc-downmix': 'yes',
+        'audio-channels': 'stereo',
+        'audio-normalize-downmix': 'yes',
+        'audio-spdif': '',
         'cache': 'yes',
         'cache-on-disk': 'no',
         'cache-secs': isMobileOrTv ? '45' : '60',
@@ -4840,6 +4851,30 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                       ),
                     IconButton(
                       visualDensity: VisualDensity.compact,
+                      tooltip: '🔊 音轨与声道选择 (立体声/左声道/右声道/多音轨)',
+                      onPressed: () {
+                        if (overlayMode) _pokeLiveOsd();
+                        _showLiveAudioTrackChannelSheet();
+                      },
+                      icon: const Icon(
+                        Icons.surround_sound_rounded,
+                        size: 18,
+                      ),
+                    ),
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: '💬 字幕选择 (内嵌字幕 / 外挂字幕)',
+                      onPressed: () {
+                        if (overlayMode) _pokeLiveOsd();
+                        _showLiveSubtitleSheet();
+                      },
+                      icon: const Icon(
+                        Icons.subtitles_outlined,
+                        size: 18,
+                      ),
+                    ),
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
                       tooltip: '🔴 录制当前直播流到下载队列',
                       onPressed: _activeStreamUrl.isEmpty
                           ? null
@@ -5189,6 +5224,483 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
           ],
         ),
       ),
+    );
+  }
+
+  Future<void> _applyLiveAudioChannelMode(String mode) async {
+    try {
+      final dynamic platform = _player.platform;
+      setState(() {
+        _liveAudioChannelMode = mode;
+      });
+      if (mode == 'stereo') {
+        await platform.setProperty('ad-lavc-downmix', 'yes');
+        await platform.setProperty('audio-channels', 'stereo');
+        await platform.setProperty('af', '');
+      } else if (mode == 'left') {
+        await platform.setProperty('audio-channels', 'stereo');
+        await platform.setProperty('af', 'lavfi=[pan=stereo|c0=c0|c1=c0]');
+      } else if (mode == 'right') {
+        await platform.setProperty('audio-channels', 'stereo');
+        await platform.setProperty('af', 'lavfi=[pan=stereo|c0=c1|c1=c1]');
+      } else if (mode == 'boost') {
+        await platform.setProperty('audio-channels', 'stereo');
+        await platform.setProperty('af', 'lavfi=[volume=2.0]');
+      } else if (mode == 'native') {
+        await platform.setProperty('ad-lavc-downmix', 'no');
+        await platform.setProperty('audio-channels', 'auto-safe');
+        await platform.setProperty('af', '');
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _showLiveAudioTrackChannelSheet() async {
+    final audioTracks = _player.state.tracks.audio
+        .where((t) => t.id != 'auto' && t.id != 'no')
+        .toList();
+    final curAudio = _player.state.track.audio;
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xF2101622),
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+      ),
+      builder: (ctx) {
+        final channelModes = <Map<String, String>>[
+          {'id': 'stereo', 'label': '立体声混音 (推荐)'},
+          {'id': 'left', 'label': '左声道单音'},
+          {'id': 'right', 'label': '右声道单音'},
+          {'id': 'boost', 'label': '人声/音量增强'},
+          {'id': 'native', 'label': '原生多声道'},
+        ];
+        return StatefulBuilder(
+          builder: (sheetCtx, setSheetState) {
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(18, 12, 18, 18),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Center(
+                      child: Container(
+                        width: 38,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: Colors.white24,
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        const Icon(
+                          Icons.surround_sound_rounded,
+                          color: Color(0xFF38BDF8),
+                          size: 20,
+                        ),
+                        const SizedBox(width: 8),
+                        const Expanded(
+                          child: Text(
+                            '音轨与声道选择 (立体声 / 左右声道 / 多语种)',
+                            style: TextStyle(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w700,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          onPressed: () => Navigator.of(sheetCtx).pop(),
+                          icon: const Icon(
+                            Icons.close_rounded,
+                            color: Colors.white70,
+                            size: 20,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      '声道输出模式',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white70,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: channelModes.map((m) {
+                        final id = m['id']!;
+                        final selected = _liveAudioChannelMode == id;
+                        return ChoiceChip(
+                          label: Text(
+                            m['label']!,
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: selected
+                                  ? FontWeight.w700
+                                  : FontWeight.w500,
+                              color: selected
+                                  ? const Color(0xFF38BDF8)
+                                  : Colors.white70,
+                            ),
+                          ),
+                          selected: selected,
+                          selectedColor: const Color(0x3338BDF8),
+                          backgroundColor: const Color(0x14FFFFFF),
+                          side: BorderSide(
+                            color: selected
+                                ? const Color(0xFF38BDF8)
+                                : Colors.white12,
+                          ),
+                          onSelected: (_) async {
+                            await _applyLiveAudioChannelMode(id);
+                            setSheetState(() {});
+                          },
+                        );
+                      }).toList(),
+                    ),
+                    const SizedBox(height: 14),
+                    const Text(
+                      '音频轨道列表',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white70,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    if (audioTracks.isEmpty)
+                      const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 8),
+                        child: Text(
+                          '当前直播流使用默认音轨，您可通过上方「声道输出模式」切换立体声或左右声道。',
+                          style: TextStyle(color: Colors.white70, fontSize: 13),
+                        ),
+                      )
+                    else
+                      ConstrainedBox(
+                        constraints: const BoxConstraints(maxHeight: 280),
+                        child: ListView.separated(
+                          shrinkWrap: true,
+                          itemCount: audioTracks.length,
+                          separatorBuilder: (_, __) =>
+                              const SizedBox(height: 6),
+                          itemBuilder: (_, idx) {
+                            final track = audioTracks[idx];
+                            final selected = curAudio.id == track.id;
+                            final title = [
+                              if ((track.title ?? '').trim().isNotEmpty)
+                                track.title!.trim(),
+                              if ((track.language ?? '').trim().isNotEmpty)
+                                track.language!.trim().toUpperCase(),
+                              if ((track.codec ?? '').trim().isNotEmpty)
+                                track.codec!.trim().toUpperCase(),
+                            ].where((s) => s.isNotEmpty).join(' · ');
+                            return InkWell(
+                              borderRadius: BorderRadius.circular(12),
+                              onTap: () async {
+                                Navigator.of(sheetCtx).pop();
+                                try {
+                                  await _player.setAudioTrack(track);
+                                } catch (_) {}
+                              },
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 14,
+                                  vertical: 11,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: selected
+                                      ? const Color(0x3338BDF8)
+                                      : const Color(0x14FFFFFF),
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(
+                                    color: selected
+                                        ? const Color(0xFF38BDF8)
+                                        : Colors.white12,
+                                  ),
+                                ),
+                                child: Row(
+                                  children: [
+                                    Icon(
+                                      selected
+                                          ? Icons.radio_button_checked_rounded
+                                          : Icons.radio_button_off_rounded,
+                                      size: 18,
+                                      color: selected
+                                          ? const Color(0xFF38BDF8)
+                                          : Colors.white54,
+                                    ),
+                                    const SizedBox(width: 10),
+                                    Expanded(
+                                      child: Text(
+                                        title.isNotEmpty
+                                            ? '#${idx + 1}  $title'
+                                            : '音轨 #${idx + 1} (ID: ${track.id})',
+                                        style: TextStyle(
+                                          fontSize: 13.5,
+                                          fontWeight: selected
+                                              ? FontWeight.w700
+                                              : FontWeight.w500,
+                                          color: selected
+                                              ? const Color(0xFF38BDF8)
+                                              : Colors.white,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _showLiveSubtitleSheet() async {
+    final subTracks = _player.state.tracks.subtitle
+        .where((t) => t.id != 'auto' && t.id != 'no')
+        .toList();
+    final curSub = _player.state.track.subtitle;
+    final subOff = curSub.id == 'no';
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xF2101622),
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(18, 12, 18, 18),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(
+                  child: Container(
+                    width: 38,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: Colors.white24,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    const Icon(
+                      Icons.subtitles_rounded,
+                      color: Color(0xFF38BDF8),
+                      size: 20,
+                    ),
+                    const SizedBox(width: 8),
+                    const Expanded(
+                      child: Text(
+                        '字幕轨道选择',
+                        style: TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                    TextButton.icon(
+                      onPressed: () async {
+                        try {
+                          const channel = MethodChannel(
+                            'com.linsion.m3u8_client/native_utils',
+                          );
+                          final res = await channel.invokeMethod<dynamic>(
+                            'pickFiles',
+                            {'allowMultiple': false},
+                          );
+                          if (res is List && res.isNotEmpty) {
+                            final path = res.first.toString().trim();
+                            if (path.isNotEmpty) {
+                              final fileName =
+                                  path.split(RegExp(r'[/\\]')).last;
+                              await _player.setSubtitleTrack(
+                                SubtitleTrack.uri(
+                                  Uri.file(path).toString(),
+                                  title: fileName,
+                                ),
+                              );
+                              if (ctx.mounted) Navigator.of(ctx).pop();
+                            }
+                          }
+                        } catch (_) {}
+                      },
+                      icon: const Icon(
+                        Icons.upload_file_rounded,
+                        size: 16,
+                        color: Color(0xFF38BDF8),
+                      ),
+                      label: const Text(
+                        '加载外挂字幕 (.srt/.ass)',
+                        style: TextStyle(
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w600,
+                          color: Color(0xFF38BDF8),
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      onPressed: () => Navigator.of(ctx).pop(),
+                      icon: const Icon(
+                        Icons.close_rounded,
+                        color: Colors.white70,
+                        size: 20,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                InkWell(
+                  borderRadius: BorderRadius.circular(12),
+                  onTap: () async {
+                    Navigator.of(ctx).pop();
+                    await _player.setSubtitleTrack(SubtitleTrack.no());
+                  },
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 11,
+                    ),
+                    decoration: BoxDecoration(
+                      color: subOff
+                          ? const Color(0x3338BDF8)
+                          : const Color(0x14FFFFFF),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                        color: subOff
+                            ? const Color(0xFF38BDF8)
+                            : Colors.white12,
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          subOff
+                              ? Icons.radio_button_checked_rounded
+                              : Icons.radio_button_off_rounded,
+                          size: 18,
+                          color: subOff
+                              ? const Color(0xFF38BDF8)
+                              : Colors.white54,
+                        ),
+                        const SizedBox(width: 10),
+                        const Text(
+                          '关闭字幕',
+                          style: TextStyle(
+                            fontSize: 13.5,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                if (subTracks.isNotEmpty) ...[
+                  const SizedBox(height: 6),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 280),
+                    child: ListView.separated(
+                      shrinkWrap: true,
+                      itemCount: subTracks.length,
+                      separatorBuilder: (_, __) => const SizedBox(height: 6),
+                      itemBuilder: (_, idx) {
+                        final track = subTracks[idx];
+                        final selected = !subOff && curSub.id == track.id;
+                        final label = [
+                          if ((track.title ?? '').trim().isNotEmpty)
+                            track.title!.trim(),
+                          if ((track.language ?? '').trim().isNotEmpty)
+                            track.language!.trim().toUpperCase(),
+                        ].where((s) => s.isNotEmpty).join(' · ');
+                        return InkWell(
+                          borderRadius: BorderRadius.circular(12),
+                          onTap: () async {
+                            Navigator.of(ctx).pop();
+                            await _player.setSubtitleTrack(track);
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 11,
+                            ),
+                            decoration: BoxDecoration(
+                              color: selected
+                                  ? const Color(0x3338BDF8)
+                                  : const Color(0x14FFFFFF),
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: selected
+                                    ? const Color(0xFF38BDF8)
+                                    : Colors.white12,
+                              ),
+                            ),
+                            child: Row(
+                              children: [
+                                Icon(
+                                  selected
+                                      ? Icons.radio_button_checked_rounded
+                                      : Icons.radio_button_off_rounded,
+                                  size: 18,
+                                  color: selected
+                                      ? const Color(0xFF38BDF8)
+                                      : Colors.white54,
+                                ),
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: Text(
+                                    label.isNotEmpty
+                                        ? '#${idx + 1}  $label'
+                                        : '内嵌字幕 #${idx + 1} (ID: ${track.id})',
+                                    style: TextStyle(
+                                      fontSize: 13.5,
+                                      fontWeight: selected
+                                          ? FontWeight.w700
+                                          : FontWeight.w500,
+                                      color: selected
+                                          ? const Color(0xFF38BDF8)
+                                          : Colors.white,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 }

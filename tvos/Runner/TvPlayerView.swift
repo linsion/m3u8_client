@@ -1521,6 +1521,9 @@ struct TvPlayerModalView: View {
   @State private var show115LoginSheet: Bool = false
   @State private var showProxySelectorSheet: Bool = false
   @State private var showAudioTrackSelectorSheet: Bool = false
+  @State private var showSubtitleSelectorSheet: Bool = false
+  @State private var isMuted: Bool = false
+  @State private var volumeLevel: Float = 1.0
   @State private var didFallbackToProxy: Bool = false
   @State private var didPerformResumeSeek: Bool = false
   @State private var didTriggerOutroSkip: Bool = false
@@ -1731,13 +1734,20 @@ struct TvPlayerModalView: View {
               )
             )
 
-            if !request.isLive && hasSelectableAudioTracks {
+            if !request.isLive {
               Button {
                 showAudioTrackSelectorSheet = true
               } label: {
-                Label("音轨: \(currentAudioTrackButtonTitle) ▾", systemImage: "speaker.wave.2.bubble.left.fill")
+                Label("音轨/声道: \(currentAudioTrackButtonTitle) ▾", systemImage: "speaker.wave.2.bubble.left.fill")
               }
               .buttonStyle(TvApplePillButtonStyle(isSelected: showAudioTrackSelectorSheet, compact: true))
+
+              Button {
+                showSubtitleSelectorSheet = true
+              } label: {
+                Label("字幕: \(currentSubtitleButtonTitle) ▾", systemImage: "captions.bubble.fill")
+              }
+              .buttonStyle(TvApplePillButtonStyle(isSelected: showSubtitleSelectorSheet, compact: true))
             }
 
             Button {
@@ -2004,14 +2014,19 @@ struct TvPlayerModalView: View {
                 }
 
                 if !request.isLive {
-                  if hasSelectableAudioTracks {
-                    Button {
-                      showAudioTrackSelectorSheet = true
-                    } label: {
-                      Label("音轨: \(currentAudioTrackButtonTitle) ▾", systemImage: "speaker.wave.2.bubble.left.fill")
-                    }
-                    .buttonStyle(TvApplePillButtonStyle(isSelected: showAudioTrackSelectorSheet, compact: true))
+                  Button {
+                    showAudioTrackSelectorSheet = true
+                  } label: {
+                    Label("音轨/声道: \(currentAudioTrackButtonTitle) ▾", systemImage: "speaker.wave.2.bubble.left.fill")
                   }
+                  .buttonStyle(TvApplePillButtonStyle(isSelected: showAudioTrackSelectorSheet, compact: true))
+
+                  Button {
+                    showSubtitleSelectorSheet = true
+                  } label: {
+                    Label("字幕: \(currentSubtitleButtonTitle) ▾", systemImage: "captions.bubble.fill")
+                  }
+                  .buttonStyle(TvApplePillButtonStyle(isSelected: showSubtitleSelectorSheet, compact: true))
 
                   Button {
                     let rates: [Float] = [0.75, 1.0, 1.25, 1.5, 2.0]
@@ -2037,6 +2052,41 @@ struct TvPlayerModalView: View {
                   }
                 } label: {
                   Label("隐藏控制栏", systemImage: "eye.slash.fill")
+                }
+                .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+                // Volume / Mute Control Pills
+                Button {
+                  isMuted.toggle()
+                  player.isMuted = isMuted
+                  player.volume = isMuted ? 0.0 : volumeLevel
+                } label: {
+                  Label(
+                    isMuted || volumeLevel <= 0.01 ? "已静音" : "声音 \(Int(round(volumeLevel * 100)))%",
+                    systemImage: isMuted || volumeLevel <= 0.01 ? "speaker.slash.fill" : "speaker.wave.2.fill"
+                  )
+                }
+                .buttonStyle(TvApplePillButtonStyle(isSelected: isMuted, compact: true))
+
+                Button {
+                  isMuted = false
+                  volumeLevel = max(0.0, volumeLevel - 0.1)
+                  player.isMuted = (volumeLevel <= 0.01)
+                  player.volume = volumeLevel
+                } label: {
+                  Image(systemName: "minus")
+                    .font(.system(size: 13, weight: .bold))
+                }
+                .buttonStyle(TvApplePillButtonStyle(compact: true))
+
+                Button {
+                  isMuted = false
+                  volumeLevel = min(1.0, volumeLevel + 0.1)
+                  player.isMuted = false
+                  player.volume = volumeLevel
+                } label: {
+                  Image(systemName: "plus")
+                    .font(.system(size: 13, weight: .bold))
                 }
                 .buttonStyle(TvApplePillButtonStyle(compact: true))
 
@@ -2301,6 +2351,7 @@ struct TvPlayerModalView: View {
           && !showProxySelectorSheet
           && !show115LoginSheet
           && !showAudioTrackSelectorSheet
+          && !showSubtitleSelectorSheet
           && !appState.is115Accelerating
           && now.timeIntervalSince(latestActivity) >= 3.5 {
         lastAutoHideAt = now
@@ -2309,6 +2360,17 @@ struct TvPlayerModalView: View {
           appState.playerControlsVisible = false
         }
       }
+    }
+    .sheet(isPresented: $showSubtitleSelectorSheet) {
+      TvSubtitleSelectorSheet(
+        isPresented: $showSubtitleSelectorSheet,
+        avLegibleOptions: avPlayerLegibleOptions,
+        currentAvLegibleOptionIndex: currentAvPlayerLegibleOptionIndex,
+        onSelectLegibleOption: { optionIndex in
+          selectAvPlayerLegibleOption(at: optionIndex)
+        }
+      )
+      .environmentObject(appState)
     }
     .sheet(isPresented: $showAudioTrackSelectorSheet) {
       TvAudioTrackSelectorSheet(
@@ -2917,6 +2979,48 @@ struct TvPlayerModalView: View {
     appState.showToast("已切换音轨：\(option.displayName)")
   }
 
+  private var avPlayerLegibleOptions: [AVMediaSelectionOption] {
+    guard !isUsingDirectFlvEngine,
+          let item = player.currentItem,
+          let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .legible) else {
+      return []
+    }
+    return group.options
+  }
+
+  private var currentAvPlayerLegibleOptionIndex: Int {
+    guard !isUsingDirectFlvEngine,
+          let item = player.currentItem,
+          let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .legible),
+          let selected = item.currentMediaSelection.selectedMediaOption(in: group) else {
+      return -1
+    }
+    return group.options.firstIndex(where: { $0 == selected }) ?? -1
+  }
+
+  private var currentSubtitleButtonTitle: String {
+    let opts = avPlayerLegibleOptions
+    let idx = currentAvPlayerLegibleOptionIndex
+    if idx >= 0 && idx < opts.count {
+      return opts[idx].displayName
+    }
+    return "关闭"
+  }
+
+  private func selectAvPlayerLegibleOption(at index: Int?) {
+    guard !isUsingDirectFlvEngine,
+          let item = player.currentItem,
+          let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .legible) else { return }
+    if let idx = index, idx >= 0, idx < group.options.count {
+      let option = group.options[idx]
+      item.select(option, in: group)
+      appState.showToast("已开启字幕：\(option.displayName)")
+    } else {
+      item.select(nil, in: group)
+      appState.showToast("已关闭字幕")
+    }
+  }
+
   private func seekRelative(_ delta: Double, commitImmediately: Bool = false) {
     let now = Date()
     let isContinuation = now.timeIntervalSince(lastManualSeekAt) < 1.15
@@ -3063,6 +3167,8 @@ struct TvTelegramGalleryModalView: View {
   @State private var aspectFill: Bool = false
   @State private var showProxySelectorSheet: Bool = false
   @State private var show115LoginSheet: Bool = false
+  @State private var showAudioTrackSelectorSheet: Bool = false
+  @State private var showSubtitleSelectorSheet: Bool = false
   @State private var using115Direct: Bool = false
   @State private var active115StreamUrl: String = ""
   @State private var fallback115StreamUrl: String = ""
@@ -3505,6 +3611,20 @@ struct TvTelegramGalleryModalView: View {
 
                     if isVideo {
                       Button {
+                        showAudioTrackSelectorSheet = true
+                      } label: {
+                        Label("音轨/声道 ▾", systemImage: "speaker.wave.2.bubble.left.fill")
+                      }
+                      .buttonStyle(TvApplePillButtonStyle(isSelected: showAudioTrackSelectorSheet, compact: true))
+
+                      Button {
+                        showSubtitleSelectorSheet = true
+                      } label: {
+                        Label("字幕 ▾", systemImage: "captions.bubble.fill")
+                      }
+                      .buttonStyle(TvApplePillButtonStyle(isSelected: showSubtitleSelectorSheet, compact: true))
+
+                      Button {
                         cycleRate()
                       } label: {
                         Label(String(format: "%.1fx", playbackRate), systemImage: "speedometer")
@@ -3795,6 +3915,8 @@ struct TvTelegramGalleryModalView: View {
       if appState.galleryControlsVisible
           && !showProxySelectorSheet
           && !show115LoginSheet
+          && !showAudioTrackSelectorSheet
+          && !showSubtitleSelectorSheet
           && !appState.is115Accelerating
           && now.timeIntervalSince(latestActivity) >= 3.5 {
         lastAutoHideAt = now
@@ -3803,6 +3925,60 @@ struct TvTelegramGalleryModalView: View {
           appState.galleryControlsVisible = false
         }
       }
+    }
+    .sheet(isPresented: $showAudioTrackSelectorSheet) {
+      let avOpts = player.currentItem?.asset.mediaSelectionGroup(forMediaCharacteristic: .audible)?.options ?? []
+      let curIdx: Int = {
+        guard let item = player.currentItem,
+              let grp = item.asset.mediaSelectionGroup(forMediaCharacteristic: .audible),
+              let sel = item.currentMediaSelection.selectedMediaOption(in: grp) else { return 0 }
+        return grp.options.firstIndex(where: { $0 == sel }) ?? 0
+      }()
+      TvAudioTrackSelectorSheet(
+        isPresented: $showAudioTrackSelectorSheet,
+        isMkvEngine: false,
+        mkvTracks: [],
+        currentMkvTrackNum: 0,
+        avAudibleOptions: avOpts,
+        currentAvOptionIndex: curIdx,
+        onSelectMkvTrack: { _ in },
+        onSelectAvOption: { idx in
+          guard let item = player.currentItem,
+                let grp = item.asset.mediaSelectionGroup(forMediaCharacteristic: .audible),
+                idx >= 0, idx < grp.options.count else { return }
+          let opt = grp.options[idx]
+          item.select(opt, in: grp)
+          appState.showToast("已切换音轨：\(opt.displayName)")
+        }
+      )
+      .environmentObject(appState)
+    }
+    .sheet(isPresented: $showSubtitleSelectorSheet) {
+      let legOpts = player.currentItem?.asset.mediaSelectionGroup(forMediaCharacteristic: .legible)?.options ?? []
+      let curLegIdx: Int = {
+        guard let item = player.currentItem,
+              let grp = item.asset.mediaSelectionGroup(forMediaCharacteristic: .legible),
+              let sel = item.currentMediaSelection.selectedMediaOption(in: grp) else { return -1 }
+        return grp.options.firstIndex(where: { $0 == sel }) ?? -1
+      }()
+      TvSubtitleSelectorSheet(
+        isPresented: $showSubtitleSelectorSheet,
+        avLegibleOptions: legOpts,
+        currentAvLegibleOptionIndex: curLegIdx,
+        onSelectLegibleOption: { idx in
+          guard let item = player.currentItem,
+                let grp = item.asset.mediaSelectionGroup(forMediaCharacteristic: .legible) else { return }
+          if let i = idx, i >= 0, i < grp.options.count {
+            let opt = grp.options[i]
+            item.select(opt, in: grp)
+            appState.showToast("已开启字幕：\(opt.displayName)")
+          } else {
+            item.select(nil, in: grp)
+            appState.showToast("已关闭字幕")
+          }
+        }
+      )
+      .environmentObject(appState)
     }
     .sheet(isPresented: $show115LoginSheet) {
       Tv115QuickLoginSheet(
@@ -4866,7 +5042,12 @@ struct TvAudioTrackSelectorSheet: View {
 
         ScrollView {
           VStack(spacing: 14) {
-            if isMkvEngine {
+            if totalCount == 0 {
+              Text("当前视频仅包含默认主音轨，正在以立体声/多声道混音输出")
+                .font(.system(size: 18, weight: .medium))
+                .foregroundColor(.white.opacity(0.75))
+                .padding(.vertical, 32)
+            } else if isMkvEngine {
               ForEach(Array(mkvTracks.enumerated()), id: \.element.trackNum) { idx, track in
                 let isCurrent = (track.trackNum == currentMkvTrackNum)
                 Button {
@@ -4992,6 +5173,150 @@ struct TvAudioTrackSelectorSheet: View {
                 }
                 .buttonStyle(TvAppleSurfaceButtonStyle(isSelected: isCurrent, cornerRadius: 16))
               }
+            }
+          }
+          .padding(6)
+        }
+        .focusSection()
+      }
+      .padding(44)
+    }
+  }
+}
+
+struct TvSubtitleSelectorSheet: View {
+  @EnvironmentObject var appState: TvAppState
+  @Binding var isPresented: Bool
+  let avLegibleOptions: [AVMediaSelectionOption]
+  let currentAvLegibleOptionIndex: Int
+  let onSelectLegibleOption: (Int?) -> Void
+
+  var body: some View {
+    let theme = TvThemePalette.current
+
+    ZStack {
+      Color(red: 0.05, green: 0.06, blue: 0.09)
+        .ignoresSafeArea()
+
+      VStack(alignment: .leading, spacing: 24) {
+        HStack(spacing: 16) {
+          Image(systemName: "captions.bubble.fill")
+            .font(.system(size: 32, weight: .bold))
+            .foregroundColor(theme.accentHover)
+
+          VStack(alignment: .leading, spacing: 4) {
+            Text("选择字幕轨道")
+              .font(.system(size: 30, weight: .bold))
+              .foregroundColor(.white)
+            Text("共检测到 \(avLegibleOptions.count) 条内嵌字幕轨道")
+              .font(.system(size: 16, weight: .medium))
+              .foregroundColor(.white.opacity(0.65))
+          }
+
+          Spacer()
+
+          Button("关闭") {
+            isPresented = false
+          }
+          .buttonStyle(TvApplePillButtonStyle(compact: true))
+        }
+        .focusSection()
+
+        Divider()
+          .background(Color.white.opacity(0.14))
+
+        ScrollView {
+          VStack(spacing: 14) {
+            let isOff = (currentAvLegibleOptionIndex < 0)
+            Button {
+              onSelectLegibleOption(nil)
+              isPresented = false
+            } label: {
+              HStack(spacing: 18) {
+                Image(systemName: isOff ? "checkmark.circle.fill" : "captions.bubble")
+                  .font(.system(size: 26, weight: .bold))
+                  .foregroundColor(
+                    isOff
+                      ? Color(red: 0.25, green: 0.88, blue: 0.52)
+                      : .white.opacity(0.70)
+                  )
+                  .frame(width: 34)
+
+                Text("关闭字幕")
+                  .font(.system(size: 21, weight: .bold))
+                  .foregroundColor(.white)
+
+                Spacer()
+
+                if isOff {
+                  Text("当前使用")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+                    .background(Color(red: 0.20, green: 0.62, blue: 0.96))
+                    .clipShape(Capsule(style: .continuous))
+                }
+              }
+              .padding(.horizontal, 24)
+              .padding(.vertical, 18)
+            }
+            .buttonStyle(TvAppleSurfaceButtonStyle(isSelected: isOff, cornerRadius: 16))
+
+            ForEach(Array(avLegibleOptions.enumerated()), id: \.offset) { idx, option in
+              let isCurrent = (idx == currentAvLegibleOptionIndex)
+              let localeStr = option.locale?.localizedString(forLanguageCode: option.locale?.languageCode ?? "") ?? ""
+              Button {
+                onSelectLegibleOption(idx)
+                isPresented = false
+              } label: {
+                HStack(spacing: 18) {
+                  Image(systemName: isCurrent ? "checkmark.circle.fill" : "captions.bubble.fill")
+                    .font(.system(size: 26, weight: .bold))
+                    .foregroundColor(
+                      isCurrent
+                        ? Color(red: 0.25, green: 0.88, blue: 0.52)
+                        : .white.opacity(0.70)
+                    )
+                    .frame(width: 34)
+
+                  Text("#\(idx + 1)")
+                    .font(.system(size: 15, weight: .bold, design: .monospaced))
+                    .foregroundColor(theme.accentHover)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(theme.accent.opacity(0.18))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                  VStack(alignment: .leading, spacing: 4) {
+                    Text(option.displayName)
+                      .font(.system(size: 21, weight: .bold))
+                      .foregroundColor(.white)
+                      .lineLimit(1)
+                    if !localeStr.isEmpty {
+                      Text("语言: \(localeStr)")
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundColor(.white.opacity(0.60))
+                        .lineLimit(1)
+                    }
+                  }
+
+                  Spacer()
+
+                  if isCurrent {
+                    Text("当前使用")
+                      .font(.system(size: 14, weight: .bold))
+                      .foregroundColor(.white)
+                      .padding(.horizontal, 14)
+                      .padding(.vertical, 6)
+                      .background(Color(red: 0.20, green: 0.62, blue: 0.96))
+                      .clipShape(Capsule(style: .continuous))
+                  }
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 18)
+              }
+              .buttonStyle(TvAppleSurfaceButtonStyle(isSelected: isCurrent, cornerRadius: 16))
             }
           }
           .padding(6)

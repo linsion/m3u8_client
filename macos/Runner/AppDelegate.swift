@@ -12,7 +12,6 @@ class AppDelegate: FlutterAppDelegate {
       reason: "流光视频运行期间保持屏幕常亮并防止系统进入休眠"
     )
     setupStatusMenuItem()
-    super.applicationDidFinishLaunching(notification)
   }
 
   override func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

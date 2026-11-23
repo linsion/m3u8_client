@@ -15716,6 +15716,8 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
         'ad-lavc-threads': '0',
         'ad-lavc-downmix': 'yes',
         'audio-channels': 'stereo',
+        'audio-normalize-downmix': 'yes',
+        'audio-spdif': '',
         'hr-seek-framedrop': 'yes',
         'network-timeout': '20',
         'tls-verify': 'no',
@@ -17183,11 +17185,17 @@ class _TelegramPhotoGalleryDialogState
     _videoController = null;
   }
 
+  String _galleryAudioChannelMode = 'stereo';
+
   Future<void> _configureGalleryVideoPlayer(Player p) async {
     try {
       final dynamic platform = p.platform;
       final isMobileOrTv = Platform.isAndroid || Platform.isIOS;
       final props = <String, String>{
+        'aid': 'auto',
+        'sid': 'auto',
+        'mute': 'no',
+        'volume': '100',
         'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto-safe',
         'hwdec-codecs': 'h264,hevc,vp8,vp9,av1',
         'vd-lavc-check-hw-profile': 'yes',
@@ -17215,6 +17223,8 @@ class _TelegramPhotoGalleryDialogState
         'ad-lavc-threads': '0',
         'ad-lavc-downmix': 'yes',
         'audio-channels': 'stereo',
+        'audio-normalize-downmix': 'yes',
+        'audio-spdif': '',
         'hr-seek-framedrop': 'yes',
         'network-timeout': '20',
         'tls-verify': 'no',
@@ -17704,6 +17714,35 @@ class _TelegramPhotoGalleryDialogState
     return h > 0 ? '$h:$m:$s' : '$m:$s';
   }
 
+  Future<void> _applyGalleryAudioChannelMode(String mode) async {
+    final player = _videoPlayer;
+    if (player == null) return;
+    try {
+      final dynamic platform = player.platform;
+      setState(() {
+        _galleryAudioChannelMode = mode;
+      });
+      if (mode == 'stereo') {
+        await platform.setProperty('ad-lavc-downmix', 'yes');
+        await platform.setProperty('audio-channels', 'stereo');
+        await platform.setProperty('af', '');
+      } else if (mode == 'left') {
+        await platform.setProperty('audio-channels', 'stereo');
+        await platform.setProperty('af', 'lavfi=[pan=stereo|c0=c0|c1=c0]');
+      } else if (mode == 'right') {
+        await platform.setProperty('audio-channels', 'stereo');
+        await platform.setProperty('af', 'lavfi=[pan=stereo|c0=c1|c1=c1]');
+      } else if (mode == 'boost') {
+        await platform.setProperty('audio-channels', 'stereo');
+        await platform.setProperty('af', 'lavfi=[volume=2.0]');
+      } else if (mode == 'native') {
+        await platform.setProperty('ad-lavc-downmix', 'no');
+        await platform.setProperty('audio-channels', 'auto-safe');
+        await platform.setProperty('af', '');
+      }
+    } catch (_) {}
+  }
+
   Future<void> _showGalleryAudioSubtitleSelectorSheet() async {
     final player = _videoPlayer;
     if (player == null) return;
@@ -17721,6 +17760,13 @@ class _TelegramPhotoGalleryDialogState
         borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
       ),
       builder: (ctx) {
+        final channelModes = <Map<String, String>>[
+          {'id': 'stereo', 'label': '立体声混音 (推荐)'},
+          {'id': 'left', 'label': '左声道单音'},
+          {'id': 'right', 'label': '右声道单音'},
+          {'id': 'boost', 'label': '人声/音量增强'},
+          {'id': 'native', 'label': '原生多声道'},
+        ];
         return StatefulBuilder(
           builder: (ctx, setSheetState) {
             final curAudio = player.state.track.audio;
@@ -17753,7 +17799,7 @@ class _TelegramPhotoGalleryDialogState
                         const SizedBox(width: 8),
                         const Expanded(
                           child: Text(
-                            '音轨与字幕选择',
+                            '声道、音轨与字幕选择',
                             style: TextStyle(
                               fontSize: 15.5,
                               fontWeight: FontWeight.w700,
@@ -17772,9 +17818,40 @@ class _TelegramPhotoGalleryDialogState
                         ),
                       ],
                     ),
-                    const SizedBox(height: 10),
+                    const SizedBox(height: 8),
                     const Text(
-                      '音轨 / 声道',
+                      '声道输出模式',
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white70,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: channelModes.map((m) {
+                        final id = m['id']!;
+                        final selected = _galleryAudioChannelMode == id;
+                        return ChoiceChip(
+                          label: Text(m['label']!),
+                          selected: selected,
+                          selectedColor: const Color(0xFF3E99EE),
+                          labelStyle: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 12,
+                          ),
+                          onSelected: (_) async {
+                            await _applyGalleryAudioChannelMode(id);
+                            setSheetState(() {});
+                          },
+                        );
+                      }).toList(),
+                    ),
+                    const SizedBox(height: 12),
+                    const Text(
+                      '音轨列表',
                       style: TextStyle(
                         fontSize: 12.5,
                         fontWeight: FontWeight.w700,
@@ -17784,7 +17861,7 @@ class _TelegramPhotoGalleryDialogState
                     const SizedBox(height: 6),
                     if (audioTracks.isEmpty)
                       const Text(
-                        '当前视频流仅包含默认音轨',
+                        '当前视频流仅包含默认音轨，可通过上方切换立体声或左右声道',
                         style: TextStyle(fontSize: 12, color: Colors.white54),
                       )
                     else
@@ -17827,15 +17904,63 @@ class _TelegramPhotoGalleryDialogState
                         ],
                       ),
                     const SizedBox(height: 14),
-                    const Text(
-                      '内嵌字幕',
-                      style: TextStyle(
-                        fontSize: 12.5,
-                        fontWeight: FontWeight.w700,
-                        color: Colors.white70,
-                      ),
+                    Row(
+                      children: [
+                        const Text(
+                          '内嵌与外挂字幕',
+                          style: TextStyle(
+                            fontSize: 12.5,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.white70,
+                          ),
+                        ),
+                        const Spacer(),
+                        TextButton.icon(
+                          onPressed: () async {
+                            try {
+                              const channel = MethodChannel(
+                                'com.linsion.m3u8_client/native_utils',
+                              );
+                              final res = await channel.invokeMethod<dynamic>(
+                                'pickFiles',
+                                {'allowMultiple': false},
+                              );
+                              if (res is List && res.isNotEmpty) {
+                                final path = res.first.toString().trim();
+                                if (path.isNotEmpty) {
+                                  final fileName =
+                                      path.split(RegExp(r'[/\\]')).last;
+                                  await player.setSubtitleTrack(
+                                    SubtitleTrack.uri(
+                                      Uri.file(path).toString(),
+                                      title: fileName,
+                                    ),
+                                  );
+                                  if (ctx.mounted) Navigator.of(ctx).pop();
+                                  _showGalleryHud(
+                                    '已加载外挂字幕: $fileName',
+                                    state: 'success',
+                                  );
+                                }
+                              }
+                            } catch (_) {}
+                          },
+                          icon: const Icon(
+                            Icons.upload_file_rounded,
+                            size: 15,
+                            color: Color(0xFF5EB5F7),
+                          ),
+                          label: const Text(
+                            '加载外挂字幕 (.srt/.ass)',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Color(0xFF5EB5F7),
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
-                    const SizedBox(height: 6),
+                    const SizedBox(height: 4),
                     Wrap(
                       spacing: 8,
                       runSpacing: 8,
