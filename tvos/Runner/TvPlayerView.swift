@@ -1504,6 +1504,7 @@ struct TvPlayerModalView: View {
   @State private var player: AVPlayer = AVPlayer()
   @State private var flvEngine: TvDirectFlvHardwareEngine = TvDirectFlvHardwareEngine()
   @State private var isUsingDirectFlvEngine: Bool = false
+  @State private var activeMkvProxyUrl: URL? = nil
   @State private var isPlaying: Bool = true
   @State private var userWantsToPlay: Bool = true
   @State private var isBuffering: Bool = true
@@ -1976,7 +1977,9 @@ struct TvPlayerModalView: View {
                     let rates: [Float] = [0.75, 1.0, 1.25, 1.5, 2.0]
                     let idx = rates.firstIndex(of: playbackRate) ?? 1
                     playbackRate = rates[(idx + 1) % rates.count]
-                    if isPlaying {
+                    if isUsingDirectFlvEngine {
+                      flvEngine.setPlaybackRate(playbackRate)
+                    } else if isPlaying {
                       player.rate = playbackRate
                     }
                   } label: {
@@ -2125,12 +2128,29 @@ struct TvPlayerModalView: View {
         if flvEngine.isActivelyPlaying {
           if isBuffering { isBuffering = false }
           if !isPlaying && userWantsToPlay { isPlaying = true }
+          if !request.isLive {
+            let curPos = flvEngine.currentPositionSec
+            let curDur = flvEngine.currentDurationSec
+            if curDur > 0 {
+              durationSec = curDur
+              bufferedSec = min(curDur, curPos + 15.0)
+            }
+            if Date().timeIntervalSince(lastManualSeekAt) >= 0.85 && curPos >= 0 {
+              positionSec = curPos
+            }
+          }
+        }
+        let proxyRate = TvNetworkSpeedMonitor.shared.recentDownstreamBytesPerSecond
+        if proxyRate > 0 {
+          let prev = appState.latestMeasuredSpeedBytesPerSec
+          appState.latestMeasuredSpeedBytesPerSec = prev <= 1024 ? proxyRate : (prev * 0.35 + proxyRate * 0.65)
         }
       } else if let curItem = player.currentItem {
         switch curItem.status {
         case .readyToPlay:
           if !didPerformResumeSeek {
             didPerformResumeSeek = true
+            lastProgressAdvanceAt = now
             if request.resumeSeconds > 3 && !request.isLive && positionSec < 2 {
               let target = CMTime(seconds: request.resumeSeconds, preferredTimescale: 600)
               player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
@@ -2149,16 +2169,18 @@ struct TvPlayerModalView: View {
               isBuffering = false
             }
           } else if userWantsToPlay && !request.isLive {
+            // While our 24-worker local proxy is actively downloading (`recentDownstreamBytesPerSecond > 16 KB/s`),
+            // AVPlayer is actively receiving data for a large 30G–100G file — NEVER kill or recreate AVPlayerItem!
+            let activeDownstream = TvNetworkSpeedMonitor.shared.recentDownstreamBytesPerSecond
+            if activeDownstream > 16384 {
+              lastProgressAdvanceAt = now
+            }
             let stalledFor = now.timeIntervalSince(lastProgressAdvanceAt)
             if stalledFor >= 2.8 && (player.timeControlStatus != .playing || player.rate == 0) {
               isBuffering = true
-              if stalledFor < 8.5 {
-                if curItem.isPlaybackLikelyToKeepUp {
-                  player.playImmediately(atRate: playbackRate)
-                } else {
-                  player.play()
-                }
-              } else if now.timeIntervalSince(lastStallRecoveryAt) >= 8.5 {
+              if stalledFor < 45.0 || activeDownstream > 4096 {
+                player.playImmediately(atRate: playbackRate)
+              } else if now.timeIntervalSince(lastStallRecoveryAt) >= 45.0 {
                 lastStallRecoveryAt = now
                 lastProgressAdvanceAt = now
                 let savedPos = positionSec
@@ -2174,7 +2196,12 @@ struct TvPlayerModalView: View {
             isBuffering = false
           }
         case .failed:
-          if using115Direct,
+          let activeUrlStr = (player.currentItem?.asset as? AVURLAsset)?.url.absoluteString ?? request.streamUrl
+          if activeUrlStr.contains("127.0.0.1:") && activeUrlStr.contains("/tg_video") {
+            // AVPlayer failed to demux this container (e.g. a 50 GB Matroska .mkv file disguised with another extension or unsupported codec container):
+            // seamlessly switch to our zero-copy Matroska VideoToolbox/AudioToolbox hardware engine!
+            startMatroskaHardwareEngine(proxyUrlStr: activeUrlStr, resumeAt: positionSec)
+          } else if using115Direct,
              !fallback115StreamUrl.isEmpty,
              fallback115StreamUrl != active115StreamUrl {
             let next115 = fallback115StreamUrl
@@ -2193,10 +2220,11 @@ struct TvPlayerModalView: View {
             isBuffering = false
           }
         default:
-          let timeoutLimit: TimeInterval = 18.0
+          let timeoutLimit: TimeInterval = 45.0
           if using115Direct,
              !fallback115StreamUrl.isEmpty,
              fallback115StreamUrl != active115StreamUrl,
+             TvNetworkSpeedMonitor.shared.recentDownstreamBytesPerSecond < 4096,
              now.timeIntervalSince(streamStartedAt) >= timeoutLimit {
             let next115 = fallback115StreamUrl
             fallback115StreamUrl = ""
@@ -2424,7 +2452,13 @@ struct TvPlayerModalView: View {
     }
     isUsingDirectFlvEngine = false
 
-    let isHlsTarget = baseTargetUrl.lowercased().contains(".m3u8") || baseTargetUrl.contains("/api/vod/proxy")
+    let lowerTarget = baseTargetUrl.lowercased()
+    if lowerTarget.contains("127.0.0.1:") && (lowerTarget.contains("/tg_video.mkv") || lowerTarget.contains("/tg_video.webm")) {
+      startMatroskaHardwareEngine(proxyUrlStr: baseTargetUrl, resumeAt: resumeAt)
+      return
+    }
+
+    let isHlsTarget = lowerTarget.contains(".m3u8") || baseTargetUrl.contains("/api/vod/proxy")
     if !baseTargetUrl.contains("127.0.0.1:")
         && !TvLocalHlsProxyServer.isDomesticOrLocalUrl(baseTargetUrl) {
       if isHlsTarget && (!request.isLive || eff == .proxyNode) {
@@ -2454,12 +2488,64 @@ struct TvPlayerModalView: View {
     startPlayerItem(urlStr: baseTargetUrl, resumeAt: resumeAt)
   }
 
+  private func startMatroskaHardwareEngine(proxyUrlStr: String, resumeAt: Double? = nil) {
+    let proxyUrl = URL(string: proxyUrlStr)
+    cleanupPlayer(keepingRelayUrl: proxyUrl)
+    guard let proxyUrl else {
+      isBuffering = false
+      return
+    }
+    activeMkvProxyUrl = proxyUrl
+    isUsingDirectFlvEngine = true
+    isBuffering = true
+    userWantsToPlay = true
+    isPlaying = true
+    let initialSeek = resumeAt ?? (!request.isLive && request.resumeSeconds > 3 ? request.resumeSeconds : 0)
+    if initialSeek > 0 {
+      positionSec = initialSeek
+    }
+    flvEngine.onFirstFrameRendered = {
+      Task { @MainActor in
+        self.isBuffering = false
+        self.isPlaying = true
+      }
+    }
+    flvEngine.onAllCandidatesFailed = {
+      Task { @MainActor in
+        self.isBuffering = false
+      }
+    }
+    flvEngine.onMkvProgress = { pos, dur in
+      Task { @MainActor in
+        if dur > 0 {
+          self.durationSec = dur
+          self.bufferedSec = min(dur, pos + 15.0)
+        }
+        if Date().timeIntervalSince(self.lastManualSeekAt) >= 0.85 {
+          self.positionSec = pos
+        }
+        if pos > 3 {
+          self.recordProgress(pos: pos, dur: dur)
+        }
+      }
+    }
+    flvEngine.startMatroska(
+      proxyUrlStr: proxyUrlStr,
+      resumeAtSeconds: initialSeek,
+      rate: playbackRate
+    )
+  }
+
   private func startPlayerItem(
     urlStr: String,
     resumeAt: Double? = nil,
     overrideHeaders: [String: String]? = nil,
     fallbackDirect115Url: String? = nil
   ) {
+    if urlStr.contains("127.0.0.1:") && (urlStr.lowercased().contains("/tg_video.mkv") || urlStr.lowercased().contains("/tg_video.webm")) {
+      startMatroskaHardwareEngine(proxyUrlStr: urlStr, resumeAt: resumeAt)
+      return
+    }
     cleanupPlayer(keepingRelayUrl: URL(string: urlStr))
     guard let url = URL(string: urlStr) else {
       isBuffering = false
@@ -2480,10 +2566,13 @@ struct TvPlayerModalView: View {
     }
     let asset = AVURLAsset(url: url, options: options)
     let item = AVPlayerItem(asset: asset)
-    item.preferredForwardBufferDuration = request.isLive ? 2.5 : 120
+    // Our 127.0.0.1 local proxy already maintains a 96–256 MB RAM buffer across 24 parallel workers!
+    // Setting preferredForwardBufferDuration = 8.0 and automaticallyWaitsToMinimizeStalling = false
+    // ensures AVPlayer renders the very first 4K frame of a 50 GB movie immediately without waiting for 900 MB of forward buffer!
+    item.preferredForwardBufferDuration = request.isLive ? 2.5 : 8.0
 
     player.replaceCurrentItem(with: item)
-    player.automaticallyWaitsToMinimizeStalling = true
+    player.automaticallyWaitsToMinimizeStalling = isLocalLoopback ? false : true
     let initialSeek = resumeAt ?? (!request.isLive && request.resumeSeconds > 3 ? request.resumeSeconds : 0)
     if initialSeek > 1 && !request.isLive {
       didPerformResumeSeek = true
@@ -2684,6 +2773,11 @@ struct TvPlayerModalView: View {
     let maxDur = durationSec > 0 ? durationSec : max(0, positionSec + delta + 3600)
     let target = min(maxDur, max(0, positionSec + delta))
     positionSec = target
+    if isUsingDirectFlvEngine {
+      isBuffering = true
+      flvEngine.seek(to: target)
+      return
+    }
     player.currentItem?.cancelPendingSeeks()
     let tol = CMTime(seconds: 1.2, preferredTimescale: 600)
     player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: tol, toleranceAfter: tol) { [weak player] _ in
@@ -2696,6 +2790,12 @@ struct TvPlayerModalView: View {
   private func cleanupPlayer(keepingRelayUrl: URL? = nil) {
     flvEngine.stop()
     isUsingDirectFlvEngine = false
+    if let mkvUrl = activeMkvProxyUrl, mkvUrl != keepingRelayUrl {
+      TvLocalHlsProxyServer.shared.releaseTelegramVideoProxyUrl(mkvUrl)
+    }
+    if keepingRelayUrl == nil || activeMkvProxyUrl != keepingRelayUrl {
+      activeMkvProxyUrl = nil
+    }
     if let token = timeObserverToken {
       player.removeTimeObserver(token)
       timeObserverToken = nil

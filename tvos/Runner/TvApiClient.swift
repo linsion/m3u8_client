@@ -2120,6 +2120,22 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
 
   private var task: URLSessionDataTask?
   private var session: URLSession?
+  private var mkvTask: Task<Void, Never>?
+  private var isMkvMode: Bool = false
+  private var mkvProxyUrl: URL? = nil
+  private var mkvDurationSec: Double = 0
+  private var mkvCurrentPositionSec: Double = 0
+  private var mkvTargetSeekSec: Double? = nil
+  private var mkvPlaybackRate: Float = 1.0
+  private var mkvVideoTrackNum: Int = -1
+  private var mkvAudioTrackNum: Int = -1
+  private var mkvVideoContentCompPrefix: Data = Data()
+  private var mkvAudioContentCompPrefix: Data = Data()
+  private var mkvTimestampScaleNs: Int64 = 1_000_000
+  private var mkvAudioFormatId: AudioFormatID = kAudioFormatMPEG4AAC
+  private var mkvAudioFramesPerPacket: Int64 = 1024
+  private var mkvAudioChannels: UInt32 = 2
+  private var mkvAudioBitDepth: UInt32 = 16
   private var isStopped = true
   private var isPaused = false
 
@@ -2128,6 +2144,25 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
 
   var onFirstFrameRendered: (@Sendable () -> Void)?
   var onAllCandidatesFailed: (@Sendable () -> Void)?
+  var onMkvProgress: (@Sendable (_ positionSec: Double, _ durationSec: Double) -> Void)?
+
+  var currentDurationSec: Double {
+    lock.lock()
+    defer { lock.unlock() }
+    return mkvDurationSec
+  }
+
+  var currentPositionSec: Double {
+    lock.lock()
+    defer { lock.unlock() }
+    if isMkvMode && hasStartedSynchronizer {
+      let t = CMTimeGetSeconds(synchronizer.currentTime())
+      if t.isFinite && t >= 0 {
+        return t
+      }
+    }
+    return mkvCurrentPositionSec
+  }
 
   override init() {
     super.init()
@@ -2225,11 +2260,40 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
   func resume() {
     lock.lock()
     let started = hasStartedSynchronizer
+    let rate = mkvPlaybackRate
     isPaused = false
     lock.unlock()
     if started {
-      synchronizer.rate = 1.0
+      synchronizer.rate = rate
     }
+  }
+
+  func setPlaybackRate(_ rate: Float) {
+    lock.lock()
+    mkvPlaybackRate = max(0.5, min(2.0, rate))
+    let started = hasStartedSynchronizer
+    let paused = isPaused
+    lock.unlock()
+    if started && !paused {
+      synchronizer.rate = mkvPlaybackRate
+    }
+  }
+
+  func seek(to seconds: Double) {
+    lock.lock()
+    guard isMkvMode, !isStopped else {
+      lock.unlock()
+      return
+    }
+    let clamped = max(0, mkvDurationSec > 0 ? min(seconds, mkvDurationSec) : seconds)
+    mkvTargetSeekSec = clamped
+    mkvCurrentPositionSec = clamped
+    hasStartedSynchronizer = false
+    lock.unlock()
+
+    synchronizer.rate = 0.0
+    displayLayer.flush()
+    audioRenderer.flush()
   }
 
   func stop() {
@@ -2238,8 +2302,19 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
     isPaused = false
     let t = task
     let s = session
+    let mt = mkvTask
     task = nil
     session = nil
+    mkvTask = nil
+    isMkvMode = false
+    mkvProxyUrl = nil
+    mkvDurationSec = 0
+    mkvCurrentPositionSec = 0
+    mkvTargetSeekSec = nil
+    mkvVideoTrackNum = -1
+    mkvAudioTrackNum = -1
+    mkvVideoContentCompPrefix.removeAll()
+    mkvAudioContentCompPrefix.removeAll()
     buffer.removeAll(keepingCapacity: false)
     cursor = 0
     headerSkipped = false
@@ -2261,6 +2336,7 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
 
     t?.cancel()
     s?.invalidateAndCancel()
+    mt?.cancel()
     synchronizer.rate = 0.0
     displayLayer.flushAndRemoveImage()
     audioRenderer.flush()
@@ -2917,6 +2993,1080 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
 
         audioRenderer.enqueue(sb)
       }
+    }
+  }
+
+  // MARK: - 30 GB – 100 GB+ Matroska (.mkv / .webm) Direct Hardware Streaming Engine (24-Worker Block Cache -> VideoToolbox / AudioToolbox)
+
+  func startMatroska(proxyUrlStr: String, resumeAtSeconds: Double = 0, rate: Float = 1.0) {
+    stop()
+    guard let proxyUrl = URL(string: proxyUrlStr) else {
+      onAllCandidatesFailed?()
+      return
+    }
+    lock.lock()
+    self.isStopped = false
+    self.isPaused = false
+    self.isMkvMode = true
+    self.mkvProxyUrl = proxyUrl
+    self.mkvPlaybackRate = max(0.5, min(2.0, rate))
+    self.mkvCurrentPositionSec = max(0, resumeAtSeconds)
+    self.mkvTargetSeekSec = resumeAtSeconds > 1.0 ? resumeAtSeconds : nil
+    self.hasStartedSynchronizer = false
+    self.hasRenderedFirstVideoFrame = false
+    self.lastFrameReceivedAt = Date()
+    let readerId = UUID()
+    let streamTask = Task.detached(priority: .userInitiated) { [weak self] () -> Void in
+      await self?.runMatroskaStreamLoop(proxyUrl: proxyUrl, reader: readerId)
+    }
+    self.mkvTask = streamTask
+    lock.unlock()
+  }
+
+  private static func readEbmlId(_ bytes: [UInt8], at pos: inout Int, end: Int) -> UInt32? {
+    guard pos < end else { return nil }
+    let b0 = bytes[pos]
+    guard b0 != 0 else { return nil }
+    var len = 1
+    var mask: UInt8 = 0x80
+    while (b0 & mask) == 0 && len < 4 {
+      mask >>= 1
+      len += 1
+    }
+    guard pos + len <= end else { return nil }
+    var val: UInt32 = 0
+    for i in 0..<len {
+      val = (val << 8) | UInt32(bytes[pos + i])
+    }
+    pos += len
+    return val
+  }
+
+  private static func readEbmlSize(_ bytes: [UInt8], at pos: inout Int, end: Int) -> Int64? {
+    guard pos < end else { return nil }
+    let b0 = bytes[pos]
+    guard b0 != 0 else { return nil }
+    var len = 1
+    var mask: UInt8 = 0x80
+    while (b0 & mask) == 0 && len < 8 {
+      mask >>= 1
+      len += 1
+    }
+    guard pos + len <= end else { return nil }
+    var val = Int64(b0 & ~mask)
+    var allOnes = (b0 & ~mask) == (mask - 1)
+    for i in 1..<len {
+      let bi = bytes[pos + i]
+      if bi != 0xFF { allOnes = false }
+      val = (val << 8) | Int64(bi)
+    }
+    pos += len
+    return allOnes ? -1 : val
+  }
+
+  private static func readEbmlSignedVint(_ bytes: [UInt8], at pos: inout Int, end: Int) -> Int64? {
+    guard pos < end else { return nil }
+    let b0 = bytes[pos]
+    guard b0 != 0 else { return nil }
+    var len = 1
+    var mask: UInt8 = 0x80
+    while (b0 & mask) == 0 && len < 8 {
+      mask >>= 1
+      len += 1
+    }
+    guard pos + len <= end else { return nil }
+    var raw = Int64(b0 & ~mask)
+    for i in 1..<len {
+      raw = (raw << 8) | Int64(bytes[pos + i])
+    }
+    pos += len
+    let bias: Int64 = (1 << (7 * len - 1)) - 1
+    return raw - bias
+  }
+
+  private static func readEbmlUInt(_ bytes: [UInt8], from start: Int, length: Int) -> UInt64 {
+    guard length > 0 else { return 0 }
+    var v: UInt64 = 0
+    let count = min(8, length)
+    for i in 0..<count {
+      v = (v << 8) | UInt64(bytes[start + i])
+    }
+    return v
+  }
+
+  private static func readEbmlFloat(_ bytes: [UInt8], from start: Int, length: Int) -> Double {
+    if length == 4 {
+      let u = UInt32(truncatingIfNeeded: readEbmlUInt(bytes, from: start, length: 4))
+      return Double(Float(bitPattern: u))
+    } else if length == 8 {
+      let u = readEbmlUInt(bytes, from: start, length: 8)
+      return Double(bitPattern: u)
+    }
+    return 0
+  }
+
+  private func parseMatroskaHeaderAndTracks(_ data: Data) -> Int {
+    let bytes = [UInt8](data)
+    let end = bytes.count
+    var pos = 0
+    var firstClusterOffset = -1
+
+    while pos + 4 <= end {
+      let elemStart = pos
+      guard let eid = Self.readEbmlId(bytes, at: &pos, end: end),
+            let esize = Self.readEbmlSize(bytes, at: &pos, end: end) else {
+        break
+      }
+      if eid == 0x1F43B675 { // Cluster
+        firstClusterOffset = elemStart
+        break
+      }
+      if eid == 0x18538067 { // Segment (step inside container)
+        continue
+      }
+      let elemEnd = (esize >= 0 && pos + Int(esize) <= end) ? (pos + Int(esize)) : end
+      if eid == 0x1549A966 { // Info
+        var ipos = pos
+        var scaleNs: Int64 = 1_000_000
+        var rawDur: Double = 0
+        while ipos < elemEnd {
+          guard let iid = Self.readEbmlId(bytes, at: &ipos, end: elemEnd),
+                let isize = Self.readEbmlSize(bytes, at: &ipos, end: elemEnd),
+                isize >= 0, ipos + Int(isize) <= elemEnd else { break }
+          let len = Int(isize)
+          if iid == 0x2AD7B1 {
+            scaleNs = max(1, Int64(Self.readEbmlUInt(bytes, from: ipos, length: len)))
+          } else if iid == 0x4489 {
+            rawDur = Self.readEbmlFloat(bytes, from: ipos, length: len)
+          }
+          ipos += len
+        }
+        lock.lock()
+        mkvTimestampScaleNs = scaleNs
+        if rawDur > 0 {
+          mkvDurationSec = (rawDur * Double(scaleNs)) / 1_000_000_000.0
+        }
+        lock.unlock()
+      } else if eid == 0x1654AE6B { // Tracks
+        var tpos = pos
+        while tpos < elemEnd {
+          guard let tid = Self.readEbmlId(bytes, at: &tpos, end: elemEnd),
+                let tsize = Self.readEbmlSize(bytes, at: &tpos, end: elemEnd),
+                tsize >= 0, tpos + Int(tsize) <= elemEnd else { break }
+          let entryEnd = tpos + Int(tsize)
+          if tid == 0xAE { // TrackEntry
+            parseMatroskaTrackEntry(bytes, from: tpos, to: entryEnd)
+          }
+          tpos = entryEnd
+        }
+      }
+      if esize < 0 || pos + Int(esize) > end {
+        break
+      }
+      pos += Int(esize)
+    }
+    return firstClusterOffset
+  }
+
+  private func parseMatroskaTrackEntry(_ bytes: [UInt8], from start: Int, to end: Int) {
+    var pos = start
+    var trackNum = -1
+    var trackType = 0
+    var codecId = ""
+    var codecPrivate = Data()
+    var compPrefix = Data()
+    var sampleRate: Double = 48000
+    var channels: UInt32 = 2
+    var bitDepth: UInt32 = 16
+
+    while pos < end {
+      guard let eid = Self.readEbmlId(bytes, at: &pos, end: end),
+            let esize = Self.readEbmlSize(bytes, at: &pos, end: end),
+            esize >= 0, pos + Int(esize) <= end else { break }
+      let len = Int(esize)
+      switch eid {
+      case 0xD7: // TrackNumber
+        trackNum = Int(Self.readEbmlUInt(bytes, from: pos, length: len))
+      case 0x83: // TrackType (1 = video, 2 = audio)
+        trackType = Int(Self.readEbmlUInt(bytes, from: pos, length: len))
+      case 0x86: // CodecID
+        codecId = String(bytes: bytes[pos..<(pos + len)], encoding: .utf8)?.trimmingCharacters(in: .controlCharacters) ?? ""
+      case 0x63A2: // CodecPrivate
+        codecPrivate = Data(bytes[pos..<(pos + len)])
+      case 0xE1: // Audio
+        var apos = pos
+        let aend = pos + len
+        while apos < aend {
+          guard let aid = Self.readEbmlId(bytes, at: &apos, end: aend),
+                let asize = Self.readEbmlSize(bytes, at: &apos, end: aend),
+                asize >= 0, apos + Int(asize) <= aend else { break }
+          let alen = Int(asize)
+          if aid == 0xB5 {
+            let sr = Self.readEbmlFloat(bytes, from: apos, length: alen)
+            if sr >= 8000 { sampleRate = sr }
+          } else if aid == 0x9F {
+            let ch = UInt32(Self.readEbmlUInt(bytes, from: apos, length: alen))
+            if ch > 0 { channels = ch }
+          } else if aid == 0x6264 {
+            let bd = UInt32(Self.readEbmlUInt(bytes, from: apos, length: alen))
+            if bd > 0 { bitDepth = bd }
+          }
+          apos += alen
+        }
+      case 0x6D80: // ContentEncodings
+        var cpos = pos
+        let cend = pos + len
+        while cpos < cend {
+          guard let cid = Self.readEbmlId(bytes, at: &cpos, end: cend),
+                let csize = Self.readEbmlSize(bytes, at: &cpos, end: cend),
+                csize >= 0, cpos + Int(csize) <= cend else { break }
+          let clen = Int(csize)
+          if cid == 0x6240 || cid == 0x5034 { // ContentEncoding / ContentCompression
+            continue
+          } else if cid == 0x4255 { // ContentCompSettings (header stripping prefix bytes)
+            compPrefix = Data(bytes[cpos..<(cpos + clen)])
+          }
+          cpos += clen
+        }
+      default:
+        break
+      }
+      pos += len
+    }
+
+    guard trackNum > 0 else { return }
+    lock.lock()
+    defer { lock.unlock() }
+
+    if trackType == 1 && mkvVideoTrackNum < 0 {
+      if codecId.contains("V_MPEG4/ISO/AVC") {
+        mkvVideoTrackNum = trackNum
+        mkvVideoContentCompPrefix = compPrefix
+        videoCodecId = 7
+        configureMkvAvcCodecPrivateLocked(codecPrivate)
+      } else if codecId.contains("V_MPEGH/ISO/HEVC") {
+        mkvVideoTrackNum = trackNum
+        mkvVideoContentCompPrefix = compPrefix
+        videoCodecId = 12
+        configureMkvHevcCodecPrivateLocked(codecPrivate)
+      }
+    } else if trackType == 2 && mkvAudioTrackNum < 0 {
+      if codecId.contains("A_AAC") || codecId.contains("A_AC3") || codecId.contains("A_EAC3") || codecId.contains("A_MPEG/L3") || codecId.contains("A_FLAC") || codecId.contains("A_PCM/INT/LIT") {
+        mkvAudioTrackNum = trackNum
+        mkvAudioContentCompPrefix = compPrefix
+        configureMkvAudioFormatLocked(codecId: codecId, codecPrivate: codecPrivate, sampleRate: sampleRate, channels: channels, bitDepth: bitDepth)
+      }
+    }
+  }
+
+  private func configureMkvAvcCodecPrivateLocked(_ cp: Data) {
+    guard cp.count >= 7 else { return }
+    if cp[0] == 1 {
+      nalLengthSize = Int(cp[4] & 0x03) + 1
+      var pos = 5
+      let numSps = Int(cp[pos] & 0x1F)
+      pos += 1
+      var spsList: [Data] = []
+      var ppsList: [Data] = []
+      for _ in 0..<numSps {
+        guard pos + 2 <= cp.count else { break }
+        let len = (Int(cp[pos]) << 8) | Int(cp[pos + 1])
+        pos += 2
+        guard pos + len <= cp.count else { break }
+        spsList.append(cp.subdata(in: pos..<(pos + len)))
+        pos += len
+      }
+      if pos < cp.count {
+        let numPps = Int(cp[pos])
+        pos += 1
+        for _ in 0..<numPps {
+          guard pos + 2 <= cp.count else { break }
+          let len = (Int(cp[pos]) << 8) | Int(cp[pos + 1])
+          pos += 2
+          guard pos + len <= cp.count else { break }
+          ppsList.append(cp.subdata(in: pos..<(pos + len)))
+          pos += len
+        }
+      }
+      if let sps = spsList.first, let pps = ppsList.first {
+        cachedH264Sps = sps
+        cachedH264Pps = pps
+        videoFormatDesc = Self.createH264FormatDesc(sps: sps, pps: pps, nalLengthSize: nalLengthSize)
+      }
+    } else {
+      nalLengthSize = 4
+      for n in Self.splitAnnexBNalus(cp) where !n.isEmpty {
+        let nType = n[0] & 0x1F
+        if nType == 7 { cachedH264Sps = n }
+        else if nType == 8 { cachedH264Pps = n }
+      }
+      if let sps = cachedH264Sps, let pps = cachedH264Pps {
+        videoFormatDesc = Self.createH264FormatDesc(sps: sps, pps: pps, nalLengthSize: 4)
+      }
+    }
+  }
+
+  private func configureMkvHevcCodecPrivateLocked(_ cp: Data) {
+    var paramSets: [Data] = []
+    if cp.count >= 4 && ((cp[0] == 0 && cp[1] == 0 && cp[2] == 0 && cp[3] == 1) || (cp[0] == 0 && cp[1] == 0 && cp[2] == 1)) {
+      nalLengthSize = 4
+      for n in Self.splitAnnexBNalus(cp) where !n.isEmpty {
+        let nType = (n[0] >> 1) & 0x3F
+        if nType == 32 || nType == 33 || nType == 34 {
+          paramSets.append(n)
+        }
+      }
+    } else if cp.count >= 23 {
+      nalLengthSize = Int(cp[21] & 0x03) + 1
+      let numArrays = Int(cp[22])
+      var pos = 23
+      var vps: Data? = nil
+      var sps: Data? = nil
+      var pps: Data? = nil
+      for _ in 0..<numArrays {
+        guard pos + 3 <= cp.count else { break }
+        let nType = cp[pos] & 0x3F
+        let numNalus = (Int(cp[pos + 1]) << 8) | Int(cp[pos + 2])
+        pos += 3
+        for _ in 0..<numNalus {
+          guard pos + 2 <= cp.count else { break }
+          let len = (Int(cp[pos]) << 8) | Int(cp[pos + 1])
+          pos += 2
+          guard pos + len <= cp.count else { break }
+          let nalu = cp.subdata(in: pos..<(pos + len))
+          pos += len
+          if nType == 32 && vps == nil { vps = nalu }
+          else if nType == 33 && sps == nil { sps = nalu }
+          else if nType == 34 && pps == nil { pps = nalu }
+        }
+      }
+      if let v = vps, let s = sps, let p = pps {
+        paramSets = [v, s, p]
+      }
+    }
+    if paramSets.count >= 3 {
+      cachedHevcParamSets = Array(paramSets.prefix(3))
+      videoFormatDesc = Self.createHevcFormatDesc(paramSets: cachedHevcParamSets, nalLengthSize: nalLengthSize)
+    }
+  }
+
+  private func configureMkvAudioFormatLocked(codecId: String, codecPrivate: Data, sampleRate: Double, channels: UInt32, bitDepth: UInt32) {
+    var sr = sampleRate >= 8000 ? sampleRate : 48000.0
+    var ch = max(1, min(8, channels))
+    var formatId: AudioFormatID = kAudioFormatMPEG4AAC
+    var framesPerPkt: UInt32 = 1024
+    var formatFlags: AudioFormatFlags = 0
+    var bytesPerPkt: UInt32 = 0
+    var bytesPerFrame: UInt32 = 0
+    var bitsPerChan: UInt32 = 0
+    var cookie = codecPrivate
+
+    if codecId.contains("A_AAC") {
+      formatId = kAudioFormatMPEG4AAC
+      framesPerPkt = 1024
+      if cookie.count >= 2 {
+        let b0 = cookie[0], b1 = cookie[1]
+        let freqIdx = Int(((b0 & 0x07) << 1) | ((b1 >> 7) & 0x01))
+        let chanCfg = UInt32((b1 >> 3) & 0x0F)
+        let sampleRates: [Float64] = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350]
+        if freqIdx < sampleRates.count { sr = sampleRates[freqIdx] }
+        if chanCfg > 0 && chanCfg <= 8 { ch = chanCfg }
+      }
+    } else if codecId.contains("A_AC3") {
+      formatId = kAudioFormatAC3
+      framesPerPkt = 1536
+      cookie = Data()
+    } else if codecId.contains("A_EAC3") {
+      formatId = kAudioFormatEnhancedAC3
+      framesPerPkt = 1536
+      cookie = Data()
+    } else if codecId.contains("A_MPEG/L3") {
+      formatId = kAudioFormatMPEGLayer3
+      framesPerPkt = 1152
+      cookie = Data()
+    } else if codecId.contains("A_FLAC") {
+      formatId = kAudioFormatFLAC
+      framesPerPkt = 4096
+    } else if codecId.contains("A_PCM/INT/LIT") {
+      formatId = kAudioFormatLinearPCM
+      formatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked
+      bitsPerChan = (bitDepth == 24 || bitDepth == 32) ? bitDepth : 16
+      framesPerPkt = 1
+      bytesPerFrame = (bitsPerChan / 8) * ch
+      bytesPerPkt = bytesPerFrame
+      cookie = Data()
+    }
+
+    self.audioSampleRate = Int32(sr)
+    self.mkvAudioFormatId = formatId
+    self.mkvAudioFramesPerPacket = Int64(framesPerPkt)
+    self.mkvAudioChannels = ch
+    self.mkvAudioBitDepth = bitDepth
+
+    var asbd = AudioStreamBasicDescription(
+      mSampleRate: sr,
+      mFormatID: formatId,
+      mFormatFlags: formatFlags,
+      mBytesPerPacket: bytesPerPkt,
+      mFramesPerPacket: framesPerPkt,
+      mBytesPerFrame: bytesPerFrame,
+      mChannelsPerFrame: ch,
+      mBitsPerChannel: bitsPerChan,
+      mReserved: 0
+    )
+    var fmt: CMAudioFormatDescription? = nil
+    if !cookie.isEmpty {
+      cookie.withUnsafeBytes { rawPtr in
+        if let base = rawPtr.baseAddress {
+          _ = CMAudioFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault,
+            asbd: &asbd,
+            layoutSize: 0,
+            layout: nil,
+            magicCookieSize: cookie.count,
+            magicCookie: base,
+            extensions: nil,
+            formatDescriptionOut: &fmt
+          )
+        }
+      }
+    } else {
+      _ = CMAudioFormatDescriptionCreate(
+        allocator: kCFAllocatorDefault,
+        asbd: &asbd,
+        layoutSize: 0,
+        layout: nil,
+        magicCookieSize: 0,
+        magicCookie: nil,
+        extensions: nil,
+        formatDescriptionOut: &fmt
+      )
+    }
+    if let validFmt = fmt {
+      self.audioFormatDesc = validFmt
+    }
+  }
+
+  private func runMatroskaStreamLoop(proxyUrl: URL, reader: UUID) async {
+    guard let probed = await TvLocalHlsProxyServer.shared.probeMediaMetaForEngine(proxyUrl: proxyUrl) else {
+      let cb = onAllCandidatesFailed
+      DispatchQueue.main.async { cb?() }
+      return
+    }
+    let targetKey = probed.targetKey
+    let remoteUrl = probed.remoteUrl
+    let headers = probed.headers
+    let meta = probed.meta
+    let blockSize: Int64 = 1_048_576
+    let maxBlockIndex = max(0, (meta.totalSize - 1) / blockSize)
+
+    // 1. Read Block 0 (and Block 1 if needed) to parse EBML Info + Tracks before the first Cluster
+    guard var headerData = await TvLocalHlsProxyServer.shared.fetchMediaBlockForEngine(
+      targetKey: targetKey,
+      remoteUrl: remoteUrl,
+      headers: headers,
+      blockIndex: 0,
+      meta: meta,
+      reader: reader
+    ), !headerData.isEmpty else {
+      let cb = onAllCandidatesFailed
+      DispatchQueue.main.async { cb?() }
+      return
+    }
+
+    var firstClusterOff = parseMatroskaHeaderAndTracks(headerData)
+    if firstClusterOff < 0 && maxBlockIndex >= 1 {
+      if let block1 = await TvLocalHlsProxyServer.shared.fetchMediaBlockForEngine(
+        targetKey: targetKey,
+        remoteUrl: remoteUrl,
+        headers: headers,
+        blockIndex: 1,
+        meta: meta,
+        reader: reader
+      ) {
+        headerData.append(block1)
+        firstClusterOff = parseMatroskaHeaderAndTracks(headerData)
+      }
+    }
+
+    lock.lock()
+    let hasVideoTrack = (mkvVideoTrackNum > 0)
+    let durSec = mkvDurationSec
+    lock.unlock()
+
+    guard hasVideoTrack else {
+      let cb = onAllCandidatesFailed
+      DispatchQueue.main.async { cb?() }
+      return
+    }
+    if durSec > 0, let progCb = onMkvProgress {
+      DispatchQueue.main.async { progCb(0, durSec) }
+    }
+
+    var currentBlockIdx: Int64 = 0
+    var streamBuf = headerData
+    var bufCursor = max(0, firstClusterOff)
+    var currentClusterTimestamp: Int64 = 0
+    var waitingForKeyframeAfterSeek = false
+    var lastProgressReportAt = Date.distantPast
+
+    while !Task.isCancelled {
+      lock.lock()
+      if isStopped {
+        lock.unlock()
+        break
+      }
+      let paused = isPaused
+      let seekTarget = mkvTargetSeekSec
+      if seekTarget != nil {
+        mkvTargetSeekSec = nil
+      }
+      let knownDur = mkvDurationSec
+      lock.unlock()
+
+      if let targetSec = seekTarget {
+        let ratio = (knownDur > 1.0) ? min(0.995, max(0.0, targetSec / knownDur)) : 0.0
+        currentBlockIdx = min(maxBlockIndex, max(0, Int64(Double(maxBlockIndex) * ratio)))
+        streamBuf.removeAll(keepingCapacity: true)
+        bufCursor = 0
+        waitingForKeyframeAfterSeek = true
+        guard let seekBlock = await TvLocalHlsProxyServer.shared.fetchMediaBlockForEngine(
+          targetKey: targetKey,
+          remoteUrl: remoteUrl,
+          headers: headers,
+          blockIndex: currentBlockIdx,
+          meta: meta,
+          reader: reader
+        ), !seekBlock.isEmpty else {
+          break
+        }
+        streamBuf.append(seekBlock)
+        // Scan for the 4-byte Cluster EBML ID (`0x1F 0x43 0xB6 0x75`)
+        if let clusterPos = Self.findMatroskaClusterMagic(in: streamBuf, from: 0) {
+          bufCursor = clusterPos
+        } else if currentBlockIdx + 1 <= maxBlockIndex,
+                  let nextBlock = await TvLocalHlsProxyServer.shared.fetchMediaBlockForEngine(
+                    targetKey: targetKey,
+                    remoteUrl: remoteUrl,
+                    headers: headers,
+                    blockIndex: currentBlockIdx + 1,
+                    meta: meta,
+                    reader: reader
+                  ) {
+          currentBlockIdx += 1
+          streamBuf.append(nextBlock)
+          bufCursor = Self.findMatroskaClusterMagic(in: streamBuf, from: 0) ?? 0
+        }
+      }
+
+      if paused {
+        try? await Task.sleep(nanoseconds: 40_000_000)
+        continue
+      }
+
+      // Backpressure control: keep ~3.0 seconds of decoded/compressed frames queued ahead of synchronizer clock
+      // so we never exhaust Apple TV RAM while keeping VideoToolbox 100% fed!
+      lock.lock()
+      let syncStarted = hasStartedSynchronizer
+      let lastQueuedVideoMs = normVideoDtsMs
+      lock.unlock()
+      if syncStarted {
+        let curSyncSec = CMTimeGetSeconds(synchronizer.currentTime())
+        if curSyncSec.isFinite && curSyncSec >= 0 {
+          if Date().timeIntervalSince(lastProgressReportAt) >= 0.45 {
+            lastProgressReportAt = Date()
+            lock.lock()
+            mkvCurrentPositionSec = curSyncSec
+            let d = mkvDurationSec
+            lock.unlock()
+            if let progCb = onMkvProgress {
+              DispatchQueue.main.async { progCb(curSyncSec, d) }
+            }
+          }
+          let aheadSec = (Double(lastQueuedVideoMs) / 1000.0) - curSyncSec
+          if aheadSec > 3.2 {
+            try? await Task.sleep(nanoseconds: 25_000_000)
+            continue
+          }
+        }
+      }
+
+      // Ensure at least 2 MB is buffered in `streamBuf` before parsing the next EBML element
+      while (streamBuf.count - bufCursor) < 1_572_864 && currentBlockIdx < maxBlockIndex {
+        currentBlockIdx += 1
+        guard let nextData = await TvLocalHlsProxyServer.shared.fetchMediaBlockForEngine(
+          targetKey: targetKey,
+          remoteUrl: remoteUrl,
+          headers: headers,
+          blockIndex: currentBlockIdx,
+          meta: meta,
+          reader: reader
+        ), !nextData.isEmpty else {
+          break
+        }
+        if bufCursor > 1_048_576 {
+          streamBuf.removeSubrange(0..<bufCursor)
+          bufCursor = 0
+        }
+        streamBuf.append(nextData)
+      }
+
+      if bufCursor >= streamBuf.count {
+        break
+      }
+
+      // Parse EBML elements inside Segment / Cluster
+      let parsed = parseNextMatroskaElements(
+        in: streamBuf,
+        cursor: &bufCursor,
+        isAtEof: currentBlockIdx >= maxBlockIndex,
+        clusterTimestamp: &currentClusterTimestamp,
+        waitingForKeyframe: &waitingForKeyframeAfterSeek
+      )
+      if !parsed {
+        if currentBlockIdx >= maxBlockIndex {
+          break
+        }
+        // If corrupted bytes or unknown element reached, jump to next Cluster magic
+        if let nextCluster = Self.findMatroskaClusterMagic(in: streamBuf, from: bufCursor + 1) {
+          bufCursor = nextCluster
+        } else {
+          bufCursor = max(bufCursor, streamBuf.count - 4)
+        }
+      }
+    }
+  }
+
+  private static func findMatroskaClusterMagic(in data: Data, from startOffset: Int) -> Int? {
+    guard data.count >= startOffset + 4 else { return nil }
+    return data.withUnsafeBytes { rawBuf -> Int? in
+      guard let ptr = rawBuf.bindMemory(to: UInt8.self).baseAddress else { return nil }
+      let limit = data.count - 4
+      var i = max(0, startOffset)
+      while i <= limit {
+        if ptr[i] == 0x1F && ptr[i + 1] == 0x43 && ptr[i + 2] == 0xB6 && ptr[i + 3] == 0x75 {
+          return i
+        }
+        i += 1
+      }
+      return nil
+    }
+  }
+
+  private func parseNextMatroskaElements(
+    in data: Data,
+    cursor: inout Int,
+    isAtEof: Bool,
+    clusterTimestamp: inout Int64,
+    waitingForKeyframe: inout Bool
+  ) -> Bool {
+    let totalCount = data.count
+    var processedCount = 0
+    return data.withUnsafeBytes { rawBuf -> Bool in
+      guard let basePtr = rawBuf.bindMemory(to: UInt8.self).baseAddress else { return false }
+      while cursor + 3 <= totalCount && processedCount < 64 {
+        let elemStart = cursor
+        // Read EBML ID inline from pointer
+        let b0 = basePtr[cursor]
+        if b0 == 0 {
+          cursor += 1
+          continue
+        }
+        var idLen = 1
+        var idMask: UInt8 = 0x80
+        while (b0 & idMask) == 0 && idLen < 4 {
+          idMask >>= 1
+          idLen += 1
+        }
+        if cursor + idLen >= totalCount {
+          cursor = elemStart
+          return processedCount > 0
+        }
+        var eid: UInt32 = 0
+        for i in 0..<idLen {
+          eid = (eid << 8) | UInt32(basePtr[cursor + i])
+        }
+        cursor += idLen
+
+        // Read EBML Size inline from pointer
+        let sb0 = basePtr[cursor]
+        if sb0 == 0 {
+          cursor = elemStart + 1
+          continue
+        }
+        var szLen = 1
+        var szMask: UInt8 = 0x80
+        while (sb0 & szMask) == 0 && szLen < 8 {
+          szMask >>= 1
+          szLen += 1
+        }
+        if cursor + szLen > totalCount {
+          cursor = elemStart
+          return processedCount > 0
+        }
+        var esize = Int64(sb0 & ~szMask)
+        var allOnes = (sb0 & ~szMask) == (szMask - 1)
+        for i in 1..<szLen {
+          let bi = basePtr[cursor + i]
+          if bi != 0xFF { allOnes = false }
+          esize = (esize << 8) | Int64(bi)
+        }
+        if allOnes { esize = -1 }
+        cursor += szLen
+
+        // Container elements that we step into directly without waiting for their full body:
+        // Segment (0x18538067), Cluster (0x1F43B675), BlockGroup (0xA0)
+        if eid == 0x18538067 || eid == 0x1F43B675 || eid == 0xA0 {
+          processedCount += 1
+          continue
+        }
+
+        if esize < 0 {
+          return false
+        }
+        let bodyLen = Int(esize)
+        if cursor + bodyLen > totalCount {
+          if isAtEof {
+            cursor = totalCount
+            return true
+          }
+          // Need more blocks from network before this element is complete
+          cursor = elemStart
+          return processedCount > 0
+        }
+
+        if eid == 0xE7 { // Cluster Timestamp
+          var ts: UInt64 = 0
+          for i in 0..<min(8, bodyLen) {
+            ts = (ts << 8) | UInt64(basePtr[cursor + i])
+          }
+          clusterTimestamp = Int64(bitPattern: ts)
+        } else if eid == 0xA3 || eid == 0xA1 { // SimpleBlock (0xA3) or Block (0xA1)
+          let blockSlice = data.subdata(in: cursor..<(cursor + bodyLen))
+          decodeMatroskaBlock(
+            blockSlice,
+            isSimpleBlock: eid == 0xA3,
+            clusterTimestamp: clusterTimestamp,
+            waitingForKeyframe: &waitingForKeyframe
+          )
+        }
+        cursor += bodyLen
+        processedCount += 1
+      }
+      return processedCount > 0
+    }
+  }
+
+  private func decodeMatroskaBlock(
+    _ block: Data,
+    isSimpleBlock: Bool,
+    clusterTimestamp: Int64,
+    waitingForKeyframe: inout Bool
+  ) {
+    guard block.count >= 4 else { return }
+    let bytes = [UInt8](block)
+    var pos = 0
+    guard let rawTrackVint = Self.readEbmlSize(bytes, at: &pos, end: bytes.count),
+          pos + 3 <= bytes.count else { return }
+    let trackNum = Int(rawTrackVint)
+    let relTs = Int16(bitPattern: (UInt16(bytes[pos]) << 8) | UInt16(bytes[pos + 1]))
+    let flags = bytes[pos + 2]
+    pos += 3
+
+    lock.lock()
+    let vTrack = mkvVideoTrackNum
+    let aTrack = mkvAudioTrackNum
+    let scaleNs = mkvTimestampScaleNs
+    let vPrefix = mkvVideoContentCompPrefix
+    let aPrefix = mkvAudioContentCompPrefix
+    lock.unlock()
+
+    guard trackNum == vTrack || trackNum == aTrack else { return }
+
+    let absTicks = max(0, clusterTimestamp + Int64(relTs))
+    let ptsMs = (absTicks * scaleNs) / 1_000_000
+    let isKeyframe = isSimpleBlock ? ((flags & 0x80) != 0) : true
+    let lacing = (flags >> 1) & 0x03
+
+    var framePayloads: [Data] = []
+    if lacing == 0 {
+      if pos < block.count {
+        framePayloads.append(block.subdata(in: pos..<block.count))
+      }
+    } else if pos < block.count {
+      let numFrames = Int(bytes[pos]) + 1
+      pos += 1
+      var frameSizes: [Int] = []
+      if lacing == 1 { // Xiph lacing
+        var sum = 0
+        for _ in 0..<(numFrames - 1) {
+          var sz = 0
+          while pos < bytes.count {
+            let b = Int(bytes[pos])
+            pos += 1
+            sz += b
+            if b < 255 { break }
+          }
+          frameSizes.append(sz)
+          sum += sz
+        }
+        let lastSz = max(0, (block.count - pos) - sum)
+        frameSizes.append(lastSz)
+      } else if lacing == 3 { // EBML lacing
+        var sum = 0
+        var prevSz = 0
+        for i in 0..<(numFrames - 1) {
+          if i == 0 {
+            guard let firstSz = Self.readEbmlSize(bytes, at: &pos, end: bytes.count), firstSz >= 0 else { break }
+            prevSz = Int(firstSz)
+          } else {
+            guard let delta = Self.readEbmlSignedVint(bytes, at: &pos, end: bytes.count) else { break }
+            prevSz = max(0, prevSz + Int(delta))
+          }
+          frameSizes.append(prevSz)
+          sum += prevSz
+        }
+        let lastSz = max(0, (block.count - pos) - sum)
+        frameSizes.append(lastSz)
+      } else if lacing == 2 { // Fixed-size lacing
+        let rem = block.count - pos
+        let each = numFrames > 0 ? (rem / numFrames) : rem
+        frameSizes = Array(repeating: each, count: numFrames)
+      }
+      for sz in frameSizes where sz > 0 && pos + sz <= block.count {
+        framePayloads.append(block.subdata(in: pos..<(pos + sz)))
+        pos += sz
+      }
+    }
+
+    if trackNum == vTrack {
+      for (idx, var rawFrame) in framePayloads.enumerated() {
+        if !vPrefix.isEmpty {
+          var restored = vPrefix
+          restored.append(rawFrame)
+          rawFrame = restored
+        }
+        if waitingForKeyframe {
+          if !isKeyframe && !Self.containsKeyframeNalu(rawFrame, codecId: videoCodecId, nalLengthSize: nalLengthSize) {
+            continue
+          }
+          waitingForKeyframe = false
+        }
+        enqueueMatroskaVideoFrame(rawFrame, ptsMs: ptsMs + Int64(idx * 33), isKeyframe: isKeyframe)
+      }
+    } else if trackNum == aTrack && !waitingForKeyframe {
+      for (idx, var rawAudio) in framePayloads.enumerated() {
+        if !aPrefix.isEmpty {
+          var restored = aPrefix
+          restored.append(rawAudio)
+          rawAudio = restored
+        }
+        enqueueMatroskaAudioFrame(rawAudio, basePtsMs: ptsMs, frameOffsetIndex: idx)
+      }
+    }
+  }
+
+  private static func containsKeyframeNalu(_ payload: Data, codecId: UInt8, nalLengthSize: Int) -> Bool {
+    let isAnnexB = payload.count >= 4 && ((payload[0] == 0 && payload[1] == 0 && payload[2] == 0 && payload[3] == 1) || (payload[0] == 0 && payload[1] == 0 && payload[2] == 1))
+    let nalus = isAnnexB ? splitAnnexBNalus(payload) : splitAvccNalus(payload, nalLengthSize: nalLengthSize)
+    for n in nalus where !n.isEmpty {
+      if codecId == 7 {
+        let t = n[0] & 0x1F
+        if t == 5 || t == 7 { return true }
+      } else if codecId == 12 {
+        let t = (n[0] >> 1) & 0x3F
+        if (16...21).contains(t) || t == 32 || t == 33 { return true }
+      }
+    }
+    return false
+  }
+
+  private func enqueueMatroskaVideoFrame(_ rawPayload: Data, ptsMs: Int64, isKeyframe: Bool) {
+    lock.lock()
+    defer { lock.unlock() }
+    guard !isStopped else { return }
+
+    var framePayload = rawPayload
+    let isAnnexB = framePayload.count >= 4 && ((framePayload[0] == 0 && framePayload[1] == 0 && framePayload[2] == 0 && framePayload[3] == 1) || (framePayload[0] == 0 && framePayload[1] == 0 && framePayload[2] == 1))
+    if isAnnexB || videoFormatDesc == nil || isKeyframe {
+      let nalus = isAnnexB ? Self.splitAnnexBNalus(framePayload) : Self.splitAvccNalus(framePayload, nalLengthSize: nalLengthSize)
+      if videoCodecId == 7 {
+        var updated = false
+        for n in nalus where !n.isEmpty {
+          let nType = n[0] & 0x1F
+          if nType == 7 { cachedH264Sps = n; updated = true }
+          else if nType == 8 { cachedH264Pps = n; updated = true }
+        }
+        if (updated || videoFormatDesc == nil), let sps = cachedH264Sps, let pps = cachedH264Pps {
+          if let validFmt = Self.createH264FormatDesc(sps: sps, pps: pps, nalLengthSize: isAnnexB ? 4 : nalLengthSize) {
+            videoFormatDesc = validFmt
+          }
+        }
+      } else if videoCodecId == 12 {
+        var vps: Data? = cachedHevcParamSets.count >= 1 ? cachedHevcParamSets[0] : nil
+        var sps: Data? = cachedHevcParamSets.count >= 2 ? cachedHevcParamSets[1] : nil
+        var pps: Data? = cachedHevcParamSets.count >= 3 ? cachedHevcParamSets[2] : nil
+        var updated = false
+        for n in nalus where !n.isEmpty {
+          let nType = (n[0] >> 1) & 0x3F
+          if nType == 32 { vps = n; updated = true }
+          else if nType == 33 { sps = n; updated = true }
+          else if nType == 34 { pps = n; updated = true }
+        }
+        if (updated || videoFormatDesc == nil), let v = vps, let s = sps, let p = pps {
+          cachedHevcParamSets = [v, s, p]
+          if let validFmt = Self.createHevcFormatDesc(paramSets: cachedHevcParamSets, nalLengthSize: isAnnexB ? 4 : nalLengthSize) {
+            videoFormatDesc = validFmt
+          }
+        }
+      }
+      if isAnnexB {
+        framePayload = Self.packLengthPrefixedNalus(nalus)
+      }
+    }
+
+    guard let fmt = videoFormatDesc else { return }
+    let len = framePayload.count
+    guard len > 4 else { return }
+
+    normVideoDtsMs = ptsMs
+
+    var blockBuf: CMBlockBuffer? = nil
+    guard CMBlockBufferCreateWithMemoryBlock(
+      allocator: kCFAllocatorDefault,
+      memoryBlock: nil,
+      blockLength: len,
+      blockAllocator: kCFAllocatorDefault,
+      customBlockSource: nil,
+      offsetToData: 0,
+      dataLength: len,
+      flags: 0,
+      blockBufferOut: &blockBuf
+    ) == kCMBlockBufferNoErr, let bb = blockBuf else { return }
+
+    framePayload.withUnsafeBytes { rawPtr in
+      if let base = rawPtr.baseAddress {
+        _ = CMBlockBufferReplaceDataBytes(
+          with: base,
+          blockBuffer: bb,
+          offsetIntoDestination: 0,
+          dataLength: len
+        )
+      }
+    }
+
+    // Use kCMTimeInvalid for decodeTimeStamp so VideoToolbox hardware-reorders B-frames automatically by PTS!
+    var timing = CMSampleTimingInfo(
+      duration: CMTime(value: 41, timescale: 1000),
+      presentationTimeStamp: CMTime(value: ptsMs, timescale: 1000),
+      decodeTimeStamp: .invalid
+    )
+    var sampleBuf: CMSampleBuffer? = nil
+    guard CMSampleBufferCreateReady(
+      allocator: kCFAllocatorDefault,
+      dataBuffer: bb,
+      formatDescription: fmt,
+      sampleCount: 1,
+      sampleTimingEntryCount: 1,
+      sampleTimingArray: &timing,
+      sampleSizeEntryCount: 1,
+      sampleSizeArray: [len],
+      sampleBufferOut: &sampleBuf
+    ) == noErr, let sb = sampleBuf else { return }
+
+    if displayLayer.status == .failed {
+      displayLayer.flush()
+    }
+    displayLayer.enqueue(sb)
+    renderedVideoFrameCount += 1
+    lastFrameReceivedAt = Date()
+
+    if !hasStartedSynchronizer {
+      hasStartedSynchronizer = true
+      mkvCurrentPositionSec = Double(ptsMs) / 1000.0
+      if !isPaused {
+        synchronizer.setRate(mkvPlaybackRate, time: CMTime(value: ptsMs, timescale: 1000))
+      } else {
+        synchronizer.setRate(0.0, time: CMTime(value: ptsMs, timescale: 1000))
+      }
+    }
+    if !hasRenderedFirstVideoFrame {
+      hasRenderedFirstVideoFrame = true
+      let cb = onFirstFrameRendered
+      DispatchQueue.main.async { cb?() }
+    }
+  }
+
+  private func enqueueMatroskaAudioFrame(_ rawAudio: Data, basePtsMs: Int64, frameOffsetIndex: Int) {
+    lock.lock()
+    defer { lock.unlock() }
+    guard !isStopped, let fmt = audioFormatDesc else { return }
+    let len = rawAudio.count
+    guard len > 0 else { return }
+
+    let sr = max(8000, Int64(audioSampleRate))
+    let framesPerPkt = max(1, mkvAudioFramesPerPacket)
+    let samplePts = ((basePtsMs * sr) / 1000) + Int64(frameOffsetIndex) * framesPerPkt
+
+    var blockBuf: CMBlockBuffer? = nil
+    guard CMBlockBufferCreateWithMemoryBlock(
+      allocator: kCFAllocatorDefault,
+      memoryBlock: nil,
+      blockLength: len,
+      blockAllocator: kCFAllocatorDefault,
+      customBlockSource: nil,
+      offsetToData: 0,
+      dataLength: len,
+      flags: 0,
+      blockBufferOut: &blockBuf
+    ) == kCMBlockBufferNoErr, let bb = blockBuf else { return }
+
+    rawAudio.withUnsafeBytes { rawPtr in
+      if let base = rawPtr.baseAddress {
+        _ = CMBlockBufferReplaceDataBytes(
+          with: base,
+          blockBuffer: bb,
+          offsetIntoDestination: 0,
+          dataLength: len
+        )
+      }
+    }
+
+    var sampleBuf: CMSampleBuffer? = nil
+    if mkvAudioFormatId == kAudioFormatLinearPCM {
+      let bytesPerFrame = max(1, Int((mkvAudioBitDepth / 8) * mkvAudioChannels))
+      let numSamples = max(1, len / bytesPerFrame)
+      var timing = CMSampleTimingInfo(
+        duration: CMTime(value: 1, timescale: audioSampleRate),
+        presentationTimeStamp: CMTime(value: samplePts, timescale: audioSampleRate),
+        decodeTimeStamp: .invalid
+      )
+      guard CMSampleBufferCreateReady(
+        allocator: kCFAllocatorDefault,
+        dataBuffer: bb,
+        formatDescription: fmt,
+        sampleCount: numSamples,
+        sampleTimingEntryCount: 1,
+        sampleTimingArray: &timing,
+        sampleSizeEntryCount: 1,
+        sampleSizeArray: [bytesPerFrame],
+        sampleBufferOut: &sampleBuf
+      ) == noErr else { return }
+    } else {
+      var pktDesc = AudioStreamPacketDescription(mStartOffset: 0, mVariableFramesInPacket: 0, mDataByteSize: UInt32(len))
+      guard CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+        allocator: kCFAllocatorDefault,
+        dataBuffer: bb,
+        formatDescription: fmt,
+        sampleCount: 1,
+        presentationTimeStamp: CMTime(value: samplePts, timescale: audioSampleRate),
+        packetDescriptions: &pktDesc,
+        sampleBufferOut: &sampleBuf
+      ) == noErr else { return }
+    }
+
+    if let sb = sampleBuf {
+      audioRenderer.enqueue(sb)
     }
   }
 }
@@ -4123,6 +5273,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
   private var tgActivePrefetchCountByUrl: [String: Int] = [:]
   private var tgPreferDirectByUrl: [String: Date] = [:]
   private var tgPlayheadBlockByUrl: [String: Int64] = [:]
+  private var tgTailProbeBlockByUrl: [String: Int64] = [:]
   private var tgLastAccessByUrl: [String: Date] = [:]
   private var tgActiveBackgroundUrl: String = ""
 
@@ -4406,6 +5557,9 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     var allowed = CharacterSet.urlQueryAllowed
     allowed.remove(charactersIn: "&+=?#")
     let enc = remoteUrl.addingPercentEncoding(withAllowedCharacters: allowed) ?? remoteUrl
+    if cleanExt == ".ts" || cleanExt == ".m2ts" || cleanExt == ".mts" {
+      return "http://127.0.0.1:\(port)/virtual_ts.m3u8?u=\(enc)&playback=\(playbackId)"
+    }
     return "http://127.0.0.1:\(port)\(reqPath)?u=\(enc)&playback=\(playbackId)"
   }
 
@@ -4416,7 +5570,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
   }
 
   func releaseTelegramVideoProxyUrl(_ url: URL) {
-    guard url.host == "127.0.0.1", url.path.hasPrefix("/tg_video"),
+    guard url.host == "127.0.0.1", (url.path.hasPrefix("/tg_video") || url.path == "/virtual_ts.m3u8"),
           let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems,
           let remoteUrl = query.first(where: { $0.name == "u" })?.value,
           let playbackId = query.first(where: { $0.name == "playback" })?.value else { return }
@@ -4445,6 +5599,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     }
     tgBlockOrder.removeAll { $0.hasPrefix(prefix) }
     tgPlayheadBlockByUrl.removeValue(forKey: key)
+    tgTailProbeBlockByUrl.removeValue(forKey: key)
     tgLastAccessByUrl.removeValue(forKey: key)
     tgActivePrefetchCountByUrl.removeValue(forKey: key)
     tgPreferDirectByUrl.removeValue(forKey: key)
@@ -4648,7 +5803,87 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       }
     }
 
+    if (bytes[0] == 0x00 && bytes[1] == 0x00 && bytes[2] == 0x00 && bytes.count >= 12) {
+      return (patchMp4Hev1ToHvc1IfNeeded(rawChunk), 0, rawTotalSize, contentType)
+    }
+
     return (Data(bytes), stripPrefix, effectiveTotal, contentType)
+  }
+
+  /// Patches `hev1` FourCC inside MP4 `stsd` video sample description atoms to `hvc1` so tvOS `AVPlayer` natively hardware-decodes
+  /// 30 GB – 100 GB+ 4K HEVC `.mp4` / `.mov` / `.m4v` files muxed with `hev1`.
+  static func patchMp4Hev1ToHvc1IfNeeded(_ data: Data) -> Data {
+    guard data.count >= 24 else { return data }
+    var out = data
+    var patched = false
+    out.withUnsafeMutableBytes { rawBuf in
+      guard let ptr = rawBuf.bindMemory(to: UInt8.self).baseAddress else { return }
+      let limit = data.count - 20
+      var i = 0
+      while i < limit {
+        // Match `"stsd"` (`0x73, 0x74, 0x73, 0x64`) followed 12 bytes later by `"hev1"` (`0x68, 0x65, 0x76, 0x31`)
+        if ptr[i] == 0x73 && ptr[i + 1] == 0x74 && ptr[i + 2] == 0x73 && ptr[i + 3] == 0x64 {
+          let tagOff = i + 16
+          if tagOff + 4 <= data.count &&
+              ptr[tagOff] == 0x68 && ptr[tagOff + 1] == 0x65 && ptr[tagOff + 2] == 0x76 && ptr[tagOff + 3] == 0x31 {
+            ptr[tagOff] = 0x68     // 'h'
+            ptr[tagOff + 1] = 0x76 // 'v'
+            ptr[tagOff + 2] = 0x63 // 'c'
+            ptr[tagOff + 3] = 0x31 // '1'
+            patched = true
+          }
+          i += 16
+        } else {
+          i += 1
+        }
+      }
+    }
+    return patched ? out : data
+  }
+
+  /// Exposed helper for `TvDirectFlvHardwareEngine` (Matroska `.mkv` / `.webm` hardware mode) to probe metadata and fetch 1 MB blocks
+  /// directly from the shared 24-worker Range block cache (`tgBlockCache`).
+  func probeMediaMetaForEngine(
+    proxyUrl: URL
+  ) async -> (targetKey: String, remoteUrl: URL, headers: [String: String], meta: (totalSize: Int64, contentType: String, headerChunk: Data, stripPrefixBytes: Int))? {
+    guard let comp = URLComponents(url: proxyUrl, resolvingAgainstBaseURL: false),
+          let remoteStr = comp.queryItems?.first(where: { $0.name == "u" })?.value,
+          let remoteUrl = URL(string: remoteStr),
+          let playbackId = comp.queryItems?.first(where: { $0.name == "playback" })?.value else {
+      return nil
+    }
+    let key = "\(remoteStr)#\(playbackId)"
+    let hdrs = getTgHeadersAndMeta(for: key).headers
+    guard let meta = await ensureTelegramVideoMeta(targetUrl: key, url: remoteUrl, requestPath: proxyUrl.path),
+          meta.totalSize > 0 else {
+      return nil
+    }
+    let effectiveUrl = resolvedCdnUrl(for: key, fallback: remoteUrl)
+    return (key, effectiveUrl, hdrs, meta)
+  }
+
+  func fetchMediaBlockForEngine(
+    targetKey: String,
+    remoteUrl: URL,
+    headers: [String: String],
+    blockIndex: Int64,
+    meta: (totalSize: Int64, contentType: String, headerChunk: Data, stripPrefixBytes: Int),
+    reader: UUID
+  ) async -> Data? {
+    let maxBlockIndex = max(0, (meta.totalSize - 1) / Self.tgBlockSize)
+    if updateTelegramPlayhead(targetUrl: targetKey, blockIndex: blockIndex, maxBlockIndex: maxBlockIndex, reader: reader) {
+      pumpTelegramSlidingWindow(targetUrl: targetKey, url: remoteUrl, meta: meta)
+    }
+    let data = await getOrFetchTelegramBlock(
+      targetUrl: targetKey,
+      url: remoteUrl,
+      headers: headers,
+      blockIndex: blockIndex,
+      meta: meta,
+      isPrefetch: false
+    )
+    pumpTelegramSlidingWindow(targetUrl: targetKey, url: remoteUrl, meta: meta)
+    return data
   }
 
   private func startNewFlvSession(
@@ -4861,6 +6096,49 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
           isHead: method == "HEAD"
         )
       }
+      return
+    }
+
+    if path == "/virtual_ts.m3u8",
+       let targetUrl = comp?.queryItems?.first(where: { $0.name == "u" })?.value,
+       let remoteUrl = URL(string: targetUrl),
+       let playbackId = comp?.queryItems?.first(where: { $0.name == "playback" })?.value {
+      let key = "\(targetUrl)#\(playbackId)"
+      guard let meta = await ensureTelegramVideoMeta(targetUrl: key, url: remoteUrl, requestPath: "/tg_video.ts"),
+            meta.totalSize > 0 else {
+        sendResponse(conn: conn, status: "502 Bad Gateway", contentType: "text/plain", body: Data(), isHead: method == "HEAD")
+        return
+      }
+      var allowed = CharacterSet.urlQueryAllowed
+      allowed.remove(charactersIn: "&+=?#")
+      let enc = targetUrl.addingPercentEncoding(withAllowedCharacters: allowed) ?? targetUrl
+      let localPort = self.port
+      // Align slice size to an exact multiple of 188-byte MPEG-TS packets (~8 MB = 44,619 * 188 = 8,388,372 bytes)
+      let sliceSize: Int64 = 44_619 * 188
+      var lines: [String] = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:4",
+        "#EXT-X-PLAYLIST-TYPE:VOD",
+        "#EXT-X-TARGETDURATION:10",
+        "#EXT-X-MEDIA-SEQUENCE:0"
+      ]
+      var offset: Int64 = 0
+      while offset < meta.totalSize {
+        let len = min(sliceSize, meta.totalSize - offset)
+        lines.append("#EXTINF:10.000,")
+        lines.append("#EXT-X-BYTERANGE:\(len)@\(offset)")
+        lines.append("http://127.0.0.1:\(localPort)/tg_video.ts?u=\(enc)&playback=\(playbackId)")
+        offset += len
+      }
+      lines.append("#EXT-X-ENDLIST")
+      let body = Data((lines.joined(separator: "\n") + "\n").utf8)
+      sendResponse(
+        conn: conn,
+        status: "200 OK",
+        contentType: "application/vnd.apple.mpegurl",
+        body: body,
+        isHead: method == "HEAD"
+      )
       return
     }
 
@@ -5284,14 +6562,19 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     tgLastAccessByUrl[targetUrl] = Date()
 
     let currentPlayhead = tgPlayheadBlockByUrl[targetUrl] ?? 0
-    // Protect against AVPlayer's parallel tail metadata (`moov` / `Cues`) probe at the end of the file:
-    // If AVPlayer briefly reads the last 8 blocks of the file while playback is near the beginning/middle,
-    // do NOT overwrite `tgPlayheadBlockByUrl` to the end of the file and do NOT cancel any in-flight prefetch workers!
-    let isTailMetadataProbe = maxBlockIndex > 16
-      && blockIndex >= max(4, maxBlockIndex - 8)
-      && currentPlayhead < maxBlockIndex - 16
-    if !isTailMetadataProbe {
+    // Dual-window support for 30 GB – 100 GB+ `.mp4` / `.mov` files where the tail `moov` atom at the end of the file can be 15 MB – 64 MB:
+    // If AVPlayer reads within the last 64 MB (`maxBlockIndex - 64 .. maxBlockIndex`) while playback is near the beginning/middle,
+    // record `tgTailProbeBlockByUrl` so our 24 parallel workers prefetch BOTH the tail `moov` blocks AND the main video playhead without cancelling!
+    let isTailMetadataProbe = maxBlockIndex > 32
+      && blockIndex >= max(8, maxBlockIndex - 64)
+      && currentPlayhead < maxBlockIndex - 64
+    if isTailMetadataProbe {
+      tgTailProbeBlockByUrl[targetUrl] = blockIndex
+    } else {
       tgPlayheadBlockByUrl[targetUrl] = blockIndex
+      if blockIndex > 8 && blockIndex < maxBlockIndex - 64 {
+        tgTailProbeBlockByUrl.removeValue(forKey: targetUrl)
+      }
     }
 
     let isLargeUserSeek = !isTailMetadataProbe && abs(blockIndex - currentPlayhead) > 24
@@ -5300,7 +6583,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
         task.cancel()
       } else if isLargeUserSeek,
                 let index = Int64(key.dropFirst(prefix.count)),
-                index < maxBlockIndex - 6,
+                index < maxBlockIndex - 64,
                 (index < blockIndex - 2 || index > blockIndex + Int64(Self.tgLookaheadBlocks)) {
         task.cancel()
       }
@@ -5360,6 +6643,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       return
     }
     let playhead = tgPlayheadBlockByUrl[targetUrl] ?? 0
+    let tailProbe = tgTailProbeBlockByUrl[targetUrl]
     let hdrs = tgHeadersByUrl[targetUrl] ?? [:]
 
     let playheadKey = "\(targetUrl)#\(playhead)"
@@ -5369,21 +6653,30 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     if !isPlayheadReady && playhead <= maxBlockIndex {
       candidates.append(playhead)
     }
+    // If AVPlayer is currently probing a 15–64 MB tail `moov` atom at the end of a 50 GB file, prioritize prefetching 16 blocks ahead of `tailProbe` in parallel!
+    if let tp = tailProbe, tp <= maxBlockIndex {
+      for offset in 0...15 {
+        let tIdx = tp + Int64(offset)
+        if tIdx <= maxBlockIndex && !candidates.contains(tIdx) {
+          candidates.append(tIdx)
+        }
+      }
+    }
     // Pre-fetch the first 4 MB AND the final 2 MB (`moov` / `Cues`) immediately at startup so both header and tail probes hit RAM at 0ms!
     for offset in 1...min(4, lookaheadForTarget) {
       let idx = playhead + Int64(offset)
-      if idx <= maxBlockIndex {
+      if idx <= maxBlockIndex && !candidates.contains(idx) {
         candidates.append(idx)
       }
     }
     if playhead <= 2 && maxBlockIndex > 6 {
-      candidates.append(maxBlockIndex)
-      candidates.append(maxBlockIndex - 1)
+      if !candidates.contains(maxBlockIndex) { candidates.append(maxBlockIndex) }
+      if !candidates.contains(maxBlockIndex - 1) { candidates.append(maxBlockIndex - 1) }
     }
     if lookaheadForTarget > 4 {
       for offset in 5...lookaheadForTarget {
         let idx = playhead + Int64(offset)
-        if idx <= maxBlockIndex {
+        if idx <= maxBlockIndex && !candidates.contains(idx) {
           candidates.append(idx)
         }
       }
@@ -5567,13 +6860,15 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
 
         let upStart = logicalStart + prefixOffset
         let upEnd = logicalEnd + prefixOffset
-        fetchedResult = await self.fetchTelegramRangeChunk(
+        if let rawData = await self.fetchTelegramRangeChunk(
           targetUrl: targetUrl,
           url: effectiveUrl,
           headers: headers,
           start: upStart,
           end: upEnd
-        )
+        ) {
+          fetchedResult = Self.patchMp4Hev1ToHvc1IfNeeded(rawData)
+        }
         return fetchedResult
       }
     }
@@ -6080,6 +7375,13 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       req.setValue(v, forHTTPHeaderField: k)
     }
     let sess = preferredSession(for: effectiveUrlStr)
+    if sess === directUrlSession {
+      if let data = await TvContinuousStreamSessionDelegate.shared.fetchSegmentData(request: req, session: directStreamSession),
+         let text = String(data: data, encoding: .utf8),
+         text.contains("#EXTM3U") {
+        return (text, logicalBase)
+      }
+    }
     if let (data, resp) = try? await sess.data(for: req),
        let http = resp as? HTTPURLResponse,
        (200..<300).contains(http.statusCode),
@@ -6089,10 +7391,15 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       TvNetworkSpeedMonitor.shared.recordDownstreamBytes(data.count)
       return (text, finalUrl)
     }
-    // If proxy node failed or blocked the VOD CDN, immediately fall back to directUrlSession
+    // If proxy node failed or blocked the VOD CDN, immediately fall back to directStreamSession / directUrlSession
     if sess !== directUrlSession {
       var directReq = req
       directReq.timeoutInterval = 8.0
+      if let data = await TvContinuousStreamSessionDelegate.shared.fetchSegmentData(request: directReq, session: directStreamSession),
+         let text = String(data: data, encoding: .utf8),
+         text.contains("#EXTM3U") {
+        return (text, logicalBase)
+      }
       if let (data, resp) = try? await directUrlSession.data(for: directReq),
          let http = resp as? HTTPURLResponse,
          (200..<300).contains(http.statusCode),

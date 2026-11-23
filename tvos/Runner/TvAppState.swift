@@ -3529,15 +3529,16 @@ final class TvAppState: ObservableObject {
       }
 
       // 2. Direct 115 Cloud Drive playback:
-      // - For .mp4 / .mov / .m4v, resolve ONLY `resolvePickcodeStreamUrl` first (skips unnecessary `files/video` + m3u8 fetch round-trips for instant startup!)
-      // - For non-MP4 containers (.mkv / .avi / .rmvb / .wmv / .flv / .ts), resolve ONLY `resolvePickcodeHlsM3u8Url` first and fall back to `resolvePickcodeStreamUrl` only if needed
+      // - For .mp4 / .mov / .m4v, OR huge files (>= 10 GB where 115 cloud transcode is unavailable), resolve `resolvePickcodeStreamUrl` directly!
+      // - For < 10 GB non-MP4 containers (.mkv / .avi / .rmvb / .wmv / .flv / .ts), try `resolvePickcodeHlsM3u8Url` first and fall back to `resolvePickcodeStreamUrl`
       if entry.sourceKind == .cloud115 {
         guard !entry.pickcode115.isEmpty else {
           self.showToast("⚠️ 该 115 文件缺少 pickcode，无法播放")
           return
         }
         let ext = entry.normalizedExt
-        let needsHlsTranscode = [".f4v", ".flv", ".mkv", ".avi", ".rmvb", ".wmv", ".ts", ".webm", ".iso"].contains(ext)
+        let isHugeRemuxFile = entry.size >= 10 * 1024 * 1024 * 1024
+        let needsHlsTranscode = !isHugeRemuxFile && [".f4v", ".flv", ".mkv", ".avi", ".rmvb", ".wmv", ".ts", ".webm", ".iso"].contains(ext)
 
         var primaryStream = ""
         var backupStream = ""
@@ -3628,7 +3629,8 @@ final class TvAppState: ObservableObject {
         if entry.sourceKind == .alist {
           let mount = self.storageMounts.first(where: { $0.id == entry.mountId }) ?? self.activeStorageMount
           let ext = entry.normalizedExt
-          let isNonMp4Container = [".mkv", ".avi", ".rmvb", ".wmv", ".ts", ".webm", ".iso"].contains(ext)
+          let isHugeRemuxFile = entry.size >= 10 * 1024 * 1024 * 1024
+          let isNonMp4Container = !isHugeRemuxFile && [".mkv", ".avi", ".rmvb", ".wmv", ".ts", ".webm", ".iso"].contains(ext)
 
           async let infoTask = TvRemoteStorageClient.shared.resolveAlistStreamInfo(
             mount: mount,
