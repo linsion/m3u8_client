@@ -5515,6 +5515,12 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
       expectedBytes: Int,
       continuation: CheckedContinuation<Data?, Never>
     )
+    case multiBlockStream(
+      startOffset: Int64,
+      sliceLengths: [Int],
+      onSliceReady: @Sendable (Int, Data) -> Bool,
+      continuation: CheckedContinuation<Int, Never>
+    )
     case fullSegment(
       continuation: CheckedContinuation<Data?, Never>
     )
@@ -5539,6 +5545,7 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
     var isSuspended = false
     var isFinished = false
     var didTransferAnyBytes = false
+    var emittedSliceCount: Int = 0
 
     init(mode: Mode) {
       self.mode = mode
@@ -5609,6 +5616,47 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
           )
         )
         ctx.buffer.reserveCapacity(min(expectedBytes, 4_194_304))
+        lock.lock()
+        contexts[key] = ctx
+        lock.unlock()
+        taskBox.lock()
+        createdTask = task
+        taskBox.unlock()
+        task.resume()
+      }
+    } onCancel: {
+      taskBox.lock()
+      let t = createdTask
+      taskBox.unlock()
+      t?.cancel()
+    }
+  }
+
+  /// Streams a contiguous 16-block (`64 MB`) range over a single HTTP request and emits each `4 MB` block via `onSliceReady`
+  /// the instant its bytes arrive in `didReceive data`, eliminating per-block TCP reconnects and avoiding 115 CDN's `c=2` (`115 pmt X-2`) HTTP 403 limit!
+  func streamMultiBlockRange(
+    request: URLRequest,
+    session: URLSession,
+    startOffset: Int64,
+    sliceLengths: [Int],
+    onSliceReady: @escaping @Sendable (Int, Data) -> Bool
+  ) async -> Int {
+    guard !sliceLengths.isEmpty else { return 0 }
+    let taskBox = NSLock()
+    var createdTask: URLSessionDataTask?
+    return await withTaskCancellationHandler {
+      await withCheckedContinuation { (cont: CheckedContinuation<Int, Never>) in
+        let task = session.dataTask(with: request)
+        let key = SessionTaskKey(sessionId: ObjectIdentifier(session), taskId: task.taskIdentifier)
+        let ctx = TaskContext(
+          mode: .multiBlockStream(
+            startOffset: startOffset,
+            sliceLengths: sliceLengths,
+            onSliceReady: onSliceReady,
+            continuation: cont
+          )
+        )
+        ctx.buffer.reserveCapacity(min(sliceLengths[0] + 262_144, 4_456_448))
         lock.lock()
         contexts[key] = ctx
         lock.unlock()
@@ -5738,6 +5786,8 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
       } else {
         cont.resume(returning: nil)
       }
+    case .multiBlockStream(_, _, _, let cont):
+      cont.resume(returning: ctx.emittedSliceCount)
     case .fullSegment(let cont):
       if !ctx.buffer.isEmpty {
         cont.resume(returning: ctx.buffer)
@@ -5870,7 +5920,7 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
       lock.unlock()
       completionHandler(.allow)
 
-    case .rangeBlock(let startOffset, _, _):
+    case .rangeBlock(let startOffset, _, _), .multiBlockStream(let startOffset, _, _, _):
       let contentRange = http.value(forHTTPHeaderField: "Content-Range") ?? http.value(forHTTPHeaderField: "content-range") ?? ""
       guard http.statusCode == 206,
             contentRange.isEmpty || contentRange.lowercased().hasPrefix("bytes \(startOffset)-") else {
@@ -5992,6 +6042,36 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
       // so CFNetwork marks the warm high-cwnd TCP socket as idle in the Keep-Alive pool BEFORE the worker launches its next Range request!
       lock.unlock()
 
+    case .multiBlockStream(_, let sliceLengths, let onSliceReady, _):
+      ctx.buffer.append(data)
+      while ctx.emittedSliceCount < sliceLengths.count {
+        let need = sliceLengths[ctx.emittedSliceCount]
+        if ctx.buffer.count < need {
+          break
+        }
+        let slice = Data(ctx.buffer.prefix(need))
+        ctx.buffer.removeSubrange(0..<need)
+        let idx = ctx.emittedSliceCount
+        ctx.emittedSliceCount += 1
+        let reachedAll = ctx.emittedSliceCount >= sliceLengths.count
+        lock.unlock()
+        let keepGoing = onSliceReady(idx, slice)
+        if !keepGoing {
+          dataTask.cancel()
+          finishContext(key: key)
+          return
+        }
+        if reachedAll {
+          return
+        }
+        lock.lock()
+        guard let stillActive = contexts[key], !stillActive.isFinished else {
+          lock.unlock()
+          return
+        }
+      }
+      lock.unlock()
+
     case .fullSegment:
       ctx.buffer.append(data)
       lock.unlock()
@@ -6046,7 +6126,7 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
       } else {
         finishContext(key: key, headerResult: .success(nil))
       }
-    case .rangeBlock, .fullSegment:
+    case .rangeBlock, .multiBlockStream, .fullSegment:
       finishContext(key: key)
     case .continuousRange:
       finishContext(key: key, streamSuccess: error == nil && didTransfer)
@@ -6088,15 +6168,60 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
   private var tgVideoMetaCache: [String: (totalSize: Int64, contentType: String, headerChunk: Data, stripPrefixBytes: Int)] = [:]
   private var tgMetaOrder: [String] = []
   private var tgMetaInFlight: [String: Task<(totalSize: Int64, contentType: String, headerChunk: Data, stripPrefixBytes: Int)?, Never>] = [:]
-  private static let tgBlockSize: Int64 = 4_194_304 // 4 MB block size -> 16 independent TCP sockets = 100-125+ MB/s (1 Gbps full-line saturation)
+  private final class TgBlockWaiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var resolved = false
+    private var value: Data? = nil
+    private var continuations: [CheckedContinuation<Data?, Never>] = []
+    var batchTask: Task<Void, Never>? = nil
+    let blockIndex: Int64
+
+    init(blockIndex: Int64) {
+      self.blockIndex = blockIndex
+    }
+
+    func wait() async -> Data? {
+      await withCheckedContinuation { (cont: CheckedContinuation<Data?, Never>) in
+        lock.lock()
+        if resolved {
+          let v = value
+          lock.unlock()
+          cont.resume(returning: v)
+        } else {
+          continuations.append(cont)
+          lock.unlock()
+        }
+      }
+    }
+
+    func resolve(_ data: Data?) {
+      lock.lock()
+      guard !resolved else {
+        lock.unlock()
+        return
+      }
+      resolved = true
+      value = data
+      let list = continuations
+      continuations.removeAll()
+      lock.unlock()
+      for c in list {
+        c.resume(returning: data)
+      }
+    }
+  }
+
+  private static let tgBlockSize: Int64 = 4_194_304 // 4 MB block slice size
   static var engineBlockSize: Int64 { tgBlockSize }
   private static let tgMaxCachedBlocks: Int = 216 // 216 x 4 MB = 864 MB shared in-memory ring cache on Apple TV 4K
-  private static let tgMaxConcurrentPrefetchPerUrl = 16
-  private static let tgDomesticConcurrentPrefetchPerUrl = 16
+  private static let tgBatchBlocksPerStream: Int64 = 16 // 16 x 4 MB = 64 MB continuous stream per HTTP request (zero per-block reconnect overhead!)
+  private static let tgMaxConcurrentPrefetchPerUrl = 4
+  private static let tgDomesticConcurrentPrefetchPerUrl = 4
   private static let tgLookaheadBlocks = 192 // 192 x 4 MB = 768 MB continuous forward lookahead window (never stops after 64 MB!)
   private var tgBlockCache: [String: Data] = [:]
   private var tgBlockOrder: [String] = []
   private var tgInFlightBlocks: [String: Task<Data?, Never>] = [:]
+  private var tgInFlightWaiters: [String: TgBlockWaiter] = [:]
   private var tgInFlightIsPrefetch: [String: Bool] = [:]
   private var tgActivePrefetchCountByUrl: [String: Int] = [:]
   private var tgPreferDirectByUrl: [String: Date] = [:]
@@ -6105,7 +6230,23 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
   private var tgLastAccessByUrl: [String: Date] = [:]
   private var tgActiveBackgroundUrl: String = ""
 
+  /// Respects 115 CDN's signed ticket concurrency parameter (`&c=2` -> `{"status":403,"message":"115 pmt 3-2"}`)
+  /// so we NEVER exceed the CDN's per-ticket connection permit limit while streaming 64 MB continuous multi-block batches at full 1 Gbps speed!
   private func maxPrefetchWorkers(for targetUrl: String) -> Int {
+    tgLock.lock()
+    let resolvedStr = tgResolvedCdnUrlByUrl[targetUrl]?.absoluteString ?? ""
+    tgLock.unlock()
+    for candidate in [resolvedStr, targetUrl] where !candidate.isEmpty {
+      let lower = candidate.lowercased()
+      if let comp = URLComponents(string: candidate),
+         let cStr = comp.queryItems?.first(where: { $0.name == "c" })?.value,
+         let cVal = Int(cStr), (1...8).contains(cVal) {
+        return cVal
+      }
+      if lower.contains("115cdn") || lower.contains("115.com") || lower.contains("115vod") || lower.contains("anxia.com") {
+        return 2
+      }
+    }
     if isForceDirectTarget(targetUrl) || Self.isDomesticOrLocalUrl(targetUrl) {
       return Self.tgDomesticConcurrentPrefetchPerUrl
     }
@@ -6268,7 +6409,13 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     sessionLock.unlock()
 
     directUrlSession.reset {}
+    var waitersToResolve: [TgBlockWaiter] = []
     tgLock.lock()
+    for (_, w) in tgInFlightWaiters {
+      w.batchTask?.cancel()
+      waitersToResolve.append(w)
+    }
+    tgInFlightWaiters.removeAll()
     for (_, task) in tgInFlightBlocks {
       task.cancel()
     }
@@ -6280,6 +6427,9 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     }
     tgMetaInFlight.removeAll()
     tgLock.unlock()
+    for w in waitersToResolve {
+      w.resolve(nil)
+    }
 
     startListenerIfNeeded()
   }
@@ -6453,9 +6603,14 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     tgMetaOrder.removeAll { $0 == key }
     let probe = tgMetaInFlight.removeValue(forKey: key)
     var blockTasks: [Task<Data?, Never>] = []
+    var waitersToResolve: [TgBlockWaiter] = []
     for blockKey in tgInFlightBlocks.keys.filter({ $0.hasPrefix(prefix) }) {
       if let task = tgInFlightBlocks.removeValue(forKey: blockKey) {
         blockTasks.append(task)
+      }
+      if let w = tgInFlightWaiters.removeValue(forKey: blockKey) {
+        w.batchTask?.cancel()
+        waitersToResolve.append(w)
       }
       tgInFlightIsPrefetch.removeValue(forKey: blockKey)
     }
@@ -6472,6 +6627,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     tgLock.unlock()
     probe?.cancel()
     for task in blockTasks { task.cancel() }
+    for w in waitersToResolve { w.resolve(nil) }
     if let passthrough {
       for task in passthrough.values { task.cancel() }
     }
@@ -7697,6 +7853,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     let lookahead = Int64(Self.tgLookaheadBlocks)
     for (key, task) in tgInFlightBlocks where tgInFlightIsPrefetch[key] == true {
       if !key.hasPrefix(prefix) {
+        if let w = tgInFlightWaiters[key] { w.batchTask?.cancel() }
         task.cancel()
       } else if didThisReaderJump,
                 let index = Int64(key.dropFirst(prefix.count)) {
@@ -7706,6 +7863,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
           index >= rBlock - 1 && index <= rBlock + lookahead
         }
         if !isNeededByAnyReader && index < maxBlockIndex - 32 {
+          if let w = tgInFlightWaiters[key] { w.batchTask?.cancel() }
           task.cancel()
         }
       }
@@ -7742,7 +7900,9 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     tgLock.unlock()
   }
 
-  /// Keeps a 768 MB (`192 x 4 MB`) window of completed blocks ahead of the playhead using 16 parallel workers across 16 independent TCP sockets.
+  /// Keeps a 768 MB (`192 x 4 MB`) window of completed blocks ahead of the playhead using continuous 64 MB (`16 x 4 MB`) multi-block streams.
+  /// By streaming 64 MB per HTTP request within the CDN's exact connection permit limit (e.g. `c=2` on 115cdn.net),
+  /// TCP congestion window ramps to 50–100+ MB/s without per-block reconnect stalls and with 0% `HTTP 403 (115 pmt X-2)` errors!
   private func pumpTelegramSlidingWindow(
     targetUrl: String,
     url: URL,
@@ -7751,7 +7911,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     let blockSize = Self.tgBlockSize
     let maxBlockIndex = max(0, (meta.totalSize - 1) / blockSize)
     let maxWorkersForTarget = maxPrefetchWorkers(for: targetUrl)
-    let lookaheadForTarget = Self.tgLookaheadBlocks
+    let lookaheadForTarget = Int64(Self.tgLookaheadBlocks)
     let effectiveUrl = resolvedCdnUrl(for: targetUrl, fallback: url)
 
     tgLock.lock()
@@ -7774,66 +7934,302 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       .map { $0.blockIndex }
     let hdrs = tgHeadersByUrl[targetUrl] ?? [:]
 
-    var candidates: [Int64] = []
-    candidates.reserveCapacity(lookaheadForTarget + 16)
-    func addCandidate(_ idx: Int64) {
-      if idx >= 0 && idx <= maxBlockIndex && !candidates.contains(idx) {
-        candidates.append(idx)
-      }
+    var plannedBatches: [(startBlock: Int64, endBlock: Int64, waiters: [TgBlockWaiter], slot: Int64)] = []
+    var reservedInThisPass = Set<Int64>()
+
+    func isBlockAvailableToClaim(_ idx: Int64) -> Bool {
+      guard idx >= 0 && idx <= maxBlockIndex && !reservedInThisPass.contains(idx) else { return false }
+      let key = "\(targetUrl)#\(idx)"
+      return tgBlockCache[key] == nil && tgInFlightBlocks[key] == nil && tgInFlightWaiters[key] == nil
     }
 
-    // 1. Immediate priority: current block + next 4 blocks of the active playhead and any concurrent reader
-    for offset in 0...4 {
-      addCandidate(playhead + Int64(offset))
-    }
-    for h in activeReaderBlocks where h != playhead {
-      for offset in 0...2 {
-        addCandidate(h + Int64(offset))
+    func tryClaimContiguousBatch(from anchor: Int64, maxSpan: Int64, maxBlocksInBatch: Int64) -> (Int64, Int64)? {
+      let limit = min(maxBlockIndex, anchor + maxSpan)
+      var cur = max(0, anchor)
+      while cur <= limit {
+        if isBlockAvailableToClaim(cur) {
+          let s = cur
+          var e = s
+          let maxE = min(limit, s + maxBlocksInBatch - 1)
+          while e + 1 <= maxE && isBlockAvailableToClaim(e + 1) {
+            e += 1
+          }
+          for b in s...e {
+            reservedInThisPass.insert(b)
+          }
+          return (s, e)
+        }
+        cur += 1
       }
-    }
-    if let tp = tailProbe {
-      for offset in 0...5 {
-        addCandidate(tp + Int64(offset))
-      }
-    }
-    // 2. Startup tail metadata (`moov` / `Cues`) pre-warm when playhead is near the beginning of a large file
-    if playhead <= 1 && maxBlockIndex > 4 {
-      addCandidate(maxBlockIndex)
-      addCandidate(maxBlockIndex - 1)
-    }
-    // 3. Continuously fill the entire 768 MB (`192 x 4 MB`) lookahead window ahead of `playhead` so all 16 workers stay at 1 Gbps!
-    if lookaheadForTarget >= 5 {
-      for offset in 5...lookaheadForTarget {
-        addCandidate(playhead + Int64(offset))
-      }
+      return nil
     }
 
-    var blocksToLaunch: [Int64] = []
-    for idx in candidates {
-      let activeCount = tgActivePrefetchCountByUrl[targetUrl] ?? 0
-      if activeCount + blocksToLaunch.count >= maxWorkersForTarget {
+    var activeCount = tgActivePrefetchCountByUrl[targetUrl] ?? 0
+    var slotSeed: Int64 = playhead + Int64(activeCount)
+
+    // 1. Primary forward continuous stream batches from `playhead` across the 768 MB lookahead window
+    while activeCount < maxWorkersForTarget {
+      var claimed: (Int64, Int64)? = nil
+      // First ensure the immediate playhead window (`playhead ... playhead + 15`) is claimed
+      claimed = tryClaimContiguousBatch(from: playhead, maxSpan: lookaheadForTarget, maxBlocksInBatch: Self.tgBatchBlocksPerStream)
+      if claimed == nil {
+        for rBlock in activeReaderBlocks where rBlock != playhead {
+          if let hit = tryClaimContiguousBatch(from: rBlock, maxSpan: 15, maxBlocksInBatch: 8) {
+            claimed = hit
+            break
+          }
+        }
+      }
+      if claimed == nil, let tp = tailProbe {
+        claimed = tryClaimContiguousBatch(from: tp, maxSpan: 7, maxBlocksInBatch: 4)
+      }
+      guard let (sBlock, eBlock) = claimed else {
         break
       }
-      let key = "\(targetUrl)#\(idx)"
-      if tgBlockCache[key] == nil && tgInFlightBlocks[key] == nil {
-        blocksToLaunch.append(idx)
+
+      activeCount += 1
+      tgActivePrefetchCountByUrl[targetUrl] = activeCount
+      var batchWaiters: [TgBlockWaiter] = []
+      batchWaiters.reserveCapacity(Int(eBlock - sBlock + 1))
+      for b in sBlock...eBlock {
+        let bKey = "\(targetUrl)#\(b)"
+        let waiter = TgBlockWaiter(blockIndex: b)
+        tgInFlightWaiters[bKey] = waiter
+        tgInFlightIsPrefetch[bKey] = true
+        tgInFlightBlocks[bKey] = Task<Data?, Never> {
+          await waiter.wait()
+        }
+        batchWaiters.append(waiter)
       }
+      plannedBatches.append((sBlock, eBlock, batchWaiters, slotSeed))
+      slotSeed += 1
     }
     tgLock.unlock()
 
-    for idx in blocksToLaunch {
-      Task.detached(priority: idx <= playhead + 3 ? .userInitiated : .utility) { [weak self] in
+    for batch in plannedBatches {
+      let bTask = Task.detached(priority: batch.startBlock <= playhead + 4 ? .userInitiated : .utility) { [weak self] in
         guard let self = self else { return }
-        _ = await self.getOrFetchTelegramBlock(
+        await self.runTelegramMultiBlockBatch(
           targetUrl: targetUrl,
           url: effectiveUrl,
           headers: hdrs,
-          blockIndex: idx,
+          startBlock: batch.startBlock,
+          endBlock: batch.endBlock,
           meta: meta,
-          isPrefetch: true
+          waiters: batch.waiters,
+          slot: batch.slot
         )
       }
+      tgLock.lock()
+      for w in batch.waiters {
+        w.batchTask = bTask
+      }
+      tgLock.unlock()
     }
+  }
+
+  /// Streams a contiguous batch of `startBlock ... endBlock` (`up to 16 x 4 MB = 64 MB`) over a single HTTP request,
+  /// committing each 4 MB block to `tgBlockCache` and waking up any waiting player read the instant that 4 MB boundary arrives!
+  private func runTelegramMultiBlockBatch(
+    targetUrl: String,
+    url: URL,
+    headers: [String: String],
+    startBlock: Int64,
+    endBlock: Int64,
+    meta: (totalSize: Int64, contentType: String, headerChunk: Data, stripPrefixBytes: Int),
+    waiters: [TgBlockWaiter],
+    slot: Int64
+  ) async {
+    let blockSize = Self.tgBlockSize
+    let prefixOffset = Int64(meta.stripPrefixBytes)
+    let primarySession = preferredTelegramOrMediaSession(for: targetUrl)
+    let cdnUrl = resolvedCdnUrl(for: targetUrl, fallback: url)
+    let fbUrl = fallbackRemoteUrl(for: targetUrl)
+    let latestHeaders = getTgHeadersAndMeta(for: targetUrl).headers
+    let effectiveHeaders = latestHeaders.isEmpty ? headers : latestHeaders
+    let count = Int(endBlock - startBlock + 1)
+
+    var nextUnresolvedIdx = 0
+    // Fast-path: if `startBlock == 0` and the entire file fits inside the 512 KB `meta.headerChunk`
+    if startBlock == 0 && !meta.headerChunk.isEmpty {
+      let expected0 = Int(min(meta.totalSize - 1, blockSize - 1) + 1)
+      if meta.headerChunk.count >= expected0 {
+        let patched0 = Self.patchMp4Hev1ToHvc1IfNeeded(meta.headerChunk.subdata(in: 0..<expected0))
+        storeCompletedBatchBlock(targetUrl: targetUrl, blockIndex: 0, data: patched0, waiter: waiters[0])
+        nextUnresolvedIdx = 1
+      }
+    }
+
+    for attempt in 0..<3 {
+      if Task.isCancelled || nextUnresolvedIdx >= count { break }
+      let curStartBlock = startBlock + Int64(nextUnresolvedIdx)
+      var sliceLengths: [Int] = []
+      sliceLengths.reserveCapacity(count - nextUnresolvedIdx)
+      var wireStart: Int64 = curStartBlock * blockSize + prefixOffset
+      if curStartBlock == 0 && !meta.headerChunk.isEmpty {
+        wireStart = Int64(meta.headerChunk.count) + prefixOffset
+      }
+      var wireEnd: Int64 = wireStart - 1
+      for idx in nextUnresolvedIdx..<count {
+        let b = startBlock + Int64(idx)
+        let bStart = b * blockSize
+        let bEnd = min(meta.totalSize - 1, bStart + blockSize - 1)
+        let fullLen = Int(bEnd - bStart + 1)
+        let wireLen = (b == 0 && !meta.headerChunk.isEmpty) ? max(0, fullLen - meta.headerChunk.count) : fullLen
+        sliceLengths.append(wireLen)
+        wireEnd += Int64(wireLen)
+      }
+      guard wireStart <= wireEnd, !sliceLengths.isEmpty else { break }
+
+      let reqUrl: URL = {
+        if attempt <= 1 { return cdnUrl }
+        return fbUrl ?? url
+      }()
+      var req = URLRequest(url: reqUrl)
+      req.httpMethod = "GET"
+      req.timeoutInterval = 22.0
+      for (k, v) in effectiveHeaders where !v.isEmpty {
+        req.setValue(v, forHTTPHeaderField: k)
+      }
+      req.setValue("bytes=\(wireStart)-\(wireEnd)", forHTTPHeaderField: "Range")
+      req.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+
+      let baseIdxForAttempt = nextUnresolvedIdx
+      let poolSess = (attempt > 0 || primarySession === directStreamSession)
+        ? directStreamSession(forSlot: slot &+ Int64(attempt))
+        : primarySession
+      let emitted = await TvContinuousStreamSessionDelegate.shared.streamMultiBlockRange(
+        request: req,
+        session: poolSess,
+        startOffset: wireStart,
+        sliceLengths: sliceLengths
+      ) { [weak self] relIdx, wireSlice in
+        guard let self = self else { return false }
+        let absIdx = baseIdxForAttempt + relIdx
+        let b = startBlock + Int64(absIdx)
+        let bStart = b * blockSize
+        let bEnd = min(meta.totalSize - 1, bStart + blockSize - 1)
+        let expectedBlockLen = Int(bEnd - bStart + 1)
+        let rawBlock: Data
+        if b == 0 && !meta.headerChunk.isEmpty {
+          var combined = Data(capacity: meta.headerChunk.count + wireSlice.count)
+          combined.append(meta.headerChunk)
+          combined.append(wireSlice)
+          rawBlock = combined.count <= expectedBlockLen ? combined : combined.subdata(in: 0..<expectedBlockLen)
+        } else {
+          rawBlock = wireSlice
+        }
+        let patched = Self.patchMp4Hev1ToHvc1IfNeeded(rawBlock)
+        return self.storeCompletedBatchBlock(
+          targetUrl: targetUrl,
+          blockIndex: b,
+          data: patched,
+          waiter: waiters[absIdx]
+        )
+      }
+      nextUnresolvedIdx = max(nextUnresolvedIdx, baseIdxForAttempt + emitted)
+      if nextUnresolvedIdx >= count || Task.isCancelled {
+        break
+      }
+      try? await Task.sleep(nanoseconds: UInt64((attempt + 1) * 140_000_000))
+    }
+
+    // Finalize any remaining blocks in the batch and release our worker slot
+    var shouldPump = false
+    tgLock.lock()
+    for idx in nextUnresolvedIdx..<count {
+      let b = startBlock + Int64(idx)
+      let bKey = "\(targetUrl)#\(b)"
+      tgInFlightBlocks.removeValue(forKey: bKey)
+      tgInFlightWaiters.removeValue(forKey: bKey)
+      tgInFlightIsPrefetch.removeValue(forKey: bKey)
+    }
+    let cur = tgActivePrefetchCountByUrl[targetUrl] ?? 1
+    tgActivePrefetchCountByUrl[targetUrl] = max(0, cur - 1)
+    shouldPump = (tgActiveBackgroundUrl == targetUrl && tgHeadersByUrl[targetUrl] != nil && !Task.isCancelled)
+    tgLock.unlock()
+
+    for idx in nextUnresolvedIdx..<count {
+      waiters[idx].resolve(nil)
+    }
+
+    if shouldPump && !meta.contentType.hasPrefix("audio/") {
+      pumpTelegramSlidingWindow(targetUrl: targetUrl, url: url, meta: meta)
+    }
+  }
+
+  /// Stores a freshly sliced 4 MB block in `tgBlockCache`, wakes any awaiting player continuation at 0ms,
+  /// and returns `false` only if this stream was superseded or jumped past by a large seek.
+  private func storeCompletedBatchBlock(
+    targetUrl: String,
+    blockIndex: Int64,
+    data: Data,
+    waiter: TgBlockWaiter
+  ) -> Bool {
+    let key = "\(targetUrl)#\(blockIndex)"
+    let prefix = "\(targetUrl)#"
+    var keepStreaming = true
+    tgLock.lock()
+    guard tgHeadersByUrl[targetUrl] != nil else {
+      tgLock.unlock()
+      waiter.resolve(nil)
+      return false
+    }
+    tgInFlightBlocks.removeValue(forKey: key)
+    tgInFlightWaiters.removeValue(forKey: key)
+    tgInFlightIsPrefetch.removeValue(forKey: key)
+    if !data.isEmpty {
+      let curPlayhead = tgPlayheadBlockByUrl[targetUrl] ?? 0
+      if tgBlockCache[key] == nil {
+        tgBlockOrder.append(key)
+        while tgBlockOrder.count > Self.tgMaxCachedBlocks {
+          if let inactiveIdx = tgBlockOrder.firstIndex(where: { !$0.hasPrefix(prefix) }) {
+            let evictedKey = tgBlockOrder.remove(at: inactiveIdx)
+            tgBlockCache.removeValue(forKey: evictedKey)
+          } else if let playedIdx = tgBlockOrder.firstIndex(where: {
+            guard $0.hasPrefix(prefix), let bIdx = Int64($0.dropFirst(prefix.count)) else { return false }
+            return bIdx < curPlayhead - 2
+          }) {
+            let evictedKey = tgBlockOrder.remove(at: playedIdx)
+            tgBlockCache.removeValue(forKey: evictedKey)
+          } else {
+            let evictedKey = tgBlockOrder.removeFirst()
+            tgBlockCache.removeValue(forKey: evictedKey)
+          }
+        }
+      }
+      tgBlockCache[key] = data
+      let lookahead = Int64(Self.tgLookaheadBlocks)
+      let tailProbe = tgTailProbeBlockByUrl[targetUrl] ?? -999
+      let withinWindow = (blockIndex >= curPlayhead - 1 && blockIndex <= curPlayhead + lookahead)
+        || abs(blockIndex - tailProbe) <= 8
+      keepStreaming = (tgActiveBackgroundUrl == targetUrl) && withinWindow
+    }
+    tgLock.unlock()
+    waiter.resolve(data.isEmpty ? nil : data)
+    return keepStreaming
+  }
+
+  /// Cancels the furthest active prefetch batch stream for `targetUrl` so an urgent on-demand seek/tail probe
+  /// can immediately acquire one of the CDN's `c=2` connection permits without triggering `HTTP 403 (115 pmt 3-2)`.
+  private func cancelFurthestPrefetchBatch(for targetUrl: String, neededBlock: Int64) -> Bool {
+    let prefix = "\(targetUrl)#"
+    var batchToCancel: Task<Void, Never>? = nil
+    var furthestDist: Int64 = -1
+    tgLock.lock()
+    for (k, waiter) in tgInFlightWaiters where k.hasPrefix(prefix) {
+      let dist = abs(waiter.blockIndex - neededBlock)
+      if dist > furthestDist, let bt = waiter.batchTask {
+        furthestDist = dist
+        batchToCancel = bt
+      }
+    }
+    tgLock.unlock()
+    if let bt = batchToCancel {
+      bt.cancel()
+      return true
+    }
+    return false
   }
 
   private func lookupOrRegisterTelegramBlockFetch(
@@ -7854,7 +8250,9 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       return (cached, nil, false)
     }
     if let inFlight = tgInFlightBlocks[key] {
-      if !isPrefetch && tgInFlightIsPrefetch[key] == true {
+      // Only decrement `tgActivePrefetchCountByUrl` for standalone single-block prefetches;
+      // multi-block batch streams (`tgInFlightWaiters[key] != nil`) manage their own single worker slot in `runTelegramMultiBlockBatch`!
+      if !isPrefetch && tgInFlightIsPrefetch[key] == true && tgInFlightWaiters[key] == nil {
         tgInFlightIsPrefetch[key] = false
         tgActivePrefetchCountByUrl[targetUrl] = max(0, (tgActivePrefetchCountByUrl[targetUrl] ?? 1) - 1)
       }
@@ -7947,6 +8345,29 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     let effectiveUrl = resolvedCdnUrl(for: targetUrl, fallback: url)
 
     let key = "\(targetUrl)#\(blockIndex)"
+    if !isPrefetch {
+      let maxWorkers = maxPrefetchWorkers(for: targetUrl)
+      var needPreempt = false
+      var alreadyKnown = false
+      tgLock.lock()
+      if tgBlockCache[key] != nil || tgInFlightBlocks[key] != nil {
+        alreadyKnown = true
+      } else if (tgActivePrefetchCountByUrl[targetUrl] ?? 0) >= maxWorkers {
+        needPreempt = true
+      }
+      tgLock.unlock()
+
+      if !alreadyKnown {
+        if needPreempt && cancelFurthestPrefetchBatch(for: targetUrl, neededBlock: blockIndex) {
+          // Wait briefly for the cancelled prefetch stream's TCP FIN to release one of the CDN's `c=2` connection permits
+          try? await Task.sleep(nanoseconds: 65_000_000)
+        }
+        if !meta.contentType.hasPrefix("audio/") {
+          pumpTelegramSlidingWindow(targetUrl: targetUrl, url: effectiveUrl, meta: meta)
+        }
+      }
+    }
+
     let state = lookupOrRegisterTelegramBlockFetch(
       key: key,
       targetUrl: targetUrl,

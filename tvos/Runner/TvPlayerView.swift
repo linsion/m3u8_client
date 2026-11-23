@@ -2471,6 +2471,23 @@ struct TvPlayerModalView: View {
       startMatroskaHardwareEngine(proxyUrlStr: baseTargetUrl, resumeAt: resumeAt)
       return
     }
+    // If a direct HTTP(S) `.mkv` / `.webm` / `.ts` / `.m2ts` URL reached the player without being wrapped by `prepareTelegramVideoProxyUrl`,
+    // wrap it automatically so `.mkv` / `.webm` enters `startMatroskaHardwareEngine` and `.ts` / `.m2ts` enters `/virtual_ts.m3u8`!
+    let targetPathExt = ((URL(string: baseTargetUrl)?.path ?? "") as NSString).pathExtension.lowercased()
+    if !lowerTarget.contains("127.0.0.1:") && baseTargetUrl.hasPrefix("http") && ["mkv", "webm", "ts", "m2ts", "mts"].contains(targetPathExt) {
+      let wrapped = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
+        remoteUrl: baseTargetUrl,
+        headers: request.headers,
+        extHint: ".\(targetPathExt)",
+        forceDirectConnection: TvLocalHlsProxyServer.isDomesticOrLocalUrl(baseTargetUrl)
+      )
+      if targetPathExt == "mkv" || targetPathExt == "webm" {
+        startMatroskaHardwareEngine(proxyUrlStr: wrapped, resumeAt: resumeAt)
+      } else {
+        startPlayerItem(urlStr: wrapped, resumeAt: resumeAt)
+      }
+      return
+    }
 
     let isHlsTarget = lowerTarget.contains(".m3u8") || baseTargetUrl.contains("/api/vod/proxy")
     if !baseTargetUrl.contains("127.0.0.1:")

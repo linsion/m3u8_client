@@ -1653,20 +1653,32 @@ final class TvAppState: ObservableObject {
       mergedHeaders["Cookie"] = api.cookieHeaderValue
     }
     let isHlsCandidate = finalStream.lowercased().contains(".m3u8") || finalStream.contains("/api/vod/proxy")
-    if !finalStream.contains("127.0.0.1:") && !TvLocalHlsProxyServer.isDomesticOrLocalUrl(finalStream) {
+    if !finalStream.contains("127.0.0.1:") {
       if isHlsCandidate {
-        if let proxiedHls = await TvLocalHlsProxyServer.shared.prepareProxyPlaylistUrl(
-          gatewayUrl: finalStream,
-          resolvedUrl: finalStream,
-          headers: mergedHeaders
-        ) {
+        if !TvLocalHlsProxyServer.isDomesticOrLocalUrl(finalStream),
+           let proxiedHls = await TvLocalHlsProxyServer.shared.prepareProxyPlaylistUrl(
+             gatewayUrl: finalStream,
+             resolvedUrl: finalStream,
+             headers: mergedHeaders
+           ) {
           finalStream = proxiedHls
         }
-      } else if effRoute == .proxyNode && finalStream.hasPrefix("http") {
-        finalStream = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
-          remoteUrl: finalStream,
-          headers: mergedHeaders
-        )
+      } else if finalStream.hasPrefix("http") {
+        // Infer container extension from URL path or episode/VOD title so AList/115 `.mkv`/`.ts`/`.m2ts`/`.mp4`
+        // movies opened from VOD (`tvbox_0` / `alistfile:...`) also run through our 64 MB continuous Range proxy & Matroska hardware engine!
+        let urlPathExt = ((URL(string: finalStream)?.path ?? "") as NSString).pathExtension.lowercased()
+        let titleExt = (ep.title as NSString).pathExtension.lowercased()
+        let vodExt = (detail.vodName as NSString).pathExtension.lowercased()
+        let detectedExt = !urlPathExt.isEmpty ? ".\(urlPathExt)" : (!titleExt.isEmpty ? ".\(titleExt)" : (!vodExt.isEmpty ? ".\(vodExt)" : ".mp4"))
+        let isDomesticDirect = TvLocalHlsProxyServer.isDomesticOrLocalUrl(finalStream) || finalStream.contains("/d/")
+        if isDomesticDirect || effRoute == .proxyNode || [".mkv", ".webm", ".ts", ".m2ts", ".mts", ".mp4", ".mov", ".m4v"].contains(detectedExt) {
+          finalStream = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
+            remoteUrl: finalStream,
+            headers: mergedHeaders,
+            extHint: detectedExt,
+            forceDirectConnection: isDomesticDirect
+          )
+        }
       }
     }
 
