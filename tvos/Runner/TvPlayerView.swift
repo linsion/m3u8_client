@@ -2566,10 +2566,9 @@ struct TvPlayerModalView: View {
     }
     let asset = AVURLAsset(url: url, options: options)
     let item = AVPlayerItem(asset: asset)
-    // Our 127.0.0.1 local proxy already maintains a 96–256 MB RAM buffer across 24 parallel workers!
-    // Setting preferredForwardBufferDuration = 8.0 and automaticallyWaitsToMinimizeStalling = false
-    // ensures AVPlayer renders the very first 4K frame of a 50 GB movie immediately without waiting for 900 MB of forward buffer!
-    item.preferredForwardBufferDuration = request.isLive ? 2.5 : 8.0
+    // Setting automaticallyWaitsToMinimizeStalling = false ensures AVPlayer renders the very first 4K frame at 0ms,
+    // while preferredForwardBufferDuration = 300.0 lets AVPlayer continuously pull up to 5 minutes of forward buffer at 1 Gbps!
+    item.preferredForwardBufferDuration = request.isLive ? 2.5 : 300.0
 
     player.replaceCurrentItem(with: item)
     player.automaticallyWaitsToMinimizeStalling = isLocalLoopback ? false : true
