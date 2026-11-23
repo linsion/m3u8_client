@@ -579,6 +579,8 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
         if (!mounted) return;
         // On Android / Android TV, automatically use the embedded zero-copy AndroidX Media3 ExoPlayer
         // (`SurfaceView` hardware renderer) for ultra-large files (>= 8 GB Blu-ray remuxes / 4K ISO / MKV / MP4).
+        Duration? initialSeekPos;
+        int? initialAudioTrackOrderIdx;
         if (!inMiniPlayer &&
             Platform.isAndroid &&
             entry.size >= 8 * 1024 * 1024 * 1024) {
@@ -587,8 +589,17 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
             title: entry.name,
             headers: resolved.headers,
           );
-          if (exoRes.error != 'FALLBACK_MPV_SOFT_AUDIO' || !mounted) {
+          final errStr = exoRes.error ?? '';
+          if (!errStr.startsWith('FALLBACK_MPV_SOFT_AUDIO') || !mounted) {
             return;
+          }
+          if (exoRes.positionMs > 1000) {
+            initialSeekPos = Duration(milliseconds: exoRes.positionMs);
+          }
+          if (errStr.startsWith('FALLBACK_MPV_SOFT_AUDIO:')) {
+            initialAudioTrackOrderIdx = int.tryParse(
+              errStr.substring('FALLBACK_MPV_SOFT_AUDIO:'.length),
+            );
           }
         }
         if (inMiniPlayer) {
@@ -618,6 +629,9 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
             title: entry.name,
             streamUrl: resolved.url,
             headers: resolved.headers,
+            initialPosition: initialSeekPos,
+            initialAudioTrackOrderIndex: initialAudioTrackOrderIdx,
+            OpenedFromExoFallback: initialSeekPos != null || initialAudioTrackOrderIdx != null,
             fallback115: initial115 == null
                 ? null
                 : () => resolve115(useCloudTranscode: !initial115.isTranscoded),
@@ -4727,6 +4741,9 @@ class _MediaFilePlayerDialog extends StatefulWidget {
   final String title;
   final String streamUrl;
   final Map<String, String> headers;
+  final Duration? initialPosition;
+  final int? initialAudioTrackOrderIndex;
+  final bool OpenedFromExoFallback;
   final Future<Resolved115Stream?> Function()? fallback115;
   final void Function(
     int position,
@@ -4740,6 +4757,9 @@ class _MediaFilePlayerDialog extends StatefulWidget {
     required this.title,
     required this.streamUrl,
     required this.headers,
+    this.initialPosition,
+    this.initialAudioTrackOrderIndex,
+    this.OpenedFromExoFallback = false,
     this.fallback115,
     this.onEnterMiniPlayer,
   });
@@ -4756,9 +4776,14 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
   StreamSubscription<Duration>? _durSub;
   StreamSubscription<bool>? _playingSub;
   StreamSubscription<bool>? _bufferingSub;
+  StreamSubscription<Tracks>? _tracksSub;
+  StreamSubscription<Track>? _trackSub;
   Timer? _osdHideTimer;
   late String _activeUrl;
   late Map<String, String> _activeHeaders;
+  List<AudioTrack> _audioTracks = const [];
+  AudioTrack? _activeAudioTrack;
+  bool _didApplyInitialAudioTrack = false;
   bool _tryingFallback = false;
   bool _triedFallback = false;
   bool _reportedPlaybackError = false;
@@ -4836,6 +4861,29 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
         setState(() => _isBuffering = buf);
       }
     });
+    _tracksSub = _player.stream.tracks.listen((tracks) {
+      if (!mounted) return;
+      final realTracks = tracks.audio
+          .where((t) => t.id != 'auto' && t.id != 'no')
+          .toList();
+      setState(() {
+        _audioTracks = realTracks.isNotEmpty ? realTracks : tracks.audio;
+        _activeAudioTrack = _player.state.track.audio;
+      });
+      if (!_didApplyInitialAudioTrack &&
+          realTracks.isNotEmpty &&
+          widget.initialAudioTrackOrderIndex != null) {
+        final idx = widget.initialAudioTrackOrderIndex!;
+        if (idx >= 0 && idx < realTracks.length) {
+          _didApplyInitialAudioTrack = true;
+          unawaited(_player.setAudioTrack(realTracks[idx]));
+        }
+      }
+    });
+    _trackSub = _player.stream.track.listen((trk) {
+      if (!mounted) return;
+      setState(() => _activeAudioTrack = trk.audio);
+    });
     unawaited(_openInitialStream());
     _scheduleOsdAutoHide();
   }
@@ -4872,7 +4920,7 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
     await _configureMediaPlayer();
     if (!mounted) return;
     try {
-      await _openActiveStream();
+      await _openActiveStream(position: widget.initialPosition);
     } catch (_) {
       await _handlePlaybackError();
     }
@@ -4914,7 +4962,7 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
     }
     if (!mounted || _reportedPlaybackError) return;
     _reportedPlaybackError = true;
-    if (Platform.isAndroid) {
+    if (Platform.isAndroid && !widget.OpenedFromExoFallback) {
       await _openInEmbeddedExoPlayer();
       return;
     }
@@ -5033,6 +5081,8 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
     _durSub?.cancel();
     _playingSub?.cancel();
     _bufferingSub?.cancel();
+    _tracksSub?.cancel();
+    _trackSub?.cancel();
     if (Platform.isAndroid || Platform.isIOS) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
       if (_didChangeOrientation) {
@@ -5057,39 +5107,338 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
     if (res.positionMs > 1000) {
       await _player.seek(Duration(milliseconds: res.positionMs));
     }
-    if (res.error == 'FALLBACK_MPV_SOFT_AUDIO') {
+    final errStr = res.error ?? '';
+    if (errStr.startsWith('FALLBACK_MPV_SOFT_AUDIO')) {
+      if (errStr.startsWith('FALLBACK_MPV_SOFT_AUDIO:')) {
+        final idx = int.tryParse(
+          errStr.substring('FALLBACK_MPV_SOFT_AUDIO:'.length),
+        );
+        final realTracks = _player.state.tracks.audio
+            .where((t) => t.id != 'auto' && t.id != 'no')
+            .toList();
+        if (idx != null && idx >= 0 && idx < realTracks.length) {
+          await _player.setAudioTrack(realTracks[idx]);
+        }
+      }
       await _player.play();
     }
   }
 
+  String _formatAudioTrackTitle(AudioTrack t, int index) {
+    final parts = <String>[];
+    final lang = (t.language ?? '').trim().toLowerCase();
+    final rawTitle = (t.title ?? '').trim();
+    if (rawTitle.contains('国语') || rawTitle.contains('国配') || lang.startsWith('cmn')) {
+      parts.add('国语');
+    } else if (rawTitle.contains('粤语') || lang.startsWith('yue')) {
+      parts.add('粤语');
+    } else if (lang.startsWith('zh') || lang.startsWith('chi') || lang.startsWith('zho')) {
+      parts.add('中文');
+    } else if (lang.startsWith('en')) {
+      parts.add('英语');
+    } else if (lang.startsWith('ja') || lang.startsWith('jpn')) {
+      parts.add('日语');
+    } else if (lang.startsWith('ko') || lang.startsWith('kor')) {
+      parts.add('韩语');
+    } else if (lang.isNotEmpty && lang != 'und') {
+      parts.add(lang.toUpperCase());
+    } else {
+      parts.add('音轨${index + 1}');
+    }
+    if (rawTitle.isNotEmpty && !parts.any((p) => rawTitle == p)) {
+      parts.add(rawTitle);
+    }
+    final codec = (t.codec ?? '').trim();
+    if (codec.isNotEmpty) {
+      parts.add(codec.toUpperCase());
+    }
+    if ((t.channelscount ?? 0) > 0) {
+      final ch = t.channelscount!;
+      parts.add(ch == 8 ? '7.1' : (ch == 6 ? '5.1' : (ch == 2 ? '2.0' : '${ch}ch')));
+    }
+    return parts.join(' · ');
+  }
+
+  Future<void> _showAudioTrackSelectorDialog() async {
+    final realTracks = _player.state.tracks.audio
+        .where((t) => t.id != 'auto' && t.id != 'no')
+        .toList();
+    final tracks = realTracks.isNotEmpty ? realTracks : _audioTracks;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setDialogState) {
+            final current = _player.state.track.audio;
+            return AlertDialog(
+              backgroundColor: VideoPlatformTheme.bgElevated,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(18),
+                side: BorderSide(color: VideoPlatformTheme.accent.withValues(alpha: 0.45)),
+              ),
+              title: Row(
+                children: [
+                  Icon(
+                    Icons.surround_sound_rounded,
+                    color: VideoPlatformTheme.accent,
+                    size: 22,
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    '选择音轨 / 声道 (共 ${tracks.length} 条 · 全格式软解已启用)',
+                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                  ),
+                ],
+              ),
+              content: SizedBox(
+                width: 560,
+                child: tracks.isEmpty
+                    ? const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 20),
+                        child: Text('正在解析视频音轨列表，请稍候再试...'),
+                      )
+                    : ConstrainedBox(
+                        constraints: const BoxConstraints(maxHeight: 420),
+                        child: ListView.separated(
+                          shrinkWrap: true,
+                          itemCount: tracks.length,
+                          separatorBuilder: (_, __) => const SizedBox(height: 8),
+                          itemBuilder: (_, idx) {
+                            final t = tracks[idx];
+                            final isSelected = current.id == t.id;
+                            final label = _formatAudioTrackTitle(t, idx);
+                            return StatefulBuilder(
+                              builder: (itemCtx, setItemState) {
+                                return InkWell(
+                                  autofocus: isSelected || idx == 0,
+                                  borderRadius: BorderRadius.circular(12),
+                                  onFocusChange: (_) {
+                                    if (itemCtx.mounted) setItemState(() {});
+                                  },
+                                  onTap: () async {
+                                    await _player.setAudioTrack(t);
+                                    if (mounted) {
+                                      setState(() => _activeAudioTrack = t);
+                                    }
+                                    if (ctx.mounted) {
+                                      Navigator.of(ctx).pop();
+                                    }
+                                  },
+                                  child: Builder(
+                                    builder: (bCtx) {
+                                      final isFocused = Focus.of(bCtx).hasPrimaryFocus;
+                                      return AnimatedContainer(
+                                        duration: const Duration(milliseconds: 120),
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 16,
+                                          vertical: 12,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: isFocused
+                                              ? VideoPlatformTheme.accent
+                                              : (isSelected
+                                                  ? VideoPlatformTheme.accent.withValues(alpha: 0.22)
+                                                  : VideoPlatformTheme.bgCard),
+                                          borderRadius: BorderRadius.circular(12),
+                                          border: Border.all(
+                                            color: isFocused
+                                                ? const Color(0xFFFFE066)
+                                                : (isSelected
+                                                    ? VideoPlatformTheme.accent
+                                                    : VideoPlatformTheme.borderSubtle),
+                                            width: isFocused ? 2.8 : 1.2,
+                                          ),
+                                        ),
+                                        child: Row(
+                                          children: [
+                                            Icon(
+                                              isSelected
+                                                  ? Icons.check_circle_rounded
+                                                  : Icons.audiotrack_rounded,
+                                              size: 19,
+                                              color: isFocused || isSelected
+                                                  ? Colors.white
+                                                  : VideoPlatformTheme.textSecondary,
+                                            ),
+                                            const SizedBox(width: 10),
+                                            Expanded(
+                                              child: Text(
+                                                '#${idx + 1}  $label',
+                                                style: TextStyle(
+                                                  fontSize: 13.5,
+                                                  fontWeight: isFocused || isSelected
+                                                      ? FontWeight.w700
+                                                      : FontWeight.w500,
+                                                  color: Colors.white,
+                                                ),
+                                              ),
+                                            ),
+                                            if (isSelected)
+                                              Container(
+                                                padding: const EdgeInsets.symmetric(
+                                                  horizontal: 8,
+                                                  vertical: 2,
+                                                ),
+                                                decoration: BoxDecoration(
+                                                  color: Colors.black26,
+                                                  borderRadius: BorderRadius.circular(8),
+                                                ),
+                                                child: const Text(
+                                                  '当前音轨',
+                                                  style: TextStyle(
+                                                    fontSize: 11,
+                                                    fontWeight: FontWeight.w700,
+                                                    color: Colors.white,
+                                                  ),
+                                                ),
+                                              ),
+                                          ],
+                                        ),
+                                      );
+                                    },
+                                  ),
+                                );
+                              },
+                            );
+                          },
+                        ),
+                      ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  child: const Text('关闭'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    _wakeControls();
+  }
+
+  Widget _buildAudioTrackButton() {
+    final realTracks = _player.state.tracks.audio
+        .where((t) => t.id != 'auto' && t.id != 'no')
+        .toList();
+    final tracks = realTracks.isNotEmpty ? realTracks : _audioTracks;
+    final active = _activeAudioTrack ?? _player.state.track.audio;
+    final activeIdx = tracks.indexWhere((t) => t.id == active.id);
+    final shortLabel = activeIdx >= 0
+        ? _formatAudioTrackTitle(tracks[activeIdx], activeIdx)
+        : (tracks.isNotEmpty ? '共${tracks.length}轨' : '默认');
+
+    return StatefulBuilder(
+      builder: (btnCtx, setBtnState) {
+        return InkWell(
+          borderRadius: BorderRadius.circular(12),
+          onFocusChange: (_) {
+            if (btnCtx.mounted) setBtnState(() {});
+          },
+          onTap: _showAudioTrackSelectorDialog,
+          child: Builder(
+            builder: (ctx) {
+              final isFocused = Focus.of(ctx).hasPrimaryFocus;
+              return AnimatedContainer(
+                duration: const Duration(milliseconds: 120),
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                decoration: BoxDecoration(
+                  color: isFocused
+                      ? VideoPlatformTheme.accent
+                      : const Color(0xFF1E3A8A).withValues(alpha: 0.55),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: isFocused
+                        ? const Color(0xFFFFE066)
+                        : const Color(0xFF60A5FA),
+                    width: isFocused ? 2.6 : 1.0,
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.surround_sound_rounded,
+                      size: 14,
+                      color: isFocused ? Colors.white : const Color(0xFF93C5FD),
+                    ),
+                    const SizedBox(width: 4),
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 165),
+                      child: Text(
+                        '音轨: $shortLabel ▾',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+
   Widget _buildExoHardwareButton() {
     if (!Platform.isAndroid) return const SizedBox.shrink();
-    return InkWell(
-      borderRadius: BorderRadius.circular(12),
-      onTap: _openInEmbeddedExoPlayer,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-        decoration: BoxDecoration(
-          color: const Color(0xFF0284C7).withValues(alpha: 0.22),
+    return StatefulBuilder(
+      builder: (btnCtx, setBtnState) {
+        return InkWell(
           borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: const Color(0xFF38BDF8)),
-        ),
-        child: const Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.bolt_rounded, size: 14, color: Color(0xFF38BDF8)),
-            SizedBox(width: 3),
-            Text(
-              'Exo硬解',
-              style: TextStyle(
-                fontSize: 11.5,
-                fontWeight: FontWeight.w700,
-                color: Color(0xFF38BDF8),
-              ),
-            ),
-          ],
-        ),
-      ),
+          onFocusChange: (_) {
+            if (btnCtx.mounted) setBtnState(() {});
+          },
+          onTap: _openInEmbeddedExoPlayer,
+          child: Builder(
+            builder: (ctx) {
+              final isFocused = Focus.of(ctx).hasPrimaryFocus;
+              return AnimatedContainer(
+                duration: const Duration(milliseconds: 120),
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: isFocused
+                      ? const Color(0xFF0284C7)
+                      : const Color(0xFF0284C7).withValues(alpha: 0.22),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: isFocused
+                        ? const Color(0xFFFFE066)
+                        : const Color(0xFF38BDF8),
+                    width: isFocused ? 2.6 : 1.0,
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.bolt_rounded,
+                      size: 14,
+                      color: isFocused ? Colors.white : const Color(0xFF38BDF8),
+                    ),
+                    const SizedBox(width: 3),
+                    Text(
+                      'Exo硬解',
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w700,
+                        color: isFocused ? Colors.white : const Color(0xFF38BDF8),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        );
+      },
     );
   }
 
@@ -5120,33 +5469,53 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
 
   Widget _buildFitModePill() {
     final isFull = _fitMode != 'fit';
-    return InkWell(
-      borderRadius: BorderRadius.circular(12),
-      onTap: _cycleFitMode,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-        decoration: BoxDecoration(
-          color: isFull
-              ? VideoPlatformTheme.accent.withValues(alpha: 0.22)
-              : VideoPlatformTheme.bgCard.withValues(alpha: 0.85),
+    return StatefulBuilder(
+      builder: (btnCtx, setBtnState) {
+        return InkWell(
           borderRadius: BorderRadius.circular(12),
-          border: Border.all(
-            color: isFull
-                ? VideoPlatformTheme.accent
-                : VideoPlatformTheme.borderSubtle,
+          onFocusChange: (_) {
+            if (btnCtx.mounted) setBtnState(() {});
+          },
+          onTap: _cycleFitMode,
+          child: Builder(
+            builder: (ctx) {
+              final isFocused = Focus.of(ctx).hasPrimaryFocus;
+              return AnimatedContainer(
+                duration: const Duration(milliseconds: 120),
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: isFocused
+                      ? VideoPlatformTheme.accent
+                      : (isFull
+                          ? VideoPlatformTheme.accent.withValues(alpha: 0.22)
+                          : VideoPlatformTheme.bgCard.withValues(alpha: 0.85)),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: isFocused
+                        ? const Color(0xFFFFE066)
+                        : (isFull
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.borderSubtle),
+                    width: isFocused ? 2.6 : 1.0,
+                  ),
+                ),
+                child: Text(
+                  _fitModeLabel(),
+                  style: TextStyle(
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w600,
+                    color: isFocused
+                        ? Colors.white
+                        : (isFull
+                            ? VideoPlatformTheme.accent
+                            : VideoPlatformTheme.textPrimary),
+                  ),
+                ),
+              );
+            },
           ),
-        ),
-        child: Text(
-          _fitModeLabel(),
-          style: TextStyle(
-            fontSize: 11.5,
-            fontWeight: FontWeight.w600,
-            color: isFull
-                ? VideoPlatformTheme.accent
-                : VideoPlatformTheme.textPrimary,
-          ),
-        ),
-      ),
+        );
+      },
     );
   }
 
@@ -5580,6 +5949,8 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
                                 child: Row(
                                   children: [
                                     _build115Button(),
+                                    const SizedBox(width: 6),
+                                    _buildAudioTrackButton(),
                                     if (Platform.isAndroid) ...[
                                       const SizedBox(width: 6),
                                       _buildExoHardwareButton(),
@@ -5858,6 +6229,8 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
                           mainAxisSize: MainAxisSize.min,
                           children: [
                             _build115Button(),
+                            const SizedBox(width: 6),
+                            _buildAudioTrackButton(),
                             if (Platform.isAndroid) ...[
                               const SizedBox(width: 6),
                               _buildExoHardwareButton(),

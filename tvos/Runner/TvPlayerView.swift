@@ -1520,6 +1520,7 @@ struct TvPlayerModalView: View {
   @State private var active115Headers: [String: String] = [:]
   @State private var show115LoginSheet: Bool = false
   @State private var showProxySelectorSheet: Bool = false
+  @State private var showAudioTrackSelectorSheet: Bool = false
   @State private var didFallbackToProxy: Bool = false
   @State private var didPerformResumeSeek: Bool = false
   @State private var didTriggerOutroSkip: Bool = false
@@ -1535,6 +1536,8 @@ struct TvPlayerModalView: View {
   @State private var lastAutoHideAt: Date = .distantPast
   @State private var lastManualSeekAt: Date = .distantPast
   @State private var lastSeekDeltaSec: Int = 0
+  @State private var pendingSeekCommitWorkItem: DispatchWorkItem? = nil
+  @State private var hasUncommittedSeekPreview: Bool = false
   private static let autoHideTick = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
 
   @ViewBuilder
@@ -1573,11 +1576,12 @@ struct TvPlayerModalView: View {
           }
         )
       } else if showSeekHud {
+        let signStr = lastSeekDeltaSec >= 0 ? "+\(lastSeekDeltaSec)s" : "\(lastSeekDeltaSec)s"
         HStack(spacing: 12) {
           Image(systemName: lastSeekDeltaSec >= 0 ? "goforward.10" : "gobackward.10")
             .font(.system(size: 28, weight: .bold))
             .foregroundColor(Color(red: 0.35, green: 0.78, blue: 1.0))
-          Text("\(lastSeekDeltaSec >= 0 ? "快进" : "快退") · \(formatClock(positionSec)) / \(formatClock(durationSec))")
+          Text("\(lastSeekDeltaSec >= 0 ? "快进" : "快退") \(signStr) · \(formatClock(positionSec)) / \(formatClock(durationSec))")
             .font(.system(size: 22, weight: .bold, design: .monospaced))
             .foregroundColor(.white)
         }
@@ -1708,6 +1712,15 @@ struct TvPlayerModalView: View {
                 compact: true
               )
             )
+
+            if !request.isLive && hasSelectableAudioTracks {
+              Button {
+                showAudioTrackSelectorSheet = true
+              } label: {
+                Label("音轨: \(currentAudioTrackButtonTitle) ▾", systemImage: "speaker.wave.2.bubble.left.fill")
+              }
+              .buttonStyle(TvApplePillButtonStyle(isSelected: showAudioTrackSelectorSheet, compact: true))
+            }
 
             Button {
               aspectFill.toggle()
@@ -1892,14 +1905,14 @@ struct TvPlayerModalView: View {
 
                 if !request.isLive {
                   Button {
-                    seekRelative(-15)
+                    seekRelative(-15, commitImmediately: true)
                   } label: {
                     Label("快退15s", systemImage: "gobackward.15")
                   }
                   .buttonStyle(TvApplePillButtonStyle(compact: true))
 
                   Button {
-                    seekRelative(15)
+                    seekRelative(15, commitImmediately: true)
                   } label: {
                     Label("快进15s", systemImage: "goforward.15")
                   }
@@ -1973,16 +1986,13 @@ struct TvPlayerModalView: View {
                 }
 
                 if !request.isLive {
-                  if isUsingDirectFlvEngine && flvEngine.availableMkvAudioTracks.count > 0 {
+                  if hasSelectableAudioTracks {
                     Button {
-                      if let newTitle = flvEngine.cycleMkvAudioTrack() {
-                        appState.showToast("已切换音轨：\(newTitle)")
-                      }
+                      showAudioTrackSelectorSheet = true
                     } label: {
-                      let curTrk = flvEngine.availableMkvAudioTracks.first(where: { $0.trackNum == flvEngine.currentMkvAudioTrackNum })
-                      Label("音轨: \(curTrk?.displayTitle ?? "默认")", systemImage: "speaker.wave.2.bubble.left.fill")
+                      Label("音轨: \(currentAudioTrackButtonTitle) ▾", systemImage: "speaker.wave.2.bubble.left.fill")
                     }
-                    .buttonStyle(TvApplePillButtonStyle(compact: true))
+                    .buttonStyle(TvApplePillButtonStyle(isSelected: showAudioTrackSelectorSheet, compact: true))
                   }
 
                   Button {
@@ -2272,6 +2282,7 @@ struct TvPlayerModalView: View {
           && !appState.playerShowEpisodeDrawer
           && !showProxySelectorSheet
           && !show115LoginSheet
+          && !showAudioTrackSelectorSheet
           && !appState.is115Accelerating
           && now.timeIntervalSince(latestActivity) >= 3.5 {
         lastAutoHideAt = now
@@ -2280,6 +2291,25 @@ struct TvPlayerModalView: View {
           appState.playerControlsVisible = false
         }
       }
+    }
+    .sheet(isPresented: $showAudioTrackSelectorSheet) {
+      TvAudioTrackSelectorSheet(
+        isPresented: $showAudioTrackSelectorSheet,
+        isMkvEngine: isUsingDirectFlvEngine,
+        mkvTracks: flvEngine.availableMkvAudioTracks,
+        currentMkvTrackNum: flvEngine.currentMkvAudioTrackNum,
+        avAudibleOptions: avPlayerAudibleOptions,
+        currentAvOptionIndex: currentAvPlayerAudibleOptionIndex,
+        onSelectMkvTrack: { trackNum in
+          if let newTitle = flvEngine.selectMkvAudioTrack(trackNum: trackNum) {
+            appState.showToast("已切换音轨：\(newTitle)")
+          }
+        },
+        onSelectAvOption: { optionIndex in
+          selectAvPlayerAudibleOption(at: optionIndex)
+        }
+      )
+      .environmentObject(appState)
     }
     .sheet(isPresented: $show115LoginSheet) {
       Tv115QuickLoginSheet(
@@ -2318,10 +2348,16 @@ struct TvPlayerModalView: View {
       appState.isPlayerScrubberFocused = !request.isLive
       appState.videoDirectSeekHandler = { dir in
         guard !request.isLive else { return }
+        if dir == 0 {
+          if hasUncommittedSeekPreview {
+            commitCurrentPositionSeek()
+          }
+          return
+        }
         wakeUpControls()
         focusedField = .scrubber
         appState.isPlayerScrubberFocused = true
-        seekRelative(Double(dir) * 10)
+        seekRelative(Double(dir) * 10, commitImmediately: false)
       }
       loadCurrentStream(forceProxy: false)
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
@@ -2813,21 +2849,100 @@ struct TvPlayerModalView: View {
     }
   }
 
-  private func seekRelative(_ delta: Double) {
-    lastInteractionAt = Date()
-    lastManualSeekAt = Date()
-    lastProgressAdvanceAt = Date()
-    lastSeekDeltaSec = Int(delta)
+  private var avPlayerAudibleOptions: [AVMediaSelectionOption] {
+    guard !isUsingDirectFlvEngine,
+          let item = player.currentItem,
+          let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .audible) else {
+      return []
+    }
+    return group.options
+  }
+
+  private var currentAvPlayerAudibleOptionIndex: Int {
+    guard !isUsingDirectFlvEngine,
+          let item = player.currentItem,
+          let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .audible) else {
+      return 0
+    }
+    let selected = item.currentMediaSelection.selectedMediaOption(in: group)
+    return group.options.firstIndex(where: { $0 == selected }) ?? 0
+  }
+
+  private var hasSelectableAudioTracks: Bool {
+    if isUsingDirectFlvEngine {
+      return !flvEngine.availableMkvAudioTracks.isEmpty
+    }
+    return !avPlayerAudibleOptions.isEmpty
+  }
+
+  private var currentAudioTrackButtonTitle: String {
+    if isUsingDirectFlvEngine {
+      let tracks = flvEngine.availableMkvAudioTracks
+      let curTrk = tracks.first(where: { $0.trackNum == flvEngine.currentMkvAudioTrackNum }) ?? tracks.first
+      return curTrk?.displayTitle ?? "默认"
+    }
+    let opts = avPlayerAudibleOptions
+    let idx = currentAvPlayerAudibleOptionIndex
+    if idx >= 0 && idx < opts.count {
+      return opts[idx].displayName
+    }
+    return "默认"
+  }
+
+  private func selectAvPlayerAudibleOption(at index: Int) {
+    guard !isUsingDirectFlvEngine,
+          let item = player.currentItem,
+          let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .audible),
+          index >= 0, index < group.options.count else { return }
+    let option = group.options[index]
+    item.select(option, in: group)
+    appState.showToast("已切换音轨：\(option.displayName)")
+  }
+
+  private func seekRelative(_ delta: Double, commitImmediately: Bool = false) {
+    let now = Date()
+    let isContinuation = now.timeIntervalSince(lastManualSeekAt) < 1.15
+    lastInteractionAt = now
+    lastManualSeekAt = now
+    lastProgressAdvanceAt = now
+    if isContinuation && ((lastSeekDeltaSec >= 0 && delta >= 0) || (lastSeekDeltaSec < 0 && delta < 0)) {
+      lastSeekDeltaSec += Int(delta)
+    } else {
+      lastSeekDeltaSec = Int(delta)
+    }
     let maxDur = durationSec > 0 ? durationSec : max(0, positionSec + delta + 3600)
     let target = min(maxDur, max(0, positionSec + delta))
     positionSec = target
+    hasUncommittedSeekPreview = true
+
+    pendingSeekCommitWorkItem?.cancel()
+    pendingSeekCommitWorkItem = nil
+    if commitImmediately {
+      commitCurrentPositionSeek()
+    } else {
+      let work = DispatchWorkItem {
+        self.commitCurrentPositionSeek()
+      }
+      pendingSeekCommitWorkItem = work
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.24, execute: work)
+    }
+  }
+
+  private func commitCurrentPositionSeek() {
+    pendingSeekCommitWorkItem?.cancel()
+    pendingSeekCommitWorkItem = nil
+    guard hasUncommittedSeekPreview else { return }
+    hasUncommittedSeekPreview = false
+    let target = positionSec
+    lastManualSeekAt = Date()
+    lastProgressAdvanceAt = Date()
     if isUsingDirectFlvEngine {
       isBuffering = true
       flvEngine.seek(to: target)
       return
     }
     player.currentItem?.cancelPendingSeeks()
-    let tol = CMTime(seconds: 1.2, preferredTimescale: 600)
+    let tol = CMTime(seconds: 1.0, preferredTimescale: 600)
     player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: tol, toleranceAfter: tol) { [weak player] _ in
       if self.userWantsToPlay {
         player?.playImmediately(atRate: self.playbackRate)
@@ -2836,6 +2951,9 @@ struct TvPlayerModalView: View {
   }
 
   private func cleanupPlayer(keepingRelayUrl: URL? = nil) {
+    pendingSeekCommitWorkItem?.cancel()
+    pendingSeekCommitWorkItem = nil
+    hasUncommittedSeekPreview = false
     flvEngine.stop()
     isUsingDirectFlvEngine = false
     if let mkvUrl = activeMkvProxyUrl, mkvUrl != keepingRelayUrl {
@@ -2948,6 +3066,8 @@ struct TvTelegramGalleryModalView: View {
   @State private var lastAutoHideAt: Date = .distantPast
   @State private var lastManualSeekAt: Date = .distantPast
   @State private var lastSeekDeltaSec: Int = 0
+  @State private var pendingSeekCommitWorkItem: DispatchWorkItem? = nil
+  @State private var hasUncommittedSeekPreview: Bool = false
   private static let autoHideTick = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
 
   private var currentMessage: TvTelegramMessage {
@@ -3699,10 +3819,16 @@ struct TvTelegramGalleryModalView: View {
       appState.videoDirectSeekHandler = { dir in
         let isVid = currentMessage.isVideo || currentMessage.isAudio
         guard isVid else { return }
+        if dir == 0 {
+          if hasUncommittedSeekPreview {
+            commitCurrentPositionSeek()
+          }
+          return
+        }
         wakeUpGalleryControls()
         galleryFocus = .scrubber
         appState.isPlayerScrubberFocused = true
-        seekRelative(Double(dir) * 5)
+        seekRelative(Double(dir) * 5, commitImmediately: false)
       }
       loadCurrentMedia()
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
@@ -3990,16 +4116,45 @@ struct TvTelegramGalleryModalView: View {
     }
   }
 
-  private func seekRelative(_ delta: Double) {
-    lastInteractionAt = Date()
-    lastManualSeekAt = Date()
-    lastProgressAdvanceAt = Date()
-    lastSeekDeltaSec = Int(delta)
+  private func seekRelative(_ delta: Double, commitImmediately: Bool = false) {
+    let now = Date()
+    let isContinuation = now.timeIntervalSince(lastManualSeekAt) < 1.15
+    lastInteractionAt = now
+    lastManualSeekAt = now
+    lastProgressAdvanceAt = now
+    if isContinuation && ((lastSeekDeltaSec >= 0 && delta >= 0) || (lastSeekDeltaSec < 0 && delta < 0)) {
+      lastSeekDeltaSec += Int(delta)
+    } else {
+      lastSeekDeltaSec = Int(delta)
+    }
     let maxDur = durationSec > 0 ? durationSec : max(0, positionSec + delta + 3600)
     let target = min(maxDur, max(0, positionSec + delta))
     positionSec = target
+    hasUncommittedSeekPreview = true
+
+    pendingSeekCommitWorkItem?.cancel()
+    pendingSeekCommitWorkItem = nil
+    if commitImmediately {
+      commitCurrentPositionSeek()
+    } else {
+      let work = DispatchWorkItem {
+        self.commitCurrentPositionSeek()
+      }
+      pendingSeekCommitWorkItem = work
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.24, execute: work)
+    }
+  }
+
+  private func commitCurrentPositionSeek() {
+    pendingSeekCommitWorkItem?.cancel()
+    pendingSeekCommitWorkItem = nil
+    guard hasUncommittedSeekPreview else { return }
+    hasUncommittedSeekPreview = false
+    let target = positionSec
+    lastManualSeekAt = Date()
+    lastProgressAdvanceAt = Date()
     player.currentItem?.cancelPendingSeeks()
-    let tol = CMTime(seconds: 1.2, preferredTimescale: 600)
+    let tol = CMTime(seconds: 1.0, preferredTimescale: 600)
     player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: tol, toleranceAfter: tol) { [weak player] _ in
       if self.userWantsToPlay {
         player?.play()
@@ -4020,6 +4175,9 @@ struct TvTelegramGalleryModalView: View {
   }
 
   private func cleanupPlayer() {
+    pendingSeekCommitWorkItem?.cancel()
+    pendingSeekCommitWorkItem = nil
+    hasUncommittedSeekPreview = false
     if let token = timeObserverToken {
       player.removeTimeObserver(token)
       timeObserverToken = nil
@@ -4636,6 +4794,193 @@ struct Tv115QuickLoginSheet: View {
           onLoginCompleted()
         }
       }
+    }
+  }
+}
+
+// MARK: - In-Player Pop-Up Audio Track / Channel Selector List Sheet (Apple TV)
+
+struct TvAudioTrackSelectorSheet: View {
+  @EnvironmentObject var appState: TvAppState
+  @Binding var isPresented: Bool
+  let isMkvEngine: Bool
+  let mkvTracks: [TvDirectFlvHardwareEngine.MkvAudioTrackCandidate]
+  let currentMkvTrackNum: Int
+  let avAudibleOptions: [AVMediaSelectionOption]
+  let currentAvOptionIndex: Int
+  let onSelectMkvTrack: (Int) -> Void
+  let onSelectAvOption: (Int) -> Void
+
+  var body: some View {
+    let theme = TvThemePalette.current
+    let totalCount = isMkvEngine ? mkvTracks.count : avAudibleOptions.count
+
+    ZStack {
+      Color(red: 0.05, green: 0.06, blue: 0.09)
+        .ignoresSafeArea()
+
+      VStack(alignment: .leading, spacing: 24) {
+        HStack(spacing: 16) {
+          Image(systemName: "speaker.wave.2.bubble.left.fill")
+            .font(.system(size: 32, weight: .bold))
+            .foregroundColor(theme.accentHover)
+
+          VStack(alignment: .leading, spacing: 4) {
+            Text("选择音轨 / 声道")
+              .font(.system(size: 30, weight: .bold))
+              .foregroundColor(.white)
+            Text("共检测到 \(totalCount) 条音轨 · TrueHD / DTS 源码音轨已自动绑定同语言杜比 5.1 兼容核以确保有声输出")
+              .font(.system(size: 16, weight: .medium))
+              .foregroundColor(.white.opacity(0.65))
+          }
+
+          Spacer()
+
+          Button("关闭") {
+            isPresented = false
+          }
+          .buttonStyle(TvApplePillButtonStyle(compact: true))
+        }
+        .focusSection()
+
+        Divider()
+          .background(Color.white.opacity(0.14))
+
+        ScrollView {
+          VStack(spacing: 14) {
+            if isMkvEngine {
+              ForEach(Array(mkvTracks.enumerated()), id: \.element.trackNum) { idx, track in
+                let isCurrent = (track.trackNum == currentMkvTrackNum)
+                Button {
+                  onSelectMkvTrack(track.trackNum)
+                  isPresented = false
+                } label: {
+                  HStack(spacing: 18) {
+                    Image(systemName: isCurrent ? "checkmark.circle.fill" : "speaker.wave.2.fill")
+                      .font(.system(size: 26, weight: .bold))
+                      .foregroundColor(
+                        isCurrent
+                          ? Color(red: 0.25, green: 0.88, blue: 0.52)
+                          : .white.opacity(0.70)
+                      )
+                      .frame(width: 34)
+
+                    Text("#\(idx + 1)")
+                      .font(.system(size: 15, weight: .bold, design: .monospaced))
+                      .foregroundColor(theme.accentHover)
+                      .padding(.horizontal, 10)
+                      .padding(.vertical, 5)
+                      .background(theme.accent.opacity(0.18))
+                      .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                    VStack(alignment: .leading, spacing: 4) {
+                      Text(track.displayTitle)
+                        .font(.system(size: 21, weight: .bold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                      if !track.detailSubtitle.isEmpty {
+                        Text(track.detailSubtitle)
+                          .font(.system(size: 15, weight: .medium))
+                          .foregroundColor(.white.opacity(0.60))
+                          .lineLimit(1)
+                      }
+                    }
+
+                    Spacer()
+
+                    let statusText = track.isHardwareSupported
+                      ? (track.demuxTrackNum != track.trackNum ? "已绑定杜比兼容核" : "Apple TV 原生硬解")
+                      : "无独立兼容轨"
+                    let statusColor = track.isHardwareSupported
+                      ? Color(red: 0.25, green: 0.85, blue: 0.55)
+                      : Color(red: 1.0, green: 0.68, blue: 0.22)
+
+                    Text(statusText)
+                      .font(.system(size: 13, weight: .bold))
+                      .foregroundColor(statusColor)
+                      .padding(.horizontal, 12)
+                      .padding(.vertical, 6)
+                      .background(statusColor.opacity(0.16))
+                      .clipShape(Capsule(style: .continuous))
+
+                    if isCurrent {
+                      Text("当前使用")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 6)
+                        .background(Color(red: 0.20, green: 0.62, blue: 0.96))
+                        .clipShape(Capsule(style: .continuous))
+                    }
+                  }
+                  .padding(.horizontal, 24)
+                  .padding(.vertical, 18)
+                }
+                .buttonStyle(TvAppleSurfaceButtonStyle(isSelected: isCurrent, cornerRadius: 16))
+              }
+            } else {
+              ForEach(Array(avAudibleOptions.enumerated()), id: \.offset) { idx, option in
+                let isCurrent = (idx == currentAvOptionIndex)
+                let localeStr = option.locale?.localizedString(forLanguageCode: option.locale?.languageCode ?? "") ?? ""
+                Button {
+                  onSelectAvOption(idx)
+                  isPresented = false
+                } label: {
+                  HStack(spacing: 18) {
+                    Image(systemName: isCurrent ? "checkmark.circle.fill" : "speaker.wave.2.fill")
+                      .font(.system(size: 26, weight: .bold))
+                      .foregroundColor(
+                        isCurrent
+                          ? Color(red: 0.25, green: 0.88, blue: 0.52)
+                          : .white.opacity(0.70)
+                      )
+                      .frame(width: 34)
+
+                    Text("#\(idx + 1)")
+                      .font(.system(size: 15, weight: .bold, design: .monospaced))
+                      .foregroundColor(theme.accentHover)
+                      .padding(.horizontal, 10)
+                      .padding(.vertical, 5)
+                      .background(theme.accent.opacity(0.18))
+                      .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                    VStack(alignment: .leading, spacing: 4) {
+                      Text(option.displayName)
+                        .font(.system(size: 21, weight: .bold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                      if !localeStr.isEmpty {
+                        Text("语言: \(localeStr)")
+                          .font(.system(size: 15, weight: .medium))
+                          .foregroundColor(.white.opacity(0.60))
+                          .lineLimit(1)
+                      }
+                    }
+
+                    Spacer()
+
+                    if isCurrent {
+                      Text("当前使用")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 6)
+                        .background(Color(red: 0.20, green: 0.62, blue: 0.96))
+                        .clipShape(Capsule(style: .continuous))
+                    }
+                  }
+                  .padding(.horizontal, 24)
+                  .padding(.vertical, 18)
+                }
+                .buttonStyle(TvAppleSurfaceButtonStyle(isSelected: isCurrent, cornerRadius: 16))
+              }
+            }
+          }
+          .padding(6)
+        }
+        .focusSection()
+      }
+      .padding(44)
     }
   }
 }

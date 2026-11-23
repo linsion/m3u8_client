@@ -33,6 +33,7 @@ import android.os.Bundle
 import android.os.PowerManager
 import android.os.SystemClock
 import android.view.Gravity
+import android.view.View
 import android.view.KeyEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -1231,11 +1232,12 @@ class MainActivity : FlutterActivity() {
             }
 
             val playerView = PlayerView(this).apply {
+                id = View.generateViewId()
                 player = exoPlayer
                 useController = true
                 resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
                 setShowBuffering(PlayerView.SHOW_BUFFERING_ALWAYS)
-                controllerShowTimeoutMs = 4000
+                controllerShowTimeoutMs = 4500
                 isFocusable = true
                 isFocusableInTouchMode = true
                 layoutParams = FrameLayout.LayoutParams(
@@ -1245,14 +1247,55 @@ class MainActivity : FlutterActivity() {
             }
             root.addView(playerView)
 
-            // Top bar with video title, aspect ratio toggle, and Exit button
+            // High-visibility Android TV D-Pad focus styling so users always see which top bar or dialog button is selected!
+            fun styleTvFocusableButton(
+                btn: Button,
+                normalBgColor: Int,
+                focusedBgColor: Int = Color.rgb(2, 132, 199),
+                normalBorderColor: Int = Color.argb(110, 255, 255, 255),
+                focusedBorderColor: Int = Color.rgb(255, 224, 102)
+            ) {
+                fun buildBg(focused: Boolean): GradientDrawable {
+                    return GradientDrawable().apply {
+                        shape = GradientDrawable.RECTANGLE
+                        cornerRadius = 20f
+                        setColor(if (focused) focusedBgColor else normalBgColor)
+                        setStroke(
+                            if (focused) 4 else 1,
+                            if (focused) focusedBorderColor else normalBorderColor
+                        )
+                    }
+                }
+                btn.isFocusable = true
+                btn.isFocusableInTouchMode = false
+                btn.isAllCaps = false
+                btn.background = buildBg(false)
+                btn.setOnFocusChangeListener { v, hasFocus ->
+                    v.background = buildBg(hasFocus)
+                    (v as? Button)?.setTextColor(
+                        if (hasFocus) Color.rgb(255, 250, 220) else Color.WHITE
+                    )
+                    v.animate()
+                        .scaleX(if (hasFocus) 1.09f else 1.0f)
+                        .scaleY(if (hasFocus) 1.09f else 1.0f)
+                        .setDuration(130)
+                        .start()
+                    if (hasFocus) {
+                        playerView.showController()
+                    }
+                }
+            }
+
+            // Top bar with video title, audio track pop-up list button, soft-audio fallback button, and Exit button
             val topBar = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
+                clipChildren = false
+                clipToPadding = false
                 setPadding(36, 24, 36, 20)
                 background = GradientDrawable(
                     GradientDrawable.Orientation.TOP_BOTTOM,
-                    intArrayOf(Color.argb(210, 0, 0, 0), Color.TRANSPARENT)
+                    intArrayOf(Color.argb(225, 0, 0, 0), Color.TRANSPARENT)
                 )
                 layoutParams = FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
@@ -1285,17 +1328,28 @@ class MainActivity : FlutterActivity() {
             topBar.addView(titleView)
 
             data class AudioTrackChoice(
+                val orderIndex: Int,
                 val group: Tracks.Group,
                 val trackIndex: Int,
                 val format: Format,
                 val label: String,
                 val priority: Int,
-                val isSupported: Boolean
+                val isSupported: Boolean,
+                val isRiskyPassthrough: Boolean
             )
             val rejectedAudioIds = mutableSetOf<String>()
 
             fun formatTrackKey(fmt: Format, groupIdx: Int, trkIdx: Int): String {
                 return "${fmt.id ?: ""}_${fmt.sampleMimeType ?: ""}_${fmt.channelCount}_${fmt.language ?: ""}_${groupIdx}_$trkIdx"
+            }
+
+            fun isRiskyPassthroughFormat(fmt: Format, isSupported: Boolean): Boolean {
+                val mime = (fmt.sampleMimeType ?: "").lowercase()
+                return !isSupported ||
+                    mime.contains("true-hd") ||
+                    mime.contains("mlp") ||
+                    mime.contains("dts") ||
+                    (fmt.channelCount > 6 && (mime.contains("eac3") || mime.contains("ac3")))
             }
 
             fun scoreAudioFormat(fmt: Format, isSupported: Boolean): Int {
@@ -1312,9 +1366,9 @@ class MainActivity : FlutterActivity() {
                     mime.contains("dts") || mime.contains("true-hd") || mime.contains("mlp") -> 25
                     else -> 50
                 }
-                if (isSupported) score += 200
+                if (isSupported && !isRiskyPassthroughFormat(fmt, isSupported)) score += 200
                 if (fmt.channelCount in 2..6) score += 15
-                else if (fmt.channelCount > 6 && (mime.contains("dts") || mime.contains("true-hd"))) score -= 30
+                else if (fmt.channelCount > 6) score -= 35
                 if (labelLower.contains("zh") || labelLower.contains("chi") || labelLower.contains("zho") || labelLower.contains("cmn") || labelLower.contains("国语") || labelLower.contains("粤语")) {
                     score += 12
                 } else if (labelLower.contains("en") || labelLower.contains("eng")) {
@@ -1346,9 +1400,11 @@ class MainActivity : FlutterActivity() {
                     else -> if (fmt.channelCount > 0) "${fmt.channelCount}ch" else ""
                 }
                 val lang = (fmt.language ?: "").lowercase()
+                val rawLabel = (fmt.label ?: "").trim()
                 val langText = when {
-                    lang.startsWith("zh") || lang.startsWith("chi") || lang.startsWith("zho") || lang.startsWith("cmn") -> "中文"
-                    lang.startsWith("yue") -> "粤语"
+                    rawLabel.contains("国语") || rawLabel.contains("国配") || lang.startsWith("cmn") -> "国语"
+                    rawLabel.contains("粤语") || lang.startsWith("yue") -> "粤语"
+                    lang.startsWith("zh") || lang.startsWith("chi") || lang.startsWith("zho") -> "中文"
                     lang.startsWith("en") -> "英语"
                     lang.startsWith("ja") || lang.startsWith("jpn") -> "日语"
                     lang.startsWith("ko") || lang.startsWith("kor") -> "韩语"
@@ -1361,7 +1417,7 @@ class MainActivity : FlutterActivity() {
                 return listOf(langText, codecShort, chText).filter { it.isNotBlank() }.joinToString("·")
             }
 
-            fun collectAudioChoices(): List<AudioTrackChoice> {
+            fun collectAudioChoices(includeRejected: Boolean = false): List<AudioTrackChoice> {
                 val groups = exoPlayer.currentTracks.groups
                 val list = mutableListOf<AudioTrackChoice>()
                 for ((gIdx, g) in groups.withIndex()) {
@@ -1369,16 +1425,20 @@ class MainActivity : FlutterActivity() {
                     for (tIdx in 0 until g.length) {
                         val fmt = g.getTrackFormat(tIdx)
                         val key = formatTrackKey(fmt, gIdx, tIdx)
-                        if (rejectedAudioIds.contains(key)) continue
-                        val supported = g.isTrackSupported(tIdx)
+                        val isRej = rejectedAudioIds.contains(key)
+                        if (isRej && !includeRejected) continue
+                        val supported = !isRej && g.isTrackSupported(tIdx)
+                        val risky = isRiskyPassthroughFormat(fmt, supported)
                         list.add(
                             AudioTrackChoice(
+                                orderIndex = list.size,
                                 group = g,
                                 trackIndex = tIdx,
                                 format = fmt,
                                 label = buildAudioTrackLabel(fmt, list.size),
                                 priority = scoreAudioFormat(fmt, supported),
-                                isSupported = supported
+                                isSupported = supported,
+                                isRiskyPassthrough = risky
                             )
                         )
                     }
@@ -1387,38 +1447,80 @@ class MainActivity : FlutterActivity() {
             }
 
             val audioTrackBtn = Button(this).apply {
-                text = "音轨: 自动"
-                textSize = 12.5f
+                id = View.generateViewId()
+                text = "🔊 音轨: 自动 ▾"
+                textSize = 13f
                 setTextColor(Color.WHITE)
-                setBackgroundColor(Color.argb(175, 30, 58, 138))
-                setPadding(22, 8, 22, 8)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(24, 10, 24, 10)
                 layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
                 ).apply {
-                    rightMargin = 16
+                    rightMargin = 18
                 }
             }
+            styleTvFocusableButton(
+                btn = audioTrackBtn,
+                normalBgColor = Color.argb(215, 30, 64, 175),
+                focusedBgColor = Color.rgb(3, 105, 161)
+            )
             topBar.addView(audioTrackBtn)
 
             val mpvFallbackBtn = Button(this).apply {
-                text = "切换软解音轨"
-                textSize = 12.5f
+                id = View.generateViewId()
+                text = "⚡ 切换全能软解音轨"
+                textSize = 13f
                 setTextColor(Color.WHITE)
-                setBackgroundColor(Color.argb(175, 15, 118, 110))
-                setPadding(22, 8, 22, 8)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(24, 10, 24, 10)
                 layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
                 ).apply {
-                    rightMargin = 16
+                    rightMargin = 18
                 }
                 setOnClickListener {
                     finishWithCurrentPos("FALLBACK_MPV_SOFT_AUDIO")
                     dismissNativeExoPlayerDialog()
                 }
             }
+            styleTvFocusableButton(
+                btn = mpvFallbackBtn,
+                normalBgColor = Color.argb(215, 15, 118, 110),
+                focusedBgColor = Color.rgb(13, 148, 136)
+            )
             topBar.addView(mpvFallbackBtn)
+
+            val closeBtn = Button(this).apply {
+                id = View.generateViewId()
+                text = "✕ 退出播放"
+                textSize = 13f
+                setTextColor(Color.WHITE)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(24, 10, 24, 10)
+                setOnClickListener {
+                    finishWithCurrentPos()
+                    dismissNativeExoPlayerDialog()
+                }
+            }
+            styleTvFocusableButton(
+                btn = closeBtn,
+                normalBgColor = Color.argb(215, 51, 65, 85),
+                focusedBgColor = Color.rgb(185, 28, 28)
+            )
+            topBar.addView(closeBtn)
+
+            // Explicit D-Pad focus graph between top bar buttons and PlayerView
+            audioTrackBtn.nextFocusRightId = mpvFallbackBtn.id
+            audioTrackBtn.nextFocusLeftId = audioTrackBtn.id
+            audioTrackBtn.nextFocusDownId = playerView.id
+            mpvFallbackBtn.nextFocusLeftId = audioTrackBtn.id
+            mpvFallbackBtn.nextFocusRightId = closeBtn.id
+            mpvFallbackBtn.nextFocusDownId = playerView.id
+            closeBtn.nextFocusLeftId = mpvFallbackBtn.id
+            closeBtn.nextFocusRightId = closeBtn.id
+            closeBtn.nextFocusDownId = playerView.id
 
             fun selectAudioChoice(choice: AudioTrackChoice) {
                 trackSelector.setParameters(
@@ -1428,33 +1530,154 @@ class MainActivity : FlutterActivity() {
                             TrackSelectionOverride(choice.group.mediaTrackGroup, listOf(choice.trackIndex))
                         )
                 )
-                audioTrackBtn.text = "音轨: ${choice.label}"
+                audioTrackBtn.text = "🔊 音轨: ${choice.label} ▾"
+            }
+
+            fun showAudioTrackListDialog() {
+                val allChoices = collectAudioChoices(includeRejected = true)
+                if (allChoices.isEmpty()) {
+                    finishWithCurrentPos("FALLBACK_MPV_SOFT_AUDIO")
+                    dismissNativeExoPlayerDialog()
+                    return
+                }
+                val pickerDialog = Dialog(this, android.R.style.Theme_Translucent_NoTitleBar_Fullscreen)
+                val overlayRoot = FrameLayout(this).apply {
+                    setBackgroundColor(Color.argb(190, 0, 0, 0))
+                    setOnClickListener { pickerDialog.dismiss() }
+                }
+                val card = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(42, 34, 42, 34)
+                    clipChildren = false
+                    clipToPadding = false
+                    background = GradientDrawable().apply {
+                        shape = GradientDrawable.RECTANGLE
+                        cornerRadius = 28f
+                        setColor(Color.rgb(15, 23, 42))
+                        setStroke(2, Color.argb(110, 56, 189, 248))
+                    }
+                    layoutParams = FrameLayout.LayoutParams(
+                        920,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        Gravity.CENTER
+                    )
+                    isClickable = true
+                }
+
+                val headerTitle = TextView(this).apply {
+                    text = "选择音轨 / 声道 (遥控器上下键移动高亮，确认键切换)"
+                    textSize = 18f
+                    setTextColor(Color.WHITE)
+                    typeface = Typeface.DEFAULT_BOLD
+                    setPadding(4, 0, 4, 8)
+                }
+                card.addView(headerTitle)
+
+                val headerSub = TextView(this).apply {
+                    text = "提示：标注「硬解支持」的音轨可直接切换；TrueHD / DTS 源码音轨点击后将自动无缝切入全能软解音轨播放"
+                    textSize = 12.5f
+                    setTextColor(Color.argb(195, 226, 232, 240))
+                    setPadding(4, 0, 4, 20)
+                }
+                card.addView(headerSub)
+
+                val scrollView = android.widget.ScrollView(this).apply {
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        540
+                    )
+                }
+                val listLayout = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    clipChildren = false
+                    clipToPadding = false
+                    setPadding(8, 8, 8, 8)
+                }
+
+                var initialFocusBtn: Button? = null
+                for (choice in allChoices) {
+                    val isCurrent = choice.group.isTrackSelected(choice.trackIndex)
+                    val hwOk = choice.isSupported && !choice.isRiskyPassthrough
+                    val statusBadge = if (hwOk) "✓ 硬解支持" else "⚡ 自动切软解播放"
+                    val prefix = if (isCurrent) "● [当前] " else "   "
+                    val rawName = (choice.format.label ?: "").trim()
+                    val nameSuffix = if (rawName.isNotEmpty() && !choice.label.contains(rawName)) " ($rawName)" else ""
+
+                    val itemBtn = Button(this).apply {
+                        text = "$prefix#${choice.orderIndex + 1}  ${choice.label}$nameSuffix    ·    $statusBadge"
+                        textSize = 14f
+                        setTextColor(Color.WHITE)
+                        typeface = if (isCurrent) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+                        gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                        setPadding(28, 18, 28, 18)
+                        layoutParams = LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.WRAP_CONTENT
+                        ).apply {
+                            bottomMargin = 14
+                        }
+                        setOnClickListener {
+                            pickerDialog.dismiss()
+                            if (hwOk) {
+                                selectAudioChoice(choice)
+                                titleView.text = "  $title · 已切换至 ${choice.label}"
+                            } else {
+                                finishWithCurrentPos("FALLBACK_MPV_SOFT_AUDIO:${choice.orderIndex}")
+                                dismissNativeExoPlayerDialog()
+                            }
+                        }
+                    }
+                    styleTvFocusableButton(
+                        btn = itemBtn,
+                        normalBgColor = if (isCurrent) Color.argb(230, 30, 64, 175) else Color.argb(210, 30, 41, 59),
+                        focusedBgColor = Color.rgb(2, 132, 199)
+                    )
+                    if (isCurrent || initialFocusBtn == null) {
+                        initialFocusBtn = itemBtn
+                    }
+                    listLayout.addView(itemBtn)
+                }
+
+                val softSwitchBtn = Button(this).apply {
+                    text = "⚡ 切换至内置全能软解播放器 (支持所有 TrueHD 7.1 / DTS-HD 源码音轨)"
+                    textSize = 13.5f
+                    setTextColor(Color.WHITE)
+                    typeface = Typeface.DEFAULT_BOLD
+                    gravity = Gravity.CENTER
+                    setPadding(24, 16, 24, 16)
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        topMargin = 6
+                    }
+                    setOnClickListener {
+                        pickerDialog.dismiss()
+                        finishWithCurrentPos("FALLBACK_MPV_SOFT_AUDIO")
+                        dismissNativeExoPlayerDialog()
+                    }
+                }
+                styleTvFocusableButton(
+                    btn = softSwitchBtn,
+                    normalBgColor = Color.argb(225, 15, 118, 110),
+                    focusedBgColor = Color.rgb(13, 148, 136)
+                )
+                listLayout.addView(softSwitchBtn)
+
+                scrollView.addView(listLayout)
+                card.addView(scrollView)
+                overlayRoot.addView(card)
+                pickerDialog.setContentView(overlayRoot)
+                pickerDialog.show()
+                initialFocusBtn?.post {
+                    initialFocusBtn?.requestFocus()
+                }
             }
 
             audioTrackBtn.setOnClickListener {
-                val choices = collectAudioChoices()
-                if (choices.isEmpty()) {
-                    titleView.text = "  $title (无可选硬解音轨，可点右侧「切换软解音轨」)"
-                    return@setOnClickListener
-                }
-                val curIdx = choices.indexOfFirst { it.group.isTrackSelected(it.trackIndex) }
-                val nextChoice = choices[(curIdx + 1).coerceAtLeast(0) % choices.size]
-                selectAudioChoice(nextChoice)
-                titleView.text = "  $title · 已切换至 ${nextChoice.label}"
+                showAudioTrackListDialog()
             }
 
-            val closeBtn = Button(this).apply {
-                text = "退出全屏硬解"
-                textSize = 12.5f
-                setTextColor(Color.WHITE)
-                setBackgroundColor(Color.argb(175, 45, 55, 72))
-                setPadding(24, 8, 24, 8)
-                setOnClickListener {
-                    finishWithCurrentPos()
-                    dismissNativeExoPlayerDialog()
-                }
-            }
-            topBar.addView(closeBtn)
             root.addView(topBar)
 
             playerView.setControllerVisibilityListener(
@@ -1465,6 +1688,7 @@ class MainActivity : FlutterActivity() {
 
             dialog.setOnKeyListener { _, keyCode, event ->
                 if (event.action == KeyEvent.ACTION_DOWN) {
+                    val topBarHasFocus = audioTrackBtn.hasFocus() || mpvFallbackBtn.hasFocus() || closeBtn.hasFocus()
                     when (keyCode) {
                         KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_ESCAPE -> {
                             if (playerView.isControllerFullyVisible) {
@@ -1475,6 +1699,10 @@ class MainActivity : FlutterActivity() {
                                 dismissNativeExoPlayerDialog()
                                 true
                             }
+                        }
+                        KeyEvent.KEYCODE_MENU -> {
+                            showAudioTrackListDialog()
+                            true
                         }
                         KeyEvent.KEYCODE_DPAD_CENTER,
                         KeyEvent.KEYCODE_ENTER,
@@ -1509,9 +1737,24 @@ class MainActivity : FlutterActivity() {
                                 false
                             }
                         }
-                        KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> {
+                        KeyEvent.KEYCODE_DPAD_UP -> {
                             if (!playerView.isControllerFullyVisible) {
                                 playerView.showController()
+                                audioTrackBtn.post { audioTrackBtn.requestFocus() }
+                                true
+                            } else if (!topBarHasFocus) {
+                                audioTrackBtn.requestFocus()
+                                true
+                            } else {
+                                true
+                            }
+                        }
+                        KeyEvent.KEYCODE_DPAD_DOWN -> {
+                            if (!playerView.isControllerFullyVisible) {
+                                playerView.showController()
+                                true
+                            } else if (topBarHasFocus) {
+                                playerView.requestFocus()
                                 true
                             } else {
                                 false
@@ -1532,20 +1775,25 @@ class MainActivity : FlutterActivity() {
             var didAutoSelectInitialSafeAudio = false
             exoPlayer.addListener(object : Player.Listener {
                 override fun onTracksChanged(tracks: Tracks) {
-                    val choices = collectAudioChoices()
-                    if (choices.isEmpty()) return
+                    val choices = collectAudioChoices(includeRejected = false)
+                    val allTracks = collectAudioChoices(includeRejected = true)
+                    if (allTracks.isEmpty()) return
+
+                    val safeChoices = choices.filter { it.isSupported && !it.isRiskyPassthrough }
+                    val anySupportedChoices = choices.filter { it.isSupported }
+                    // If the file contains audio tracks, but ZERO audio tracks are supported by Android TV's hardware MediaCodecAudioRenderer
+                    // (e.g. a Blu-ray MKV with only TrueHD / DTS-HD audio), automatically switch to our built-in libmpv soft-audio player at 0ms!
+                    if (anySupportedChoices.isEmpty()) {
+                        finishWithCurrentPos("FALLBACK_MPV_SOFT_AUDIO")
+                        dismissNativeExoPlayerDialog()
+                        return
+                    }
+
                     val currentSelected = choices.firstOrNull { it.group.isTrackSelected(it.trackIndex) }
                     if (!didAutoSelectInitialSafeAudio) {
                         didAutoSelectInitialSafeAudio = true
-                        val curMime = (currentSelected?.format?.sampleMimeType ?: "").lowercase()
-                        val curCh = currentSelected?.format?.channelCount ?: 2
-                        val curIsRiskyPassthrough = curMime.contains("true-hd") ||
-                            curMime.contains("mlp") ||
-                            curMime.contains("dts") ||
-                            curCh > 6 ||
-                            currentSelected?.isSupported == false
-                        if (curIsRiskyPassthrough) {
-                            val bestSafe = choices.maxByOrNull { it.priority }
+                        if (currentSelected == null || !currentSelected.isSupported || currentSelected.isRiskyPassthrough) {
+                            val bestSafe = (safeChoices.ifEmpty { anySupportedChoices }).maxByOrNull { it.priority }
                             if (bestSafe != null && bestSafe != currentSelected) {
                                 selectAudioChoice(bestSafe)
                                 return
@@ -1553,7 +1801,7 @@ class MainActivity : FlutterActivity() {
                         }
                     }
                     if (currentSelected != null) {
-                        audioTrackBtn.text = "音轨: ${currentSelected.label}"
+                        audioTrackBtn.text = "🔊 音轨: ${currentSelected.label} ▾"
                     }
                 }
 
@@ -1579,12 +1827,14 @@ class MainActivity : FlutterActivity() {
                                 }
                             }
                         }
-                        val remainingChoices = collectAudioChoices().sortedByDescending { it.priority }
-                        val nextBest = remainingChoices.firstOrNull()
+                        val remainingSafe = collectAudioChoices(includeRejected = false)
+                            .filter { it.isSupported && !it.isRiskyPassthrough }
+                            .sortedByDescending { it.priority }
+                        val nextBest = remainingSafe.firstOrNull()
                         if (nextBest != null) {
-                            // 1) Switch to the next compatible audio track (e.g. AC-3 / E-AC-3 / AAC) and resume seamlessly!
+                            // 1) Switch to the next hardware-supported audio track (e.g. AC-3 / E-AC-3 / AAC) and resume seamlessly!
                             selectAudioChoice(nextBest)
-                            titleView.text = "  $title · 原音轨硬解不支持，已自动切换至 ${nextBest.label}"
+                            titleView.text = "  $title · 已自动优选兼容音轨 ${nextBest.label}"
                             if (savedPos > 500L) {
                                 exoPlayer.seekTo(savedPos)
                             }
@@ -1592,8 +1842,7 @@ class MainActivity : FlutterActivity() {
                             exoPlayer.playWhenReady = true
                             return
                         }
-                        // 2) If all audio tracks in the MKV are TrueHD/DTS and unsupported by Android TV's MediaCodec AudioRenderer,
-                        // automatically fall back to our built-in libmpv (`mediacodec-copy` hardware video + FFmpeg software audio)!
+                        // 2) No hardware-supported audio track left in ExoPlayer -> seamlessly switch to libmpv (`mediacodec-copy` video + FFmpeg software audio)!
                         finishWithCurrentPos("FALLBACK_MPV_SOFT_AUDIO")
                         dismissNativeExoPlayerDialog()
                         return

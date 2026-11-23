@@ -13,11 +13,61 @@ final class TvInteractiveWindow: UIWindow {
   var onVideoLeftRightSeekPress: ((Int) -> Bool)?
   private var lastTouchActivityTime: CFTimeInterval = 0
   private var touchBeganPoint: CGPoint? = nil
+  private var seekHoldTimer: Timer? = nil
+  private var seekHoldDirection: Int = 0
+  private var seekHoldTickCount: Int = 0
+
+  private func stopSeekHoldTimer(notifyRelease: Bool = false) {
+    seekHoldTimer?.invalidate()
+    seekHoldTimer = nil
+    let hadHold = seekHoldDirection != 0
+    seekHoldDirection = 0
+    seekHoldTickCount = 0
+    if notifyRelease && hadHold {
+      _ = onVideoLeftRightSeekPress?(0)
+    }
+  }
+
+  private func startSeekHoldTimer(direction: Int) {
+    stopSeekHoldTimer(notifyRelease: false)
+    seekHoldDirection = direction
+    seekHoldTickCount = 0
+    let timer = Timer(timeInterval: 0.14, repeats: true) { [weak self] t in
+      guard let self = self, self.seekHoldDirection != 0 else {
+        t.invalidate()
+        return
+      }
+      self.seekHoldTickCount += 1
+      // Wait ~280ms (2 ticks) before continuous rapid stepping kicks in so a single quick click only steps once!
+      guard self.seekHoldTickCount >= 2 else { return }
+      // Accelerate step multiplier as the user continues holding Left/Right:
+      // ticks 2..7 -> 1x (10s), ticks 8..16 -> 2x (20s), ticks 17..28 -> 3x (30s), ticks 29+ -> 6x (60s)
+      let mult: Int
+      if self.seekHoldTickCount >= 29 {
+        mult = 6
+      } else if self.seekHoldTickCount >= 17 {
+        mult = 3
+      } else if self.seekHoldTickCount >= 8 {
+        mult = 2
+      } else {
+        mult = 1
+      }
+      if self.onVideoLeftRightSeekPress?(self.seekHoldDirection * mult) == true {
+        self.lastTouchActivityTime = CACurrentMediaTime()
+        self.onRemoteActivity?()
+      } else {
+        self.stopSeekHoldTimer(notifyRelease: false)
+      }
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    seekHoldTimer = timer
+  }
 
   override func sendEvent(_ event: UIEvent) {
     if let pressesEvent = event as? UIPressesEvent {
       let allPresses = pressesEvent.allPresses
       if allPresses.contains(where: { $0.type == .menu }) {
+        stopSeekHoldTimer(notifyRelease: false)
         if allPresses.contains(where: { $0.type == .menu && $0.phase == .began }) {
           onMenuBackPress?()
         }
@@ -28,11 +78,19 @@ final class TvInteractiveWindow: UIWindow {
         if onVideoLeftRightSeekPress?(dir) == true {
           lastTouchActivityTime = CACurrentMediaTime()
           onRemoteActivity?()
+          startSeekHoldTimer(direction: dir)
+          return
+        }
+      }
+      if allPresses.contains(where: { ($0.type == .leftArrow || $0.type == .rightArrow) && ($0.phase == .ended || $0.phase == .cancelled) }) {
+        let wasHolding = seekHoldDirection != 0
+        stopSeekHoldTimer(notifyRelease: true)
+        if wasHolding || onVideoLeftRightSeekPress?(0) == true {
           return
         }
       }
       if allPresses.contains(where: { ($0.type == .leftArrow || $0.type == .rightArrow) && $0.phase != .began }) {
-        if onVideoLeftRightSeekPress?(0) == true {
+        if seekHoldDirection != 0 || onVideoLeftRightSeekPress?(0) == true {
           return
         }
       }
@@ -341,20 +399,16 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
       if hosting?.presentedViewController != nil { return false }
       if let playback = self.appState.activePlayback, !playback.isLive {
         if !self.appState.playerControlsVisible || self.appState.isPlayerScrubberFocused {
-          if dir != 0 {
-            Task { @MainActor in
-              self.appState.triggerVideoDirectSeek(direction: dir)
-            }
+          Task { @MainActor in
+            self.appState.triggerVideoDirectSeek(direction: dir)
           }
           return true
         }
       }
       if let gallery = self.appState.activeTelegramGallery, !gallery.mediaMessages.isEmpty {
         if !self.appState.galleryControlsVisible || self.appState.isPlayerScrubberFocused {
-          if dir != 0 {
-            Task { @MainActor in
-              self.appState.triggerVideoDirectSeek(direction: dir)
-            }
+          Task { @MainActor in
+            self.appState.triggerVideoDirectSeek(direction: dir)
           }
           return true
         }
