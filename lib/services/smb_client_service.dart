@@ -310,11 +310,17 @@ class SmbClientService {
               isPartial = true;
             } else if (sStr.isNotEmpty) {
               start = int.tryParse(sStr) ?? 0;
-              end = eStr.isNotEmpty ? (int.tryParse(eStr) ?? (totalSize - 1)) : (totalSize - 1);
+              end = eStr.isNotEmpty
+                  ? (int.tryParse(eStr) ?? (totalSize - 1))
+                  : (totalSize - 1);
               if (end >= totalSize) end = totalSize - 1;
               isPartial = true;
             }
           }
+        } else if (rangeHeader == null && totalSize > 32 * 1024 * 1024) {
+          // Serve large files as 206 Partial Content from byte 0 so demuxers
+          // immediately recognize byte-range seeking support without waiting.
+          isPartial = true;
         }
 
         if (totalSize > 0 && (start < 0 || start >= totalSize || start > end)) {
@@ -335,6 +341,7 @@ class SmbClientService {
           _guessMimeType(target.relPath),
         );
         req.response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
+        req.response.headers.set(HttpHeaders.connectionHeader, 'close');
         req.response.headers.contentLength = contentLength;
         if (isPartial && totalSize > 0) {
           req.response.headers.set(
@@ -359,45 +366,22 @@ class SmbClientService {
             onError: (Object _) => clientDisconnected = true,
           ),
         );
-        int pendingAheadOffset = offset;
-        Future<Uint8List>? pendingAheadRead;
         while (remaining > 0 && !clientDisconnected) {
           final int toRead = math.min(remaining, chunkSize);
-          final Future<Uint8List> currentRead;
-          if (pendingAheadRead != null && pendingAheadOffset == offset) {
-            currentRead = pendingAheadRead;
-            pendingAheadRead = null;
-          } else {
-            currentRead = conn.readFileChunk(
-              fileId: fileId,
-              offset: offset,
-              length: toRead,
-            );
-          }
-          final chunk = await currentRead;
+          final chunk = await conn.readFileChunk(
+            fileId: fileId,
+            offset: offset,
+            length: toRead,
+          );
           if (chunk.isEmpty || clientDisconnected) break;
-          final nextOffset = offset + chunk.length;
-          final nextRemaining = remaining - chunk.length;
-          if (nextRemaining > 0 && !clientDisconnected) {
-            final nextToRead = math.min(nextRemaining, chunkSize);
-            pendingAheadOffset = nextOffset;
-            pendingAheadRead = conn.readFileChunk(
-              fileId: fileId,
-              offset: nextOffset,
-              length: nextToRead,
-            );
-          }
           LocalProxyTunnelBridge.recordDownstreamBytes(chunk.length);
           req.response.add(chunk);
-          offset = nextOffset;
-          remaining = nextRemaining;
+          offset += chunk.length;
+          remaining -= chunk.length;
         }
-        if (pendingAheadRead != null) {
-          try {
-            await pendingAheadRead;
-          } catch (_) {}
+        if (!clientDisconnected) {
+          await req.response.flush();
         }
-        await req.response.flush();
         await req.response.close();
       } finally {
         if (fileId != null) {
@@ -830,11 +814,12 @@ class _Smb2Connection {
     bool allowNoMoreFiles = false,
   }) async {
     while (true) {
-      final msgId = _messageId++;
       final creditCharge = creditChargeOverride ??
           ((_supportsLargeMtu && body.length > 65536)
               ? ((body.length - 1) ~/ 65536) + 1
               : (command == 0 ? 0 : 1));
+      final msgId = _messageId;
+      _messageId += math.max(1, creditCharge);
       final header = ByteData(64);
       // ProtocolId: \xFESMB
       header.setUint8(0, 0xFE);

@@ -65,6 +65,39 @@ class TvPlatformService {
     }
   }
 
+  /// Launches the built-in native AndroidX Media3 `ExoPlayer` zero-copy `SurfaceView`
+  /// fullscreen player dialog on Android / Android TV for ultra-smooth 50GB+ 4K Blu-ray remux
+  /// and high-bitrate live/VOD playback. Returns the playback position (in ms) when closed.
+  static Future<({int positionMs, String? error})> openNativeExoPlayer({
+    required String streamUrl,
+    required String title,
+    Map<String, String> headers = const {},
+    int startPositionMs = 0,
+  }) async {
+    if (kIsWeb || !Platform.isAndroid) {
+      return (positionMs: startPositionMs, error: 'Unsupported platform');
+    }
+    unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
+    try {
+      final res = await _channel.invokeMapMethod<String, dynamic>(
+        'openNativeExoPlayer',
+        {
+          'url': streamUrl,
+          'title': title,
+          'headers': headers,
+          'positionMs': startPositionMs,
+        },
+      );
+      final pos =
+          int.tryParse((res?['positionMs'] ?? startPositionMs).toString()) ??
+          startPositionMs;
+      final err = res?['error']?.toString();
+      return (positionMs: pos, error: err);
+    } catch (e) {
+      return (positionMs: startPositionMs, error: e.toString());
+    }
+  }
+
   /// Launches the stream in popular Apple TV / Android TV players (Infuse, VLC, IINA, MX Player).
   static Future<bool> openInTvExternalPlayer(
     String streamUrl, {

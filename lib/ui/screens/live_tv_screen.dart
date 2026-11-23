@@ -4885,6 +4885,21 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                               ),
                             );
                           }
+                        } else if (action == 'exoplayer') {
+                          final target = _activeStreamUrl.isNotEmpty
+                              ? _activeStreamUrl
+                              : lineUrl;
+                          if (target.isNotEmpty) {
+                            await _player.pause();
+                            await TvPlatformService.openNativeExoPlayer(
+                              streamUrl: target,
+                              title: ch.name,
+                              headers: _activeStreamHeaders,
+                            );
+                            if (mounted) {
+                              await _player.play();
+                            }
+                          }
                         } else if (lineUrl.isNotEmpty) {
                           await TvPlatformService.openInTvExternalPlayer(
                             lineUrl,
@@ -4893,6 +4908,21 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                         }
                       },
                       itemBuilder: (_) => [
+                        if (Platform.isAndroid)
+                          const PopupMenuItem(
+                            value: 'exoplayer',
+                            child: Row(
+                              children: [
+                                Icon(
+                                  Icons.bolt_rounded,
+                                  size: 18,
+                                  color: Color(0xFF38BDF8),
+                                ),
+                                SizedBox(width: 8),
+                                Text('切换内嵌 ExoPlayer 零拷贝硬解播放'),
+                              ],
+                            ),
+                          ),
                         if (widget.appState.supportsAirPlay)
                           const PopupMenuItem(
                             value: 'airplay',

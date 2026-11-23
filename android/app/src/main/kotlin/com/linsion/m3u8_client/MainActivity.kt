@@ -33,6 +33,7 @@ import android.os.Bundle
 import android.os.PowerManager
 import android.os.SystemClock
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.ViewGroup
@@ -44,6 +45,18 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.ui.AspectRatioFrameLayout
+import androidx.media3.ui.PlayerView
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.BinaryBitmap
 import com.google.zxing.DecodeHintType
@@ -75,6 +88,8 @@ class MainActivity : FlutterActivity() {
     private var pendingPermissionResult: MethodChannel.Result? = null
     private var pendingQrScanResult: MethodChannel.Result? = null
     private var activeQrDialog: Dialog? = null
+    private var activeExoDialog: Dialog? = null
+    private var activeExoPlayer: ExoPlayer? = null
     private var pendingTapPayload: Map<String, Any>? = null
 
     private var mediaSession: MediaSession? = null
@@ -100,6 +115,7 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        dismissNativeExoPlayerDialog()
         clearLockScreenMediaSession()
         unregisterMediaControlReceiver()
         super.onDestroy()
@@ -130,6 +146,21 @@ class MainActivity : FlutterActivity() {
                                 "supportsAirPlay" to false
                             )
                         )
+                    }
+                    "openNativeExoPlayer" -> {
+                        val url = call.argument<String>("url") ?: ""
+                        val title = call.argument<String>("title") ?: "视频播放"
+                        val startPosMs = (call.argument<Number>("positionMs")?.toLong() ?: 0L).coerceAtLeast(0L)
+                        val rawHeaders = call.argument<Map<String, Any>>("headers") ?: emptyMap()
+                        val headers = mutableMapOf<String, String>()
+                        for ((k, v) in rawHeaders) {
+                            val ks = k.trim()
+                            val vs = v.toString().trim()
+                            if (ks.isNotEmpty() && vs.isNotEmpty()) {
+                                headers[ks] = vs
+                            }
+                        }
+                        showNativeExoPlayerDialog(url, title, headers, startPosMs, result)
                     }
                     else -> result.notImplemented()
                 }
@@ -1076,5 +1107,263 @@ class MainActivity : FlutterActivity() {
             pm.hasSystemFeature("android.software.leanback_only") ||
             pm.hasSystemFeature("android.hardware.type.television") ||
             !pm.hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN)
+    }
+
+    private fun dismissNativeExoPlayerDialog() {
+        try {
+            activeExoPlayer?.stop()
+            activeExoPlayer?.release()
+        } catch (_: Exception) {}
+        activeExoPlayer = null
+        try {
+            activeExoDialog?.dismiss()
+        } catch (_: Exception) {}
+        activeExoDialog = null
+    }
+
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    private fun showNativeExoPlayerDialog(
+        streamUrl: String,
+        title: String,
+        headers: Map<String, String>,
+        startPositionMs: Long,
+        result: MethodChannel.Result
+    ) {
+        if (streamUrl.isBlank()) {
+            result.success(mapOf("positionMs" to startPositionMs, "error" to "Empty stream URL"))
+            return
+        }
+        dismissNativeExoPlayerDialog()
+
+        var resultSubmitted = false
+        fun finishWithCurrentPos(err: String? = null) {
+            if (resultSubmitted) return
+            resultSubmitted = true
+            val pos = try {
+                activeExoPlayer?.currentPosition?.coerceAtLeast(0L) ?: startPositionMs
+            } catch (_: Exception) {
+                startPositionMs
+            }
+            val map = mutableMapOf<String, Any>("positionMs" to pos)
+            if (!err.isNullOrBlank()) {
+                map["error"] = err
+            }
+            result.success(map)
+        }
+
+        try {
+            val ua = headers["User-Agent"]
+                ?: headers["user-agent"]
+                ?: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 115Browser/27.0.5.7"
+            val httpFactory = DefaultHttpDataSource.Factory()
+                .setUserAgent(ua)
+                .setAllowCrossProtocolRedirects(true)
+                .setConnectTimeoutMs(20000)
+                .setReadTimeoutMs(30000)
+                .setDefaultRequestProperties(headers)
+            val dataSourceFactory = DefaultDataSource.Factory(this, httpFactory)
+
+            val renderersFactory = DefaultRenderersFactory(this)
+                .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
+                .setEnableDecoderFallback(true)
+
+            val loadControl = DefaultLoadControl.Builder()
+                .setBufferDurationsMs(
+                    15000, // minBufferMs
+                    90000, // maxBufferMs
+                    1500,  // bufferForPlaybackMs
+                    3000   // bufferForPlaybackAfterRebufferMs
+                )
+                .setTargetBufferBytes(96 * 1024 * 1024)
+                .setPrioritizeTimeOverSizeThresholds(true)
+                .build()
+
+            val exoPlayer = ExoPlayer.Builder(this, renderersFactory)
+                .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
+                .setLoadControl(loadControl)
+                .setSeekBackIncrementMs(15000)
+                .setSeekForwardIncrementMs(15000)
+                .build()
+            activeExoPlayer = exoPlayer
+
+            val dialog = Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+            activeExoDialog = dialog
+            dialog.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+            val root = FrameLayout(this).apply {
+                setBackgroundColor(Color.BLACK)
+                layoutParams = ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+            }
+
+            val playerView = PlayerView(this).apply {
+                player = exoPlayer
+                useController = true
+                resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                setShowBuffering(PlayerView.SHOW_BUFFERING_ALWAYS)
+                controllerShowTimeoutMs = 4000
+                isFocusable = true
+                isFocusableInTouchMode = true
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+            }
+            root.addView(playerView)
+
+            // Top bar with video title, aspect ratio toggle, and Exit button
+            val topBar = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(36, 24, 36, 20)
+                background = GradientDrawable(
+                    GradientDrawable.Orientation.TOP_BOTTOM,
+                    intArrayOf(Color.argb(210, 0, 0, 0), Color.TRANSPARENT)
+                )
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.TOP
+                )
+            }
+
+            val badgeView = TextView(this).apply {
+                text = "ExoPlayer 零拷贝硬解"
+                textSize = 11.5f
+                setTextColor(Color.WHITE)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(18, 6, 18, 6)
+                background = GradientDrawable().apply {
+                    setColor(Color.rgb(2, 132, 199))
+                    cornerRadius = 12f
+                }
+            }
+            topBar.addView(badgeView)
+
+            val titleView = TextView(this).apply {
+                text = "  $title"
+                textSize = 15f
+                setTextColor(Color.WHITE)
+                typeface = Typeface.DEFAULT_BOLD
+                maxLines = 1
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            topBar.addView(titleView)
+
+            val closeBtn = Button(this).apply {
+                text = "退出全屏硬解"
+                textSize = 12.5f
+                setTextColor(Color.WHITE)
+                setBackgroundColor(Color.argb(175, 45, 55, 72))
+                setPadding(24, 8, 24, 8)
+                setOnClickListener {
+                    finishWithCurrentPos()
+                    dismissNativeExoPlayerDialog()
+                }
+            }
+            topBar.addView(closeBtn)
+            root.addView(topBar)
+
+            playerView.setControllerVisibilityListener(
+                PlayerView.ControllerVisibilityListener { visibility ->
+                    topBar.visibility = visibility
+                }
+            )
+
+            dialog.setOnKeyListener { _, keyCode, event ->
+                if (event.action == KeyEvent.ACTION_DOWN) {
+                    when (keyCode) {
+                        KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_ESCAPE -> {
+                            if (playerView.isControllerFullyVisible) {
+                                playerView.hideController()
+                                true
+                            } else {
+                                finishWithCurrentPos()
+                                dismissNativeExoPlayerDialog()
+                                true
+                            }
+                        }
+                        KeyEvent.KEYCODE_DPAD_CENTER,
+                        KeyEvent.KEYCODE_ENTER,
+                        KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+                            if (!playerView.isControllerFullyVisible) {
+                                if (exoPlayer.isPlaying) {
+                                    exoPlayer.pause()
+                                } else {
+                                    exoPlayer.play()
+                                }
+                                playerView.showController()
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        KeyEvent.KEYCODE_DPAD_LEFT -> {
+                            if (!playerView.isControllerFullyVisible) {
+                                exoPlayer.seekBack()
+                                playerView.showController()
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                            if (!playerView.isControllerFullyVisible) {
+                                exoPlayer.seekForward()
+                                playerView.showController()
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> {
+                            if (!playerView.isControllerFullyVisible) {
+                                playerView.showController()
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        else -> false
+                    }
+                } else {
+                    false
+                }
+            }
+
+            dialog.setOnDismissListener {
+                finishWithCurrentPos()
+                dismissNativeExoPlayerDialog()
+            }
+
+            exoPlayer.addListener(object : Player.Listener {
+                override fun onPlayerError(error: PlaybackException) {
+                    val errMsg = error.localizedMessage ?: "ExoPlayer 播放异常 (${error.errorCodeName})"
+                    titleView.text = "  ⚠️ $errMsg"
+                }
+            })
+
+            dialog.setContentView(root)
+            dialog.show()
+            playerView.requestFocus()
+
+            val mediaUri = if (streamUrl.startsWith("/")) {
+                Uri.fromFile(java.io.File(streamUrl))
+            } else {
+                Uri.parse(streamUrl)
+            }
+            val mediaItem = MediaItem.fromUri(mediaUri)
+            exoPlayer.setMediaItem(mediaItem)
+            if (startPositionMs > 1000L) {
+                exoPlayer.seekTo(startPositionMs)
+            }
+            exoPlayer.prepare()
+            exoPlayer.playWhenReady = true
+        } catch (e: Exception) {
+            dismissNativeExoPlayerDialog()
+            finishWithCurrentPos(e.localizedMessage ?: e.toString())
+        }
     }
 }

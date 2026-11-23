@@ -13,6 +13,7 @@ import '../../services/api_client.dart';
 import '../../services/local_115_direct_service.dart';
 import '../../services/remote_storage_service.dart';
 import '../../services/smb_client_service.dart';
+import '../../services/tv_platform_service.dart';
 import '../../state/app_state.dart';
 import '../theme.dart';
 import '../widgets/cloud_music_player.dart';
@@ -561,6 +562,7 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
               pickcode: entry.pickcode115,
               fileName: entry.name,
               extension: entry.normalizedExt,
+              fileSize: entry.size,
               useCloudTranscode: useCloudTranscode,
             );
         final initial115 = is115 ? await resolve115() : null;
@@ -575,6 +577,18 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
               subtitle: '115 网盘 · ${entry.formattedSize}',
             );
         if (!mounted) return;
+        // On Android / Android TV, automatically use the embedded zero-copy AndroidX Media3 ExoPlayer
+        // (`SurfaceView` hardware renderer) for ultra-large files (>= 8 GB Blu-ray remuxes / 4K ISO / MKV / MP4).
+        if (!inMiniPlayer &&
+            Platform.isAndroid &&
+            entry.size >= 8 * 1024 * 1024 * 1024) {
+          await TvPlatformService.openNativeExoPlayer(
+            streamUrl: resolved.url,
+            title: entry.name,
+            headers: resolved.headers,
+          );
+          return;
+        }
         if (inMiniPlayer) {
           widget.appState.startMiniPlayer(
             MiniPlayerSession(
@@ -4892,6 +4906,10 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
     }
     if (!mounted || _reportedPlaybackError) return;
     _reportedPlaybackError = true;
+    if (Platform.isAndroid) {
+      await _openInEmbeddedExoPlayer();
+      return;
+    }
     ScaffoldMessenger.maybeOf(context)?.showSnackBar(
       SnackBar(content: Text(fallback == null
           ? '视频播放失败，请确认文件格式和网络连接'
@@ -4987,6 +5005,53 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
     }
     _player.dispose();
     super.dispose();
+  }
+
+  Future<void> _openInEmbeddedExoPlayer() async {
+    if (!Platform.isAndroid || !mounted) return;
+    final curMs = _player.state.position.inMilliseconds;
+    await _player.pause();
+    final res = await TvPlatformService.openNativeExoPlayer(
+      streamUrl: _activeUrl,
+      title: widget.title,
+      headers: _activeHeaders,
+      startPositionMs: curMs,
+    );
+    if (!mounted) return;
+    if (res.positionMs > 1000) {
+      await _player.seek(Duration(milliseconds: res.positionMs));
+    }
+  }
+
+  Widget _buildExoHardwareButton() {
+    if (!Platform.isAndroid) return const SizedBox.shrink();
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: _openInEmbeddedExoPlayer,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        decoration: BoxDecoration(
+          color: const Color(0xFF0284C7).withValues(alpha: 0.22),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: const Color(0xFF38BDF8)),
+        ),
+        child: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.bolt_rounded, size: 14, color: Color(0xFF38BDF8)),
+            SizedBox(width: 3),
+            Text(
+              'Exo硬解',
+              style: TextStyle(
+                fontSize: 11.5,
+                fontWeight: FontWeight.w700,
+                color: Color(0xFF38BDF8),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   Widget _build115Button() {
@@ -5221,6 +5286,10 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
                                   child: Row(
                                     children: [
                                       _build115Button(),
+                                      if (Platform.isAndroid) ...[
+                                        const SizedBox(width: 6),
+                                        _buildExoHardwareButton(),
+                                      ],
                                       const SizedBox(width: 6),
                                       _buildFitModePill(),
                                       const SizedBox(width: 6),
@@ -5335,6 +5404,10 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
                                       mainAxisSize: MainAxisSize.min,
                                       children: [
                                         _build115Button(),
+                                        if (Platform.isAndroid) ...[
+                                          const SizedBox(width: 6),
+                                          _buildExoHardwareButton(),
+                                        ],
                                         const SizedBox(width: 6),
                                         IconButton(
                                           tooltip: '快退 10 秒',

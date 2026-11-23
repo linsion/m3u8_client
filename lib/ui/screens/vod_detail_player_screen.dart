@@ -2999,6 +2999,36 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                                 size: 18,
                               ),
                             ),
+                            if (Platform.isAndroid)
+                              IconButton(
+                                visualDensity: VisualDensity.compact,
+                                tooltip: '使用内嵌 ExoPlayer 零拷贝硬解全屏播放',
+                                onPressed: _activeStreamUrl.isEmpty
+                                    ? null
+                                    : () async {
+                                        final curMs =
+                                            _player.state.position.inMilliseconds;
+                                        await _player.pause();
+                                        final res = await TvPlatformService
+                                            .openNativeExoPlayer(
+                                              streamUrl: _activeStreamUrl,
+                                              title: _resolveCurrent115VideoName(),
+                                              headers: _activeStreamHeaders,
+                                              startPositionMs: curMs,
+                                            );
+                                        if (!mounted) return;
+                                        if (res.positionMs > 1000) {
+                                          await _player.seek(
+                                            Duration(milliseconds: res.positionMs),
+                                          );
+                                        }
+                                      },
+                                icon: const Icon(
+                                  Icons.bolt_rounded,
+                                  size: 19,
+                                  color: Color(0xFF38BDF8),
+                                ),
+                              ),
                             if (isWide)
                               IconButton(
                                 visualDensity: VisualDensity.compact,
@@ -3433,6 +3463,36 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                               onPressed: () =>
                                   _toggleFullscreenMode(forceValue: true),
                             ),
+                            if (Platform.isAndroid) ...[
+                              const SizedBox(width: 10),
+                              _buildTvFocusableControlBtn(
+                                icon: Icons.bolt_rounded,
+                                label: 'Exo硬解全屏',
+                                tooltip: '使用内嵌 ExoPlayer 零拷贝硬解全屏播放',
+                                onPressed: _activeStreamUrl.isEmpty
+                                    ? null
+                                    : () async {
+                                        final curMs = _player
+                                            .state.position.inMilliseconds;
+                                        await _player.pause();
+                                        final res = await TvPlatformService
+                                            .openNativeExoPlayer(
+                                              streamUrl: _activeStreamUrl,
+                                              title: _resolveCurrent115VideoName(),
+                                              headers: _activeStreamHeaders,
+                                              startPositionMs: curMs,
+                                            );
+                                        if (!mounted) return;
+                                        if (res.positionMs > 1000) {
+                                          await _player.seek(
+                                            Duration(
+                                              milliseconds: res.positionMs,
+                                            ),
+                                          );
+                                        }
+                                      },
+                              ),
+                            ],
                             if (hasMultipleEps) ...[
                               const SizedBox(width: 10),
                               _buildTvFocusableControlBtn(

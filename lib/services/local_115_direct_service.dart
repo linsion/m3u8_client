@@ -926,19 +926,22 @@ class Local115DirectService extends ChangeNotifier {
     required String pickcode,
     required String fileName,
     required String extension,
+    int fileSize = 0,
     bool? useCloudTranscode,
   }) async {
-    final needsHlsTranscode = const {
-      '.f4v',
-      '.flv',
-      '.mkv',
-      '.avi',
-      '.rmvb',
-      '.wmv',
-      '.ts',
-      '.webm',
-      '.iso',
-    }.contains(extension.toLowerCase());
+    final extLower = extension.toLowerCase();
+    // 115's cloud transcode API (`webapi.115.com/files/video`) does not transcode huge remux files (> 15 GB)
+    // and modern libmpv/ExoPlayer natively demuxes .mkv/.ts/.webm/.mp4/.mov with hardware acceleration.
+    final isHugeRemux = fileSize >= 12 * 1024 * 1024 * 1024;
+    final needsHlsTranscode = !isHugeRemux &&
+        const {
+          '.f4v',
+          '.flv',
+          '.avi',
+          '.rmvb',
+          '.wmv',
+          '.iso',
+        }.contains(extLower);
 
     final routes = useCloudTranscode == null
         ? [needsHlsTranscode, !needsHlsTranscode]
@@ -1325,6 +1328,13 @@ class Local115DirectService extends ChangeNotifier {
     if (pathLower.endsWith('.mp4') || pathLower.endsWith('.m4v')) {
       return 'video/mp4';
     }
+    if (pathLower.endsWith('.mkv')) return 'video/x-matroska';
+    if (pathLower.endsWith('.ts') || pathLower.endsWith('.m2ts')) {
+      return 'video/mp2t';
+    }
+    if (pathLower.endsWith('.webm')) return 'video/webm';
+    if (pathLower.endsWith('.avi')) return 'video/x-msvideo';
+    if (pathLower.endsWith('.flv')) return 'video/x-flv';
     if (pathLower.endsWith('.mov')) return 'video/quicktime';
     return null;
   }
@@ -1798,6 +1808,22 @@ class Local115DirectService extends ChangeNotifier {
       final value = upstream.headers.value(name);
       if (value != null) downstream.headers.set(name, value);
     }
+    final currentCt =
+        (downstream.headers.value(HttpHeaders.contentTypeHeader) ?? '')
+            .toLowerCase();
+    if (currentCt.isEmpty ||
+        currentCt.contains('octet-stream') ||
+        currentCt.contains('force-download')) {
+      final inferred =
+          _inferMimeTypeFromPath(request.uri.path.toLowerCase()) ??
+          _inferMimeTypeFromPath(uri.path.toLowerCase());
+      if (inferred != null) {
+        downstream.headers.set(HttpHeaders.contentTypeHeader, inferred);
+      }
+    }
+    if (downstream.headers.value(HttpHeaders.acceptRangesHeader) == null) {
+      downstream.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
+    }
     downstream.headers.set('Access-Control-Allow-Origin', '*');
     if (request.method == 'HEAD') {
       await upstream.drain<void>();
@@ -1947,7 +1973,8 @@ class Local115DirectService extends ChangeNotifier {
         await _serveProxyPlaylist(request, uri, headers);
         return;
       }
-      if (path.endsWith('.resource') || path.endsWith('.key') ||
+      if (path.endsWith('.resource') ||
+          path.endsWith('.key') ||
           path.endsWith('.ts')) {
         await _pipeProxyResource(request, uri, headers);
         return;
@@ -2029,6 +2056,19 @@ class Local115DirectService extends ChangeNotifier {
         cursor = end;
       }
 
+      final isLargeStreamVideo =
+          meta.supportsRanges &&
+          meta.stripPrefixBytes == 0 &&
+          meta.totalSize >= 16 * 1024 * 1024 &&
+          (path.endsWith('.mkv') ||
+              path.endsWith('.mp4') ||
+              path.endsWith('.m4v') ||
+              path.endsWith('.mov') ||
+              path.endsWith('.m2ts') ||
+              path.endsWith('.webm') ||
+              path.endsWith('.avi') ||
+              path.endsWith('.flv'));
+
       if (cursor <= range.end && !meta.supportsRanges && !disconnected) {
         await _streamWithoutUpstreamRanges(
           response,
@@ -2038,63 +2078,44 @@ class Local115DirectService extends ChangeNotifier {
           length: range.end - cursor + 1,
           isCancelled: () => disconnected,
         );
+      } else if (cursor <= range.end && isLargeStreamVideo && !disconnected) {
+        // Stream large video range requests (> 16 MB) continuously over a single upstream
+        // HTTP 206 Range connection (just like ExoPlayer / IJKPlayer HttpDataSource)
+        // instead of slicing into 25,000+ separate 2 MB HTTP requests for a 50 GB file!
+        final upstream = await _openProxyUpstream(
+          uri,
+          headers,
+          range: 'bytes=$cursor-${range.end}',
+        );
+        if (upstream.statusCode == HttpStatus.partialContent ||
+            (cursor == 0 && upstream.statusCode == HttpStatus.ok)) {
+          await for (final chunk in upstream) {
+            if (disconnected) {
+              try {
+                final sock = await upstream.detachSocket();
+                sock.destroy();
+              } catch (_) {}
+              break;
+            }
+            LocalProxyTunnelBridge.recordDownstreamBytes(chunk.length);
+            response.add(chunk);
+          }
+        } else {
+          await upstream.listen((_) {}).cancel();
+        }
       } else {
         const chunkSize = 2 * 1024 * 1024;
-        int? prefetchedStart;
-        Future<
-          ({
-            Uint8List bytes,
-            int statusCode,
-            int totalSize,
-            String contentType,
-          })?
-        >? prefetchedFuture;
-
         while (cursor <= range.end && !disconnected) {
           final rawStart = cursor + meta.stripPrefixBytes;
           final rawEnd =
               min(range.end, cursor + chunkSize - 1) + meta.stripPrefixBytes;
-          final Future<
-            ({
-              Uint8List bytes,
-              int statusCode,
-              int totalSize,
-              String contentType,
-            })?
-          > currentFetch;
-          if (prefetchedFuture != null && prefetchedStart == rawStart) {
-            currentFetch = prefetchedFuture;
-            prefetchedFuture = null;
-          } else {
-            currentFetch = _fetchUpstreamRangeChunk(
-              uri: uri,
-              customHeaders: headers,
-              start: rawStart,
-              end: rawEnd,
-              isCancelled: () => disconnected,
-            );
-          }
-
-          // Speculatively prefetch the next 2 MB range chunk concurrently while currentFetch is in flight
-          final nextCursor = min(range.end + 1, cursor + chunkSize);
-          if (nextCursor <= range.end &&
-              prefetchedFuture == null &&
-              !disconnected) {
-            final nextRawStart = nextCursor + meta.stripPrefixBytes;
-            final nextRawEnd =
-                min(range.end, nextCursor + chunkSize - 1) +
-                meta.stripPrefixBytes;
-            prefetchedStart = nextRawStart;
-            prefetchedFuture = _fetchUpstreamRangeChunk(
-              uri: uri,
-              customHeaders: headers,
-              start: nextRawStart,
-              end: nextRawEnd,
-              isCancelled: () => disconnected,
-            );
-          }
-
-          final chunk = await currentFetch;
+          final chunk = await _fetchUpstreamRangeChunk(
+            uri: uri,
+            customHeaders: headers,
+            start: rawStart,
+            end: rawEnd,
+            isCancelled: () => disconnected,
+          );
           if (chunk == null ||
               chunk.totalSize != meta.totalSize + meta.stripPrefixBytes ||
               disconnected) {
