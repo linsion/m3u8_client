@@ -3672,16 +3672,12 @@ final class TvAppState: ObservableObject {
               forceDirectConnection: true,
               fallbackRemoteUrl: info.alistProxyUrl
             )
-            if !info.alistProxyUrl.isEmpty && info.alistProxyUrl != info.url {
-              backupUrl = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
-                remoteUrl: info.alistProxyUrl,
-                headers: playHeaders,
-                extHint: ext.isEmpty ? ".mp4" : ext,
-                forceDirectConnection: true
-              )
-            } else {
-              backupUrl = primaryUrl
-            }
+            // Never call `prepareTelegramVideoProxyUrl` a second time for `backupUrl` here!
+            // A second call immediately overwrites `tgActiveBackgroundUrl` with `backupUrl`, killing `primaryUrl`'s
+            // 16-worker 1 Gbps prefetcher and launching competing downloads for `backupUrl`.
+            backupUrl = (!info.alistProxyUrl.isEmpty && info.alistProxyUrl != info.url)
+              ? info.alistProxyUrl
+              : primaryUrl
           }
 
           self.playerControlsVisible = true

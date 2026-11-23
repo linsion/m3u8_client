@@ -3693,17 +3693,23 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
     self.mkvAudioFramesPerPacket = Int64(framesPerPkt)
     self.mkvAudioChannels = ch
     self.mkvAudioBitDepth = bitDepth
-    self.audioFormatDesc = Self.createMkvAudioFormatDesc(
-      formatId: formatId,
-      formatFlags: formatFlags,
-      sampleRate: sr,
-      channels: ch,
-      bitsPerChan: bitsPerChan,
-      bytesPerPkt: bytesPerPkt,
-      framesPerPkt: framesPerPkt,
-      bytesPerFrame: bytesPerFrame,
-      cookie: cookie
-    )
+    if (formatId == kAudioFormatAC3 || formatId == kAudioFormatEnhancedAC3) && cookie.isEmpty {
+      // Defer `CMAudioFormatDescription` creation until the first `0x0B 0x77` syncframe arrives in `enqueueMatroskaAudioFrame`
+      // so we build an exact `dac3` (for AC-3) or `dec3` (for E-AC-3) magic cookie instead of a cookie-less descriptor that stalls `audioRenderer`!
+      self.audioFormatDesc = nil
+    } else {
+      self.audioFormatDesc = Self.createMkvAudioFormatDesc(
+        formatId: formatId,
+        formatFlags: formatFlags,
+        sampleRate: sr,
+        channels: ch,
+        bitsPerChan: bitsPerChan,
+        bytesPerPkt: bytesPerPkt,
+        framesPerPkt: framesPerPkt,
+        bytesPerFrame: bytesPerFrame,
+        cookie: cookie
+      )
+    }
   }
 
   private static func createMkvAudioFormatDesc(
@@ -3810,9 +3816,10 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
     let blockSize = TvLocalHlsProxyServer.engineBlockSize
     let maxBlockIndex = max(0, (totalSize - 1) / blockSize)
 
-    // Local 2-block MRU cache so sequential EBML header/frame reads within a 2 MB block have 0 lock overhead
+    // Local 2-block MRU cache so sequential EBML header/frame reads within a 4 MB block have 0 lock overhead
     var localBlock0: (idx: Int64, data: Data)? = nil
     var localBlock1: (idx: Int64, data: Data)? = nil
+    var didKickInitialPrefetch = false
 
     func getBlock(_ idx: Int64) async -> Data? {
       if idx < 0 || idx > maxBlockIndex { return nil }
@@ -3841,6 +3848,16 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
       guard fileOffset >= 0, fileOffset < totalSize, count > 0 else { return nil }
       let clampedCount = Int(min(Int64(count), totalSize - fileOffset))
       if fileOffset + Int64(clampedCount) <= Int64(meta.headerChunk.count) {
+        if !didKickInitialPrefetch {
+          didKickInitialPrefetch = true
+          TvLocalHlsProxyServer.shared.kickEnginePrefetchWindow(
+            targetKey: targetKey,
+            remoteUrl: remoteUrl,
+            blockIndex: 0,
+            meta: meta,
+            reader: reader
+          )
+        }
         return meta.headerChunk.subdata(in: Int(fileOffset)..<(Int(fileOffset) + clampedCount))
       }
       let firstIdx = fileOffset / blockSize
@@ -4102,11 +4119,23 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
           if Date().timeIntervalSince(lastProgressReportAt) >= 0.45 {
             lastProgressReportAt = Date()
             lock.lock()
+            let prevPos = mkvCurrentPositionSec
             mkvCurrentPositionSec = curSyncSec
             let d = mkvDurationSec
+            let rate = mkvPlaybackRate
             lock.unlock()
             if let progCb = onMkvProgress {
               DispatchQueue.main.async { progCb(curSyncSec, d) }
+            }
+            // Watchdog: if `synchronizer.currentTime()` hasn't moved while frames are queued ahead (e.g. `audioRenderer` stalled),
+            // flush `audioRenderer` and re-kick `synchronizer.setRate` so video playback never deadlocks at 3.5s!
+            let stalledClock = abs(curSyncSec - prevPos) < 0.01 && (Double(maxQueuedPtsMs) / 1000.0) > curSyncSec + 2.0
+            if stalledClock || audioRenderer.status == .failed {
+              if audioRenderer.status == .failed {
+                audioRenderer.flush()
+              }
+              let resumeTime = CMTime(value: max(0, Int64(curSyncSec * 1000.0)), timescale: 1000)
+              synchronizer.setRate(rate, time: resumeTime)
             }
           }
           let aheadSec = (Double(maxQueuedPtsMs) / 1000.0) - curSyncSec
@@ -4377,9 +4406,54 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
     return results
   }
 
+  /// Deterministically extracts NALUs from a Matroska video block without falling for the false-positive `00 00 01` Annex-B trap
+  /// when the first 4-byte HVCC/AVCC length-prefixed NALU (typically an x265/HDR10 `PREFIX_SEI`) happens to be 256..511 bytes (`0x00 0x00 0x01 0xXX`)!
+  private static func extractMkvFrameNalus(_ payload: Data, nalLengthSize: Int) -> [Data] {
+    guard payload.count >= 4 else { return [] }
+    let primaryLenSize = (1...4).contains(nalLengthSize) ? nalLengthSize : 4
+    let candidateLenSizes = primaryLenSize == 4 ? [4] : [primaryLenSize, 4]
+
+    for lenSize in candidateLenSizes {
+      var nalus: [Data] = []
+      var pos = 0
+      var consumedCleanly = false
+      while pos + lenSize <= payload.count {
+        var len = 0
+        for i in 0..<lenSize {
+          len = (len << 8) | Int(payload[pos + i])
+        }
+        if len == 0 {
+          pos += lenSize
+          continue
+        }
+        guard len > 0, pos + lenSize + len <= payload.count else {
+          nalus.removeAll()
+          break
+        }
+        pos += lenSize
+        nalus.append(payload.subdata(in: pos..<(pos + len)))
+        pos += len
+        if pos >= payload.count - lenSize {
+          consumedCleanly = true
+        }
+      }
+      if consumedCleanly && !nalus.isEmpty {
+        return nalus
+      }
+    }
+
+    // Fallback: try non-strict AVCC if it covers at least 90% of the payload, otherwise Annex-B start codes
+    let avcc = splitAvccNalus(payload, nalLengthSize: primaryLenSize)
+    let avccBytes = avcc.reduce(0) { $0 + $1.count + primaryLenSize }
+    if !avcc.isEmpty && avccBytes >= (payload.count * 9) / 10 {
+      return avcc
+    }
+    let annexB = splitAnnexBNalus(payload)
+    return !annexB.isEmpty ? annexB : avcc
+  }
+
   private static func containsKeyframeNalu(_ payload: Data, codecId: UInt8, nalLengthSize: Int) -> Bool {
-    let isAnnexB = payload.count >= 4 && ((payload[0] == 0 && payload[1] == 0 && payload[2] == 0 && payload[3] == 1) || (payload[0] == 0 && payload[1] == 0 && payload[2] == 1))
-    let nalus = isAnnexB ? splitAnnexBNalus(payload) : splitAvccNalus(payload, nalLengthSize: nalLengthSize)
+    let nalus = extractMkvFrameNalus(payload, nalLengthSize: nalLengthSize)
     for n in nalus where !n.isEmpty {
       if codecId == 7 {
         let t = n[0] & 0x1F
@@ -4393,8 +4467,8 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
   }
 
   /// Sanitizes every H.264 / HEVC video frame before feeding `VideoToolbox` (`AVSampleBufferDisplayLayer`):
-  /// 1) Splits both Annex-B and 1/2/3/4-byte AVCC/HVCC length-prefixed NALUs.
-  /// 2) Extracts in-band `VPS/SPS/PPS` parameter sets dynamically.
+  /// 1) Splits length-prefixed HVCC/AVCC NALUs first (avoiding false-positive Annex-B detection on 256..511-byte `PREFIX_SEI` NALUs).
+  /// 2) Extracts in-band `VPS/SPS/PPS` parameter sets dynamically if `videoFormatDesc` wasn't initialized from `CodecPrivate`.
   /// 3) Strips Dolby Vision Profile 7 Dual-Layer Enhancement Layer NALUs (`nal_unit_type == 63`, `nal_unit_type == 62`, or `nuh_layer_id > 0`)
   ///    and AUD/Filler NALUs so 50 GB – 100 GB 4K Blu-ray Remux `.mkv` files never trigger `kVTVideoDecoderBadDataErr (-12909)`.
   /// 4) Repacks all clean VCL + SEI NALUs with standard 4-byte length prefixes (`nalUnitHeaderLength = 4`) and attaches `DTS <= PTS` timing for hardware B-frame reordering.
@@ -4403,42 +4477,29 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
     defer { lock.unlock() }
     guard !isStopped else { return }
 
-    let isAnnexB = rawPayload.count >= 4 && ((rawPayload[0] == 0 && rawPayload[1] == 0 && rawPayload[2] == 0 && rawPayload[3] == 1) || (rawPayload[0] == 0 && rawPayload[1] == 0 && rawPayload[2] == 1))
-    var rawNalus = isAnnexB ? Self.splitAnnexBNalus(rawPayload) : Self.splitAvccNalus(rawPayload, nalLengthSize: nalLengthSize)
-    if rawNalus.isEmpty && !isAnnexB && nalLengthSize != 4 {
-      rawNalus = Self.splitAvccNalus(rawPayload, nalLengthSize: 4)
-    }
-    if rawNalus.isEmpty {
-      rawNalus = Self.splitAnnexBNalus(rawPayload)
-    }
+    let rawNalus = Self.extractMkvFrameNalus(rawPayload, nalLengthSize: nalLengthSize)
 
     var cleanNalus: [Data] = []
     cleanNalus.reserveCapacity(rawNalus.count)
 
     if videoCodecId == 7 {
-      var updated = false
       for n in rawNalus where !n.isEmpty {
         let nType = n[0] & 0x1F
         if nType == 7 {
           cachedH264Sps = n
-          updated = true
         } else if nType == 8 {
           cachedH264Pps = n
-          updated = true
         } else if nType >= 1 && nType <= 6 {
           cleanNalus.append(n)
         }
       }
-      if (updated || videoFormatDesc == nil), let sps = cachedH264Sps, let pps = cachedH264Pps {
-        if let validFmt = Self.createH264FormatDesc(sps: sps, pps: pps, nalLengthSize: 4) {
-          videoFormatDesc = validFmt
-        }
+      if videoFormatDesc == nil, let sps = cachedH264Sps, let pps = cachedH264Pps {
+        videoFormatDesc = Self.createH264FormatDesc(sps: sps, pps: pps, nalLengthSize: 4)
       }
     } else if videoCodecId == 12 {
-      var vps: Data? = cachedHevcParamSets.count >= 1 ? cachedHevcParamSets[0] : nil
-      var sps: Data? = cachedHevcParamSets.count >= 2 ? cachedHevcParamSets[1] : nil
-      var pps: Data? = cachedHevcParamSets.count >= 3 ? cachedHevcParamSets[2] : nil
-      var updated = false
+      var vpsList: [Data] = []
+      var spsList: [Data] = []
+      var ppsList: [Data] = []
       for n in rawNalus where n.count >= 2 {
         let nType = (n[0] >> 1) & 0x3F
         let layerId = ((n[0] & 0x01) << 5) | ((n[1] >> 3) & 0x1F)
@@ -4447,34 +4508,36 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
           continue
         }
         if nType == 32 {
-          vps = n
-          updated = true
+          vpsList.append(n)
         } else if nType == 33 {
-          sps = n
-          updated = true
+          spsList.append(n)
         } else if nType == 34 {
-          pps = n
-          updated = true
+          ppsList.append(n)
         } else if nType <= 21 || nType == 39 || nType == 40 {
           cleanNalus.append(n)
         }
       }
-      if (updated || videoFormatDesc == nil), let v = vps, let s = sps, let p = pps {
-        cachedHevcParamSets = [v, s, p]
-        if let validFmt = Self.createHevcFormatDesc(paramSets: cachedHevcParamSets, nalLengthSize: 4)
+      if !vpsList.isEmpty && !spsList.isEmpty && !ppsList.isEmpty {
+        cachedHevcParamSets = [vpsList[0], spsList[0], ppsList[0]]
+        if videoFormatDesc == nil {
+          var allSets: [Data] = []
+          allSets.append(contentsOf: vpsList)
+          allSets.append(contentsOf: spsList)
+          allSets.append(contentsOf: ppsList)
+          videoFormatDesc = Self.createHevcFormatDescAll(paramSets: allSets, nalLengthSize: 4)
+            ?? Self.createHevcFormatDesc(paramSets: cachedHevcParamSets, nalLengthSize: 4)
             ?? Self.createVideoFormatDescFromRawExtensionAtom(
               codecType: kCMVideoCodecType_HEVC,
               atomKey: "hvcC",
               rawConfig: mkvRawCodecPrivate,
               width: mkvVideoWidth,
               height: mkvVideoHeight
-            ) {
-          videoFormatDesc = validFmt
+            )
         }
       }
     }
 
-    guard !cleanNalus.isEmpty, let fmt = videoFormatDesc else { return }
+    guard !cleanNalus.isEmpty, var fmt = videoFormatDesc else { return }
     let framePayload = Self.packLengthPrefixedNalus(cleanNalus)
     let len = framePayload.count
     guard len > 4 else { return }
@@ -4551,6 +4614,33 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
       displayLayer.flush()
     }
     displayLayer.enqueue(sb)
+    if displayLayer.status == .failed && isKeyframe && !mkvRawCodecPrivate.isEmpty {
+      displayLayer.flush()
+      if let rawFmt = Self.createVideoFormatDescFromRawExtensionAtom(
+        codecType: videoCodecId == 12 ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
+        atomKey: videoCodecId == 12 ? "hvcC" : "avcC",
+        rawConfig: mkvRawCodecPrivate,
+        width: mkvVideoWidth,
+        height: mkvVideoHeight
+      ) {
+        videoFormatDesc = rawFmt
+        fmt = rawFmt
+        var retrySb: CMSampleBuffer? = nil
+        if CMSampleBufferCreateReady(
+          allocator: kCFAllocatorDefault,
+          dataBuffer: bb,
+          formatDescription: fmt,
+          sampleCount: 1,
+          sampleTimingEntryCount: 1,
+          sampleTimingArray: &timing,
+          sampleSizeEntryCount: 1,
+          sampleSizeArray: [len],
+          sampleBufferOut: &retrySb
+        ) == noErr, let validRetry = retrySb {
+          displayLayer.enqueue(validRetry)
+        }
+      }
+    }
     renderedVideoFrameCount += 1
     lastFrameReceivedAt = Date()
 
@@ -4571,35 +4661,84 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
     }
   }
 
-  /// Dynamically builds a 3-byte `dac3` (`AC3SpecificBox`) magic cookie from the first AC-3 (`0x0B 0x77`) syncframe if `audioFormatDesc` was nil
-  private static func buildAc3FormatDescFromFrame(_ frame: Data, defaultSampleRate: Double, defaultChannels: UInt32) -> CMAudioFormatDescription? {
+  /// Dynamically builds either a 3-byte `dac3` (`AC3SpecificBox`) or 5-byte `dec3` (`EC3SpecificBox`) magic cookie
+  /// from the first AC-3 / E-AC-3 (`0x0B 0x77`) syncframe so Apple TV's AudioToolbox hardware decoder starts cleanly!
+  private static func buildAc3OrEac3FormatDescFromFrame(
+    _ frame: Data,
+    formatId: AudioFormatID,
+    defaultSampleRate: Double,
+    defaultChannels: UInt32
+  ) -> (desc: CMAudioFormatDescription, framesPerPacket: Int64)? {
     guard frame.count >= 7, frame[0] == 0x0B, frame[1] == 0x77 else { return nil }
-    let fscod = UInt32((frame[4] >> 6) & 0x03)
-    let frmsizecod = UInt32(frame[4] & 0x3F)
     let bsid = UInt32((frame[5] >> 3) & 0x1F)
-    let bsmod = UInt32(frame[5] & 0x07)
-    let acmod = UInt32((frame[6] >> 5) & 0x07)
     let rates: [Double] = [48000.0, 44100.0, 32000.0, defaultSampleRate]
-    let sr = rates[Int(min(3, fscod))]
     let chTable: [UInt32] = [2, 1, 2, 3, 3, 4, 4, 5]
-    let ch = min(8, chTable[Int(min(7, acmod))] + 1)
-    let dac3Val: UInt32 = (fscod << 22) | (bsid << 17) | (bsmod << 14) | (acmod << 11) | (1 << 10) | ((frmsizecod >> 1) << 5)
-    let cookie = Data([
-      UInt8((dac3Val >> 16) & 0xFF),
-      UInt8((dac3Val >> 8) & 0xFF),
-      UInt8(dac3Val & 0xFF)
-    ])
-    return createMkvAudioFormatDesc(
-      formatId: kAudioFormatAC3,
-      formatFlags: 0,
-      sampleRate: sr,
-      channels: defaultChannels > 0 ? defaultChannels : ch,
-      bitsPerChan: 0,
-      bytesPerPkt: 0,
-      framesPerPkt: 1536,
-      bytesPerFrame: 0,
-      cookie: cookie
-    )
+
+    if bsid > 10 || formatId == kAudioFormatEnhancedAC3 {
+      // E-AC-3 (`dec3` / `EC3SpecificBox`): parse `frmsiz`, `fscod`, `numblkscod`, `acmod`, `lfeon`
+      let frmsiz = ((UInt32(frame[2] & 0x07) << 8) | UInt32(frame[3]))
+      let fscod = UInt32((frame[4] >> 6) & 0x03)
+      let numblkscod = Int((frame[4] >> 4) & 0x03)
+      let acmod = UInt32((frame[4] >> 1) & 0x07)
+      let lfeon = UInt32(frame[4] & 0x01)
+      let blocksPerFrame: [Int] = [1, 2, 3, 6]
+      let blks = (fscod == 3) ? 6 : blocksPerFrame[min(3, numblkscod)]
+      let framesPerPkt = UInt32(blks * 256)
+      let sr = rates[Int(min(3, fscod))]
+      let ch = min(8, chTable[Int(min(7, acmod))] + lfeon)
+      let dataRate = min(0x1FFF, ((frmsiz + 1) * 48) / UInt32(max(1, blks)))
+      let hdr16 = UInt16((dataRate << 3) & 0xFFF8)
+      let sub24: UInt32 = (fscod << 22) | (min(31, bsid) << 17) | (acmod << 9) | (lfeon << 8)
+      let cookie = Data([
+        UInt8((hdr16 >> 8) & 0xFF),
+        UInt8(hdr16 & 0xFF),
+        UInt8((sub24 >> 16) & 0xFF),
+        UInt8((sub24 >> 8) & 0xFF),
+        UInt8(sub24 & 0xFF)
+      ])
+      if let desc = createMkvAudioFormatDesc(
+        formatId: kAudioFormatEnhancedAC3,
+        formatFlags: 0,
+        sampleRate: sr,
+        channels: defaultChannels > 0 ? defaultChannels : ch,
+        bitsPerChan: 0,
+        bytesPerPkt: 0,
+        framesPerPkt: framesPerPkt,
+        bytesPerFrame: 0,
+        cookie: cookie
+      ) {
+        return (desc, Int64(framesPerPkt))
+      }
+      return nil
+    } else {
+      // Standard AC-3 (`dac3` / `AC3SpecificBox`)
+      let fscod = UInt32((frame[4] >> 6) & 0x03)
+      let frmsizecod = UInt32(frame[4] & 0x3F)
+      let bsmod = UInt32(frame[5] & 0x07)
+      let acmod = UInt32((frame[6] >> 5) & 0x07)
+      let sr = rates[Int(min(3, fscod))]
+      let ch = min(8, chTable[Int(min(7, acmod))] + 1)
+      let dac3Val: UInt32 = (fscod << 22) | (bsid << 17) | (bsmod << 14) | (acmod << 11) | (1 << 10) | ((frmsizecod >> 1) << 5)
+      let cookie = Data([
+        UInt8((dac3Val >> 16) & 0xFF),
+        UInt8((dac3Val >> 8) & 0xFF),
+        UInt8(dac3Val & 0xFF)
+      ])
+      if let desc = createMkvAudioFormatDesc(
+        formatId: kAudioFormatAC3,
+        formatFlags: 0,
+        sampleRate: sr,
+        channels: defaultChannels > 0 ? defaultChannels : ch,
+        bitsPerChan: 0,
+        bytesPerPkt: 0,
+        framesPerPkt: 1536,
+        bytesPerFrame: 0,
+        cookie: cookie
+      ) {
+        return (desc, 1536)
+      }
+      return nil
+    }
   }
 
   private func enqueueMatroskaAudioFrame(_ rawAudio: Data, basePtsMs: Int64, frameOffsetIndex: Int) {
@@ -4610,7 +4749,15 @@ final class TvDirectFlvHardwareEngine: NSObject, URLSessionDataDelegate, @unchec
     guard len > 0 else { return }
 
     if audioFormatDesc == nil && (mkvAudioFormatId == kAudioFormatAC3 || mkvAudioFormatId == kAudioFormatEnhancedAC3) {
-      audioFormatDesc = Self.buildAc3FormatDescFromFrame(rawAudio, defaultSampleRate: Double(audioSampleRate), defaultChannels: mkvAudioChannels)
+      if let built = Self.buildAc3OrEac3FormatDescFromFrame(
+        rawAudio,
+        formatId: mkvAudioFormatId,
+        defaultSampleRate: Double(audioSampleRate),
+        defaultChannels: mkvAudioChannels
+      ) {
+        audioFormatDesc = built.desc
+        mkvAudioFramesPerPacket = built.framesPerPacket
+      }
     }
     guard let fmt = audioFormatDesc else { return }
 
@@ -5398,8 +5545,13 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
     }
   }
 
+  private struct SessionTaskKey: Hashable {
+    let sessionId: ObjectIdentifier
+    let taskId: Int
+  }
+
   private let lock = NSLock()
-  private var contexts: [Int: TaskContext] = [:]
+  private var contexts: [SessionTaskKey: TaskContext] = [:]
   private var recentRedirectCookiesByUrl: [String: String] = [:]
 
   func consumeRedirectCookie(for urlStr: String) -> String? {
@@ -5418,10 +5570,11 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
     return try await withTaskCancellationHandler {
       try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(Data, HTTPURLResponse)?, Error>) in
         let task = session.dataTask(with: request)
+        let key = SessionTaskKey(sessionId: ObjectIdentifier(session), taskId: task.taskIdentifier)
         let ctx = TaskContext(mode: .headerProbe(maxBytes: maxBytes, continuation: cont))
         ctx.buffer.reserveCapacity(min(maxBytes, 524288))
         lock.lock()
-        contexts[task.taskIdentifier] = ctx
+        contexts[key] = ctx
         lock.unlock()
         taskBox.lock()
         createdTask = task
@@ -5447,6 +5600,7 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
     return await withTaskCancellationHandler {
       await withCheckedContinuation { (cont: CheckedContinuation<Data?, Never>) in
         let task = session.dataTask(with: request)
+        let key = SessionTaskKey(sessionId: ObjectIdentifier(session), taskId: task.taskIdentifier)
         let ctx = TaskContext(
           mode: .rangeBlock(
             startOffset: startOffset,
@@ -5456,7 +5610,7 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
         )
         ctx.buffer.reserveCapacity(min(expectedBytes, 4_194_304))
         lock.lock()
-        contexts[task.taskIdentifier] = ctx
+        contexts[key] = ctx
         lock.unlock()
         taskBox.lock()
         createdTask = task
@@ -5480,10 +5634,11 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
     return await withTaskCancellationHandler {
       await withCheckedContinuation { (cont: CheckedContinuation<Data?, Never>) in
         let task = session.dataTask(with: request)
+        let key = SessionTaskKey(sessionId: ObjectIdentifier(session), taskId: task.taskIdentifier)
         let ctx = TaskContext(mode: .fullSegment(continuation: cont))
         ctx.buffer.reserveCapacity(1_048_576)
         lock.lock()
-        contexts[task.taskIdentifier] = ctx
+        contexts[key] = ctx
         lock.unlock()
         taskBox.lock()
         createdTask = task
@@ -5508,9 +5663,10 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
     return await withTaskCancellationHandler {
       await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
         let task = session.dataTask(with: request)
+        let key = SessionTaskKey(sessionId: ObjectIdentifier(session), taskId: task.taskIdentifier)
         let ctx = TaskContext(mode: .continuousRange(conn: conn, continuation: cont))
         lock.lock()
-        contexts[task.taskIdentifier] = ctx
+        contexts[key] = ctx
         lock.unlock()
         taskBox.lock()
         createdTask = task
@@ -5536,9 +5692,10 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
     return await withTaskCancellationHandler {
       await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
         let task = session.dataTask(with: request)
+        let key = SessionTaskKey(sessionId: ObjectIdentifier(session), taskId: task.taskIdentifier)
         let ctx = TaskContext(mode: .passthrough(conn: conn, isHead: isHead, continuation: cont))
         lock.lock()
-        contexts[task.taskIdentifier] = ctx
+        contexts[key] = ctx
         lock.unlock()
         taskBox.lock()
         createdTask = task
@@ -5554,12 +5711,12 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
   }
 
   private func finishContext(
-    taskId: Int,
+    key: SessionTaskKey,
     headerResult: Result<(Data, HTTPURLResponse)?, Error>? = nil,
     streamSuccess: Bool? = nil
   ) {
     lock.lock()
-    guard let ctx = contexts.removeValue(forKey: taskId), !ctx.isFinished else {
+    guard let ctx = contexts.removeValue(forKey: key), !ctx.isFinished else {
       lock.unlock()
       return
     }
@@ -5615,6 +5772,7 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
     newRequest request: URLRequest,
     completionHandler: @escaping (URLRequest?) -> Void
   ) {
+    let key = SessionTaskKey(sessionId: ObjectIdentifier(session), taskId: task.taskIdentifier)
     var redirected = request
     if let orig = task.originalRequest {
       // Unconditionally preserve User-Agent (e.g. 115Browser/AList UA), Range, and Accept-Encoding across cross-domain 301/302 redirects!
@@ -5634,7 +5792,7 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
       if !mergedCookie.isEmpty {
         redirected.setValue(mergedCookie, forHTTPHeaderField: "Cookie")
         lock.lock()
-        if let ctx = contexts[task.taskIdentifier] {
+        if let ctx = contexts[key] {
           ctx.mergedCookieHeader = mergedCookie
         }
         if recentRedirectCookiesByUrl.count > 64 {
@@ -5661,16 +5819,16 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
     didReceive response: URLResponse,
     completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
   ) {
-    let taskId = dataTask.taskIdentifier
+    let key = SessionTaskKey(sessionId: ObjectIdentifier(session), taskId: dataTask.taskIdentifier)
     lock.lock()
-    guard let ctx = contexts[taskId], !ctx.isFinished else {
+    guard let ctx = contexts[key], !ctx.isFinished else {
       lock.unlock()
       completionHandler(.cancel)
       return
     }
     guard let http = response as? HTTPURLResponse else {
       lock.unlock()
-      finishContext(taskId: taskId, headerResult: .success(nil), streamSuccess: false)
+      finishContext(key: key, headerResult: .success(nil), streamSuccess: false)
       completionHandler(.cancel)
       return
     }
@@ -5695,7 +5853,7 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
       if http.statusCode == 200 && (http.expectedContentLength < 0 || http.expectedContentLength > Int64(maxBytes)) {
         lock.unlock()
         finishContext(
-          taskId: taskId,
+          key: key,
           headerResult: .failure(NSError(domain: "TvMediaHeader", code: -200, userInfo: nil))
         )
         completionHandler(.cancel)
@@ -5705,7 +5863,7 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
       guard http.statusCode == 206 || http.statusCode == 200,
             http.statusCode != 206 || contentRange.lowercased().hasPrefix("bytes 0-") else {
         lock.unlock()
-        finishContext(taskId: taskId, headerResult: .success(nil))
+        finishContext(key: key, headerResult: .success(nil))
         completionHandler(.cancel)
         return
       }
@@ -5717,7 +5875,7 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
       guard http.statusCode == 206,
             contentRange.isEmpty || contentRange.lowercased().hasPrefix("bytes \(startOffset)-") else {
         lock.unlock()
-        finishContext(taskId: taskId)
+        finishContext(key: key)
         completionHandler(.cancel)
         return
       }
@@ -5727,7 +5885,7 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
     case .fullSegment:
       guard (200..<300).contains(http.statusCode) else {
         lock.unlock()
-        finishContext(taskId: taskId)
+        finishContext(key: key)
         completionHandler(.cancel)
         return
       }
@@ -5737,7 +5895,7 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
     case .continuousRange:
       guard http.statusCode == 206 || http.statusCode == 200 else {
         lock.unlock()
-        finishContext(taskId: taskId, streamSuccess: false)
+        finishContext(key: key, streamSuccess: false)
         completionHandler(.cancel)
         return
       }
@@ -5747,7 +5905,7 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
     case .passthrough(let conn, let isHead, _):
       guard (200...299).contains(http.statusCode) || http.statusCode == 416 else {
         lock.unlock()
-        finishContext(taskId: taskId, streamSuccess: false)
+        finishContext(key: key, streamSuccess: false)
         completionHandler(.cancel)
         return
       }
@@ -5764,7 +5922,7 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
       conn.send(content: encoded, completion: .contentProcessed { [weak self] err in
         if err != nil || isHead {
           dataTask.cancel()
-          self?.finishContext(taskId: taskId, streamSuccess: err == nil)
+          self?.finishContext(key: key, streamSuccess: err == nil)
         }
       })
       if isHead {
@@ -5777,11 +5935,11 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
 
   func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
     guard !data.isEmpty else { return }
-    let taskId = dataTask.taskIdentifier
+    let key = SessionTaskKey(sessionId: ObjectIdentifier(session), taskId: dataTask.taskIdentifier)
     TvNetworkSpeedMonitor.shared.recordDownstreamBytes(data.count)
 
     lock.lock()
-    guard let ctx = contexts[taskId], !ctx.isFinished else {
+    guard let ctx = contexts[key], !ctx.isFinished else {
       lock.unlock()
       dataTask.cancel()
       return
@@ -5798,13 +5956,13 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
         }
       }
       if ctx.buffer.count >= maxBytes, let http = ctx.httpResponse {
-        // Only cancel if server returned HTTP 200 (ignoring Range); for HTTP 206 (Content-Length == maxBytes),
-        // let `didCompleteWithError` finish naturally 0ms later so CFNetwork returns the warm TCP+TLS socket to the Keep-Alive pool!
-        if http.statusCode == 200 {
+        // Cancel only if the server ignored our upper bound (`expectedContentLength > maxBytes` or `statusCode == 200`);
+        // for an exact `HTTP 206` (`expectedContentLength == maxBytes`), let `didCompleteWithError` fire 0ms later so the warm TCP socket stays in the Keep-Alive pool!
+        if http.statusCode == 200 || http.expectedContentLength < 0 || http.expectedContentLength > Int64(maxBytes) {
           let finalData = ctx.buffer
           lock.unlock()
           dataTask.cancel()
-          finishContext(taskId: taskId, headerResult: .success((finalData, http)))
+          finishContext(key: key, headerResult: .success((finalData, http)))
           return
         }
       }
@@ -5820,14 +5978,18 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
           ctx.buffer.append(data.subdata(in: 0..<remaining))
         }
       }
-      if overflowed {
+      let openEndedResponse: Bool = {
+        guard let http = ctx.httpResponse else { return false }
+        return http.expectedContentLength < 0 || http.expectedContentLength > Int64(expectedBytes)
+      }()
+      if overflowed || (ctx.buffer.count >= expectedBytes && openEndedResponse) {
         lock.unlock()
         dataTask.cancel()
-        finishContext(taskId: taskId)
+        finishContext(key: key)
         return
       }
-      // For exact HTTP 206 Range blocks, let `didCompleteWithError` fire 0ms later so CFNetwork marks the warm high-cwnd TCP socket
-      // as idle in the Keep-Alive pool BEFORE the worker launches its next Range request!
+      // For exact HTTP 206 Range blocks (`expectedContentLength == expectedBytes`), let `didCompleteWithError` fire 0ms later
+      // so CFNetwork marks the warm high-cwnd TCP socket as idle in the Keep-Alive pool BEFORE the worker launches its next Range request!
       lock.unlock()
 
     case .fullSegment:
@@ -5847,11 +6009,11 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
         guard let self else { return }
         if err != nil {
           dataTask.cancel()
-          self.finishContext(taskId: taskId, streamSuccess: false)
+          self.finishContext(key: key, streamSuccess: false)
           return
         }
         self.lock.lock()
-        if let activeCtx = self.contexts[taskId], !activeCtx.isFinished {
+        if let activeCtx = self.contexts[key], !activeCtx.isFinished {
           activeCtx.pendingSendBytes = max(0, activeCtx.pendingSendBytes - data.count)
           if activeCtx.isSuspended && activeCtx.pendingSendBytes < 3 * 1024 * 1024 {
             activeCtx.isSuspended = false
@@ -5866,9 +6028,9 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
   }
 
   func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-    let taskId = task.taskIdentifier
+    let key = SessionTaskKey(sessionId: ObjectIdentifier(session), taskId: task.taskIdentifier)
     lock.lock()
-    guard let ctx = contexts[taskId], !ctx.isFinished else {
+    guard let ctx = contexts[key], !ctx.isFinished else {
       lock.unlock()
       return
     }
@@ -5880,16 +6042,16 @@ final class TvContinuousStreamSessionDelegate: NSObject, URLSessionDataDelegate,
     switch ctx.mode {
     case .headerProbe:
       if let http, !buf.isEmpty {
-        finishContext(taskId: taskId, headerResult: .success((buf, http)))
+        finishContext(key: key, headerResult: .success((buf, http)))
       } else {
-        finishContext(taskId: taskId, headerResult: .success(nil))
+        finishContext(key: key, headerResult: .success(nil))
       }
     case .rangeBlock, .fullSegment:
-      finishContext(taskId: taskId)
+      finishContext(key: key)
     case .continuousRange:
-      finishContext(taskId: taskId, streamSuccess: error == nil && didTransfer)
+      finishContext(key: key, streamSuccess: error == nil && didTransfer)
     case .passthrough:
-      finishContext(taskId: taskId, streamSuccess: error == nil || didTransfer)
+      finishContext(key: key, streamSuccess: error == nil || didTransfer)
     }
   }
 }
@@ -6556,7 +6718,7 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     return patched ? out : data
   }
 
-  /// Exposed helper for `TvDirectFlvHardwareEngine` (Matroska `.mkv` / `.webm` hardware mode) to probe metadata and fetch 2 MB blocks
+  /// Exposed helper for `TvDirectFlvHardwareEngine` (Matroska `.mkv` / `.webm` hardware mode) to probe metadata and fetch 4 MB blocks
   /// directly from the shared Range block cache (`tgBlockCache`).
   func probeMediaMetaForEngine(
     proxyUrl: URL
@@ -6568,13 +6730,28 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
       return nil
     }
     let key = "\(remoteStr)#\(playbackId)"
+    beginTelegramPlaybackRead(targetUrl: key, reader: UUID())
     guard let meta = await ensureTelegramVideoMeta(targetUrl: key, url: remoteUrl, requestPath: proxyUrl.path),
           meta.totalSize > 0 else {
       return nil
     }
     let hdrs = getTgHeadersAndMeta(for: key).headers
     let effectiveUrl = resolvedCdnUrl(for: key, fallback: remoteUrl)
+    pumpTelegramSlidingWindow(targetUrl: key, url: effectiveUrl, meta: meta)
     return (key, effectiveUrl, hdrs, meta)
+  }
+
+  func kickEnginePrefetchWindow(
+    targetKey: String,
+    remoteUrl: URL,
+    blockIndex: Int64,
+    meta: (totalSize: Int64, contentType: String, headerChunk: Data, stripPrefixBytes: Int),
+    reader: UUID
+  ) {
+    let maxBlockIndex = max(0, (meta.totalSize - 1) / Self.tgBlockSize)
+    if updateTelegramPlayhead(targetUrl: targetKey, blockIndex: blockIndex, maxBlockIndex: maxBlockIndex, reader: reader) {
+      pumpTelegramSlidingWindow(targetUrl: targetKey, url: remoteUrl, meta: meta)
+    }
   }
 
   func fetchMediaBlockForEngine(
@@ -7502,14 +7679,15 @@ final class TvLocalHlsProxyServer: @unchecked Sendable {
     tgActiveReadersByUrl[targetUrl] = readers
 
     let currentPlayhead = tgPlayheadBlockByUrl[targetUrl] ?? 0
+    let tailWindowBlocks: Int64 = maxBlockIndex > 256 ? 128 : 32
     let isTailMetadataProbe = maxBlockIndex > 16
-      && blockIndex >= max(4, maxBlockIndex - 32)
-      && currentPlayhead < maxBlockIndex - 64
+      && blockIndex >= max(4, maxBlockIndex - tailWindowBlocks)
+      && currentPlayhead < maxBlockIndex - (tailWindowBlocks * 2)
     if isTailMetadataProbe {
       tgTailProbeBlockByUrl[targetUrl] = blockIndex
     } else {
       tgPlayheadBlockByUrl[targetUrl] = blockIndex
-      if blockIndex > 2 && blockIndex < maxBlockIndex - 32 {
+      if blockIndex > 2 && blockIndex < maxBlockIndex - tailWindowBlocks {
         tgTailProbeBlockByUrl.removeValue(forKey: targetUrl)
       }
     }

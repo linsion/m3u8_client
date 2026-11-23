@@ -2144,6 +2144,8 @@ struct TvPlayerModalView: View {
         if proxyRate > 0 {
           let prev = appState.latestMeasuredSpeedBytesPerSec
           appState.latestMeasuredSpeedBytesPerSec = prev <= 1024 ? proxyRate : (prev * 0.35 + proxyRate * 0.65)
+        } else {
+          appState.latestMeasuredSpeedBytesPerSec = 0
         }
       } else if let curItem = player.currentItem {
         switch curItem.status {
@@ -2215,7 +2217,19 @@ struct TvPlayerModalView: View {
             // Only fall back to a non-server-relay backup stream (e.g., local 127.0.0.1 multi-thread proxy fallback); NEVER auto-switch to server relay!
             didFallbackToProxy = true
             usingServerProxy = false
-            startPlayerItem(urlStr: request.backupProxyUrl, resumeAt: positionSec)
+            let fallbackTarget: String
+            if !request.backupProxyUrl.contains("127.0.0.1:") && !request.backupProxyUrl.lowercased().contains(".m3u8") {
+              let extHint = ".\((request.title as NSString).pathExtension.lowercased())"
+              fallbackTarget = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
+                remoteUrl: request.backupProxyUrl,
+                headers: request.headers,
+                extHint: extHint.count > 1 && extHint.count <= 6 ? extHint : ".mp4",
+                forceDirectConnection: true
+              )
+            } else {
+              fallbackTarget = request.backupProxyUrl
+            }
+            startPlayerItem(urlStr: fallbackTarget, resumeAt: positionSec)
           } else {
             isBuffering = false
           }
