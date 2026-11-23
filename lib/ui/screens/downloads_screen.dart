@@ -2098,7 +2098,7 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
       final dynamic platform = _player.platform;
       final isMobileOrTv = Platform.isAndroid || Platform.isIOS;
       final props = <String, String>{
-        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto-safe',
+        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto',
         'hwdec-codecs': 'h264,hevc,vp8,vp9,av1',
         'vd-lavc-check-hw-profile': 'yes',
         'vd-lavc-software-fallback': 'yes',
@@ -2112,8 +2112,6 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
         'hr-seek-framedrop': 'yes',
         'framedrop': 'vo',
         'demuxer-thread': 'yes',
-        'demuxer-lavf-probesize': '131072',
-        'demuxer-lavf-analyzeduration': '0.5',
         'cache': 'yes',
         'cache-on-disk': 'no',
         'cache-secs': isMobileOrTv ? '90' : '150',

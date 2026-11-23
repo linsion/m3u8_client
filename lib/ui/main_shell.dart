@@ -3834,8 +3834,6 @@ class _FloatingMiniPlayerOverlayState
         'ad-lavc-threads': '0',
         'ad-lavc-downmix': 'yes',
         'audio-channels': 'stereo',
-        'demuxer-lavf-probesize': '524288',
-        'demuxer-lavf-analyzeduration': '0',
         'network-timeout': '15',
         'tls-verify': 'no',
         'keep-open': 'no',

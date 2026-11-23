@@ -297,6 +297,45 @@ class RemoteStorageService {
     return info.url;
   }
 
+  static String sanitizeStreamUrl(String rawUrl) {
+    final trimmed = rawUrl.trim();
+    if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
+      return trimmed;
+    }
+    final schemeEnd = trimmed.indexOf('://');
+    if (schemeEnd < 0) return trimmed;
+    final pathStart = trimmed.indexOf('/', schemeEnd + 3);
+    if (pathStart < 0) return trimmed;
+
+    final prefix = trimmed.substring(0, pathStart);
+    final rest = trimmed.substring(pathStart);
+    final sb = StringBuffer(prefix);
+    for (final rune in rest.runes) {
+      if (rune == 0x20) {
+        sb.write('%20');
+      } else if (rune == 0x5B) {
+        sb.write('%5B');
+      } else if (rune == 0x5D) {
+        sb.write('%5D');
+      } else if (rune == 0x7B) {
+        sb.write('%7B');
+      } else if (rune == 0x7D) {
+        sb.write('%7D');
+      } else if (rune == 0x7C) {
+        sb.write('%7C');
+      } else if (rune == 0x5E) {
+        sb.write('%5E');
+      } else if (rune == 0x60) {
+        sb.write('%60');
+      } else if (rune > 127 || rune < 0x20) {
+        sb.write(Uri.encodeComponent(String.fromCharCode(rune)));
+      } else {
+        sb.writeCharCode(rune);
+      }
+    }
+    return sb.toString();
+  }
+
   Future<({String url, Map<String, String> headers, String alistProxyUrl})>
       resolveAlistStreamInfo(
     StorageMount mount,
@@ -347,7 +386,14 @@ class RemoteStorageService {
         rawHdr.forEach((k, v) {
           final rawKey = k.toString().trim();
           if (rawKey.isEmpty) return;
-          final key = switch (rawKey.toLowerCase()) {
+          final lowerK = rawKey.toLowerCase();
+          if (lowerK == 'host' ||
+              lowerK == 'connection' ||
+              lowerK == 'content-length' ||
+              lowerK == 'range') {
+            return;
+          }
+          final key = switch (lowerK) {
             'user-agent' => 'User-Agent',
             'cookie' => 'Cookie',
             'referer' || 'referrer' => 'Referer',
@@ -375,12 +421,15 @@ class RemoteStorageService {
       alistProxyUrl = '$base/d$encodedPath?sign=${Uri.encodeQueryComponent(sign)}';
     } else if (fallbackUrl.isNotEmpty &&
         !(forceRefresh && fallbackUrl.contains('sign='))) {
-      alistProxyUrl = fallbackUrl;
+      alistProxyUrl = sanitizeStreamUrl(fallbackUrl);
     } else {
       alistProxyUrl = '$base/d$encodedPath';
     }
 
-    final primaryUrl = rawUrl.startsWith('http') ? rawUrl : alistProxyUrl;
+    final sanitizedRawUrl =
+        rawUrl.startsWith('http') ? sanitizeStreamUrl(rawUrl) : '';
+    final primaryUrl =
+        sanitizedRawUrl.isNotEmpty ? sanitizedRawUrl : alistProxyUrl;
     final lowerUrl = primaryUrl.toLowerCase();
     // Always preserve the exact same User-Agent that called `/api/fs/get` so 115 / Aliyun / Quark / Baidu 302 links never return HTTP 403!
     extractedHeaders['User-Agent'] ??= defaultBrowserUserAgent;

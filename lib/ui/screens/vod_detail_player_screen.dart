@@ -569,7 +569,7 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
       final dynamic platform = _player.platform;
       final isMobileOrTv = Platform.isAndroid || Platform.isIOS;
       final props = <String, String>{
-        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto-safe',
+        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto',
         'hwdec-codecs': 'h264,hevc,vp8,vp9,av1',
         'vd-lavc-check-hw-profile': 'yes',
         'vd-lavc-software-fallback': 'yes',
@@ -593,12 +593,10 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
         'ad-lavc-downmix': 'yes',
         'audio-channels': 'stereo',
         'hr-seek-framedrop': 'yes',
-        'demuxer-lavf-probesize': '131072',
-        'demuxer-lavf-analyzeduration': '0.5',
         'network-timeout': '15',
         'tls-verify': 'no',
         'stream-lavf-o':
-            'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=4xx,5xx,reconnect_delay_max=3',
+            'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=5xx,reconnect_delay_max=3',
         'demuxer-lavf-o':
             'seg_max_retry=10,http_persistent=1,http_multiple=1,allowed_extensions=ALL,protocol_whitelist=file,http,https,httpproxy,tcp,tls,crypto,data,rtp,udp,subfile',
       };

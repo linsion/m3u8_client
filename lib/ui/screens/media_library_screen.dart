@@ -427,7 +427,7 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
   // ===========================================================================
 
   Future<({String url, String fallbackUrl, Map<String, String> headers, String subtitle})>
-      _resolveEntryEndpoint(FileEntry entry) async {
+      _resolveEntryEndpoint(FileEntry entry, {bool forceRefresh = false}) async {
     final mount = _mounts.where((m) => m.id == entry.mountId).firstOrNull ??
         _activeMount;
     switch (entry.sourceKind) {
@@ -443,6 +443,7 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
           mount,
           entry.path,
           fallbackUrl: entry.rawDownloadUrl,
+          forceRefresh: forceRefresh,
         );
         return (
           url: info.url,
@@ -650,6 +651,9 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
             initialPosition: initialSeekPos,
             initialAudioTrackOrderIndex: initialAudioTrackOrderIdx,
             OpenedFromExoFallback: initialSeekPos != null || initialAudioTrackOrderIdx != null,
+            refreshEndpoint: entry.sourceKind == StorageSourceKind.alist
+                ? () => _resolveEntryEndpoint(entry, forceRefresh: true)
+                : null,
             fallback115: initial115 == null
                 ? null
                 : () => resolve115(useCloudTranscode: !initial115.isTranscoded),
@@ -4763,6 +4767,13 @@ class _MediaFilePlayerDialog extends StatefulWidget {
   final Duration? initialPosition;
   final int? initialAudioTrackOrderIndex;
   final bool OpenedFromExoFallback;
+  final Future<
+      ({
+        String url,
+        String fallbackUrl,
+        Map<String, String> headers,
+        String subtitle,
+      })> Function()? refreshEndpoint;
   final Future<Resolved115Stream?> Function()? fallback115;
   final void Function(
     int position,
@@ -4780,6 +4791,7 @@ class _MediaFilePlayerDialog extends StatefulWidget {
     this.initialPosition,
     this.initialAudioTrackOrderIndex,
     this.OpenedFromExoFallback = false,
+    this.refreshEndpoint,
     this.fallback115,
     this.onEnterMiniPlayer,
   });
@@ -4805,8 +4817,11 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
   AudioTrack? _activeAudioTrack;
   bool _didApplyInitialAudioTrack = false;
   bool _tryingFallback = false;
+  bool _triedProxyFallback = false;
+  bool _triedRefreshEndpoint = false;
   bool _triedFallback = false;
   bool _reportedPlaybackError = false;
+  DateTime? _ignoreErrorsUntil;
   double _rate = 1.0;
   String _fitMode = 'fit'; // 'fit' (适应), 'cover' (铺满), 'fill' (拉伸)
   bool? _landscapeOverride;
@@ -4851,6 +4866,10 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
     _playbackErrors = _player.stream.error.listen((message) {
       final clean = message.trim();
       if (clean.isEmpty) return;
+      final ignoreUntil = _ignoreErrorsUntil;
+      if (ignoreUntil != null && DateTime.now().isBefore(ignoreUntil)) {
+        return;
+      }
       final hasStarted = _position > Duration.zero ||
           _duration > Duration.zero ||
           (_player.state.width ?? 0) > 0 ||
@@ -4870,7 +4889,9 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
           lower.contains('overread') ||
           lower.contains('loading aborted') ||
           lower.contains('operation was aborted') ||
-          lower.contains('audio device underrun');
+          lower.contains('audio device underrun') ||
+          lower.contains('cannot set property') ||
+          lower.contains('unknown option');
       if (isNonFatal) return;
       unawaited(_handlePlaybackError());
     });
@@ -4971,6 +4992,24 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
 
   Future<void> _openActiveStream({Duration? position}) async {
     unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
+    final targetUrl = RemoteStorageService.sanitizeStreamUrl(_activeUrl);
+    final extraHeaders = <String, String>{};
+    _activeHeaders.forEach((k, v) {
+      final lk = k.trim().toLowerCase();
+      if (v.trim().isEmpty) return;
+      // User-Agent and Referer are set via native libmpv properties below so
+      // FFmpeg http.c handles 302 redirects cleanly without sending duplicate headers.
+      if (lk == 'user-agent' ||
+          lk == 'referer' ||
+          lk == 'referrer' ||
+          lk == 'host' ||
+          lk == 'connection' ||
+          lk == 'range' ||
+          lk == 'content-length') {
+        return;
+      }
+      extraHeaders[k] = v;
+    });
     try {
       final dynamic platform = _player.platform;
       final ua = _activeHeaders['User-Agent'] ??
@@ -4981,12 +5020,14 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
           _activeHeaders['referer'] ??
           _activeHeaders['Referrer'] ??
           '';
-      if (referer.isNotEmpty) {
-        await platform.setProperty('referrer', referer);
-      }
+      await platform.setProperty('referrer', referer);
     } catch (_) {}
     await _player.open(
-      Media(_activeUrl, httpHeaders: _activeHeaders, start: position),
+      Media(
+        targetUrl,
+        httpHeaders: extraHeaders.isEmpty ? null : extraHeaders,
+        start: position,
+      ),
       play: true,
     );
     if (mounted && _rate != 1.0) await _player.setRate(_rate);
@@ -4994,41 +5035,73 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
 
   Future<void> _handlePlaybackError() async {
     if (!mounted || _tryingFallback) return;
-    // 1) If an AList direct proxy fallback URL (`/d/<path>?sign=...`) is available and we haven't tried it yet,
-    //    switch to it so AList generates a fresh 302 redirect (critical for iOS / macOS / 115 raw_url 403).
-    if (widget.fallbackUrl.isNotEmpty && _activeUrl != widget.fallbackUrl) {
+    _tryingFallback = true;
+    try {
       final position = _player.state.position;
-      setState(() {
-        _activeUrl = widget.fallbackUrl;
-      });
-      try {
-        await _openActiveStream(position: position);
-        return;
-      } catch (_) {}
-    }
-    final fallback = widget.fallback115;
-    if (fallback != null && !_triedFallback) {
-      _triedFallback = true;
-      _tryingFallback = true;
-      final position = _player.state.position;
-      try {
-        final alternate = await fallback();
-        if (!mounted) return;
-        if (alternate != null && alternate.proxyStreamUrl != _activeUrl) {
-          setState(() {
-            _activeUrl = alternate.proxyStreamUrl;
-            _activeHeaders = alternate.playbackHeaders;
-          });
-          _tryingFallback = false;
+
+      // 1) If an AList direct proxy fallback URL (`/d/<path>?sign=...`) is available and we haven't tried it yet,
+      //    switch to it so AList generates a fresh 302 redirect (critical for iOS / macOS / 115 raw_url 403).
+      if (!_triedProxyFallback &&
+          widget.fallbackUrl.isNotEmpty &&
+          _activeUrl != widget.fallbackUrl) {
+        _triedProxyFallback = true;
+        _ignoreErrorsUntil =
+            DateTime.now().add(const Duration(milliseconds: 900));
+        setState(() {
+          _activeUrl = RemoteStorageService.sanitizeStreamUrl(widget.fallbackUrl);
+        });
+        try {
           await _openActiveStream(position: position);
           return;
-        }
-      } catch (_) {
-        // Report the failure after both 115 playback routes have been tried.
-      } finally {
-        _tryingFallback = false;
+        } catch (_) {}
       }
+
+      // 2) If AList's cached `/api/fs/get` link was stale or expired, force AList to refresh
+      //    its directory & file link (`refresh: true`) and retry with the fresh URL + headers!
+      final refreshFn = widget.refreshEndpoint;
+      if (!_triedRefreshEndpoint && refreshFn != null) {
+        _triedRefreshEndpoint = true;
+        try {
+          final refreshed = await refreshFn();
+          if (!mounted) return;
+          final nextUrl =
+              RemoteStorageService.sanitizeStreamUrl(refreshed.url);
+          if (nextUrl.isNotEmpty) {
+            _ignoreErrorsUntil =
+                DateTime.now().add(const Duration(milliseconds: 900));
+            setState(() {
+              _activeUrl = nextUrl;
+              _activeHeaders = refreshed.headers;
+            });
+            await _openActiveStream(position: position);
+            return;
+          }
+        } catch (_) {}
+      }
+
+      // 3) 115 direct -> 115 cloud transcode fallback
+      final fallback = widget.fallback115;
+      if (fallback != null && !_triedFallback) {
+        _triedFallback = true;
+        try {
+          final alternate = await fallback();
+          if (!mounted) return;
+          if (alternate != null && alternate.proxyStreamUrl != _activeUrl) {
+            _ignoreErrorsUntil =
+                DateTime.now().add(const Duration(milliseconds: 900));
+            setState(() {
+              _activeUrl = alternate.proxyStreamUrl;
+              _activeHeaders = alternate.playbackHeaders;
+            });
+            await _openActiveStream(position: position);
+            return;
+          }
+        } catch (_) {}
+      }
+    } finally {
+      _tryingFallback = false;
     }
+
     if (!mounted || _reportedPlaybackError) return;
     _reportedPlaybackError = true;
     if (Platform.isAndroid && !widget.OpenedFromExoFallback) {
@@ -5036,9 +5109,13 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
       return;
     }
     ScaffoldMessenger.maybeOf(context)?.showSnackBar(
-      SnackBar(content: Text(fallback == null
-          ? '视频播放失败，请确认文件格式和网络连接'
-          : '115 原画和云转码均无法播放，请检查文件状态')),
+      SnackBar(
+        content: Text(
+          widget.fallback115 == null
+              ? '视频播放失败，请确认文件格式和网络连接'
+              : '115 原画和云转码均无法播放，请检查文件状态',
+        ),
+      ),
     );
   }
 
@@ -5047,7 +5124,7 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
       final dynamic platform = _player.platform;
       final isMobileOrTv = Platform.isAndroid || Platform.isIOS;
       final props = <String, String>{
-        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto-safe',
+        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto',
         'hwdec-codecs': 'h264,hevc,vp8,vp9,av1',
         'vd-lavc-check-hw-profile': 'yes',
         'vd-lavc-software-fallback': 'yes',
@@ -5061,8 +5138,6 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
         'hr-seek-framedrop': 'yes',
         'framedrop': 'vo',
         'demuxer-thread': 'yes',
-        'demuxer-lavf-probesize': '131072',
-        'demuxer-lavf-analyzeduration': '0.5',
         'cache': 'yes',
         'cache-on-disk': 'no',
         'cache-secs': isMobileOrTv ? '90' : '180',
@@ -5073,9 +5148,12 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
         'demuxer-max-back-bytes': isMobileOrTv ? '25165824' : '33554432',
         'demuxer-readahead-secs': isMobileOrTv ? '60' : '90',
         'stream-buffer-size': '2097152',
+        'network-timeout': '20',
         'tls-verify': 'no',
         'stream-lavf-o':
-            'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=4xx,5xx,reconnect_delay_max=3',
+            'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=5xx,reconnect_delay_max=3',
+        'demuxer-lavf-o':
+            'http_persistent=1,http_multiple=1,allowed_extensions=ALL,protocol_whitelist=file,http,https,httpproxy,tcp,tls,crypto,data,rtp,udp,subfile',
       };
       for (final entry in props.entries) {
         await platform.setProperty(entry.key, entry.value);
