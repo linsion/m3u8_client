@@ -1349,8 +1349,8 @@ class MainActivity : FlutterActivity() {
                 .setBufferDurationsMs(
                     15000, // minBufferMs
                     90000, // maxBufferMs
-                    1500,  // bufferForPlaybackMs
-                    3000   // bufferForPlaybackAfterRebufferMs
+                    500,   // bufferForPlaybackMs (fast start)
+                    1500   // bufferForPlaybackAfterRebufferMs
                 )
                 .setTargetBufferBytes(96 * 1024 * 1024)
                 .setPrioritizeTimeOverSizeThresholds(true)
@@ -1401,6 +1401,14 @@ class MainActivity : FlutterActivity() {
 
             // High-visibility Android TV & Mobile focus/touch styling
             val isTv = isAndroidTvDevice()
+            if (!isTv) {
+                if (savedExoOrientation == null) {
+                    savedExoOrientation = requestedOrientation
+                }
+                try {
+                    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                } catch (_: Exception) {}
+            }
             var normalPlaybackSpeed = 1.0f
             var isLongPressFastForward = false
             var currentResizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT

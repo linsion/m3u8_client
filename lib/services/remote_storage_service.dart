@@ -344,33 +344,46 @@ class RemoteStorageService {
     bool forceRefresh = false,
   }) async {
     final norm = normalizePath(path);
-    if (forceRefresh) {
-      final parentDir = parentPathOf(norm);
-      try {
-        await _alistJsonRequest(
-          mount,
-          '/api/fs/list',
-          {
-            'path': parentDir.isEmpty ? '/' : parentDir,
-            'password': '',
-            'page': 1,
-            'per_page': 50,
-            'refresh': true,
-          },
-          isRetry: true,
-        );
-      } catch (_) {}
+    Map<String, dynamic> root;
+    try {
+      root = await _alistJsonRequest(
+        mount,
+        '/api/fs/get',
+        {
+          'path': norm,
+          'password': '',
+          if (forceRefresh) 'refresh': true,
+        },
+        isRetry: forceRefresh,
+      );
+    } catch (_) {
+      if (forceRefresh) {
+        final parentDir = parentPathOf(norm);
+        try {
+          await _alistJsonRequest(
+            mount,
+            '/api/fs/list',
+            {
+              'path': parentDir.isEmpty ? '/' : parentDir,
+              'password': '',
+              'page': 1,
+              'per_page': 50,
+              'refresh': true,
+            },
+            isRetry: true,
+          );
+        } catch (_) {}
+      }
+      root = await _alistJsonRequest(
+        mount,
+        '/api/fs/get',
+        {
+          'path': norm,
+          'password': '',
+        },
+        isRetry: true,
+      );
     }
-    final root = await _alistJsonRequest(
-      mount,
-      '/api/fs/get',
-      {
-        'path': norm,
-        'password': '',
-        if (forceRefresh) 'refresh': true,
-      },
-      isRetry: forceRefresh,
-    );
     final data = root['data'];
     final base = cleanBaseUrl(mount.baseUrl);
     final encodedPath = norm.split('/').map(Uri.encodeComponent).join('/');

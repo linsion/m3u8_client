@@ -2012,6 +2012,12 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
     super.initState();
     if (Platform.isAndroid || Platform.isIOS) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+      _landscapeOverride = true;
+      _didChangeOrientation = true;
+      SystemChrome.setPreferredOrientations(const [
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+      ]);
     }
     unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
     _player = Player(
@@ -2117,7 +2123,11 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
         'cache-secs': isMobileOrTv ? '90' : '150',
         'demuxer-max-bytes': isMobileOrTv ? '100663296' : '167772160',
         'demuxer-readahead-secs': isMobileOrTv ? '60' : '90',
-        'stream-buffer-size': '2097152',
+        'stream-buffer-size': '262144',
+        'demuxer-lavf-probesize': '1572864',
+        'demuxer-lavf-analyzeduration': '1.5',
+        'demuxer-mkv-probe-start-time': 'no',
+        'demuxer-mkv-probe-video-duration': 'no',
         'tls-verify': 'no',
       };
       for (final entry in props.entries) {
