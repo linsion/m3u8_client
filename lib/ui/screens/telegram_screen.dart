@@ -14,6 +14,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../../models/models.dart';
 import '../../services/proxy_routing_service.dart';
+import '../../services/tv_platform_service.dart';
 import '../../state/app_state.dart';
 import '../theme.dart';
 import '../widgets/cloud_music_player.dart';
@@ -468,7 +469,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
     CloudMusicController.registerExternalAudioStopper(_stopAndCloseAudioPlayer);
     _messageScrollController.addListener(_onMessageScroll);
     widget.appState.addListener(_onAppStateChanged);
-    _nativeUtilsChannel.setMethodCallHandler(_handleNativeUtilsMethodCall);
+    NativeUtilsChannelHub.addListener(_handleNativeUtilsMethodCall);
     _notifEventSub = widget.appState.telegramNotifications.eventStream.listen(
       _onRealtimeNotificationEvent,
     );
@@ -480,8 +481,16 @@ class _TelegramScreenState extends State<TelegramScreen> {
     });
   }
 
+  bool _isPickingFiles = false;
+
   Future<dynamic> _handleNativeUtilsMethodCall(MethodCall call) async {
     if (!mounted) return null;
+    if (!widget.appState.isTelegramViewActive) {
+      if (_isDraggingFilesOverChat) {
+        setState(() => _isDraggingFilesOverChat = false);
+      }
+      return null;
+    }
     if (call.method == 'onFileDragUpdated') {
       final args = call.arguments;
       final active =
@@ -508,6 +517,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
         for (final item in rawList) {
           if (item is Map) {
             final name = (item['name'] ?? '附件').toString();
+            final mime = _guessMimeType(name);
             Uint8List bytes = item['bytes'] is Uint8List
                 ? item['bytes'] as Uint8List
                 : Uint8List(0);
@@ -521,8 +531,9 @@ class _TelegramScreenState extends State<TelegramScreen> {
                     size = await fileObj.length();
                   }
                   if (bytes.isEmpty &&
+                      mime.startsWith('image/') &&
                       size > 0 &&
-                      size <= 25 * 1024 * 1024) {
+                      size <= 8 * 1024 * 1024) {
                     bytes = await fileObj.readAsBytes();
                   }
                 }
@@ -534,7 +545,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
                 TelegramOutgoingFile(
                   name: name,
                   bytes: bytes,
-                  mimeType: _guessMimeType(name),
+                  mimeType: mime,
                   filePath: path,
                   fileSize: size,
                 ),
@@ -1432,6 +1443,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
   @override
   void dispose() {
+    NativeUtilsChannelHub.removeListener(_handleNativeUtilsMethodCall);
     CloudMusicController.unregisterExternalAudioStopper(
       _stopAndCloseAudioPlayer,
     );
@@ -3359,103 +3371,116 @@ class _TelegramScreenState extends State<TelegramScreen> {
     required bool asFile,
   }) async {
     final chat = _selectedChat;
-    if (chat == null || chat.readOnly) return;
+    if (chat == null || chat.readOnly || _isPickingFiles) return;
+    _isPickingFiles = true;
 
-    final pickedFiles = <TelegramOutgoingFile>[];
+    try {
+      final pickedFiles = <TelegramOutgoingFile>[];
 
-    // 1. Try native MethodChannel file picker on macOS & Windows
-    if (Platform.isMacOS || Platform.isWindows) {
-      try {
-        final rawList = await _nativeUtilsChannel.invokeMethod<dynamic>(
-          'pickFiles',
-          {'mediaOnly': mediaOnly},
-        );
-        if (rawList is List) {
-          for (final item in rawList) {
-            if (item is Map) {
-              final name = (item['name'] ?? '附件').toString();
-              Uint8List bytes = item['bytes'] is Uint8List
-                  ? item['bytes'] as Uint8List
-                  : Uint8List(0);
-              final path = item['path']?.toString();
-              int size = (item['size'] as num?)?.toInt() ?? bytes.length;
-              if (path != null && path.isNotEmpty) {
-                try {
-                  final fileObj = File(path);
-                  if (await fileObj.exists()) {
-                    if (size <= 0) {
-                      size = await fileObj.length();
+      // 1. Try native MethodChannel file picker on macOS & Windows
+      if (Platform.isMacOS || Platform.isWindows) {
+        try {
+          final rawList = await _nativeUtilsChannel.invokeMethod<dynamic>(
+            'pickFiles',
+            {'mediaOnly': mediaOnly},
+          );
+          if (rawList is List) {
+            for (final item in rawList) {
+              if (item is Map) {
+                final name = (item['name'] ?? '附件').toString();
+                final mime = _guessMimeType(name);
+                Uint8List bytes = item['bytes'] is Uint8List
+                    ? item['bytes'] as Uint8List
+                    : Uint8List(0);
+                final path = item['path']?.toString();
+                int size = (item['size'] as num?)?.toInt() ?? bytes.length;
+                if (path != null && path.isNotEmpty) {
+                  try {
+                    final fileObj = File(path);
+                    if (await fileObj.exists()) {
+                      if (size <= 0) {
+                        size = await fileObj.length();
+                      }
+                      if (bytes.isEmpty &&
+                          mime.startsWith('image/') &&
+                          size > 0 &&
+                          size <= 8 * 1024 * 1024) {
+                        bytes = await fileObj.readAsBytes();
+                      }
                     }
-                    if (bytes.isEmpty &&
-                        size > 0 &&
-                        size <= 25 * 1024 * 1024) {
-                      bytes = await fileObj.readAsBytes();
-                    }
-                  }
-                } catch (_) {}
-              }
-              if (size > 0 &&
-                  (bytes.isNotEmpty || (path != null && path.isNotEmpty))) {
-                pickedFiles.add(
-                  TelegramOutgoingFile(
-                    name: name,
-                    bytes: bytes,
-                    mimeType: _guessMimeType(name),
-                    filePath: path,
-                    fileSize: size,
-                  ),
-                );
+                  } catch (_) {}
+                }
+                if (size > 0 &&
+                    (bytes.isNotEmpty || (path != null && path.isNotEmpty))) {
+                  pickedFiles.add(
+                    TelegramOutgoingFile(
+                      name: name,
+                      bytes: bytes,
+                      mimeType: mime,
+                      filePath: path,
+                      fileSize: size,
+                    ),
+                  );
+                }
               }
             }
+            if (pickedFiles.isNotEmpty && mounted) {
+              _stageOrPreviewOutgoingFiles(
+                pickedFiles,
+                asFile: asFile,
+                openPreviewDialog: true,
+                dialogTitle: asFile ? '作为无损文件发送' : '发送图片与视频',
+              );
+            }
+            return;
           }
-          if (pickedFiles.isNotEmpty && mounted) {
-            _stageOrPreviewOutgoingFiles(
-              pickedFiles,
-              asFile: asFile,
-              openPreviewDialog: true,
-              dialogTitle: asFile ? '作为无损文件发送' : '发送图片与视频',
-            );
-          }
-          return;
-        }
-      } catch (_) {}
-    }
+        } catch (_) {}
+      }
 
-    // 2. Fallback: Built-in cross-platform local file browser dialog
-    if (!mounted) return;
-    final selectedPaths = await showDialog<List<String>>(
-      context: context,
-      builder: (_) => _LocalFilePickerFallbackDialog(mediaOnly: mediaOnly),
-    );
-    if (!mounted || selectedPaths == null || selectedPaths.isEmpty) return;
-
-    for (final p in selectedPaths.take(10)) {
-      try {
-        final f = File(p);
-        if (await f.exists()) {
-          final bytes = await f.readAsBytes();
-          if (bytes.isNotEmpty) {
-            final name = p.split(Platform.pathSeparator).last;
-            pickedFiles.add(
-              TelegramOutgoingFile(
-                name: name,
-                bytes: bytes,
-                mimeType: _guessMimeType(name),
-                filePath: p,
-              ),
-            );
-          }
-        }
-      } catch (_) {}
-    }
-
-    if (pickedFiles.isNotEmpty && mounted) {
-      _stageOrPreviewOutgoingFiles(
-        pickedFiles,
-        asFile: asFile,
-        openPreviewDialog: true,
-        dialogTitle: asFile ? '作为无损文件发送' : '发送图片与视频',
+      // 2. Fallback: Built-in cross-platform local file browser dialog
+      if (!mounted) return;
+      final selectedPaths = await showDialog<List<String>>(
+        context: context,
+        builder: (_) => _LocalFilePickerFallbackDialog(mediaOnly: mediaOnly),
       );
+      if (!mounted || selectedPaths == null || selectedPaths.isEmpty) return;
+
+      for (final p in selectedPaths.take(10)) {
+        try {
+          final f = File(p);
+          if (await f.exists()) {
+            final size = await f.length();
+            if (size > 0) {
+              final name = p.split(Platform.pathSeparator).last;
+              final mime = _guessMimeType(name);
+              Uint8List bytes = Uint8List(0);
+              if (mime.startsWith('image/') && size <= 8 * 1024 * 1024) {
+                bytes = await f.readAsBytes();
+              }
+              pickedFiles.add(
+                TelegramOutgoingFile(
+                  name: name,
+                  bytes: bytes,
+                  mimeType: mime,
+                  filePath: p,
+                  fileSize: size,
+                ),
+              );
+            }
+          }
+        } catch (_) {}
+      }
+
+      if (pickedFiles.isNotEmpty && mounted) {
+        _stageOrPreviewOutgoingFiles(
+          pickedFiles,
+          asFile: asFile,
+          openPreviewDialog: true,
+          dialogTitle: asFile ? '作为无损文件发送' : '发送图片与视频',
+        );
+      }
+    } finally {
+      _isPickingFiles = false;
     }
   }
 
@@ -12047,10 +12072,30 @@ class _TelegramScreenState extends State<TelegramScreen> {
                     onSelected: (action) {
                       switch (action) {
                         case 'media':
-                          _pickFilesToAttach(mediaOnly: true, asFile: false);
+                          Future<void>.delayed(
+                            const Duration(milliseconds: 50),
+                            () {
+                              if (mounted) {
+                                _pickFilesToAttach(
+                                  mediaOnly: true,
+                                  asFile: false,
+                                );
+                              }
+                            },
+                          );
                           break;
                         case 'file':
-                          _pickFilesToAttach(mediaOnly: false, asFile: true);
+                          Future<void>.delayed(
+                            const Duration(milliseconds: 50),
+                            () {
+                              if (mounted) {
+                                _pickFilesToAttach(
+                                  mediaOnly: false,
+                                  asFile: true,
+                                );
+                              }
+                            },
+                          );
                           break;
                         case 'quick_reply':
                           _showQuickRepliesDialog(tg);
@@ -12206,10 +12251,30 @@ class _TelegramScreenState extends State<TelegramScreen> {
                   onSelected: (action) {
                     switch (action) {
                       case 'media':
-                        _pickFilesToAttach(mediaOnly: true, asFile: false);
+                        Future<void>.delayed(
+                          const Duration(milliseconds: 50),
+                          () {
+                            if (mounted) {
+                              _pickFilesToAttach(
+                                mediaOnly: true,
+                                asFile: false,
+                              );
+                            }
+                          },
+                        );
                         break;
                       case 'file':
-                        _pickFilesToAttach(mediaOnly: false, asFile: true);
+                        Future<void>.delayed(
+                          const Duration(milliseconds: 50),
+                          () {
+                            if (mounted) {
+                              _pickFilesToAttach(
+                                mediaOnly: false,
+                                asFile: true,
+                              );
+                            }
+                          },
+                        );
                         break;
                       case 'paste':
                         _pasteClipboardImageOrFiles(showEmptyToast: true);
@@ -14121,17 +14186,25 @@ class _TelegramSendPreviewDialogState
                       border: Border.all(color: tg.borderLine),
                     ),
                     clipBehavior: Clip.antiAlias,
-                    child: currentFile.isImage && currentFile.bytes.isNotEmpty
+                    child: currentFile.isImage &&
+                            (currentFile.bytes.isNotEmpty ||
+                                (currentFile.filePath != null &&
+                                    currentFile.filePath!.isNotEmpty))
                         ? Stack(
                             fit: StackFit.expand,
                             children: [
                               InteractiveViewer(
                                 minScale: 0.6,
                                 maxScale: 4.0,
-                                child: Image.memory(
-                                  currentFile.bytes,
-                                  fit: BoxFit.contain,
-                                ),
+                                child: currentFile.bytes.isNotEmpty
+                                    ? Image.memory(
+                                        currentFile.bytes,
+                                        fit: BoxFit.contain,
+                                      )
+                                    : Image.file(
+                                        File(currentFile.filePath!),
+                                        fit: BoxFit.contain,
+                                      ),
                               ),
                               Positioned(
                                 left: 10,

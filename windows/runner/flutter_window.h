@@ -7,6 +7,7 @@
 #include <flutter/method_channel.h>
 #include <ole2.h>
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -22,6 +23,8 @@ class FlutterWindow : public Win32Window {
 
   void NotifyFileDragUpdated(bool active);
   void NotifyFilesDropped(const std::vector<std::wstring>& paths);
+  void PostFileDragDelta(int delta);
+  void PostFilesDropped(std::vector<std::wstring> paths);
 
  protected:
   // Win32Window:
@@ -40,8 +43,17 @@ class FlutterWindow : public Win32Window {
   // Native utility method channel (file drag-and-drop & file picker).
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> utils_channel_;
 
-  // OLE drag-and-drop target registered on the window.
-  IDropTarget* drop_target_ = nullptr;
+  // Separate OLE drag-and-drop targets for top frame and child Flutter view so
+  // crossing from window frame into child view never clears `has_files_`.
+  IDropTarget* top_drop_target_ = nullptr;
+  IDropTarget* child_drop_target_ = nullptr;
+  int active_drag_targets_ = 0;
+
+  // Tracks whether an async file picker dialog is currently open.
+  std::atomic<bool> is_picking_files_{false};
+
+  // Shared alive flag for background worker threads.
+  std::shared_ptr<std::atomic<bool>> window_alive_;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

@@ -113,12 +113,13 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
   void initState() {
     super.initState();
     _mounts = _buildBuiltInMounts();
-    _nativeUtilsChannel.setMethodCallHandler(_handleNativeDropMethodCall);
+    NativeUtilsChannelHub.addListener(_handleNativeDropMethodCall);
     _initPrefsAndLoad();
   }
 
   @override
   void dispose() {
+    NativeUtilsChannelHub.removeListener(_handleNativeDropMethodCall);
     _searchController.dispose();
     if (widget.appState.activeChildBackHandler == _handleBackPress) {
       widget.appState.activeChildBackHandler = null;
@@ -168,6 +169,12 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
 
   Future<dynamic> _handleNativeDropMethodCall(MethodCall call) async {
     if (!mounted) return null;
+    if (widget.appState.isTelegramViewActive) {
+      if (_isDraggingFilesOverManager) {
+        setState(() => _isDraggingFilesOverManager = false);
+      }
+      return null;
+    }
     if (call.method == 'onFileDragUpdated') {
       final args = call.arguments;
       final active = args is Map && args['active'] == true;

@@ -369,3 +369,47 @@ class TvLanInputService extends ChangeNotifier {
 ''';
   }
 }
+
+/// Centralized dispatcher for the `com.linsion.m3u8_client/native_utils` MethodChannel
+/// so multiple screens (`TelegramScreen`, `MediaLibraryScreen`) can subscribe to native
+/// drag-and-drop events (`onFileDragUpdated`, `onFilesDropped`) without overwriting each
+/// other's `setMethodCallHandler`.
+class NativeUtilsChannelHub {
+  NativeUtilsChannelHub._();
+
+  static const MethodChannel channel = MethodChannel(
+    'com.linsion.m3u8_client/native_utils',
+  );
+
+  static bool _initialized = false;
+  static final List<Future<dynamic> Function(MethodCall call)> _listeners = [];
+
+  static void addListener(Future<dynamic> Function(MethodCall call) listener) {
+    if (!_initialized) {
+      _initialized = true;
+      channel.setMethodCallHandler(_dispatch);
+    }
+    if (!_listeners.contains(listener)) {
+      _listeners.add(listener);
+    }
+  }
+
+  static void removeListener(
+    Future<dynamic> Function(MethodCall call) listener,
+  ) {
+    _listeners.remove(listener);
+  }
+
+  static Future<dynamic> _dispatch(MethodCall call) async {
+    final snapshot = List<Future<dynamic> Function(MethodCall call)>.from(
+      _listeners,
+    );
+    for (final listener in snapshot) {
+      try {
+        await listener(call);
+      } catch (_) {}
+    }
+    return null;
+  }
+}
+
