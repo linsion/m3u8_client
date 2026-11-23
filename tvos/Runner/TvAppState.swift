@@ -3529,22 +3529,21 @@ final class TvAppState: ObservableObject {
       }
 
       // 2. Direct 115 Cloud Drive playback:
-      // - For .mp4 / .mov / .m4v, OR huge files (>= 10 GB where 115 cloud transcode is unavailable), resolve `resolvePickcodeStreamUrl` directly!
-      // - For < 10 GB non-MP4 containers (.mkv / .avi / .rmvb / .wmv / .flv / .ts), try `resolvePickcodeHlsM3u8Url` first and fall back to `resolvePickcodeStreamUrl`
+      // - For .mp4 / .mov / .m4v / .mkv / .webm / .ts / .m2ts / .mts: stream original 4K raw file via VidHub-grade 2 MB Range block proxy + hardware VideoToolbox engine!
+      // - For legacy containers (.avi / .rmvb / .wmv / .flv / .f4v / .iso): try 115 official cloud HLS transcode (`resolvePickcodeHlsM3u8Url`) first and fall back to direct stream
       if entry.sourceKind == .cloud115 {
         guard !entry.pickcode115.isEmpty else {
           self.showToast("⚠️ 该 115 文件缺少 pickcode，无法播放")
           return
         }
         let ext = entry.normalizedExt
-        let isHugeRemuxFile = entry.size >= 10 * 1024 * 1024 * 1024
-        let needsHlsTranscode = !isHugeRemuxFile && [".f4v", ".flv", ".mkv", ".avi", ".rmvb", ".wmv", ".ts", ".webm", ".iso"].contains(ext)
+        let preferCloudHlsTranscode = [".f4v", ".flv", ".avi", ".rmvb", ".wmv", ".iso"].contains(ext)
 
         var primaryStream = ""
         var backupStream = ""
         var hdrs: [String: String] = [:]
 
-        if needsHlsTranscode {
+        if preferCloudHlsTranscode {
           if let hls = await TvLocal115DirectClient.shared.resolvePickcodeHlsM3u8Url(pickcode: entry.pickcode115),
              !hls.isEmpty {
             hdrs = TvLocal115DirectClient.shared.streamHeaders(forUrl: hls)
@@ -3629,8 +3628,7 @@ final class TvAppState: ObservableObject {
         if entry.sourceKind == .alist {
           let mount = self.storageMounts.first(where: { $0.id == entry.mountId }) ?? self.activeStorageMount
           let ext = entry.normalizedExt
-          let isHugeRemuxFile = entry.size >= 10 * 1024 * 1024 * 1024
-          let isNonMp4Container = !isHugeRemuxFile && [".mkv", ".avi", ".rmvb", ".wmv", ".ts", ".webm", ".iso"].contains(ext)
+          let preferCloudHlsTranscode = [".avi", ".rmvb", ".wmv", ".flv", ".f4v", ".iso"].contains(ext)
 
           async let infoTask = TvRemoteStorageClient.shared.resolveAlistStreamInfo(
             mount: mount,
@@ -3638,7 +3636,7 @@ final class TvAppState: ObservableObject {
             fallbackUrl: entry.rawDownloadUrl
           )
           var previewHls: (url: String, headers: [String: String])? = nil
-          if isNonMp4Container {
+          if preferCloudHlsTranscode {
             previewHls = await TvRemoteStorageClient.shared.resolveAlistVideoPreviewHlsUrl(
               mount: mount,
               path: entry.path
@@ -3671,9 +3669,19 @@ final class TvAppState: ObservableObject {
               remoteUrl: info.url,
               headers: playHeaders,
               extHint: ext.isEmpty ? ".mp4" : ext,
-              forceDirectConnection: true
+              forceDirectConnection: true,
+              fallbackRemoteUrl: info.alistProxyUrl
             )
-            backupUrl = primaryUrl
+            if !info.alistProxyUrl.isEmpty && info.alistProxyUrl != info.url {
+              backupUrl = TvLocalHlsProxyServer.shared.prepareTelegramVideoProxyUrl(
+                remoteUrl: info.alistProxyUrl,
+                headers: playHeaders,
+                extHint: ext.isEmpty ? ".mp4" : ext,
+                forceDirectConnection: true
+              )
+            } else {
+              backupUrl = primaryUrl
+            }
           }
 
           self.playerControlsVisible = true
