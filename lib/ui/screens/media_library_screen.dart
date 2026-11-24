@@ -5210,7 +5210,8 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
           await platform.setProperty('demuxer-lavf-format', 'rm');
           await platform.setProperty('hwdec', 'no');
         } else if (isDisguisedMatroska) {
-          await platform.setProperty('demuxer-lavf-format', 'matroska');
+          await platform.setProperty('hwdec', 'no');
+          await platform.setProperty('demuxer-lavf-format', '');
         } else {
           await platform.setProperty('demuxer-lavf-format', '');
         }

@@ -195,6 +195,17 @@ jobs:
           BUILD_NAME="${VERSION_TAG#v}"
           BUILD_NUM=$((100 + GITHUB_RUN_NUMBER))
           flutter pub get
+          # Replace media-kit's stripped libmpv-win32-video-build (which lacks rv40, rv30, cook, etc.)
+          # with the full-codec mpv-winbuild-cmake libmpv-2.dll so RMVB / RealVideo 4.0 + COOK play natively.
+          FULL_LIBMPV_URL="https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261111/mpv-dev-x86_64-20261111-git-bcde6b93cc.7z"
+          FULL_LIBMPV_MD5="8efd65a1dd0815a860850ad8455bb9fa"
+          for cmake_file in "$LOCALAPPDATA"/Pub/Cache/hosted/pub.dev/media_kit_libs_windows_video-*/windows/CMakeLists.txt; do
+            if [ -f "$cmake_file" ]; then
+              sed -i 's|set(LIBMPV "mpv-dev-x86_64-.*")|set(LIBMPV "mpv-dev-x86_64-20261111-git-bcde6b93cc.7z")|g' "$cmake_file"
+              sed -i "s|set(LIBMPV_URL \".*\")|set(LIBMPV_URL \"$FULL_LIBMPV_URL\")|g" "$cmake_file"
+              sed -i "s|set(LIBMPV_MD5 \".*\")|set(LIBMPV_MD5 \"$FULL_LIBMPV_MD5\")|g" "$cmake_file"
+            fi
+          done
           flutter build windows --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUM"
           mkdir -p dist
           (cd build/windows/x64/runner/Release && 7z a -tzip "$GITHUB_WORKSPACE/dist/LiuguangVideo-Windows-x64-${VERSION_TAG}.zip" .)

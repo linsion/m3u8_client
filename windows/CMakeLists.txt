@@ -87,6 +87,38 @@ if(PLUGIN_BUNDLED_LIBRARIES)
     COMPONENT Runtime)
 endif()
 
+# Override media_kit_libs_windows_video's stripped libmpv-2.dll (which lacks RealVideo 3.0/4.0
+# and RealAudio COOK decoders) with the full-codec mpv-winbuild-cmake libmpv-2.dll.
+set(FULL_LIBMPV_ARCHIVE "${CMAKE_BINARY_DIR}/mpv-dev-x86_64-20261111-git-bcde6b93cc.7z")
+set(FULL_LIBMPV_URL "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261111/mpv-dev-x86_64-20261111-git-bcde6b93cc.7z")
+set(FULL_LIBMPV_MD5 "8efd65a1dd0815a860850ad8455bb9fa")
+set(FULL_LIBMPV_DIR "${CMAKE_BINARY_DIR}/full_libmpv")
+if(EXISTS "${FULL_LIBMPV_ARCHIVE}")
+  file(MD5 "${FULL_LIBMPV_ARCHIVE}" FULL_LIBMPV_CUR_MD5)
+  if(NOT FULL_LIBMPV_CUR_MD5 STREQUAL FULL_LIBMPV_MD5)
+    file(REMOVE "${FULL_LIBMPV_ARCHIVE}")
+  endif()
+endif()
+if(NOT EXISTS "${FULL_LIBMPV_ARCHIVE}")
+  message(STATUS "Downloading full-codec libmpv archive from ${FULL_LIBMPV_URL}...")
+  file(DOWNLOAD "${FULL_LIBMPV_URL}" "${FULL_LIBMPV_ARCHIVE}")
+endif()
+if(NOT EXISTS "${FULL_LIBMPV_DIR}/libmpv-2.dll")
+  file(MAKE_DIRECTORY "${FULL_LIBMPV_DIR}")
+  execute_process(
+    COMMAND "${CMAKE_COMMAND}" -E tar xzf "${FULL_LIBMPV_ARCHIVE}"
+    WORKING_DIRECTORY "${FULL_LIBMPV_DIR}"
+  )
+endif()
+if(EXISTS "${FULL_LIBMPV_DIR}/libmpv-2.dll")
+  if(EXISTS "${CMAKE_BINARY_DIR}/libmpv")
+    file(COPY "${FULL_LIBMPV_DIR}/libmpv-2.dll" DESTINATION "${CMAKE_BINARY_DIR}/libmpv")
+  endif()
+  install(FILES "${FULL_LIBMPV_DIR}/libmpv-2.dll"
+    DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+    COMPONENT Runtime)
+endif()
+
 # Copy the native assets provided by the build.dart from all packages.
 set(NATIVE_ASSETS_DIR "${PROJECT_BUILD_DIR}native_assets/windows/")
 install(DIRECTORY "${NATIVE_ASSETS_DIR}"
