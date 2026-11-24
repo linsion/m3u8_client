@@ -466,9 +466,6 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
           subtitle: '${mount.name} · ${entry.formattedSize}',
         );
       case StorageSourceKind.smb:
-        if (forceRefresh) {
-          await SmbClientService.instance.resetAllSessions();
-        }
         final url = await SmbClientService.instance.buildLocalStreamUrl(
           mount,
           entry.path,
@@ -4983,7 +4980,14 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
           lower.contains('operation was aborted') ||
           lower.contains('audio device underrun') ||
           lower.contains('cannot set property') ||
+          lower.contains('property not found') ||
           lower.contains('unknown option') ||
+          lower.contains('option not found') ||
+          lower.contains('hwdec') ||
+          lower.contains('d3d11') ||
+          lower.contains('dxva2') ||
+          lower.contains('nvdec') ||
+          lower.contains('hardware decoding') ||
           lower.contains('stream ends prematurely') ||
           lower.contains('invalid data found when processing input');
       if (isNonFatal) return;
@@ -5133,6 +5137,31 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
     }
   }
 
+  Future<String?> _sniffLocalFileContainerMime(String filePathOrUrl) async {
+    if (filePathOrUrl.isEmpty ||
+        filePathOrUrl.startsWith('http://') ||
+        filePathOrUrl.startsWith('https://') ||
+        filePathOrUrl.startsWith('smb://')) {
+      return null;
+    }
+    try {
+      String localPath = filePathOrUrl;
+      if (localPath.startsWith('file://')) {
+        localPath = Uri.parse(localPath).toFilePath();
+      }
+      final file = File(localPath);
+      if (!await file.exists()) return null;
+      final head = <int>[];
+      await for (final chunk in file.openRead(0, 32)) {
+        head.addAll(chunk);
+        if (head.length >= 16) break;
+      }
+      return SmbClientService.sniffContainerMimeType(Uint8List.fromList(head));
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<void> _openActiveStream({Duration? position}) async {
     unawaited(CloudMusicController.stopAllBackgroundAudioForVideo());
     final targetUrl = RemoteStorageService.sanitizeStreamUrl(_activeUrl);
@@ -5151,17 +5180,41 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
       }
       extraHeaders[k] = v;
     });
+    final sniffedLocalMime = await _sniffLocalFileContainerMime(targetUrl);
+    final urlPathLower =
+        (Uri.tryParse(targetUrl)?.path ?? targetUrl).toLowerCase();
+    final isRealMedia =
+        sniffedLocalMime == 'application/vnd.rn-realmedia' ||
+        urlPathLower.endsWith('.rmvb') ||
+        urlPathLower.endsWith('.rm');
+    final isDisguisedMatroska =
+        sniffedLocalMime == 'video/x-matroska' &&
+        !urlPathLower.endsWith('.mkv');
     try {
       final dynamic platform = _player.platform;
       final ua = _activeHeaders['User-Agent'] ??
           _activeHeaders['user-agent'] ??
           RemoteStorageService.defaultBrowserUserAgent;
-      await platform.setProperty('user-agent', ua);
+      try {
+        await platform.setProperty('user-agent', ua);
+      } catch (_) {}
       final referer = _activeHeaders['Referer'] ??
           _activeHeaders['referer'] ??
           _activeHeaders['Referrer'] ??
           '';
-      await platform.setProperty('referrer', referer);
+      try {
+        await platform.setProperty('referrer', referer);
+      } catch (_) {}
+      try {
+        if (isRealMedia) {
+          await platform.setProperty('demuxer-lavf-format', 'rm');
+          await platform.setProperty('hwdec', 'no');
+        } else if (isDisguisedMatroska) {
+          await platform.setProperty('demuxer-lavf-format', 'matroska');
+        } else {
+          await platform.setProperty('demuxer-lavf-format', '');
+        }
+      } catch (_) {}
     } catch (_) {}
     await _player.setVolume(_volumePercent);
     await _player.open(
@@ -5264,9 +5317,24 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
     }
 
     if (!mounted || _reportedPlaybackError) return;
-    // Wait a brief grace period to make sure playback didn't recover or start asynchronously
-    // during demuxer range probing (e.g. SMB / MKV cue seeking at EOF).
-    await Future<void>.delayed(const Duration(milliseconds: 1200));
+    // Wait while libmpv is actively probing/buffering (up to 3.2 seconds)
+    // so large SMB / MKV / RMVB files are never falsely declared failed during header/cue seek.
+    for (int waitTick = 0; waitTick < 8; waitTick++) {
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+      if (!mounted || _reportedPlaybackError) return;
+      final started = (_position > Duration.zero ||
+          _duration > Duration.zero ||
+          _player.state.position > Duration.zero ||
+          _player.state.duration > Duration.zero ||
+          (_player.state.width ?? 0) > 0 ||
+          (_player.state.height ?? 0) > 0 ||
+          _audioTracks.any((t) => t.id != 'auto' && t.id != 'no') ||
+          _subtitleTracks.isNotEmpty);
+      if (started) return;
+      if (!_isBuffering && !_player.state.buffering && waitTick >= 2) {
+        break;
+      }
+    }
     if (!mounted || _reportedPlaybackError) return;
     final hasStartedNow = _isPlaying &&
         (_position > Duration.zero ||
@@ -5303,9 +5371,8 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
       final dynamic platform = _player.platform;
       final isMobileOrTv = Platform.isAndroid || Platform.isIOS;
       final props = <String, String>{
-        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto',
+        'hwdec': Platform.isAndroid ? 'mediacodec-copy' : 'auto-safe',
         'hwdec-codecs': 'h264,hevc,vp8,vp9,av1',
-        'vd-lavc-check-hw-profile': 'yes',
         'vd-lavc-software-fallback': 'yes',
         'vd-lavc-dr': 'yes',
         'vd-lavc-fast': 'no',
@@ -5323,12 +5390,11 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
         'hr-seek-framedrop': 'yes',
         'framedrop': 'vo',
         'demuxer-thread': 'yes',
-        // Fast-start tuning: 256KB stream block size + 1.5MB probesize + no MKV end-of-file duration seek
+        // Fast-start & disguised RMVB/MKV tuning: 256KB stream block size + 5MB probesize
         'stream-buffer-size': '262144',
-        'demuxer-lavf-probesize': '1572864',
-        'demuxer-lavf-analyzeduration': '1.5',
+        'demuxer-lavf-probesize': '5242880',
+        'demuxer-lavf-analyzeduration': '3.0',
         'demuxer-mkv-probe-start-time': 'no',
-        'demuxer-mkv-probe-video-duration': 'no',
         'cache': 'yes',
         'cache-on-disk': 'no',
         'cache-secs': isMobileOrTv ? '90' : '180',
@@ -5344,7 +5410,9 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
             'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=5xx,reconnect_delay_max=3',
       };
       for (final entry in props.entries) {
-        await platform.setProperty(entry.key, entry.value);
+        try {
+          await platform.setProperty(entry.key, entry.value);
+        } catch (_) {}
       }
     } catch (_) {}
   }

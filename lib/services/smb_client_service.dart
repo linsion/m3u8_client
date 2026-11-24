@@ -228,6 +228,112 @@ class SmbClientService {
     );
   }
 
+  static String applySniffedExtensionToFileName(
+    String rawName,
+    String? sniffedMime,
+  ) {
+    if (sniffedMime == null || sniffedMime.isEmpty) return rawName;
+    final trueExt = switch (sniffedMime) {
+      'video/x-matroska' => '.mkv',
+      'application/vnd.rn-realmedia' => '.rmvb',
+      'video/x-msvideo' => '.avi',
+      'video/x-flv' => '.flv',
+      'video/ogg' => '.ogv',
+      'video/mp4' => '.mp4',
+      _ => '',
+    };
+    if (trueExt.isEmpty) return rawName;
+    final dotIdx = rawName.lastIndexOf('.');
+    if (dotIdx > 0) {
+      final curExt = rawName.substring(dotIdx).toLowerCase();
+      if (curExt != trueExt) {
+        return '${rawName.substring(0, dotIdx)}$trueExt';
+      }
+      return rawName;
+    }
+    return '$rawName$trueExt';
+  }
+
+  Future<String?> _sniffSmbFileMimeType(
+    StorageMount mount,
+    String normVirtualPath,
+  ) async {
+    final cacheKey = '${mount.id}:$normVirtualPath';
+    final cached = _sniffedMimeCache[cacheKey];
+    if (cached != null) return cached;
+    final target = parseSmbTarget(mount, normVirtualPath);
+    if (target.host.isEmpty || target.share.isEmpty || target.relPath.isEmpty) {
+      return null;
+    }
+    _Smb2Connection? conn;
+    Uint8List? fileId;
+    var canPool = true;
+    try {
+      conn = await _acquirePooledConnection(
+        host: target.host,
+        port: target.port,
+        share: target.share,
+        username: mount.username,
+        password: mount.password,
+        domainHint: mount.token,
+      );
+      ({Uint8List fileId, int fileSize, bool isDir}) opened;
+      try {
+        opened = await conn.openFileForRead(target.relPath);
+      } catch (_) {
+        await conn.close();
+        conn = await _Smb2Connection.connectAndAuthenticate(
+          host: target.host,
+          port: target.port,
+          username: mount.username,
+          password: mount.password,
+          domainHint: mount.token,
+        );
+        await conn.treeConnect(target.share);
+        opened = await conn.openFileForRead(target.relPath);
+      }
+      fileId = opened.fileId;
+      if (opened.fileSize >= 16) {
+        final head = await conn.readFileChunk(
+          fileId: fileId,
+          offset: 0,
+          length: 32,
+        );
+        final sniffed = sniffContainerMimeType(head);
+        if (sniffed != null) {
+          _sniffedMimeCache[cacheKey] = sniffed;
+          return sniffed;
+        }
+      }
+    } catch (_) {
+      canPool = false;
+    } finally {
+      if (conn != null) {
+        if (fileId != null) {
+          try {
+            await conn.closeFile(fileId);
+          } catch (_) {
+            canPool = false;
+          }
+        }
+        if (canPool && !conn.isClosed) {
+          _releasePooledConnection(
+            host: target.host,
+            port: target.port,
+            share: target.share,
+            username: mount.username,
+            password: mount.password,
+            domainHint: mount.token,
+            conn: conn,
+          );
+        } else {
+          await conn.close();
+        }
+      }
+    }
+    return null;
+  }
+
   /// Ensures the local HTTP Range proxy server is running and returns a streamable URL
   /// for the given SMB file path.
   Future<String> buildLocalStreamUrl(
@@ -238,12 +344,13 @@ class SmbClientService {
     registerMount(mount);
     final port = await _ensureProxyServerStarted();
     final normPath = RemoteStorageService.normalizePath(virtualPath);
-    final nameSegment = (fileNameHint != null && fileNameHint.trim().isNotEmpty)
-        ? Uri.encodeComponent(fileNameHint.trim())
-        : Uri.encodeComponent(
-            normPath.split('/').where((s) => s.isNotEmpty).lastOrNull ??
-                'stream.mp4',
-          );
+    var rawName = (fileNameHint != null && fileNameHint.trim().isNotEmpty)
+        ? fileNameHint.trim()
+        : (normPath.split('/').where((s) => s.isNotEmpty).lastOrNull ??
+            'stream.mp4');
+    final sniffed = await _sniffSmbFileMimeType(mount, normPath);
+    rawName = applySniffedExtensionToFileName(rawName, sniffed);
+    final nameSegment = Uri.encodeComponent(rawName);
     return 'http://127.0.0.1:$port/smb-stream/$nameSegment?mount=${Uri.encodeQueryComponent(mount.id)}&path=${Uri.encodeQueryComponent(normPath)}';
   }
 
@@ -258,12 +365,13 @@ class SmbClientService {
       return 'smb://${mount.baseUrl}$virtualPath';
     }
     final normPath = RemoteStorageService.normalizePath(virtualPath);
-    final nameSegment = (fileNameHint != null && fileNameHint.trim().isNotEmpty)
-        ? Uri.encodeComponent(fileNameHint.trim())
-        : Uri.encodeComponent(
-            normPath.split('/').where((s) => s.isNotEmpty).lastOrNull ??
-                'stream.mp4',
-          );
+    var rawName = (fileNameHint != null && fileNameHint.trim().isNotEmpty)
+        ? fileNameHint.trim()
+        : (normPath.split('/').where((s) => s.isNotEmpty).lastOrNull ??
+            'stream.mp4');
+    final sniffed = _sniffedMimeCache['${mount.id}:$normPath'];
+    rawName = applySniffedExtensionToFileName(rawName, sniffed);
+    final nameSegment = Uri.encodeComponent(rawName);
     return 'http://127.0.0.1:$_proxyPort/smb-stream/$nameSegment?mount=${Uri.encodeQueryComponent(mount.id)}&path=${Uri.encodeQueryComponent(normPath)}';
   }
 
@@ -461,10 +569,6 @@ class SmbClientService {
               isPartial = true;
             }
           }
-        } else if (rangeHeader == null && totalSize > 32 * 1024 * 1024) {
-          // Serve large files as 206 Partial Content from byte 0 so demuxers
-          // immediately recognize byte-range seeking support without waiting.
-          isPartial = true;
         }
 
         if (totalSize > 0 && (start < 0 || start >= totalSize || start > end)) {
@@ -522,6 +626,7 @@ class SmbClientService {
 
         int offset = start;
         int remaining = contentLength;
+        int unFlushedBytes = 0;
         var clientDisconnected = false;
         unawaited(
           req.response.done.then<void>(
@@ -535,7 +640,12 @@ class SmbClientService {
           LocalProxyTunnelBridge.recordDownstreamBytes(
             prefetchedFirstChunk.length,
           );
-          req.response.add(prefetchedFirstChunk);
+          try {
+            req.response.add(prefetchedFirstChunk);
+            await req.response.flush();
+          } catch (_) {
+            clientDisconnected = true;
+          }
           offset += prefetchedFirstChunk.length;
           remaining -= prefetchedFirstChunk.length;
         }
@@ -548,14 +658,28 @@ class SmbClientService {
           );
           if (chunk.isEmpty || clientDisconnected) break;
           LocalProxyTunnelBridge.recordDownstreamBytes(chunk.length);
-          req.response.add(chunk);
+          try {
+            req.response.add(chunk);
+            unFlushedBytes += chunk.length;
+            if (unFlushedBytes >= 262144) {
+              unFlushedBytes = 0;
+              await req.response.flush();
+            }
+          } catch (_) {
+            clientDisconnected = true;
+            break;
+          }
           offset += chunk.length;
           remaining -= chunk.length;
         }
         if (!clientDisconnected) {
-          await req.response.flush();
+          try {
+            await req.response.flush();
+          } catch (_) {}
         }
-        await req.response.close();
+        try {
+          await req.response.close();
+        } catch (_) {}
       } catch (_) {
         canReturnToPool = false;
         rethrow;

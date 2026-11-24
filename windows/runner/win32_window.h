@@ -94,10 +94,13 @@ class Win32Window {
   void RemoveTrayIcon();
   void RestoreFromTray();
   void ShowTrayContextMenu();
+  void RefreshWindowAndTaskbarIcon();
 
   bool quit_on_close_ = false;
   bool force_quit_ = false;
   bool tray_icon_added_ = false;
+  UINT taskbar_created_message_ = 0;
+  int tray_restore_retries_ = 0;
 
   // window handle for top level window.
   HWND window_handle_ = nullptr;

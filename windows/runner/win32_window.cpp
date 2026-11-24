@@ -3,6 +3,7 @@
 #include <dwmapi.h>
 #include <flutter_windows.h>
 #include <shellapi.h>
+#include <shobjidl.h>
 
 #include "resource.h"
 
@@ -13,6 +14,7 @@ constexpr UINT kWakeSingleInstanceMessage = WM_APP + 2;
 constexpr UINT kTrayIconId = 1;
 constexpr UINT_PTR kTrayMenuShowId = 1001;
 constexpr UINT_PTR kTrayMenuExitId = 1002;
+constexpr UINT_PTR kTrayRestoreTimerId = 2001;
 
 /// Window attribute that enables dark mode window decorations.
 ///
@@ -95,7 +97,8 @@ WindowClassRegistrar* WindowClassRegistrar::instance_ = nullptr;
 
 const wchar_t* WindowClassRegistrar::GetWindowClass() {
   if (!class_registered_) {
-    WNDCLASS window_class{};
+    WNDCLASSEXW window_class{};
+    window_class.cbSize = sizeof(WNDCLASSEXW);
     window_class.hCursor = LoadCursor(nullptr, IDC_ARROW);
     window_class.lpszClassName = kWindowClassName;
     window_class.style = CS_HREDRAW | CS_VREDRAW;
@@ -104,10 +107,14 @@ const wchar_t* WindowClassRegistrar::GetWindowClass() {
     window_class.hInstance = GetModuleHandle(nullptr);
     window_class.hIcon =
         LoadIcon(window_class.hInstance, MAKEINTRESOURCE(IDI_APP_ICON));
+    window_class.hIconSm = static_cast<HICON>(LoadImageW(
+        window_class.hInstance, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
+        LR_DEFAULTCOLOR));
     window_class.hbrBackground = 0;
     window_class.lpszMenuName = nullptr;
     window_class.lpfnWndProc = Win32Window::WndProc;
-    RegisterClass(&window_class);
+    RegisterClassExW(&window_class);
     class_registered_ = true;
   }
   return kWindowClassName;
@@ -141,8 +148,8 @@ bool Win32Window::Create(const std::wstring& title,
   UINT dpi = FlutterDesktopGetDpiForMonitor(monitor);
   double scale_factor = dpi / 96.0;
 
-  HWND window = CreateWindow(
-      window_class, title.c_str(), WS_OVERLAPPEDWINDOW,
+  HWND window = CreateWindowExW(
+      WS_EX_APPWINDOW, window_class, title.c_str(), WS_OVERLAPPEDWINDOW,
       Scale(origin.x, scale_factor), Scale(origin.y, scale_factor),
       Scale(size.width, scale_factor), Scale(size.height, scale_factor),
       nullptr, nullptr, GetModuleHandle(nullptr), this);
@@ -151,7 +158,14 @@ bool Win32Window::Create(const std::wstring& title,
     return false;
   }
 
+  taskbar_created_message_ = ::RegisterWindowMessageW(L"TaskbarCreated");
+  if (taskbar_created_message_ != 0) {
+    ::ChangeWindowMessageFilterEx(window, taskbar_created_message_,
+                                  MSGFLT_ALLOW, nullptr);
+  }
+
   UpdateTheme(window);
+  RefreshWindowAndTaskbarIcon();
   AddTrayIcon();
 
   return OnCreate();
@@ -186,7 +200,34 @@ Win32Window::MessageHandler(HWND hwnd,
                             UINT const message,
                             WPARAM const wparam,
                             LPARAM const lparam) noexcept {
+  // Handle Windows Explorer (explorer.exe) crash & restart ("TaskbarCreated")
+  if (taskbar_created_message_ != 0 && message == taskbar_created_message_) {
+    tray_icon_added_ = false;
+    tray_restore_retries_ = 0;
+    RefreshWindowAndTaskbarIcon();
+    AddTrayIcon();
+    ::SetTimer(hwnd, kTrayRestoreTimerId, 600, nullptr);
+    return 0;
+  }
+
   switch (message) {
+    case WM_TIMER:
+      if (wparam == kTrayRestoreTimerId) {
+        RefreshWindowAndTaskbarIcon();
+        if (!tray_icon_added_) {
+          AddTrayIcon();
+        }
+        ++tray_restore_retries_;
+        if (tray_icon_added_ || tray_restore_retries_ >= 6) {
+          ::KillTimer(hwnd, kTrayRestoreTimerId);
+          if (!tray_icon_added_ && !::IsWindowVisible(hwnd)) {
+            ::ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+          }
+        }
+        return 0;
+      }
+      break;
+
     case WM_CLOSE:
       if (!force_quit_) {
         if (tray_icon_added_) {
@@ -285,8 +326,59 @@ void Win32Window::Destroy() {
   }
 }
 
+void Win32Window::RefreshWindowAndTaskbarIcon() {
+  if (!window_handle_) {
+    return;
+  }
+  HINSTANCE hinst = GetModuleHandle(nullptr);
+  HICON big_icon = static_cast<HICON>(LoadImageW(
+      hinst, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+      GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON),
+      LR_DEFAULTCOLOR));
+  HICON small_icon = static_cast<HICON>(LoadImageW(
+      hinst, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+      GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
+      LR_DEFAULTCOLOR));
+  if (!big_icon) {
+    big_icon = LoadIcon(hinst, MAKEINTRESOURCE(IDI_APP_ICON));
+  }
+  if (!small_icon) {
+    small_icon = big_icon;
+  }
+  if (big_icon) {
+    ::SendMessageW(window_handle_, WM_SETICON, ICON_BIG,
+                   reinterpret_cast<LPARAM>(big_icon));
+  }
+  if (small_icon) {
+    ::SendMessageW(window_handle_, WM_SETICON, ICON_SMALL,
+                   reinterpret_cast<LPARAM>(small_icon));
+  }
+
+  LONG_PTR ex_style = ::GetWindowLongPtrW(window_handle_, GWL_EXSTYLE);
+  if ((ex_style & WS_EX_APPWINDOW) == 0 || (ex_style & WS_EX_TOOLWINDOW) != 0) {
+    ex_style = (ex_style | WS_EX_APPWINDOW) & ~WS_EX_TOOLWINDOW;
+    ::SetWindowLongPtrW(window_handle_, GWL_EXSTYLE, ex_style);
+  }
+
+  if (::IsWindowVisible(window_handle_)) {
+    ITaskbarList* taskbar = nullptr;
+    if (SUCCEEDED(::CoCreateInstance(CLSID_TaskbarList, nullptr,
+                                     CLSCTX_INPROC_SERVER, IID_ITaskbarList,
+                                     reinterpret_cast<void**>(&taskbar))) &&
+        taskbar != nullptr) {
+      if (SUCCEEDED(taskbar->HrInit())) {
+        taskbar->AddTab(window_handle_);
+      }
+      taskbar->Release();
+    }
+    ::SetWindowPos(window_handle_, nullptr, 0, 0, 0, 0,
+                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+                       SWP_FRAMECHANGED);
+  }
+}
+
 void Win32Window::AddTrayIcon() {
-  if (tray_icon_added_ || !window_handle_) {
+  if (!window_handle_) {
     return;
   }
   NOTIFYICONDATAW nid = {};
@@ -297,7 +389,13 @@ void Win32Window::AddTrayIcon() {
   nid.uCallbackMessage = kTrayCallbackMessage;
   nid.hIcon = LoadIcon(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_APP_ICON));
   wcscpy_s(nid.szTip, L"\u6D41\u5149\u89C6\u9891");
-  if (Shell_NotifyIconW(NIM_ADD, &nid)) {
+  if (tray_icon_added_) {
+    if (Shell_NotifyIconW(NIM_MODIFY, &nid)) {
+      return;
+    }
+    tray_icon_added_ = false;
+  }
+  if (Shell_NotifyIconW(NIM_ADD, &nid) || Shell_NotifyIconW(NIM_MODIFY, &nid)) {
     tray_icon_added_ = true;
   }
 }
