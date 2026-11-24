@@ -83,6 +83,32 @@ final class TvAppState: ObservableObject {
   private var lastLiveChannelStepAt: Date = .distantPast
   private var lanListener: NWListener? = nil
 
+  // MARK: - Peer Mesh State (设备互联)
+  @Published var peerDeviceId: String = ""
+  @Published var peerDeviceName: String = "Apple TV 流光端"
+  @Published var peerPairingCode: String = ""
+  @Published var peerAllowRemoteControl: Bool = true
+  @Published var peerServerRunning: Bool = false
+  @Published var peerLocalUrl: String = ""
+  @Published var peerDevices: [TvPeerDeviceNode] = []
+  @Published var selectedPeerDeviceId: String = ""
+  @Published var peerChatMessages: [TvPeerChatMessage] = []
+  @Published var peerRemoteFiles: [TvPeerRemoteFileItem] = []
+  @Published var peerRemoteCurrentDir: String = ""
+  @Published var peerIsLoadingFiles: Bool = false
+  @Published var peerRemoteScreenImage: UIImage? = nil
+  @Published var peerScreenStreaming: Bool = false
+  @Published var peerScreenFps: Int = 5
+  @Published var peerScreenCaptureMode: String = "desktop"
+  @Published var peerVirtualCursorX: Double = 0.5
+  @Published var peerVirtualCursorY: Double = 0.5
+  @Published var peerDesktopZoomScale: Double = 1.0
+  @Published var peerIsScanning: Bool = false
+  private var peerHttpListener: NWListener? = nil
+  private var peerUdpListener: NWListener? = nil
+  private var peerScreenStreamTask: Task<Void, Never>? = nil
+  private var peerBeaconTask: Task<Void, Never>? = nil
+
   func handleDidEnterBackground() {
     guard !isAppInBackground else { return }
     isAppInBackground = true
@@ -675,6 +701,7 @@ final class TvAppState: ObservableObject {
     if let track = currentCloudMusicTrack {
       loadCloudMusicCoverAndLyrics(for: track, seq: cloudMusicOpenSeq)
     }
+    initPeerMeshStateAndStart()
   }
 
   private var remoteCommandsConfigured: Bool = false
@@ -9300,6 +9327,791 @@ final class TvAppState: ObservableObject {
       guard !Task.isCancelled else { return }
       self.is115Accelerating = false
       self.showToast("⚠️ 暂未在 115 网盘中找到已上传文件，请确认 115 账号已登录且空间充足")
+    }
+  }
+
+  // MARK: - 11. Cross-Device Peer Mesh Service (设备互联：远程桌面 / 遥控播控 / 文件直连传输 / 跨端消息)
+
+  var selectedPeerDevice: TvPeerDeviceNode? {
+    if let found = peerDevices.first(where: { $0.deviceId == selectedPeerDeviceId }) {
+      return found
+    }
+    return peerDevices.first
+  }
+
+  static func deriveDefaultPeerPairingCode(serverUrl: String, authSecret: String) -> String {
+    let seed = "\(serverUrl.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())|\(authSecret.trimmingCharacters(in: .whitespacesAndNewlines))|liuguang_mesh_2026"
+    var h: UInt32 = 2166136261
+    for b in seed.utf8 {
+      h ^= UInt32(b)
+      h = h &* 16777619
+    }
+    let chars = Array("23456789ABCDEFGHJKLMNPQRSTUVWXYZ")
+    var code = "LG-"
+    var v = h
+    for _ in 0..<6 {
+      code.append(chars[Int(v % UInt32(chars.count))])
+      v /= UInt32(chars.count)
+    }
+    return code
+  }
+
+  func initPeerMeshStateAndStart() {
+    let savedId = UserDefaults.standard.string(forKey: "tv_peer_device_id_v1") ?? ""
+    if savedId.isEmpty {
+      let generated = "tvos_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(10).lowercased())"
+      self.peerDeviceId = generated
+      UserDefaults.standard.set(generated, forKey: "tv_peer_device_id_v1")
+    } else {
+      self.peerDeviceId = savedId
+    }
+
+    let savedName = UserDefaults.standard.string(forKey: "tv_peer_device_name_v1") ?? ""
+    if savedName.isEmpty {
+      let hostName = UIDevice.current.name.trimmingCharacters(in: .whitespacesAndNewlines)
+      self.peerDeviceName = hostName.isEmpty ? "Apple TV 流光端" : "\(hostName) (Apple TV)"
+    } else {
+      self.peerDeviceName = savedName
+    }
+
+    let savedCode = UserDefaults.standard.string(forKey: "tv_peer_pairing_code_v1") ?? ""
+    if savedCode.isEmpty {
+      self.peerPairingCode = Self.deriveDefaultPeerPairingCode(serverUrl: serverUrl, authSecret: authSecret)
+    } else {
+      self.peerPairingCode = savedCode
+    }
+
+    self.peerAllowRemoteControl = UserDefaults.standard.object(forKey: "tv_peer_allow_control_v1") as? Bool ?? true
+
+    if let savedHosts = UserDefaults.standard.stringArray(forKey: "tv_peer_manual_hosts_v1") {
+      for h in savedHosts {
+        Task { @MainActor in
+          _ = await self.probePeerDeviceAtHost(h, isManual: true)
+        }
+      }
+    }
+
+    startPeerMeshServer()
+  }
+
+  func updatePeerConfig(deviceName: String, pairingCode: String, allowControl: Bool) {
+    let trimmedName = deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !trimmedName.isEmpty {
+      self.peerDeviceName = trimmedName
+      UserDefaults.standard.set(trimmedName, forKey: "tv_peer_device_name_v1")
+    }
+    let trimmedCode = pairingCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+    if !trimmedCode.isEmpty {
+      self.peerPairingCode = trimmedCode
+      UserDefaults.standard.set(trimmedCode, forKey: "tv_peer_pairing_code_v1")
+    }
+    self.peerAllowRemoteControl = allowControl
+    UserDefaults.standard.set(allowControl, forKey: "tv_peer_allow_control_v1")
+    broadcastPeerDiscoveryBeacon()
+    showToast("已保存设备互联设置")
+  }
+
+  func startPeerMeshServer() {
+    if peerServerRunning && peerHttpListener != nil { return }
+    peerHttpListener?.cancel()
+    peerUdpListener?.cancel()
+
+    let httpPort: UInt16 = 18190
+    let tcpParams = NWParameters.tcp
+    tcpParams.allowLocalEndpointReuse = true
+    if let p = NWEndpoint.Port(rawValue: httpPort),
+       let listener = try? NWListener(using: tcpParams, on: p) {
+      self.peerHttpListener = listener
+      listener.stateUpdateHandler = { [weak self] state in
+        Task { @MainActor in
+          guard let self = self else { return }
+          switch state {
+          case .ready:
+            let actualPort = listener.port?.rawValue ?? httpPort
+            let ip = Self.localLanIPv4Address() ?? "127.0.0.1"
+            self.peerLocalUrl = "http://\(ip):\(actualPort)"
+            self.peerServerRunning = true
+          case .failed, .cancelled:
+            self.peerServerRunning = false
+          default:
+            break
+          }
+        }
+      }
+      listener.newConnectionHandler = { [weak self] conn in
+        guard let self = self else { return }
+        Self.handlePeerMeshHttpConnection(conn, appState: self)
+      }
+      listener.start(queue: .global(qos: .userInitiated))
+    }
+
+    // UDP discovery listener on port 18191
+    let udpPort: UInt16 = 18191
+    let udpParams = NWParameters.udp
+    udpParams.allowLocalEndpointReuse = true
+    if let up = NWEndpoint.Port(rawValue: udpPort),
+       let uListener = try? NWListener(using: udpParams, on: up) {
+      self.peerUdpListener = uListener
+      uListener.newConnectionHandler = { [weak self] conn in
+        guard let self = self else { return }
+        conn.start(queue: .global(qos: .utility))
+        conn.receiveMessage { data, _, _, _ in
+          if let data = data, !data.isEmpty {
+            let remoteHost: String?
+            if case let .hostPort(host, _) = conn.endpoint {
+              remoteHost = "\(host)".components(separatedBy: "%").first
+            } else {
+              remoteHost = nil
+            }
+            Task { @MainActor in
+              self.handleIncomingPeerUdpDiscoveryPacket(data, remoteHost: remoteHost)
+            }
+          }
+          conn.cancel()
+        }
+      }
+      uListener.start(queue: .global(qos: .utility))
+    }
+
+    peerBeaconTask?.cancel()
+    peerBeaconTask = Task { @MainActor [weak self] in
+      while !Task.isCancelled {
+        self?.broadcastPeerDiscoveryBeacon()
+        try? await Task.sleep(nanoseconds: 8_000_000_000)
+      }
+    }
+  }
+
+  func broadcastPeerDiscoveryBeacon() {
+    let ip = Self.localLanIPv4Address() ?? ""
+    guard !ip.isEmpty else { return }
+    let payload: [String: Any] = [
+      "magic": "LIUGUANG_PEER_V1",
+      "type": "announce",
+      "pairingCode": peerPairingCode,
+      "node": buildSelfPeerNodeDict(ip: ip)
+    ]
+    guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
+    sendUdpBroadcastPacket(data: data, ip: ip, port: 18191)
+  }
+
+  private func sendUdpBroadcastPacket(data: Data, ip: String, port: UInt16) {
+    var targets = ["255.255.255.255"]
+    let parts = ip.split(separator: ".")
+    if parts.count == 4 {
+      targets.append("\(parts[0]).\(parts[1]).\(parts[2]).255")
+    }
+    for hostStr in targets {
+      let host = NWEndpoint.Host(hostStr)
+      guard let nwPort = NWEndpoint.Port(rawValue: port) else { continue }
+      let conn = NWConnection(host: host, port: nwPort, using: .udp)
+      conn.stateUpdateHandler = { state in
+        if case .ready = state {
+          conn.send(content: data, completion: .contentProcessed { _ in
+            conn.cancel()
+          })
+        } else if case .failed = state {
+          conn.cancel()
+        }
+      }
+      conn.start(queue: .global(qos: .utility))
+    }
+  }
+
+  private func handleIncomingPeerUdpDiscoveryPacket(_ data: Data, remoteHost: String?) {
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          json["magic"] as? String == "LIUGUANG_PEER_V1" else { return }
+    let type = json["type"] as? String ?? "announce"
+    let nodeMap = (json["node"] as? [String: Any]) ?? json
+    let devId = nodeMap["deviceId"] as? String ?? ""
+    if !devId.isEmpty && devId != peerDeviceId {
+      var host = (nodeMap["host"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+      if host.isEmpty || host == "0.0.0.0" || host == "127.0.0.1", let rh = remoteHost, !rh.isEmpty {
+        host = rh
+      }
+      if !host.isEmpty {
+        let node = TvPeerDeviceNode(
+          deviceId: devId,
+          deviceName: nodeMap["deviceName"] as? String ?? "流光设备",
+          platform: nodeMap["platform"] as? String ?? "Unknown",
+          host: host,
+          port: (nodeMap["port"] as? NSNumber)?.intValue ?? 18190,
+          version: nodeMap["version"] as? String ?? "1.3.8",
+          activeRoute: (nodeMap["activeRoute"] as? String) ?? (nodeMap["activeTabName"] as? String) ?? "",
+          nowPlaying: (nodeMap["nowPlaying"] as? String) ?? (nodeMap["nowPlayingTitle"] as? String) ?? "",
+          isManual: false,
+          viaRelay: false,
+          lastSeenAt: Date()
+        )
+        upsertPeerDevice(node)
+      }
+    }
+    if type == "discover" {
+      broadcastPeerDiscoveryBeacon()
+    }
+  }
+
+  func upsertPeerDevice(_ node: TvPeerDeviceNode) {
+    guard node.deviceId != peerDeviceId else { return }
+    if let idx = peerDevices.firstIndex(where: { $0.deviceId == node.deviceId }) {
+      let old = peerDevices[idx]
+      let visibleChanged = old.isOnline != node.isOnline ||
+        old.deviceName != node.deviceName ||
+        old.platform != node.platform ||
+        old.host != node.host ||
+        old.port != node.port ||
+        old.activeRoute != node.activeRoute ||
+        old.nowPlaying != node.nowPlaying
+      if visibleChanged {
+        peerDevices[idx] = node
+      }
+    } else {
+      peerDevices.append(node)
+    }
+    if selectedPeerDeviceId.isEmpty {
+      selectedPeerDeviceId = node.deviceId
+    }
+  }
+
+  func scanPeerNetwork() {
+    guard !peerIsScanning else { return }
+    peerIsScanning = true
+    broadcastPeerDiscoveryBeacon()
+    Task { @MainActor in
+      defer { self.peerIsScanning = false }
+      for existing in self.peerDevices {
+        _ = await self.probePeerDeviceAtHost("\(existing.host):\(existing.port)", isManual: existing.isManual)
+      }
+      guard let myIp = Self.localLanIPv4Address() else { return }
+      let parts = myIp.split(separator: ".")
+      guard parts.count == 4, let myLast = Int(parts[3]) else { return }
+      let prefix = "\(parts[0]).\(parts[1]).\(parts[2])"
+      // Probe nearby IPs in parallel batches
+      var candidates: [Int] = []
+      for i in 1...254 where i != myLast {
+        candidates.append(i)
+      }
+      candidates.sort { abs($0 - myLast) < abs($1 - myLast) }
+      let batchSize = 24
+      for start in stride(from: 0, to: min(candidates.count, 96), by: batchSize) {
+        let slice = candidates[start..<min(start + batchSize, candidates.count)]
+        await withTaskGroup(of: Void.self) { group in
+          for lastOctet in slice {
+            let host = "\(prefix).\(lastOctet):18190"
+            group.addTask {
+              _ = await self.probePeerDeviceAtHost(host, isManual: false, timeoutSec: 0.75)
+            }
+          }
+        }
+      }
+    }
+  }
+
+  func probePeerDeviceAtHost(_ rawInput: String, isManual: Bool, timeoutSec: TimeInterval = 2.5) async -> TvPeerDeviceNode? {
+    var trimmed = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.isEmpty { return nil }
+    if !trimmed.hasPrefix("http://") && !trimmed.hasPrefix("https://") {
+      trimmed = "http://\(trimmed)"
+    }
+    guard var comps = URLComponents(string: trimmed), let host = comps.host, !host.isEmpty else { return nil }
+    let port = comps.port ?? 18190
+    comps.port = port
+    comps.path = "/api/peer/info"
+    guard let url = comps.url else { return nil }
+
+    var req = URLRequest(url: url, timeoutInterval: timeoutSec)
+    req.setValue(peerPairingCode, forHTTPHeaderField: "x-peer-token")
+    do {
+      let (data, resp) = try await URLSession.shared.data(for: req)
+      guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+      let nodeMap = (json["node"] as? [String: Any]) ?? json
+      let devId = nodeMap["deviceId"] as? String ?? ""
+      guard !devId.isEmpty && devId != peerDeviceId else { return nil }
+      let node = TvPeerDeviceNode(
+        deviceId: devId,
+        deviceName: nodeMap["deviceName"] as? String ?? host,
+        platform: nodeMap["platform"] as? String ?? "Unknown",
+        host: host,
+        port: port,
+        version: nodeMap["version"] as? String ?? "1.3.8",
+        activeRoute: (nodeMap["activeRoute"] as? String) ?? (nodeMap["activeTabName"] as? String) ?? "",
+        nowPlaying: (nodeMap["nowPlaying"] as? String) ?? (nodeMap["nowPlayingTitle"] as? String) ?? "",
+        isManual: isManual,
+        viaRelay: false,
+        lastSeenAt: Date()
+      )
+      upsertPeerDevice(node)
+      if isManual {
+        var saved = UserDefaults.standard.stringArray(forKey: "tv_peer_manual_hosts_v1") ?? []
+        let entry = "\(host):\(port)"
+        if !saved.contains(entry) {
+          saved.append(entry)
+          UserDefaults.standard.set(saved, forKey: "tv_peer_manual_hosts_v1")
+        }
+      }
+      return node
+    } catch {
+      return nil
+    }
+  }
+
+  func startPeerDesktopStream() {
+    peerScreenStreamTask?.cancel()
+    guard selectedPeerDevice != nil else { return }
+    peerScreenStreaming = true
+    peerScreenStreamTask = Task { @MainActor [weak self] in
+      while !Task.isCancelled {
+        guard let self = self, self.peerScreenStreaming, let peer = self.selectedPeerDevice else { break }
+        let urlStr = "\(peer.baseUrl)/api/peer/screen?mode=\(self.peerScreenCaptureMode)&maxWidth=1440&t=\(Int(Date().timeIntervalSince1970 * 1000))"
+        if let url = URL(string: urlStr) {
+          var req = URLRequest(url: url, timeoutInterval: 3.5)
+          req.setValue(self.peerPairingCode, forHTTPHeaderField: "x-peer-token")
+          if let (data, resp) = try? await URLSession.shared.data(for: req),
+             let http = resp as? HTTPURLResponse, http.statusCode == 200,
+             let img = UIImage(data: data) {
+            self.peerRemoteScreenImage = img
+          }
+        }
+        let delayMs = max(140, 1000 / max(1, self.peerScreenFps))
+        try? await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
+      }
+    }
+  }
+
+  func stopPeerDesktopStream() {
+    peerScreenStreaming = false
+    peerScreenStreamTask?.cancel()
+    peerScreenStreamTask = nil
+  }
+
+  func sendPeerPointerEvent(
+    type: String,
+    normX: Double? = nil,
+    normY: Double? = nil,
+    button: String = "left",
+    deltaY: Double = 0
+  ) {
+    guard let peer = selectedPeerDevice else { return }
+    let x = min(1.0, max(0.0, normX ?? peerVirtualCursorX))
+    let y = min(1.0, max(0.0, normY ?? peerVirtualCursorY))
+    let body: [String: Any] = [
+      "action": "mouse",
+      "type": type,
+      "nx": x,
+      "ny": y,
+      "x": x,
+      "y": y,
+      "button": button,
+      "deltaX": 0.0,
+      "deltaY": deltaY,
+      "targetMode": peerScreenCaptureMode
+    ]
+    postPeerJson(peer: peer, path: "/api/peer/control", body: body)
+  }
+
+  func sendPeerControlCommand(action: String, payload: [String: Any] = [:]) {
+    guard let peer = selectedPeerDevice else { return }
+    var body = payload
+    body["action"] = action
+    if body["targetMode"] == nil {
+      body["targetMode"] = peerScreenCaptureMode
+    }
+    body["payload"] = payload
+    postPeerJson(peer: peer, path: "/api/peer/control", body: body)
+  }
+
+  func sendPeerChatMessage(text: String) {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty, let peer = selectedPeerDevice else { return }
+    let msgId = "msg_\(Int(Date().timeIntervalSince1970 * 1000))"
+    let msg = TvPeerChatMessage(
+      id: msgId,
+      fromDeviceId: peerDeviceId,
+      fromDeviceName: peerDeviceName,
+      toDeviceId: peer.deviceId,
+      text: trimmed,
+      timestamp: Date(),
+      isOutgoing: true,
+      attachmentName: nil,
+      attachmentUrl: nil
+    )
+    peerChatMessages.append(msg)
+    let body: [String: Any] = [
+      "id": msgId,
+      "fromDeviceId": peerDeviceId,
+      "fromDeviceName": peerDeviceName,
+      "toDeviceId": peer.deviceId,
+      "text": trimmed,
+      "timestampMs": Int64(Date().timeIntervalSince1970 * 1000)
+    ]
+    postPeerJson(peer: peer, path: "/api/peer/message", body: body)
+  }
+
+  func loadPeerRemoteFiles(dirPath: String = "") {
+    guard let peer = selectedPeerDevice else { return }
+    peerIsLoadingFiles = true
+    Task { @MainActor in
+      defer { self.peerIsLoadingFiles = false }
+      var comps = URLComponents(string: "\(peer.baseUrl)/api/peer/files")
+      if !dirPath.isEmpty {
+        comps?.queryItems = [URLQueryItem(name: "dir", value: dirPath)]
+      }
+      guard let url = comps?.url else { return }
+      var req = URLRequest(url: url, timeoutInterval: 5.0)
+      req.setValue(self.peerPairingCode, forHTTPHeaderField: "x-peer-token")
+      guard let (data, resp) = try? await URLSession.shared.data(for: req),
+            let http = resp as? HTTPURLResponse, http.statusCode == 200,
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        return
+      }
+      self.peerRemoteCurrentDir = json["currentDir"] as? String ?? dirPath
+      let rawItems = json["items"] as? [[String: Any]] ?? []
+      self.peerRemoteFiles = rawItems.compactMap { item in
+        let name = item["name"] as? String ?? ""
+        let path = item["path"] as? String ?? ""
+        guard !name.isEmpty && !path.isEmpty else { return nil }
+        return TvPeerRemoteFileItem(
+          name: name,
+          path: path,
+          isDir: item["isDir"] as? Bool ?? false,
+          size: (item["size"] as? NSNumber)?.int64Value ?? 0,
+          modifiedMs: (item["modifiedMs"] as? NSNumber)?.int64Value ?? 0
+        )
+      }
+    }
+  }
+
+  func playOrDownloadPeerRemoteFile(_ file: TvPeerRemoteFileItem) {
+    guard let peer = selectedPeerDevice else { return }
+    if file.isDir {
+      loadPeerRemoteFiles(dirPath: file.path)
+      return
+    }
+    var comps = URLComponents(string: "\(peer.baseUrl)/api/peer/file/download")
+    comps?.queryItems = [
+      URLQueryItem(name: "path", value: file.path),
+      URLQueryItem(name: "token", value: peerPairingCode)
+    ]
+    guard let streamUrl = comps?.url?.absoluteString else { return }
+    let lower = file.name.lowercased()
+    let isMedia = lower.hasSuffix(".mp4") || lower.hasSuffix(".mkv") || lower.hasSuffix(".mov") ||
+      lower.hasSuffix(".m3u8") || lower.hasSuffix(".ts") || lower.hasSuffix(".avi") ||
+      lower.hasSuffix(".mp3") || lower.hasSuffix(".flac") || lower.hasSuffix(".wav") || lower.hasSuffix(".m4a")
+    if isMedia {
+      playDirectStream(
+        title: file.name,
+        subtitle: "来自 \(peer.deviceName)",
+        url: streamUrl,
+        headers: ["x-peer-token": peerPairingCode]
+      )
+    } else {
+      showToast("正在从 \(peer.deviceName) 下载 \(file.name)...")
+      Task { @MainActor in
+        guard let url = URL(string: streamUrl) else { return }
+        var req = URLRequest(url: url, timeoutInterval: 60)
+        req.setValue(self.peerPairingCode, forHTTPHeaderField: "x-peer-token")
+        if let (data, _) = try? await URLSession.shared.data(for: req) {
+          let dir = Self.peerSharedDownloadsDirectory()
+          let dst = dir.appendingPathComponent(file.name)
+          try? data.write(to: dst)
+          self.showToast("已保存至本机缓存：\(file.name)")
+        } else {
+          self.showToast("下载失败：\(file.name)")
+        }
+      }
+    }
+  }
+
+  private func postPeerJson(peer: TvPeerDeviceNode, path: String, body: [String: Any]) {
+    guard let url = URL(string: "\(peer.baseUrl)\(path)"),
+          let data = try? JSONSerialization.data(withJSONObject: body) else { return }
+    var req = URLRequest(url: url, timeoutInterval: 4.0)
+    req.httpMethod = "POST"
+    req.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
+    req.setValue(peerPairingCode, forHTTPHeaderField: "x-peer-token")
+    req.httpBody = data
+    Task.detached(priority: .userInitiated) {
+      _ = try? await URLSession.shared.data(for: req)
+    }
+  }
+
+  func buildSelfPeerNodeDict(ip: String? = nil) -> [String: Any] {
+    let hostIp = ip ?? Self.localLanIPv4Address() ?? "127.0.0.1"
+    var nowPlayingStr = ""
+    if let pb = activePlayback {
+      nowPlayingStr = "🎬 \(pb.title)"
+    } else if let track = currentCloudMusicTrack, isCloudMusicPlaying {
+      nowPlayingStr = "🎵 \(track.name)"
+    }
+    return [
+      "deviceId": peerDeviceId,
+      "deviceName": peerDeviceName,
+      "platform": "Apple TV (tvOS)",
+      "host": hostIp,
+      "port": 18190,
+      "version": appShortVersion.replacingOccurrences(of: "v", with: ""),
+      "capabilities": ["remote_control", "remote_desktop", "file_transfer", "chat", "media_cast"],
+      "activeRoute": selectedSection.rawValue,
+      "nowPlaying": nowPlayingStr
+    ]
+  }
+
+  static func peerSharedDownloadsDirectory() -> URL {
+    let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+      ?? URL(fileURLWithPath: NSTemporaryDirectory())
+    let dir = base.appendingPathComponent("PeerDownloads", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir
+  }
+
+  @MainActor
+  func captureCurrentTvScreenJpegData() -> (Data, Int, Int)? {
+    guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+          let window = scene.windows.first(where: { $0.isKeyWindow }) ?? scene.windows.first else {
+      return nil
+    }
+    let bounds = window.bounds
+    guard bounds.width > 10 && bounds.height > 10 else { return nil }
+    let targetWidth: CGFloat = 1280
+    let scaleRatio = min(1.0, targetWidth / bounds.width)
+    let targetSize = CGSize(width: bounds.width * scaleRatio, height: bounds.height * scaleRatio)
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = 1.0
+    format.opaque = true
+    let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
+    let img = renderer.image { _ in
+      window.drawHierarchy(in: CGRect(origin: .zero, size: targetSize), afterScreenUpdates: false)
+    }
+    guard let jpeg = img.jpegData(compressionQuality: 0.72) else { return nil }
+    return (jpeg, Int(targetSize.width), Int(targetSize.height))
+  }
+
+  private nonisolated static func handlePeerMeshHttpConnection(_ conn: NWConnection, appState: TvAppState) {
+    conn.start(queue: .global(qos: .userInitiated))
+    conn.receive(minimumIncompleteLength: 1, maximumLength: 524288) { data, _, _, _ in
+      guard let data = data, !data.isEmpty else {
+        conn.cancel()
+        return
+      }
+      let sep = Data("\r\n\r\n".utf8)
+      guard let range = data.range(of: sep) else {
+        conn.cancel()
+        return
+      }
+      let headerStr = String(data: data.subdata(in: 0..<range.lowerBound), encoding: .utf8) ?? ""
+      let bodyData = data.subdata(in: range.upperBound..<data.count)
+      let lines = headerStr.components(separatedBy: "\r\n")
+      let firstParts = (lines.first ?? "").split(separator: " ")
+      guard firstParts.count >= 2 else {
+        conn.cancel()
+        return
+      }
+      let method = String(firstParts[0]).uppercased()
+      let pathAndQuery = String(firstParts[1])
+      let comps = URLComponents(string: "http://localhost\(pathAndQuery)")
+      let path = comps?.path ?? pathAndQuery
+
+      Task { @MainActor in
+        if path == "/api/peer/info" {
+          let payload: [String: Any] = [
+            "ok": true,
+            "node": appState.buildSelfPeerNodeDict()
+          ]
+          sendPeerHttpJsonResponse(conn: conn, status: 200, json: payload)
+          return
+        }
+
+        if path == "/api/peer/screen" {
+          if let (jpeg, w, h) = appState.captureCurrentTvScreenJpegData() {
+            var header = "HTTP/1.1 200 OK\r\n"
+            header += "Content-Type: image/jpeg\r\n"
+            header += "Content-Length: \(jpeg.count)\r\n"
+            header += "Access-Control-Allow-Origin: *\r\n"
+            header += "x-screen-width: \(w)\r\n"
+            header += "x-screen-height: \(h)\r\n"
+            header += "x-capture-mode: desktop\r\n"
+            header += "Cache-Control: no-store\r\n\r\n"
+            var packet = Data(header.utf8)
+            packet.append(jpeg)
+            conn.send(content: packet, completion: .contentProcessed { _ in conn.cancel() })
+          } else {
+            sendPeerHttpJsonResponse(conn: conn, status: 503, json: ["ok": false, "error": "Screen unavailable"])
+          }
+          return
+        }
+
+        if path == "/api/peer/message" && method == "POST" {
+          if let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any] {
+            let fromId = json["fromDeviceId"] as? String ?? "remote"
+            let fromName = json["fromDeviceName"] as? String ?? "远端设备"
+            let text = json["text"] as? String ?? ""
+            let msg = TvPeerChatMessage(
+              id: json["id"] as? String ?? "msg_\(Int(Date().timeIntervalSince1970 * 1000))",
+              fromDeviceId: fromId,
+              fromDeviceName: fromName,
+              toDeviceId: appState.peerDeviceId,
+              text: text,
+              timestamp: Date(),
+              isOutgoing: false,
+              attachmentName: json["attachmentName"] as? String,
+              attachmentUrl: json["attachmentUrl"] as? String
+            )
+            appState.peerChatMessages.append(msg)
+            appState.showToast("💬 来自 \(fromName)：\(text)")
+          }
+          sendPeerHttpJsonResponse(conn: conn, status: 200, json: ["ok": true])
+          return
+        }
+
+        if path == "/api/peer/control" && method == "POST" {
+          guard appState.peerAllowRemoteControl else {
+            sendPeerHttpJsonResponse(conn: conn, status: 403, json: ["ok": false, "error": "Remote control disabled"])
+            return
+          }
+          if let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any] {
+            let action = json["action"] as? String ?? ""
+            let payload = (json["payload"] as? [String: Any]) ?? json
+            appState.handleIncomingPeerControl(action: action, payload: payload)
+          }
+          sendPeerHttpJsonResponse(conn: conn, status: 200, json: ["ok": true])
+          return
+        }
+
+        if path == "/api/peer/files" {
+          let dir = Self.peerSharedDownloadsDirectory()
+          let requestedDir = comps?.queryItems?.first(where: { $0.name == "dir" })?.value ?? dir.path
+          let targetUrl = URL(fileURLWithPath: requestedDir.isEmpty ? dir.path : requestedDir)
+          var items: [[String: Any]] = []
+          if let contents = try? FileManager.default.contentsOfDirectory(
+            at: targetUrl,
+            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+          ) {
+            for u in contents {
+              let vals = try? u.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey])
+              items.append([
+                "name": u.lastPathComponent,
+                "path": u.path,
+                "isDir": vals?.isDirectory ?? false,
+                "size": vals?.fileSize ?? 0,
+                "modifiedMs": Int64((vals?.contentModificationDate ?? Date()).timeIntervalSince1970 * 1000)
+              ])
+            }
+          }
+          sendPeerHttpJsonResponse(conn: conn, status: 200, json: [
+            "ok": true,
+            "currentDir": targetUrl.path,
+            "roots": [["name": "Apple TV 共享文件", "path": dir.path]],
+            "items": items
+          ])
+          return
+        }
+
+        if path == "/api/peer/file/download" {
+          let filePath = comps?.queryItems?.first(where: { $0.name == "path" })?.value ?? ""
+          if !filePath.isEmpty, let fileData = try? Data(contentsOf: URL(fileURLWithPath: filePath)) {
+            var header = "HTTP/1.1 200 OK\r\n"
+            header += "Content-Type: application/octet-stream\r\n"
+            header += "Content-Length: \(fileData.count)\r\n"
+            header += "Access-Control-Allow-Origin: *\r\n\r\n"
+            var packet = Data(header.utf8)
+            packet.append(fileData)
+            conn.send(content: packet, completion: .contentProcessed { _ in conn.cancel() })
+          } else {
+            sendPeerHttpJsonResponse(conn: conn, status: 404, json: ["ok": false, "error": "File not found"])
+          }
+          return
+        }
+
+        if path == "/api/peer/file/upload" && method == "POST" {
+          let rawName = comps?.queryItems?.first(where: { $0.name == "name" })?.value ?? "file_\(Int(Date().timeIntervalSince1970))"
+          let safeName = (rawName.removingPercentEncoding ?? rawName).replacingOccurrences(of: "/", with: "_")
+          let dst = Self.peerSharedDownloadsDirectory().appendingPathComponent(safeName)
+          try? bodyData.write(to: dst)
+          appState.showToast("📥 已收到跨端传输文件：\(safeName)")
+          sendPeerHttpJsonResponse(conn: conn, status: 200, json: ["ok": true, "savedPath": dst.path])
+          return
+        }
+
+        sendPeerHttpJsonResponse(conn: conn, status: 404, json: ["ok": false, "error": "Not found"])
+      }
+    }
+  }
+
+  private nonisolated static func sendPeerHttpJsonResponse(conn: NWConnection, status: Int, json: [String: Any]) {
+    let body = (try? JSONSerialization.data(withJSONObject: json)) ?? Data("{}".utf8)
+    var header = "HTTP/1.1 \(status) OK\r\n"
+    header += "Content-Type: application/json; charset=utf-8\r\n"
+    header += "Content-Length: \(body.count)\r\n"
+    header += "Access-Control-Allow-Origin: *\r\n"
+    header += "Access-Control-Allow-Headers: *\r\n"
+    header += "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\r\n"
+    var packet = Data(header.utf8)
+    packet.append(body)
+    conn.send(content: packet, completion: .contentProcessed { _ in
+      conn.cancel()
+    })
+  }
+
+  private func handleIncomingPeerControl(action: String, payload: [String: Any]) {
+    switch action {
+    case "navigate":
+      let route = (payload["route"] as? String ?? "").lowercased()
+      switch route {
+      case "home", "vod": selectedSection = .vod
+      case "live": selectedSection = .live
+      case "telegram": selectedSection = .telegram
+      case "favorites", "history": selectedSection = .favorites
+      case "downloads": selectedSection = .downloads
+      case "files", "media": selectedSection = .mediaLibrary
+      case "music": selectedSection = .music
+      case "peer", "mesh": selectedSection = .peerMesh
+      case "proxy": selectedSection = .proxy
+      case "settings": selectedSection = .settings
+      default: break
+      }
+    case "cast_media":
+      let url = (payload["url"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+      let title = (payload["title"] as? String ?? "跨端投屏播放").trimmingCharacters(in: .whitespacesAndNewlines)
+      if !url.isEmpty {
+        playDirectStream(title: title.isEmpty ? "跨端投屏播放" : title, subtitle: "来自设备互联投屏", url: url)
+      }
+    case "text_input":
+      let text = payload["text"] as? String ?? ""
+      if !text.isEmpty {
+        if let receiver = activeLanQuickInputReceiver {
+          receiver(text)
+          showLanQuickInputModal = false
+        } else {
+          searchKeyword = text
+          showToast("⌨️ 已输入文字：\(text)")
+        }
+      }
+    case "toast":
+      if let msg = payload["message"] as? String, !msg.isEmpty {
+        showToast(msg)
+      }
+    case "key", "dpad":
+      let key = (payload["key"] as? String ?? "").lowercased()
+      switch key {
+      case "back", "escape":
+        _ = customBackHandler?()
+      case "home", "show_desktop":
+        selectedSection = .vod
+      case "play_pause", "space":
+        if currentCloudMusicTrack != nil {
+          toggleCloudMusicPlayPause()
+        }
+      case "seek_forward", "right":
+        videoDirectSeekHandler?(15)
+      case "seek_backward", "left":
+        videoDirectSeekHandler?(-15)
+      default:
+        break
+      }
+    default:
+      break
     }
   }
 }

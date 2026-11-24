@@ -27,6 +27,8 @@ class TelegramNotificationService extends ChangeNotifier {
   static const String _prefNotifySoundEnabledKey =
       'm3u8_tg_notify_sound_v1';
   static const String _prefMutedPeersKey = 'm3u8_tg_muted_peers_v1';
+  static const String _prefServerMutedPeersKey =
+      'm3u8_tg_server_muted_peers_v1';
 
   static final RegExp _validPeerRegex = RegExp(
     r'^(user|chat|channel):[1-9]\d*$',
@@ -123,17 +125,36 @@ class TelegramNotificationService extends ChangeNotifier {
     return _locallyMutedPeers.contains(key) || _serverMutedPeers.contains(key);
   }
 
+  bool isServerPeerMuted(String accountId, String peer) {
+    return _serverMutedPeers.contains(_peerKey(accountId, peer));
+  }
+
   void recordServerChatMuteState(
     String accountId,
     String peer,
     bool muted,
   ) {
+    if (peer.trim().isEmpty) return;
     final key = _peerKey(accountId, peer);
+    bool changed = false;
     if (muted) {
-      _serverMutedPeers.add(key);
+      changed = _serverMutedPeers.add(key);
       dismissByPeer(accountId, peer);
     } else {
-      _serverMutedPeers.remove(key);
+      changed = _serverMutedPeers.remove(key);
+    }
+    if (changed) {
+      notifyListeners();
+      if (!Platform.environment.containsKey('FLUTTER_TEST')) {
+        unawaited(
+          SharedPreferences.getInstance().then((prefs) {
+            prefs.setStringList(
+              _prefServerMutedPeersKey,
+              _serverMutedPeers.toList(),
+            );
+          }).catchError((_) {}),
+        );
+      }
     }
   }
 
@@ -168,6 +189,12 @@ class TelegramNotificationService extends ChangeNotifier {
         _locallyMutedPeers
           ..clear()
           ..addAll(savedMuted);
+      }
+      final savedServerMuted = prefs.getStringList(_prefServerMutedPeersKey);
+      if (savedServerMuted != null) {
+        _serverMutedPeers
+          ..clear()
+          ..addAll(savedServerMuted);
       }
     } catch (_) {}
 
@@ -377,6 +404,20 @@ class TelegramNotificationService extends ChangeNotifier {
     }
   }
 
+  /// Records server mute state from a [chats] snapshot without generating
+  /// synthetic notifications (since `/api/telegram/notification-stream` is the
+  /// authoritative source of Telegram's per-peer `notification_muted` setting).
+  void syncChatsForNotifications(String accountId, List<TelegramChat> chats) {
+    if (_disposed || chats.isEmpty) return;
+    final cleanAcc = accountId.trim().isNotEmpty ? accountId.trim() : 'default';
+    for (final chat in chats) {
+      if (!_validPeerRegex.hasMatch(chat.peer)) continue;
+      if (chat.muted) {
+        recordServerChatMuteState(cleanAcc, chat.peer, true);
+      }
+    }
+  }
+
   void _closeActiveSseStream() {
     _sseLineSub?.cancel();
     _sseLineSub = null;
@@ -524,6 +565,17 @@ class TelegramNotificationService extends ChangeNotifier {
     TelegramAccount account,
     TelegramNotificationEvent event,
   ) {
+    if (_validPeerRegex.hasMatch(event.peer) &&
+        (event.notificationSettingsChanged ||
+            event.newMessage ||
+            event.notificationMuted)) {
+      recordServerChatMuteState(
+        account.id,
+        event.peer,
+        event.notificationMuted,
+      );
+    }
+
     if (event.notificationSettingsChanged) {
       final keysToRemove = _pendingByKey.entries
           .where(
@@ -547,11 +599,19 @@ class TelegramNotificationService extends ChangeNotifier {
     }
 
     final message = event.message;
-    if (!event.newMessage ||
-        message == null ||
-        message.outgoing ||
-        message.id <= 0 ||
-        !_validPeerRegex.hasMatch(event.peer)) {
+    if (!event.newMessage || !_validPeerRegex.hasMatch(event.peer)) {
+      return;
+    }
+    if (message == null || message.id <= 0) {
+      if (!event.notificationMuted &&
+          !isPeerMuted(account.id, event.peer) &&
+          !_isReadingPeer(account.id, event.peer) &&
+          !Platform.environment.containsKey('FLUTTER_TEST')) {
+        unawaited(_fetchAndNotifyMissingMessagePayload(account, event));
+      }
+      return;
+    }
+    if (message.outgoing) {
       return;
     }
 
@@ -577,11 +637,17 @@ class TelegramNotificationService extends ChangeNotifier {
 
     // Strictly do NOT notify for muted chats or silent messages ("那些静默的不要通知")
     if (event.notificationMuted) {
-      _serverMutedPeers.add(_peerKey(account.id, event.peer));
+      recordServerChatMuteState(account.id, event.peer, true);
       dismiss(key);
       return;
     }
-    if (message.silent || isPeerMuted(account.id, event.peer)) {
+    if (message.silent) {
+      if (event.peer.startsWith('channel:') || event.peer.startsWith('chat:')) {
+        recordServerChatMuteState(account.id, event.peer, true);
+      }
+      return;
+    }
+    if (isPeerMuted(account.id, event.peer)) {
       return;
     }
 
@@ -658,6 +724,34 @@ class TelegramNotificationService extends ChangeNotifier {
     if (_systemNotificationsEnabled) {
       unawaited(_presentNativeSystemNotification(item));
     }
+  }
+
+  Future<void> _fetchAndNotifyMissingMessagePayload(
+    TelegramAccount account,
+    TelegramNotificationEvent event,
+  ) async {
+    try {
+      final res = await _apiProvider().fetchTelegramMessages(
+        accountId: account.id,
+        peer: event.peer,
+        offsetId: 0,
+        limit: 1,
+      );
+      if (!_running || _disposed || res.messages.isEmpty) return;
+      final latest = res.messages.last;
+      if (latest.outgoing || latest.id <= 0) return;
+      _receiveUpdateEvent(
+        account,
+        TelegramNotificationEvent(
+          accountId: account.id,
+          peer: event.peer,
+          chatTitle: event.chatTitle,
+          newMessage: true,
+          notificationMuted: event.notificationMuted,
+          message: latest,
+        ),
+      );
+    } catch (_) {}
   }
 
   void reconcileReadingState() {

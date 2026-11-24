@@ -109,6 +109,7 @@ class MainActivity : FlutterActivity() {
     private val notifChannelName = "com.linsion.m3u8_client/notifications"
     private val qrChannelName = "com.linsion.m3u8_client/qr_scanner"
     private val mediaSessionChannelName = "com.linsion.m3u8_client/media_session"
+    private val utilsChannelName = "com.linsion.m3u8_client/native_utils"
     private val telegramChannelId = "telegram_messages_channel"
     private val musicChannelId = "cloud_music_playback_channel"
     private val musicNotificationId = 880102
@@ -116,6 +117,9 @@ class MainActivity : FlutterActivity() {
     private var mediaSessionChannel: MethodChannel? = null
     private var pendingPermissionResult: MethodChannel.Result? = null
     private var pendingQrScanResult: MethodChannel.Result? = null
+    private var pendingPickFilesResult: MethodChannel.Result? = null
+    private var lastTouchDownX: Float = 540f
+    private var lastTouchDownY: Float = 960f
     private var activeQrDialog: Dialog? = null
     private var activeExoDialog: Dialog? = null
     private var activeExoPlayer: ExoPlayer? = null
@@ -226,6 +230,11 @@ class MainActivity : FlutterActivity() {
         mChannel.setMethodCallHandler { call, result ->
             handleMediaSessionMethodCall(call, result)
         }
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, utilsChannelName)
+            .setMethodCallHandler { call, result ->
+                handleNativeUtilsMethodCall(call, result)
+            }
     }
 
     private fun startCameraQrScan(result: MethodChannel.Result) {
@@ -593,7 +602,179 @@ class MainActivity : FlutterActivity() {
             } else {
                 finishQrScan(null)
             }
+        } else if (requestCode == 9105) {
+            val pickRes = pendingPickFilesResult
+            pendingPickFilesResult = null
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                Thread {
+                    val items = extractPickedFileItems(data)
+                    runOnUiThread {
+                        pickRes?.success(items)
+                    }
+                }.start()
+            } else {
+                pickRes?.success(emptyList<Map<String, Any>>())
+            }
         }
+    }
+
+    private fun handleNativeUtilsMethodCall(call: MethodCall, result: MethodChannel.Result) {
+        when (call.method) {
+            "checkDesktopPermissions" -> {
+                val hasAcc = LiuguangRemoteAccessibilityService.instance != null
+                result.success(
+                    mapOf(
+                        "screenCapture" to (hasAcc && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R),
+                        "accessibility" to hasAcc
+                    )
+                )
+            }
+            "requestDesktopPermissions" -> {
+                val hasAcc = LiuguangRemoteAccessibilityService.instance != null
+                if (!hasAcc) {
+                    try {
+                        val intent = Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        startActivity(intent)
+                    } catch (_: Exception) {}
+                }
+                result.success(
+                    mapOf(
+                        "screenCapture" to (hasAcc && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R),
+                        "accessibility" to hasAcc
+                    )
+                )
+            }
+            "captureDesktopScreenJpeg" -> {
+                val maxWidth = (call.argument<Int>("maxWidth") ?: 1280).coerceIn(360, 2560)
+                val quality = (call.argument<Int>("quality") ?: 72).coerceIn(30, 95)
+                val acc = LiuguangRemoteAccessibilityService.instance
+                if (acc != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    acc.captureSystemScreenJpeg(maxWidth, quality) { payload ->
+                        runOnUiThread {
+                            result.success(payload)
+                        }
+                    }
+                } else {
+                    result.success(null)
+                }
+            }
+            "injectDesktopMouseEvent" -> {
+                val type = call.argument<String>("type") ?: "tap"
+                val nx = (call.argument<Number>("nx")?.toFloat() ?: 0.5f).coerceIn(0f, 1f)
+                val ny = (call.argument<Number>("ny")?.toFloat() ?: 0.5f).coerceIn(0f, 1f)
+                val deltaX = call.argument<Number>("deltaX")?.toFloat() ?: 0f
+                val deltaY = call.argument<Number>("deltaY")?.toFloat() ?: 0f
+                val dm = resources.displayMetrics
+                val x = nx * dm.widthPixels
+                val y = ny * dm.heightPixels
+                val acc = LiuguangRemoteAccessibilityService.instance
+                if (acc != null) {
+                    when (type) {
+                        "tap" -> acc.performTap(x, y, 45L)
+                        "double_tap" -> acc.performDoubleTap(x, y)
+                        "right_click" -> acc.performTap(x, y, 520L)
+                        "down" -> {
+                            lastTouchDownX = x
+                            lastTouchDownY = y
+                        }
+                        "up" -> {
+                            val dist = kotlin.math.hypot((x - lastTouchDownX).toDouble(), (y - lastTouchDownY).toDouble())
+                            if (dist > 12.0) {
+                                acc.performSwipe(lastTouchDownX, lastTouchDownY, x, y, 220L)
+                            } else {
+                                acc.performTap(x, y, 45L)
+                            }
+                        }
+                        "scroll" -> {
+                            val endX = (x + deltaX * 2.5f).coerceIn(10f, dm.widthPixels - 10f)
+                            val endY = (y + deltaY * 2.5f).coerceIn(10f, dm.heightPixels - 10f)
+                            acc.performSwipe(x, y, endX, endY, 180L)
+                        }
+                    }
+                    result.success(true)
+                } else {
+                    result.success(false)
+                }
+            }
+            "injectDesktopKeyEvent" -> {
+                val keyName = (call.argument<String>("key") ?: "").trim().lowercase()
+                val text = call.argument<String>("text") ?: ""
+                val acc = LiuguangRemoteAccessibilityService.instance
+                if (text.isNotEmpty() && acc != null) {
+                    val ok = acc.injectFocusedText(text)
+                    result.success(ok)
+                    return
+                }
+                if (acc != null && acc.performSystemAction(keyName)) {
+                    result.success(true)
+                    return
+                }
+                result.success(false)
+            }
+            "pickFiles" -> {
+                val mediaOnly = call.argument<Boolean>("mediaOnly") ?: false
+                pendingPickFilesResult = result
+                try {
+                    val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                        type = if (mediaOnly) "*/*" else "*/*"
+                        if (mediaOnly) {
+                            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/*", "video/*"))
+                        }
+                        putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                    }
+                    startActivityForResult(Intent.createChooser(intent, "选择要发送的文件"), 9105)
+                } catch (_: Exception) {
+                    pendingPickFilesResult = null
+                    result.success(emptyList<Map<String, Any>>())
+                }
+            }
+            else -> result.notImplemented()
+        }
+    }
+
+    private fun extractPickedFileItems(data: Intent): List<Map<String, Any>> {
+        val uris = mutableListOf<Uri>()
+        data.clipData?.let { clip ->
+            for (i in 0 until clip.itemCount.coerceAtMost(10)) {
+                clip.getItemAt(i)?.uri?.let { uris.add(it) }
+            }
+        }
+        if (uris.isEmpty()) {
+            data.data?.let { uris.add(it) }
+        }
+        val items = mutableListOf<Map<String, Any>>()
+        for (uri in uris) {
+            try {
+                var fileName = "传输文件_${System.currentTimeMillis()}"
+                contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                    val nameIdx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    if (nameIdx >= 0 && cursor.moveToFirst()) {
+                        val n = cursor.getString(nameIdx)
+                        if (!n.isNullOrBlank()) fileName = n
+                    }
+                }
+                val tempFile = java.io.File(cacheDir, "peer_${System.currentTimeMillis()}_${fileName.replace(Regex("[/\\\\:]"), "_")}")
+                contentResolver.openInputStream(uri)?.use { input ->
+                    tempFile.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                val size = tempFile.length().toInt()
+                if (size > 0) {
+                    items.add(
+                        mapOf(
+                            "name" to fileName,
+                            "path" to tempFile.absolutePath,
+                            "size" to size
+                        )
+                    )
+                }
+            } catch (_: Exception) {}
+        }
+        return items
     }
 
     override fun onRequestPermissionsResult(

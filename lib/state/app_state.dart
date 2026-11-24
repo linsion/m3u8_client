@@ -390,6 +390,7 @@ class AppState extends ChangeNotifier {
   }
 
   bool get isTelegramViewActive => _isTelegramViewActive;
+  bool get isAppForeground => _isAppForeground;
 
   void updateTelegramReadingContext({
     bool? isTelegramViewActive,

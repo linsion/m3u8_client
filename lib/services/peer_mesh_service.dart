@@ -453,6 +453,7 @@ class PeerMeshService extends ChangeNotifier {
     ..idleTimeout = const Duration(seconds: 15);
 
   final Map<String, PeerDeviceNode> _peers = {};
+  final List<String> _peerDiscoveryOrder = [];
   final Set<String> _manualHostPorts = {};
   final List<PeerChatMessage> _messages = [];
   final List<PeerFileTransferTask> _transfers = [];
@@ -502,15 +503,41 @@ class PeerMeshService extends ChangeNotifier {
   List<PeerDeviceNode> get peers {
     final list = _peers.values.toList();
     list.sort((a, b) {
-      final aOnline = a.isOnline ? 0 : 1;
-      final bOnline = b.isOnline ? 0 : 1;
-      if (aOnline != bOnline) return aOnline.compareTo(bOnline);
-      final aLan = a.isLanReachable ? 0 : 1;
-      final bLan = b.isLanReachable ? 0 : 1;
-      if (aLan != bLan) return aLan.compareTo(bLan);
-      return b.lastSeenAt.compareTo(a.lastSeenAt);
+      final idxA = _peerDiscoveryOrder.indexOf(a.deviceId);
+      final idxB = _peerDiscoveryOrder.indexOf(b.deviceId);
+      if (idxA >= 0 && idxB >= 0 && idxA != idxB) {
+        return idxA.compareTo(idxB);
+      }
+      if (idxA >= 0 && idxB < 0) return -1;
+      if (idxB >= 0 && idxA < 0) return 1;
+      return a.deviceId.compareTo(b.deviceId);
     });
     return list;
+  }
+
+  void _upsertPeerNode(PeerDeviceNode node, {bool forceNotify = false}) {
+    if (node.deviceId.isEmpty || node.deviceId == _deviceId) return;
+    final existing = _peers[node.deviceId];
+    if (!_peerDiscoveryOrder.contains(node.deviceId)) {
+      _peerDiscoveryOrder.add(node.deviceId);
+    }
+    _peers[node.deviceId] = node;
+    final visibleChanged = existing == null ||
+        forceNotify ||
+        existing.isOnline != node.isOnline ||
+        existing.deviceName != node.deviceName ||
+        existing.platform != node.platform ||
+        existing.host != node.host ||
+        existing.port != node.port ||
+        existing.isLanReachable != node.isLanReachable ||
+        existing.isManual != node.isManual ||
+        existing.isTv != node.isTv ||
+        existing.activeTabName != node.activeTabName ||
+        existing.nowPlayingTitle != node.nowPlayingTitle ||
+        existing.isPlaying != node.isPlaying;
+    if (visibleChanged) {
+      notifyListeners();
+    }
   }
 
   List<PeerChatMessage> get messages => List.unmodifiable(_messages);
@@ -530,7 +557,10 @@ class PeerMeshService extends ChangeNotifier {
 
   bool get supportsNativeDesktopCapture {
     if (kIsWeb) return false;
-    return Platform.isMacOS || Platform.isWindows || Platform.isLinux;
+    return Platform.isMacOS ||
+        Platform.isWindows ||
+        Platform.isLinux ||
+        Platform.isAndroid;
   }
 
   /// Derives a deterministic 6-character pairing code from the user's connected
@@ -1221,14 +1251,18 @@ class PeerMeshService extends ChangeNotifier {
       final existing = _peers[senderId];
       final lanStillFresh = existing != null &&
           existing.isLanReachable &&
-          DateTime.now().difference(existing.lastSeenAt).inSeconds < 12;
+          DateTime.now().difference(existing.lastSeenAt).inSeconds < 40;
       final node = PeerDeviceNode.fromJson(
         map,
         isManualOverride: existing?.isManual,
         isLanReachableOverride: lanStillFresh,
-      ).copyWith(lastSeenAt: DateTime.now());
-      _peers[senderId] = node;
-      notifyListeners();
+      ).copyWith(
+        host: lanStillFresh ? existing.host : null,
+        port: lanStillFresh ? existing.port : null,
+        isLanReachable: lanStillFresh,
+        lastSeenAt: DateTime.now(),
+      );
+      _upsertPeerNode(node);
 
       // If not yet LAN-reachable, probe the peer's advertised candidate IPs
       // (including Tailscale 100.x.x.x / ZeroTier / subnet IPs) in background!
@@ -1603,9 +1637,12 @@ class PeerMeshService extends ChangeNotifier {
     try {
       final text = utf8.decode(dg.data, allowMalformed: true).trim();
       if (!text.startsWith('{')) return;
-      final map = jsonDecode(text);
-      if (map is! Map<String, dynamic>) return;
-      if (map['magic'] != 'LIUGUANG_PEER_V1') return;
+      final rawMap = jsonDecode(text);
+      if (rawMap is! Map<String, dynamic>) return;
+      if (rawMap['magic'] != 'LIUGUANG_PEER_V1') return;
+      final map = (rawMap['node'] is Map<String, dynamic>)
+          ? rawMap['node'] as Map<String, dynamic>
+          : rawMap;
       final peerId = (map['deviceId'] ?? '').toString().trim();
       if (peerId.isEmpty || peerId == _deviceId) return;
 
@@ -1620,8 +1657,7 @@ class PeerMeshService extends ChangeNotifier {
         isLanReachable: true,
         lastSeenAt: DateTime.now(),
       );
-      _peers[peerId] = node;
-      notifyListeners();
+      _upsertPeerNode(node);
     } catch (_) {}
   }
 
@@ -1679,8 +1715,11 @@ class PeerMeshService extends ChangeNotifier {
         return null;
       }
       final body = await utf8.decoder.bind(resp).join();
-      final decoded = jsonDecode(body);
-      if (decoded is! Map<String, dynamic>) return null;
+      final rawDecoded = jsonDecode(body);
+      if (rawDecoded is! Map<String, dynamic>) return null;
+      final decoded = (rawDecoded['node'] is Map<String, dynamic>)
+          ? rawDecoded['node'] as Map<String, dynamic>
+          : rawDecoded;
       final peerId = (decoded['deviceId'] ?? '').toString().trim();
       if (peerId.isEmpty || peerId == _deviceId) return null;
       final existing = _peers[peerId];
@@ -1695,8 +1734,7 @@ class PeerMeshService extends ChangeNotifier {
         isLanReachable: true,
         lastSeenAt: DateTime.now(),
       );
-      _peers[peerId] = node;
-      notifyListeners();
+      _upsertPeerNode(node, forceNotify: isManual);
       return node;
     } catch (_) {
       return null;
@@ -1751,7 +1789,7 @@ class PeerMeshService extends ChangeNotifier {
   Future<Map<String, bool>> checkMacDesktopPermissions({
     bool prompt = false,
   }) async {
-    if (kIsWeb || !Platform.isMacOS) {
+    if (kIsWeb || (!Platform.isMacOS && !Platform.isAndroid)) {
       return const {'screenCapture': true, 'accessibility': true};
     }
     try {
@@ -1768,7 +1806,7 @@ class PeerMeshService extends ChangeNotifier {
     }
   }
 
-  /// Captures a screen frame in either `'desktop'` (full OS desktop) or `'app'` (Flutter window) mode.
+  /// Captures a screen frame in either `'desktop'` (full OS desktop / full device screen) or `'app'` (Flutter window) mode.
   Future<({
     Uint8List bytes,
     String mimeType,
@@ -1784,7 +1822,7 @@ class PeerMeshService extends ChangeNotifier {
         _allowDesktopCapture &&
         supportsNativeDesktopCapture;
 
-    if (wantDesktop && !kIsWeb && Platform.isMacOS) {
+    if (wantDesktop && !kIsWeb && (Platform.isMacOS || Platform.isAndroid)) {
       try {
         final res = await NativeUtilsChannelHub.channel
             .invokeMapMethod<String, dynamic>(
@@ -1809,7 +1847,125 @@ class PeerMeshService extends ChangeNotifier {
       } catch (_) {}
     }
 
+    if (wantDesktop && !kIsWeb && Platform.isWindows) {
+      final winFrame = await _captureWindowsDesktopScreen(
+        maxWidth: maxWidth,
+        quality: quality,
+      );
+      if (winFrame != null) return winFrame;
+    }
+
+    if (wantDesktop && !kIsWeb && Platform.isLinux) {
+      final linuxFrame = await _captureLinuxDesktopScreen(
+        maxWidth: maxWidth,
+        quality: quality,
+      );
+      if (linuxFrame != null) return linuxFrame;
+    }
+
     return _captureAppRepaintBoundaryFrame(maxWidth: maxWidth);
+  }
+
+  Future<({
+    Uint8List bytes,
+    String mimeType,
+    String actualMode,
+    int width,
+    int height,
+  })?> _captureWindowsDesktopScreen({
+    int maxWidth = 1280,
+    int quality = 72,
+  }) async {
+    try {
+      final tmpPath =
+          '${Directory.systemTemp.path}\\lg_win_desk_$pid.jpg';
+      final script = '''
+Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+\$b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+\$bmp = New-Object System.Drawing.Bitmap(\$b.Width, \$b.Height)
+\$g = [System.Drawing.Graphics]::FromImage(\$bmp)
+\$g.CopyFromScreen(\$b.Location, [System.Drawing.Point]::Empty, \$b.Size)
+\$cur = [System.Windows.Forms.Cursor]::Position
+\$pen = New-Object System.Drawing.Pen([System.Drawing.Color]::Cyan, 3)
+\$g.DrawEllipse(\$pen, \$cur.X - 7, \$cur.Y - 7, 14, 14)
+\$g.Dispose()
+\$scale = [Math]::Min(1.0, $maxWidth.0 / \$b.Width)
+\$dw = [int](\$b.Width * \$scale)
+\$dh = [int](\$b.Height * \$scale)
+\$out = New-Object System.Drawing.Bitmap(\$bmp, \$dw, \$dh)
+\$bmp.Dispose()
+\$codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { \$_.MimeType -eq 'image/jpeg' }
+\$ep = New-Object System.Drawing.Imaging.EncoderParameters(1)
+\$ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, [long]$quality)
+\$out.Save('$tmpPath', \$codec, \$ep)
+\$out.Dispose()
+Write-Output "\$dw,\$dh"
+''';
+      final res = await Process.run(
+        'powershell',
+        ['-NoProfile', '-NonInteractive', '-Command', script],
+      ).timeout(const Duration(seconds: 3));
+      final f = File(tmpPath);
+      if (res.exitCode == 0 && await f.exists()) {
+        final bytes = await f.readAsBytes();
+        try {
+          await f.delete();
+        } catch (_) {}
+        if (bytes.isNotEmpty) {
+          final parts = res.stdout.toString().trim().split(',');
+          final w = parts.isNotEmpty ? (int.tryParse(parts[0]) ?? 1280) : 1280;
+          final h = parts.length > 1 ? (int.tryParse(parts[1]) ?? 720) : 720;
+          return (
+            bytes: bytes,
+            mimeType: 'image/jpeg',
+            actualMode: 'desktop',
+            width: w,
+            height: h,
+          );
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  Future<({
+    Uint8List bytes,
+    String mimeType,
+    String actualMode,
+    int width,
+    int height,
+  })?> _captureLinuxDesktopScreen({
+    int maxWidth = 1280,
+    int quality = 72,
+  }) async {
+    final tmpPath = '${Directory.systemTemp.path}/lg_linux_desk_$pid.jpg';
+    for (final cmd in <List<String>>[
+      ['scrot', '-o', '-q', '$quality', tmpPath],
+      ['grim', '-t', 'jpeg', '-q', '$quality', tmpPath],
+      ['import', '-window', 'root', '-resize', '${maxWidth}x', '-quality', '$quality', tmpPath],
+    ]) {
+      try {
+        final res = await Process.run(cmd.first, cmd.sublist(1))
+            .timeout(const Duration(seconds: 2));
+        final f = File(tmpPath);
+        if (res.exitCode == 0 && await f.exists()) {
+          final bytes = await f.readAsBytes();
+          try {
+            await f.delete();
+          } catch (_) {}
+          if (bytes.isNotEmpty) {
+            return (
+              bytes: bytes,
+              mimeType: 'image/jpeg',
+              actualMode: 'desktop',
+              width: maxWidth,
+              height: (maxWidth * 9) ~/ 16,
+            );
+          }
+        }
+      } catch (_) {}
+    }
+    return null;
   }
 
   Future<({
@@ -2089,9 +2245,16 @@ class PeerMeshService extends ChangeNotifier {
     _lastRemoteCursorAt = DateTime.now();
     notifyListeners();
 
-    if (targetMode == 'desktop' && !kIsWeb && Platform.isMacOS) {
+    final useOsDesktopControl =
+        (targetMode == 'desktop' || targetMode == 'auto') &&
+            _allowDesktopCapture &&
+            supportsNativeDesktopCapture;
+
+    if (useOsDesktopControl &&
+        !kIsWeb &&
+        (Platform.isMacOS || Platform.isAndroid)) {
       try {
-        await NativeUtilsChannelHub.channel.invokeMethod(
+        final ok = await NativeUtilsChannelHub.channel.invokeMethod<bool>(
           'injectDesktopMouseEvent',
           {
             'type': type,
@@ -2101,8 +2264,30 @@ class PeerMeshService extends ChangeNotifier {
             'deltaY': deltaY.round(),
           },
         );
-        return;
+        if (ok == true) return;
       } catch (_) {}
+    }
+
+    if (useOsDesktopControl && !kIsWeb && Platform.isWindows) {
+      if (await _injectWindowsDesktopMouse(
+        type: type,
+        nx: nx,
+        ny: ny,
+        deltaY: deltaY.round(),
+      )) {
+        return;
+      }
+    }
+
+    if (useOsDesktopControl && !kIsWeb && Platform.isLinux) {
+      if (await _injectLinuxDesktopMouse(
+        type: type,
+        nx: nx,
+        ny: ny,
+        deltaY: deltaY.round(),
+      )) {
+        return;
+      }
     }
 
     final ctx = rootRepaintBoundaryKey.currentContext;
@@ -2217,11 +2402,85 @@ class PeerMeshService extends ChangeNotifier {
     }
   }
 
+  Future<bool> _injectWindowsDesktopMouse({
+    required String type,
+    required double nx,
+    required double ny,
+    required int deltaY,
+  }) async {
+    try {
+      final script = '''
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -MemberDefinition '[DllImport("user32.dll")] public static extern void mouse_event(int dwFlags, int dx, int dy, int cButtons, int dwExtraInfo);' -Name WinMouse -Namespace Win32
+\$b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+\$x = [int](\$b.Width * $nx)
+\$y = [int](\$b.Height * $ny)
+[System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(\$x, \$y)
+switch ('$type') {
+  'tap' { [Win32.WinMouse]::mouse_event(0x0002, 0, 0, 0, 0); [Win32.WinMouse]::mouse_event(0x0004, 0, 0, 0, 0) }
+  'double_tap' { [Win32.WinMouse]::mouse_event(0x0002, 0, 0, 0, 0); [Win32.WinMouse]::mouse_event(0x0004, 0, 0, 0, 0); Start-Sleep -Milliseconds 40; [Win32.WinMouse]::mouse_event(0x0002, 0, 0, 0, 0); [Win32.WinMouse]::mouse_event(0x0004, 0, 0, 0, 0) }
+  'right_click' { [Win32.WinMouse]::mouse_event(0x0008, 0, 0, 0, 0); [Win32.WinMouse]::mouse_event(0x0010, 0, 0, 0, 0) }
+  'down' { [Win32.WinMouse]::mouse_event(0x0002, 0, 0, 0, 0) }
+  'up' { [Win32.WinMouse]::mouse_event(0x0004, 0, 0, 0, 0) }
+  'scroll' { [Win32.WinMouse]::mouse_event(0x0800, 0, 0, ${deltaY * 4}, 0) }
+}
+''';
+      final res = await Process.run(
+        'powershell',
+        ['-NoProfile', '-NonInteractive', '-Command', script],
+      ).timeout(const Duration(seconds: 2));
+      return res.exitCode == 0;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> _injectLinuxDesktopMouse({
+    required String type,
+    required double nx,
+    required double ny,
+    required int deltaY,
+  }) async {
+    try {
+      final geom = await Process.run('xdotool', ['getdisplaygeometry']);
+      final parts = geom.stdout.toString().trim().split(RegExp(r'\s+'));
+      final w = parts.isNotEmpty ? (int.tryParse(parts[0]) ?? 1920) : 1920;
+      final h = parts.length > 1 ? (int.tryParse(parts[1]) ?? 1080) : 1080;
+      final x = (nx * w).round();
+      final y = (ny * h).round();
+      final args = <String>['mousemove', '$x', '$y'];
+      if (type == 'tap') {
+        args.addAll(['click', '1']);
+      } else if (type == 'double_tap') {
+        args.addAll(['click', '--repeat', '2', '1']);
+      } else if (type == 'right_click') {
+        args.addAll(['click', '3']);
+      } else if (type == 'down') {
+        args.addAll(['mousedown', '1']);
+      } else if (type == 'up') {
+        args.addAll(['mouseup', '1']);
+      } else if (type == 'scroll') {
+        args.addAll(['click', deltaY < 0 ? '5' : '4']);
+      }
+      final res = await Process.run('xdotool', args);
+      return res.exitCode == 0;
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<void> _injectLocalKeyAction(
     String keyName, {
     String targetMode = 'app',
   }) async {
-    if (targetMode == 'desktop' && !kIsWeb && Platform.isMacOS) {
+    final useOsDesktopControl =
+        (targetMode == 'desktop' || targetMode == 'auto') &&
+            _allowDesktopCapture &&
+            supportsNativeDesktopCapture;
+
+    if (useOsDesktopControl &&
+        !kIsWeb &&
+        (Platform.isMacOS || Platform.isAndroid)) {
       try {
         final handled = await NativeUtilsChannelHub.channel.invokeMethod<bool>(
           'injectDesktopKeyEvent',
@@ -2229,6 +2488,14 @@ class PeerMeshService extends ChangeNotifier {
         );
         if (handled == true) return;
       } catch (_) {}
+    }
+
+    if (useOsDesktopControl && !kIsWeb && Platform.isWindows) {
+      if (await _injectWindowsDesktopKey(keyName: keyName)) return;
+    }
+
+    if (useOsDesktopControl && !kIsWeb && Platform.isLinux) {
+      if (await _injectLinuxDesktopKey(keyName: keyName)) return;
     }
 
     final primary = FocusManager.instance.primaryFocus;
@@ -2295,15 +2562,111 @@ class PeerMeshService extends ChangeNotifier {
     }
   }
 
+  Future<bool> _injectWindowsDesktopKey({
+    String keyName = '',
+    String text = '',
+  }) async {
+    try {
+      String sendKeyStr = text;
+      if (sendKeyStr.isEmpty) {
+        sendKeyStr = switch (keyName.toLowerCase()) {
+          'enter' || 'ok' => '{ENTER}',
+          'back' || 'escape' || 'esc' => '{ESC}',
+          'tab' => '{TAB}',
+          'space' || 'play_pause' => ' ',
+          'backspace' => '{BACKSPACE}',
+          'delete' || 'del' => '{DELETE}',
+          'up' => '{UP}',
+          'down' => '{DOWN}',
+          'left' => '{LEFT}',
+          'right' => '{RIGHT}',
+          'home' => '{HOME}',
+          'end' => '{END}',
+          'pageup' => '{PGUP}',
+          'pagedown' => '{PGDN}',
+          'ctrl+c' || 'cmd+c' => '^c',
+          'ctrl+v' || 'cmd+v' => '^v',
+          'ctrl+x' || 'cmd+x' => '^x',
+          'ctrl+a' || 'cmd+a' => '^a',
+          'ctrl+z' || 'cmd+z' => '^z',
+          'alt+tab' || 'cmd+tab' => '%{TAB}',
+          'alt+f4' || 'cmd+q' => '%{F4}',
+          _ => keyName,
+        };
+      }
+      if (keyName == 'show_desktop' || keyName == 'win+d') {
+        final res = await Process.run('powershell', [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          '(New-Object -ComObject Shell.Application).ToggleDesktop()',
+        ]).timeout(const Duration(seconds: 2));
+        return res.exitCode == 0;
+      }
+      final escaped = sendKeyStr.replaceAll("'", "''");
+      final res = await Process.run('powershell', [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('$escaped')",
+      ]).timeout(const Duration(seconds: 2));
+      return res.exitCode == 0;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> _injectLinuxDesktopKey({
+    String keyName = '',
+    String text = '',
+  }) async {
+    try {
+      if (text.isNotEmpty) {
+        final res = await Process.run('xdotool', ['type', '--', text]);
+        return res.exitCode == 0;
+      }
+      final xKey = switch (keyName.toLowerCase()) {
+        'enter' || 'ok' => 'Return',
+        'back' || 'escape' || 'esc' => 'Escape',
+        'tab' => 'Tab',
+        'space' || 'play_pause' => 'space',
+        'backspace' => 'BackSpace',
+        'delete' || 'del' => 'Delete',
+        'up' => 'Up',
+        'down' => 'Down',
+        'left' => 'Left',
+        'right' => 'Right',
+        'ctrl+c' || 'cmd+c' => 'ctrl+c',
+        'ctrl+v' || 'cmd+v' => 'ctrl+v',
+        'ctrl+a' || 'cmd+a' => 'ctrl+a',
+        'ctrl+z' || 'cmd+z' => 'ctrl+z',
+        'alt+tab' || 'cmd+tab' => 'alt+Tab',
+        'show_desktop' || 'win+d' => 'super+d',
+        _ => keyName,
+      };
+      final res = await Process.run('xdotool', ['key', xKey]);
+      return res.exitCode == 0;
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<void> _injectLocalTextInput(
     String text, {
     bool submit = false,
     String targetMode = 'app',
   }) async {
     if (text.isEmpty) return;
-    if (targetMode == 'desktop' && !kIsWeb && Platform.isMacOS) {
+    final useOsDesktopControl =
+        (targetMode == 'desktop' || targetMode == 'auto') &&
+            _allowDesktopCapture &&
+            supportsNativeDesktopCapture;
+
+    if (useOsDesktopControl &&
+        !kIsWeb &&
+        (Platform.isMacOS || Platform.isAndroid)) {
       try {
-        await NativeUtilsChannelHub.channel.invokeMethod<bool>(
+        final ok = await NativeUtilsChannelHub.channel.invokeMethod<bool>(
           'injectDesktopKeyEvent',
           {'text': text},
         );
@@ -2313,8 +2676,22 @@ class PeerMeshService extends ChangeNotifier {
             {'key': 'enter'},
           );
         }
-        return;
+        if (ok == true) return;
       } catch (_) {}
+    }
+
+    if (useOsDesktopControl && !kIsWeb && Platform.isWindows) {
+      if (await _injectWindowsDesktopKey(text: text)) {
+        if (submit) await _injectWindowsDesktopKey(keyName: 'enter');
+        return;
+      }
+    }
+
+    if (useOsDesktopControl && !kIsWeb && Platform.isLinux) {
+      if (await _injectLinuxDesktopKey(text: text)) {
+        if (submit) await _injectLinuxDesktopKey(keyName: 'enter');
+        return;
+      }
     }
 
     final primary = FocusManager.instance.primaryFocus;

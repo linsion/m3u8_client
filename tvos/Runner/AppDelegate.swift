@@ -493,6 +493,8 @@ struct TvRootView: View {
               TvMediaLibrarySectionView()
             case .music:
               TvCloudMusicFullscreenHallView(isStandaloneSection: true)
+            case .peerMesh:
+              TvPeerMeshSectionView()
             case .proxy:
               TvProxySectionView()
             case .settings:
@@ -16161,3 +16163,733 @@ struct TvMusicSmartAiPlaylistSheet: View {
     }
   }
 }
+
+// MARK: - 12. Cross-Device Peer Mesh Section View (Apple TV 设备互联：远程桌面 / 遥控播控 / 远程文件直连 / 跨端消息)
+
+struct TvPeerMeshSectionView: View {
+  @EnvironmentObject var appState: TvAppState
+  @State private var activeTab: Int = 0 // 0: 远程桌面, 1: 遥控播控, 2: 远程文件, 3: 跨端消息
+  @State private var isDpadCursorActive: Bool = false
+  @State private var cursorStepSpeed: Double = 0.045
+  @State private var chatInputText: String = ""
+  @State private var castVideoUrlText: String = ""
+
+  var body: some View {
+    HStack(spacing: 24) {
+      // Left Sidebar: Local Node Status & Discovered Peer Devices
+      peerSidebarView
+        .frame(width: 390)
+        .focusSection()
+
+      // Right Workspace
+      VStack(spacing: 18) {
+        peerWorkspaceTopBar
+          .focusSection()
+
+        if let peer = appState.selectedPeerDevice {
+          Group {
+            switch activeTab {
+            case 0:
+              peerRemoteDesktopView(peer: peer)
+            case 1:
+              peerRemoteControlPadView(peer: peer)
+            case 2:
+              peerRemoteFilesView(peer: peer)
+            default:
+              peerChatMessagesView(peer: peer)
+            }
+          }
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+          .focusSection()
+        } else {
+          peerEmptyStateView
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+      }
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+    .padding(.horizontal, 44)
+    .padding(.vertical, 20)
+    .onAppear {
+      appState.startPeerMeshServer()
+      if appState.peerDevices.isEmpty {
+        appState.scanPeerNetwork()
+      }
+    }
+    .onDisappear {
+      appState.stopPeerDesktopStream()
+    }
+  }
+
+  private var peerSidebarView: some View {
+    VStack(alignment: .leading, spacing: 14) {
+      // Local Apple TV status card
+      VStack(alignment: .leading, spacing: 8) {
+        HStack(spacing: 10) {
+          Image(systemName: "appletv.fill")
+            .font(.system(size: 22, weight: .bold))
+            .foregroundColor(Color(red: 0.22, green: 0.78, blue: 0.98))
+          VStack(alignment: .leading, spacing: 2) {
+            Text(appState.peerDeviceName)
+              .font(.system(size: 20, weight: .bold))
+              .foregroundColor(.white)
+              .lineLimit(1)
+            Text(appState.peerLocalUrl.isEmpty ? "端口 :18190 运行中" : appState.peerLocalUrl)
+              .font(.system(size: 14, weight: .medium))
+              .foregroundColor(.white.opacity(0.68))
+              .lineLimit(1)
+          }
+          Spacer()
+          Text(appState.peerPairingCode)
+            .font(.system(size: 13, weight: .bold))
+            .foregroundColor(Color(red: 0.30, green: 0.92, blue: 0.65))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(Color(red: 0.30, green: 0.92, blue: 0.65).opacity(0.16), in: Capsule())
+        }
+      }
+      .padding(16)
+      .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+      .overlay(
+        RoundedRectangle(cornerRadius: 18, style: .continuous)
+          .stroke(Color.white.opacity(0.14), lineWidth: 1)
+      )
+
+      // Action buttons row
+      HStack(spacing: 10) {
+        Button {
+          appState.scanPeerNetwork()
+        } label: {
+          HStack(spacing: 6) {
+            Image(systemName: appState.peerIsScanning ? "arrow.triangle.2.circlepath" : "dot.radiowaves.left.and.right")
+            Text(appState.peerIsScanning ? "扫描中..." : "扫描设备")
+          }
+          .font(.system(size: 16, weight: .semibold))
+          .frame(maxWidth: .infinity)
+          .padding(.vertical, 10)
+        }
+        .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 12))
+
+        Button {
+          appState.presentLanQuickInput(
+            prompt: "添加跨端设备 IP 地址（例如 192.168.1.100 或 192.168.1.100:18190）",
+            placeholder: "192.168.x.x:18190"
+          ) { hostStr in
+            Task { @MainActor in
+              if let node = await appState.probePeerDeviceAtHost(hostStr, isManual: true) {
+                appState.selectedPeerDeviceId = node.deviceId
+                appState.showToast("已连接设备：\(node.deviceName)")
+              } else {
+                appState.showToast("无法连接到 \(hostStr)")
+              }
+            }
+          }
+        } label: {
+          HStack(spacing: 6) {
+            Image(systemName: "plus.circle.fill")
+            Text("手动连IP")
+          }
+          .font(.system(size: 16, weight: .semibold))
+          .frame(maxWidth: .infinity)
+          .padding(.vertical, 10)
+        }
+        .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 12))
+
+        Button {
+          appState.presentLanQuickInput(
+            prompt: "设置跨网/局域网互联配对码（相同配对码的设备自动互通）",
+            placeholder: appState.peerPairingCode
+          ) { code in
+            appState.updatePeerConfig(
+              deviceName: appState.peerDeviceName,
+              pairingCode: code,
+              allowControl: appState.peerAllowRemoteControl
+            )
+          }
+        } label: {
+          Image(systemName: "key.fill")
+            .font(.system(size: 16, weight: .semibold))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+        }
+        .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 12))
+      }
+
+      Text("在线互联设备 (\(appState.peerDevices.count))")
+        .font(.system(size: 16, weight: .bold))
+        .foregroundColor(.white.opacity(0.65))
+        .padding(.top, 4)
+
+      ScrollView {
+        LazyVStack(spacing: 10) {
+          ForEach(appState.peerDevices) { dev in
+            let isSelected = appState.selectedPeerDevice?.deviceId == dev.deviceId
+            Button {
+              let changed = appState.selectedPeerDeviceId != dev.deviceId
+              appState.selectedPeerDeviceId = dev.deviceId
+              if changed {
+                if appState.peerScreenStreaming {
+                  appState.startPeerDesktopStream()
+                }
+                if activeTab == 2 {
+                  appState.loadPeerRemoteFiles()
+                }
+              }
+            } label: {
+              HStack(spacing: 12) {
+                Image(systemName: dev.platformIconName)
+                  .font(.system(size: 22, weight: .semibold))
+                  .foregroundColor(isSelected ? Color(red: 0.25, green: 0.85, blue: 1.0) : .white.opacity(0.8))
+                  .frame(width: 36)
+                VStack(alignment: .leading, spacing: 3) {
+                  Text(dev.deviceName)
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                  Text("\(dev.platform) · \(dev.host):\(dev.port)")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(.white.opacity(0.65))
+                    .lineLimit(1)
+                  if !dev.nowPlaying.isEmpty {
+                    Text(dev.nowPlaying)
+                      .font(.system(size: 12, weight: .semibold))
+                      .foregroundColor(Color(red: 0.30, green: 0.92, blue: 0.65))
+                      .lineLimit(1)
+                  }
+                }
+                Spacer()
+                Circle()
+                  .fill(dev.isOnline ? Color.green : Color.gray)
+                  .frame(width: 10, height: 10)
+              }
+              .padding(.horizontal, 14)
+              .padding(.vertical, 12)
+              .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                  .fill(isSelected ? Color(red: 0.16, green: 0.45, blue: 0.68).opacity(0.55) : Color.white.opacity(0.05))
+              )
+            }
+            .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 14))
+          }
+        }
+      }
+    }
+    .padding(18)
+    .background(Color.black.opacity(0.38), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+    .overlay(
+      RoundedRectangle(cornerRadius: 24, style: .continuous)
+        .stroke(Color.white.opacity(0.10), lineWidth: 1)
+    )
+  }
+
+  private var peerWorkspaceTopBar: some View {
+    HStack(spacing: 14) {
+      ForEach(0..<4, id: \.self) { idx in
+        let titles = ["🖥️ 远程桌面", "🎮 遥控播控 & 投屏", "📂 远程文件直连", "💬 跨端消息"]
+        let isSelected = activeTab == idx
+        Button {
+          activeTab = idx
+          if idx == 2 && appState.peerRemoteFiles.isEmpty {
+            appState.loadPeerRemoteFiles()
+          }
+        } label: {
+          Text(titles[idx])
+            .font(.system(size: 18, weight: isSelected ? .bold : .semibold))
+            .foregroundColor(isSelected ? .black : .white)
+            .padding(.horizontal, 22)
+            .padding(.vertical, 11)
+            .background(
+              Capsule()
+                .fill(isSelected ? Color(red: 0.25, green: 0.85, blue: 1.0) : Color.white.opacity(0.08))
+            )
+        }
+        .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 22))
+      }
+      Spacer()
+      if let peer = appState.selectedPeerDevice {
+        Text("当前连接：\(peer.deviceName) (\(peer.platform))")
+          .font(.system(size: 16, weight: .semibold))
+          .foregroundColor(.white.opacity(0.78))
+      }
+    }
+  }
+
+  private func peerRemoteDesktopView(peer: TvPeerDeviceNode) -> some View {
+    VStack(spacing: 14) {
+      // Remote Desktop Control Toolbar
+      HStack(spacing: 10) {
+        Button {
+          if appState.peerScreenStreaming {
+            appState.stopPeerDesktopStream()
+          } else {
+            appState.startPeerDesktopStream()
+          }
+        } label: {
+          HStack(spacing: 6) {
+            Image(systemName: appState.peerScreenStreaming ? "stop.fill" : "play.fill")
+            Text(appState.peerScreenStreaming ? "停止桌面画面" : "开启远程桌面")
+          }
+          .font(.system(size: 16, weight: .bold))
+          .foregroundColor(appState.peerScreenStreaming ? .red : Color(red: 0.30, green: 0.92, blue: 0.65))
+          .padding(.horizontal, 16)
+          .padding(.vertical, 9)
+        }
+        .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 12))
+
+        // Target capture mode toggle (Whole OS Desktop vs App Only)
+        Button {
+          appState.peerScreenCaptureMode = (appState.peerScreenCaptureMode == "desktop") ? "app" : "desktop"
+          appState.showToast(
+            appState.peerScreenCaptureMode == "desktop"
+              ? "已切换为：控制整个系统桌面/设备"
+              : "已切换为：仅控制流光应用窗口"
+          )
+        } label: {
+          Text(appState.peerScreenCaptureMode == "desktop" ? "🖥️ 整个系统桌面" : "📱 仅应用窗口")
+            .font(.system(size: 15, weight: .semibold))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+        }
+        .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 12))
+
+        // Zoom scale presets
+        ForEach([1.0, 1.5, 2.0, 3.0], id: \.self) { scale in
+          let active = abs(appState.peerDesktopZoomScale - scale) < 0.08
+          Button {
+            withAnimation(.easeOut(duration: 0.18)) {
+              appState.peerDesktopZoomScale = scale
+            }
+          } label: {
+            Text(String(format: "%.1fx", scale).replacingOccurrences(of: ".0x", with: "x"))
+              .font(.system(size: 15, weight: active ? .bold : .medium))
+              .foregroundColor(active ? Color(red: 0.25, green: 0.85, blue: 1.0) : .white)
+              .padding(.horizontal, 12)
+              .padding(.vertical, 9)
+          }
+          .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 10))
+        }
+
+        // Mouse Action Shortcuts
+        Button {
+          appState.sendPeerPointerEvent(type: "tap", button: "left")
+        } label: {
+          Text("🖱️ 左键")
+            .font(.system(size: 15, weight: .semibold))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+        }
+        .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 10))
+
+        Button {
+          appState.sendPeerPointerEvent(type: "double_tap", button: "left")
+        } label: {
+          Text("⚡ 双击")
+            .font(.system(size: 15, weight: .semibold))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+        }
+        .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 10))
+
+        Button {
+          appState.sendPeerPointerEvent(type: "secondary_tap", button: "right")
+        } label: {
+          Text("📋 右键")
+            .font(.system(size: 15, weight: .semibold))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+        }
+        .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 10))
+
+        Button {
+          appState.sendPeerControlCommand(action: "key", payload: ["key": "show_desktop"])
+        } label: {
+          Text("🖥️ 显示桌面")
+            .font(.system(size: 15, weight: .semibold))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+        }
+        .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 10))
+
+        Button {
+          appState.sendPeerControlCommand(action: "key", payload: ["key": "alt+tab"])
+        } label: {
+          Text("🔄 切换窗口")
+            .font(.system(size: 15, weight: .semibold))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+        }
+        .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 10))
+
+        Button {
+          appState.presentLanQuickInput(
+            prompt: "向 \(peer.deviceName) 远程桌面输入文字",
+            placeholder: "输入要发送到对方电脑/手机的文字..."
+          ) { text in
+            appState.sendPeerControlCommand(action: "text_input", payload: ["text": text])
+          }
+        } label: {
+          Text("⌨️ 打字")
+            .font(.system(size: 15, weight: .semibold))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+        }
+        .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 10))
+
+        Spacer()
+      }
+
+      // Interactive Remote Desktop Screen Canvas (Supports Siri Remote D-Pad Mouse Pointer Movement + Zoom!)
+      GeometryReader { geo in
+        Button {
+          if !appState.peerScreenStreaming {
+            appState.startPeerDesktopStream()
+          } else {
+            appState.sendPeerPointerEvent(type: "tap", button: "left")
+          }
+        } label: {
+          ZStack {
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+              .fill(Color.black.opacity(0.75))
+
+            if let img = appState.peerRemoteScreenImage {
+              let zoom = appState.peerDesktopZoomScale
+              let panOffsetX = (0.5 - appState.peerVirtualCursorX) * geo.size.width * max(0, zoom - 1.0)
+              let panOffsetY = (0.5 - appState.peerVirtualCursorY) * geo.size.height * max(0, zoom - 1.0)
+
+              ZStack {
+                Image(uiImage: img)
+                  .resizable()
+                  .aspectRatio(contentMode: .fit)
+                  .frame(width: geo.size.width, height: geo.size.height)
+
+                // High-Visibility Windows-RDP Virtual Mouse Pointer
+                ZStack {
+                  Circle()
+                    .stroke(Color.black.opacity(0.85), lineWidth: 3)
+                    .frame(width: 24, height: 24)
+                  Circle()
+                    .fill(Color(red: 0.20, green: 0.88, blue: 1.0))
+                    .frame(width: 14, height: 14)
+                  Image(systemName: "cursorarrow")
+                    .font(.system(size: 26, weight: .heavy))
+                    .foregroundColor(.white)
+                    .shadow(color: .black, radius: 4)
+                    .offset(x: 8, y: 10)
+                }
+                .position(
+                  x: appState.peerVirtualCursorX * geo.size.width,
+                  y: appState.peerVirtualCursorY * geo.size.height
+                )
+              }
+              .scaleEffect(zoom)
+              .offset(x: panOffsetX, y: panOffsetY)
+              .clipped()
+            } else {
+              VStack(spacing: 16) {
+                Image(systemName: "display.2")
+                  .font(.system(size: 56, weight: .light))
+                  .foregroundColor(Color(red: 0.25, green: 0.85, blue: 1.0))
+                Text("点击开启「\(peer.deviceName)」的远程桌面画面")
+                  .font(.system(size: 24, weight: .bold))
+                  .foregroundColor(.white)
+                Text("选中画布后：使用遥控器方向键移动远程鼠标指针，按确认键即可左键点击；支持 1x~3x 放大跟随")
+                  .font(.system(size: 16, weight: .medium))
+                  .foregroundColor(.white.opacity(0.65))
+              }
+            }
+          }
+          .frame(width: geo.size.width, height: geo.size.height)
+          .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+          .overlay(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+              .stroke(
+                isDpadCursorActive ? Color(red: 0.25, green: 0.85, blue: 1.0) : Color.white.opacity(0.15),
+                lineWidth: isDpadCursorActive ? 3 : 1
+              )
+          )
+        }
+        .buttonStyle(.plain)
+        .onMoveCommand { direction in
+          guard appState.peerScreenStreaming else { return }
+          isDpadCursorActive = true
+          let step = cursorStepSpeed / max(1.0, appState.peerDesktopZoomScale * 0.65)
+          switch direction {
+          case .left:
+            appState.peerVirtualCursorX = max(0.0, appState.peerVirtualCursorX - step)
+          case .right:
+            appState.peerVirtualCursorX = min(1.0, appState.peerVirtualCursorX + step)
+          case .up:
+            appState.peerVirtualCursorY = max(0.0, appState.peerVirtualCursorY - step)
+          case .down:
+            appState.peerVirtualCursorY = min(1.0, appState.peerVirtualCursorY + step)
+          @unknown default:
+            break
+          }
+          appState.sendPeerPointerEvent(type: "hover", button: "none")
+        }
+      }
+    }
+  }
+
+  private func peerRemoteControlPadView(peer: TvPeerDeviceNode) -> some View {
+    ScrollView {
+      VStack(alignment: .leading, spacing: 22) {
+        Text("远程遥控与一键投屏 · \(peer.deviceName)")
+          .font(.system(size: 24, weight: .bold))
+          .foregroundColor(.white)
+
+        // Row 1: Remote App Navigation
+        VStack(alignment: .leading, spacing: 12) {
+          Text("切换对方页面 / 系统级快捷操作")
+            .font(.system(size: 17, weight: .semibold))
+            .foregroundColor(.white.opacity(0.75))
+          HStack(spacing: 12) {
+            ForEach([
+              ("影视首页", "home"),
+              ("电视直播", "live"),
+              ("Telegram", "telegram"),
+              ("流光音乐", "music"),
+              ("媒体文件", "files"),
+              ("下载管理", "downloads"),
+              ("设备互联", "peer"),
+              ("系统设置", "settings")
+            ], id: \.1) { item in
+              Button {
+                appState.sendPeerControlCommand(action: "navigate", payload: ["route": item.1])
+                appState.showToast("已指令对方切换至：\(item.0)")
+              } label: {
+                Text(item.0)
+                  .font(.system(size: 16, weight: .semibold))
+                  .padding(.horizontal, 18)
+                  .padding(.vertical, 12)
+              }
+              .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 12))
+            }
+          }
+        }
+        .padding(20)
+        .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+
+        // Row 2: System & Media Playback Keys
+        VStack(alignment: .leading, spacing: 12) {
+          Text("远程系统按键 & 媒体播控")
+            .font(.system(size: 17, weight: .semibold))
+            .foregroundColor(.white.opacity(0.75))
+          HStack(spacing: 12) {
+            ForEach([
+              ("⏯ 播放/暂停", "play_pause"),
+              ("⏪ 快退 15s", "seek_backward"),
+              ("⏩ 快进 15s", "seek_forward"),
+              ("🔊 音量 +", "volume_up"),
+              ("🔉 音量 -", "volume_down"),
+              ("🖥️ 显示桌面", "show_desktop"),
+              ("🔄 切换窗口", "alt+tab"),
+              ("↩️ 返回/Esc", "back")
+            ], id: \.1) { item in
+              Button {
+                appState.sendPeerControlCommand(action: "key", payload: ["key": item.1])
+              } label: {
+                Text(item.0)
+                  .font(.system(size: 16, weight: .semibold))
+                  .padding(.horizontal, 16)
+                  .padding(.vertical, 12)
+              }
+              .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 12))
+            }
+          }
+        }
+        .padding(20)
+        .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+
+        // Row 3: Cast Media URL to Peer
+        VStack(alignment: .leading, spacing: 12) {
+          Text("投送视频流链接到「\(peer.deviceName)」立即播放")
+            .font(.system(size: 17, weight: .semibold))
+            .foregroundColor(.white.opacity(0.75))
+          HStack(spacing: 14) {
+            Button {
+              appState.presentLanQuickInput(
+                prompt: "输入要投屏到 \(peer.deviceName) 播放的视频直链 (m3u8 / mp4 / http)",
+                placeholder: "https://example.com/live.m3u8"
+              ) { url in
+                castVideoUrlText = url
+                appState.sendPeerControlCommand(
+                  action: "cast_media",
+                  payload: ["url": url, "title": "来自 Apple TV 投屏"]
+                )
+                appState.showToast("已投屏至 \(peer.deviceName)")
+              }
+            } label: {
+              HStack(spacing: 10) {
+                Image(systemName: "airplayvideo")
+                Text(castVideoUrlText.isEmpty ? "输入视频链接并一键投屏到对方设备..." : "再次投屏：\(castVideoUrlText)")
+                  .lineLimit(1)
+              }
+              .font(.system(size: 17, weight: .bold))
+              .padding(.horizontal, 22)
+              .padding(.vertical, 14)
+            }
+            .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 14))
+          }
+        }
+        .padding(20)
+        .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+      }
+    }
+  }
+
+  private func peerRemoteFilesView(peer: TvPeerDeviceNode) -> some View {
+    VStack(alignment: .leading, spacing: 14) {
+      HStack(spacing: 14) {
+        Text("远程共享文件 · \(peer.deviceName)")
+          .font(.system(size: 22, weight: .bold))
+          .foregroundColor(.white)
+        if !appState.peerRemoteCurrentDir.isEmpty {
+          Text(appState.peerRemoteCurrentDir)
+            .font(.system(size: 14, weight: .medium))
+            .foregroundColor(.white.opacity(0.6))
+            .lineLimit(1)
+        }
+        Spacer()
+        Button {
+          let current = appState.peerRemoteCurrentDir
+          let parent = (current as NSString).deletingLastPathComponent
+          appState.loadPeerRemoteFiles(dirPath: parent == current ? "" : parent)
+        } label: {
+          Label("上级目录", systemImage: "arrow.up.folder.fill")
+            .font(.system(size: 16, weight: .semibold))
+            .padding(.horizontal, 16)
+            .padding(.vertical, 9)
+        }
+        .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 12))
+
+        Button {
+          appState.loadPeerRemoteFiles(dirPath: appState.peerRemoteCurrentDir)
+        } label: {
+          Label("刷新列表", systemImage: "arrow.clockwise")
+            .font(.system(size: 16, weight: .semibold))
+            .padding(.horizontal, 16)
+            .padding(.vertical, 9)
+        }
+        .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 12))
+      }
+
+      if appState.peerIsLoadingFiles {
+        ProgressView("正在读取 \(peer.deviceName) 的共享目录...")
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+      } else if appState.peerRemoteFiles.isEmpty {
+        VStack(spacing: 14) {
+          Image(systemName: "folder.badge.questionmark")
+            .font(.system(size: 48))
+            .foregroundColor(.white.opacity(0.45))
+          Text("当前目录为空，或点击右上角「刷新列表」加载远端文件")
+            .font(.system(size: 18, weight: .medium))
+            .foregroundColor(.white.opacity(0.65))
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+      } else {
+        ScrollView {
+          LazyVStack(spacing: 10) {
+            ForEach(appState.peerRemoteFiles) { item in
+              Button {
+                appState.playOrDownloadPeerRemoteFile(item)
+              } label: {
+                HStack(spacing: 14) {
+                  Image(systemName: item.isDir ? "folder.fill" : "play.rectangle.fill")
+                    .font(.system(size: 22))
+                    .foregroundColor(item.isDir ? .yellow : Color(red: 0.25, green: 0.85, blue: 1.0))
+                    .frame(width: 34)
+                  Text(item.name)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                  Spacer()
+                  if !item.isDir {
+                    Text(ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file))
+                      .font(.system(size: 15, weight: .medium))
+                      .foregroundColor(.white.opacity(0.65))
+                  }
+                  Text(item.isDir ? "打开目录" : "直连播放 / 下载")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundColor(Color(red: 0.25, green: 0.85, blue: 1.0))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color(red: 0.25, green: 0.85, blue: 1.0).opacity(0.15), in: Capsule())
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 14)
+                .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+              }
+              .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 14))
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private func peerChatMessagesView(peer: TvPeerDeviceNode) -> some View {
+    VStack(alignment: .leading, spacing: 14) {
+      HStack {
+        Text("跨端即时消息 · \(peer.deviceName)")
+          .font(.system(size: 22, weight: .bold))
+          .foregroundColor(.white)
+        Spacer()
+        Button {
+          appState.presentLanQuickInput(
+            prompt: "发送跨端消息给 \(peer.deviceName)",
+            placeholder: "输入消息内容或链接..."
+          ) { text in
+            appState.sendPeerChatMessage(text: text)
+          }
+        } label: {
+          Label("输入并发送消息", systemImage: "paperplane.fill")
+            .font(.system(size: 16, weight: .bold))
+            .padding(.horizontal, 18)
+            .padding(.vertical, 10)
+        }
+        .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 12))
+      }
+
+      ScrollView {
+        LazyVStack(alignment: .leading, spacing: 12) {
+          ForEach(appState.peerChatMessages) { msg in
+            HStack {
+              if msg.isOutgoing { Spacer() }
+              VStack(alignment: msg.isOutgoing ? .trailing : .leading, spacing: 4) {
+                Text(msg.isOutgoing ? "我 (\(appState.peerDeviceName))" : msg.fromDeviceName)
+                  .font(.system(size: 13, weight: .semibold))
+                  .foregroundColor(.white.opacity(0.6))
+                Text(msg.text)
+                  .font(.system(size: 18, weight: .medium))
+                  .foregroundColor(.white)
+                  .padding(.horizontal, 16)
+                  .padding(.vertical, 10)
+                  .background(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                      .fill(msg.isOutgoing ? Color(red: 0.16, green: 0.45, blue: 0.68) : Color.white.opacity(0.10))
+                  )
+              }
+              if !msg.isOutgoing { Spacer() }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private var peerEmptyStateView: some View {
+    VStack(spacing: 16) {
+      Image(systemName: "display.2")
+        .font(.system(size: 64, weight: .thin))
+        .foregroundColor(Color(red: 0.25, green: 0.85, blue: 1.0))
+      Text("正在发现同一局域网或相同配对码的流光客户端")
+        .font(.system(size: 24, weight: .bold))
+        .foregroundColor(.white)
+      Text("支持 macOS / Windows / Linux / iOS / Android / Android TV / Apple TV 全平台远程桌面、文件互传与播控")
+        .font(.system(size: 16, weight: .medium))
+        .foregroundColor(.white.opacity(0.65))
+    }
+  }
+}
+

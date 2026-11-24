@@ -645,6 +645,9 @@ class _TelegramScreenState extends State<TelegramScreen> {
         widget.appState.telegramNotifications.registerActiveAccountId(
           _activeAccountId,
         );
+        if (_selectedChat != null && !_showScrollToBottomBtn) {
+          _markChatAsRead(_selectedChat!);
+        }
         unawaited(_pollLiveUpdates(forceChatListSync: true));
       }
     } else if (widget.appState.activeChildBackHandler == _handleBackPress) {
@@ -724,6 +727,31 @@ class _TelegramScreenState extends State<TelegramScreen> {
     final msg = event.message;
     final activeChat = _selectedChat;
 
+    // 0a. Sync official Telegram per-peer mute state from SSE event
+    if (event.peer.isNotEmpty &&
+        (event.notificationSettingsChanged ||
+            event.newMessage ||
+            event.notificationMuted)) {
+      widget.appState.telegramNotifications.recordServerChatMuteState(
+        _activeAccountId,
+        event.peer,
+        event.notificationMuted,
+      );
+      if (event.notificationSettingsChanged) {
+        final mIdx = _chats.indexWhere((c) => c.peer == event.peer);
+        if (mIdx >= 0 && _chats[mIdx].muted != event.notificationMuted) {
+          setState(() {
+            _chats[mIdx] =
+                _chats[mIdx].copyWith(muted: event.notificationMuted);
+            if (_selectedChat?.peer == event.peer) {
+              _selectedChat =
+                  _selectedChat!.copyWith(muted: event.notificationMuted);
+            }
+          });
+        }
+      }
+    }
+
     // 0. Update read_outbox_max_id in real time when recipient reads our sent messages/files
     if (event.readOutboxMaxId > 0 && event.peer.isNotEmpty) {
       final peerKey = _peerReadKey(event.peer);
@@ -778,7 +806,10 @@ class _TelegramScreenState extends State<TelegramScreen> {
             existing.topMessageId <= 0 || msg.id >= existing.topMessageId;
         if (isNewer) {
           final isCurrentlyReading =
-              activeChat?.peer == event.peer && !_showScrollToBottomBtn;
+              widget.appState.isTelegramViewActive &&
+              widget.appState.isAppForeground &&
+              activeChat?.peer == event.peer &&
+              !_showScrollToBottomBtn;
           final resolvedPreview = msg.resolvedPreviewText(
             isPrivateUserChat: event.peer.startsWith('user:'),
           );
@@ -807,7 +838,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
             preview: preview,
             date: msg.date > 0 ? msg.date : existing.date,
             unread: nextUnread,
-            muted: event.notificationMuted ? true : existing.muted,
+            muted: event.notificationMuted || msg.silent,
           );
           setState(() {
             if (event.newMessage && idx > 0) {
@@ -1675,6 +1706,11 @@ class _TelegramScreenState extends State<TelegramScreen> {
           chat.peer,
           true,
         );
+      } else if (widget.appState.telegramNotifications.isServerPeerMuted(
+        _activeAccountId,
+        chat.peer,
+      )) {
+        chat = chat.copyWith(muted: true);
       }
 
       if (chat.hasSharpAvatar) {
@@ -1702,7 +1738,13 @@ class _TelegramScreenState extends State<TelegramScreen> {
         }
       }
 
-      if (activeSelectedPeer != null && chat.peer == activeSelectedPeer) {
+      final isActivelyReadingSelected =
+          widget.appState.isTelegramViewActive &&
+          widget.appState.isAppForeground &&
+          !_showScrollToBottomBtn;
+      if (isActivelyReadingSelected &&
+          activeSelectedPeer != null &&
+          chat.peer == activeSelectedPeer) {
         final prev = _readUpToDateByPeer[peerKey] ?? 0;
         if (chat.date > prev) {
           _readUpToDateByPeer[peerKey] = chat.date;
@@ -2517,6 +2559,10 @@ class _TelegramScreenState extends State<TelegramScreen> {
           }
           if (changed) {
             nextMessages.sort((a, b) => a.id.compareTo(b.id));
+            final isActivelyReadingActiveChat =
+                widget.appState.isTelegramViewActive &&
+                widget.appState.isAppForeground &&
+                !_showScrollToBottomBtn;
             setState(() {
               _messages = nextMessages;
               if (hasNewer ||
@@ -2542,14 +2588,18 @@ class _TelegramScreenState extends State<TelegramScreen> {
                     date: lastReal.date > 0
                         ? lastReal.date
                         : _chats[chatIdx].date,
-                    unread: 0,
+                    unread: isActivelyReadingActiveChat
+                        ? 0
+                        : (!lastReal.outgoing && hasNewer
+                            ? _chats[chatIdx].unread + 1
+                            : _chats[chatIdx].unread),
                   );
                   _chats[chatIdx] = updated;
                 }
               }
             });
             _saveCurrentChatToMemoryCache();
-            if (hasNewer && !_showScrollToBottomBtn) {
+            if (hasNewer && isActivelyReadingActiveChat) {
               final lastReal = msgRes.messages.last;
               _markChatAsRead(
                 activeChat,
@@ -2968,6 +3018,13 @@ class _TelegramScreenState extends State<TelegramScreen> {
             List<TelegramFolder>.from(loadedFolders);
       }
 
+      // Notify TelegramNotificationService of any new unread messages across ALL chats
+      // (including unselected chats and when the user is on another tab!)
+      widget.appState.telegramNotifications.syncChatsForNotifications(
+        reqAccountId,
+        res.chats,
+      );
+
       setState(() {
         if (loadMore) {
           final existingPeers = _chats.map((c) => c.peer).toSet();
@@ -2996,7 +3053,10 @@ class _TelegramScreenState extends State<TelegramScreen> {
           if (shouldAutoSelectFirst && _chats.isNotEmpty) {
             _selectedChat = _chats.first;
             _restoreDraftForChat(_selectedChat!);
-            _markChatAsRead(_selectedChat!);
+            if (widget.appState.isTelegramViewActive &&
+                widget.appState.isAppForeground) {
+              _markChatAsRead(_selectedChat!);
+            }
             final cachedMsgs =
                 _cachedMessagesByPeer[_peerReadKey(_selectedChat!.peer)];
             if (cachedMsgs != null && cachedMsgs.messages.isNotEmpty) {
@@ -3025,7 +3085,13 @@ class _TelegramScreenState extends State<TelegramScreen> {
                       freshChat.topMessageId > currentMaxId) ||
                   (freshChat.date > 0 &&
                       freshChat.date != _selectedChat!.date);
-              _selectedChat = freshChat.copyWith(unread: 0);
+              final isActivelyReading =
+                  widget.appState.isTelegramViewActive &&
+                  widget.appState.isAppForeground &&
+                  !_showScrollToBottomBtn;
+              _selectedChat = isActivelyReading
+                  ? freshChat.copyWith(unread: 0)
+                  : freshChat;
               if (_messages.isEmpty && !_isLoadingMessages) {
                 _loadMessages(loadOlder: false);
               } else if (hasNewerServerMsg && !_isLoadingMessages) {
@@ -3218,18 +3284,32 @@ class _TelegramScreenState extends State<TelegramScreen> {
         }
         if (_messages.isNotEmpty) {
           final lastMsg = _messages.last;
+          if (!lastMsg.outgoing &&
+              lastMsg.silent &&
+              (chat.peer.startsWith('channel:') ||
+                  chat.peer.startsWith('chat:'))) {
+            widget.appState.telegramNotifications.recordServerChatMuteState(
+              _activeAccountId,
+              chat.peer,
+              true,
+            );
+          }
           final fallbackPreview = lastMsg.resolvedPreviewText(
             isPrivateUserChat: chat.peer.startsWith('user:'),
           );
           final chatIdx = _chats.indexWhere((c) => c.peer == chat.peer);
           if (chatIdx >= 0 &&
               (_chats[chatIdx].preview.trim().isEmpty ||
-                  lastMsg.id >= _chats[chatIdx].topMessageId)) {
-            if (fallbackPreview.isNotEmpty) {
-              _chats[chatIdx] = _chats[chatIdx].copyWith(
-                preview: fallbackPreview.characters.take(120).toString(),
-              );
-            }
+                  lastMsg.id >= _chats[chatIdx].topMessageId ||
+                  (!lastMsg.outgoing && lastMsg.silent))) {
+            _chats[chatIdx] = _chats[chatIdx].copyWith(
+              preview: fallbackPreview.isNotEmpty
+                  ? fallbackPreview.characters.take(120).toString()
+                  : _chats[chatIdx].preview,
+              muted: (!lastMsg.outgoing && lastMsg.silent)
+                  ? true
+                  : _chats[chatIdx].muted,
+            );
           }
         }
         _isLoadingMessages = false;

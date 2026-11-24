@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
@@ -33,12 +34,30 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
   // Remote Desktop Streaming State
   bool _isStreamingDesktop = false;
   bool _isDesktopFullscreen = false;
-  String _captureMode = 'auto'; // 'auto', 'desktop', 'app'
-  String _activeRemoteMode = 'app';
-  int _streamFps = 5;
+  bool _isLandscapeLocked = false;
+  bool _isMobileHeaderCollapsed = false;
+  bool _showFloatingKeyboardBar = false;
+  String _captureMode = 'desktop'; // Default to full system desktop ('desktop', 'auto', 'app')
+  String _activeRemoteMode = 'desktop';
+  final int _streamFps = 6;
   int _streamMaxWidth = 1280;
-  int _streamQuality = 72;
-  String _pointerTool = 'tap'; // 'tap', 'double_tap', 'right_click', 'drag'
+  final int _streamQuality = 74;
+
+  // Windows-Remote-Desktop Style Input & Zoom State
+  // 'trackpad' = Windows RDP Virtual Trackpad Pointer (best for mobile phones & TV)
+  // 'direct' = Direct Touch (tap where you touch, pinch to zoom)
+  String _touchInputMode = 'trackpad';
+  final String _pointerTool = 'tap'; // 'tap', 'double_tap', 'right_click', 'drag'
+  bool _isDragLocked = false; // Hold left mouse button down for window dragging / text selection
+  double _virtualCursorNx = 0.5;
+  double _virtualCursorNy = 0.5;
+  final double _trackpadSensitivity = 1.35;
+  double _currentZoomScale = 1.0;
+  bool _stretchToFill = false;
+  final TransformationController _zoomController = TransformationController();
+  final FocusNode _desktopCanvasFocusNode =
+      FocusNode(debugLabel: 'RemoteDesktopCanvasFocus');
+
   Uint8List? _latestFrameBytes;
   int _remoteScreenWidth = 1280;
   int _remoteScreenHeight = 720;
@@ -46,7 +65,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
   Timer? _pollingTimer;
   WebSocket? _activeWs;
   String? _desktopError;
-  Offset? _lastTapNormalized;
+  Offset? _lastTrackpadPanLocal;
 
   final TextEditingController _remoteInputController = TextEditingController();
   final TextEditingController _castUrlController = TextEditingController();
@@ -60,26 +79,41 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
   String _localSaveDirPath = '';
   bool _isDraggingFiles = false;
 
-  // macOS permissions state
-  bool _macHasScreenCapture = true;
-  bool _macHasAccessibility = true;
+  // Native OS permissions state (macOS / Android)
+  bool _osHasScreenCapture = true;
+  bool _osHasAccessibility = true;
 
   @override
   void initState() {
     super.initState();
+    if (!kIsWeb && (Platform.isIOS || Platform.isAndroid)) {
+      _touchInputMode = 'trackpad';
+    } else {
+      _touchInputMode = 'direct';
+    }
+    _zoomController.addListener(_onZoomMatrixChanged);
     _mesh.setPeerScreenActive(true);
     _mesh.addListener(_onMeshChanged);
     NativeUtilsChannelHub.addListener(_handleNativeDropCall);
     unawaited(_initAsync());
   }
 
+  void _onZoomMatrixChanged() {
+    final s = _zoomController.value.getMaxScaleOnAxis();
+    if ((s - _currentZoomScale).abs() > 0.04 && mounted) {
+      setState(() {
+        _currentZoomScale = s.clamp(1.0, 6.0);
+      });
+    }
+  }
+
   Future<void> _initAsync() async {
     await _mesh.ensureInitialized();
     final dir = await _mesh.getPeerDownloadsDirectory();
-    if (!kIsWeb && Platform.isMacOS) {
+    if (!kIsWeb && (Platform.isMacOS || Platform.isAndroid)) {
       final perms = await _mesh.checkMacDesktopPermissions(prompt: false);
-      _macHasScreenCapture = perms['screenCapture'] == true;
-      _macHasAccessibility = perms['accessibility'] == true;
+      _osHasScreenCapture = perms['screenCapture'] == true;
+      _osHasAccessibility = perms['accessibility'] == true;
     }
     if (!mounted) return;
     setState(() {
@@ -95,7 +129,13 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
 
   @override
   void dispose() {
+    if (_isLandscapeLocked) {
+      _restoreDeviceOrientation();
+    }
     _stopDesktopStream(notify: false);
+    _zoomController.removeListener(_onZoomMatrixChanged);
+    _zoomController.dispose();
+    _desktopCanvasFocusNode.dispose();
     _mesh.setPeerScreenActive(false);
     _mesh.removeListener(_onMeshChanged);
     NativeUtilsChannelHub.removeListener(_handleNativeDropCall);
@@ -136,6 +176,109 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
         _startDesktopStream();
       }
       unawaited(_refreshRemoteSharedFiles());
+    }
+  }
+
+  // ===========================================================================
+  // Zoom & Orientation Helpers (Windows Remote Desktop Mobile Experience)
+  // ===========================================================================
+
+  void _setDesktopZoom(
+    double targetScale, {
+    Offset? focalNormalized,
+    Size? viewportSize,
+  }) {
+    final clamped = targetScale.clamp(1.0, 6.0);
+    if (clamped <= 1.02) {
+      _zoomController.value = Matrix4.identity();
+      setState(() => _currentZoomScale = 1.0);
+      return;
+    }
+    final vpW = viewportSize?.width ?? 360.0;
+    final vpH = viewportSize?.height ?? 240.0;
+    final focusNx = focalNormalized?.dx ?? _virtualCursorNx;
+    final focusNy = focalNormalized?.dy ?? _virtualCursorNy;
+    final fx = focusNx * vpW;
+    final fy = focusNy * vpH;
+    final tx = (vpW / 2.0 - fx * clamped).clamp(vpW * (1.0 - clamped), 0.0);
+    final ty = (vpH / 2.0 - fy * clamped).clamp(vpH * (1.0 - clamped), 0.0);
+    final m = Matrix4.identity()
+      ..translate(tx, ty)
+      ..scale(clamped);
+    _zoomController.value = m;
+    setState(() => _currentZoomScale = clamped);
+  }
+
+  void _autoPanZoomedViewportToFollowCursor(Size viewportSize) {
+    final scale = _zoomController.value.getMaxScaleOnAxis();
+    if (scale <= 1.05) return;
+    final vpW = viewportSize.width;
+    final vpH = viewportSize.height;
+    if (vpW <= 0 || vpH <= 0) return;
+
+    final currentMatrix = _zoomController.value.clone();
+    double tx = currentMatrix.getTranslation().x;
+    double ty = currentMatrix.getTranslation().y;
+
+    // Cursor position in screen coordinates
+    final cursorScreenX = _virtualCursorNx * vpW * scale + tx;
+    final cursorScreenY = _virtualCursorNy * vpH * scale + ty;
+    const edgeMargin = 42.0;
+
+    if (cursorScreenX < edgeMargin) {
+      tx += (edgeMargin - cursorScreenX);
+    } else if (cursorScreenX > vpW - edgeMargin) {
+      tx -= (cursorScreenX - (vpW - edgeMargin));
+    }
+    if (cursorScreenY < edgeMargin) {
+      ty += (edgeMargin - cursorScreenY);
+    } else if (cursorScreenY > vpH - edgeMargin) {
+      ty -= (cursorScreenY - (vpH - edgeMargin));
+    }
+
+    tx = tx.clamp(vpW * (1.0 - scale), 0.0);
+    ty = ty.clamp(vpH * (1.0 - scale), 0.0);
+    _zoomController.value = Matrix4.identity()
+      ..translate(tx, ty)
+      ..scale(scale);
+  }
+
+  Future<void> _enterFullscreenDesktop({bool lockLandscape = false}) async {
+    setState(() {
+      _isDesktopFullscreen = true;
+    });
+    if (lockLandscape && !kIsWeb && (Platform.isIOS || Platform.isAndroid)) {
+      _isLandscapeLocked = true;
+      try {
+        await SystemChrome.setEnabledSystemUIMode(
+          SystemUiMode.immersiveSticky,
+        );
+        await SystemChrome.setPreferredOrientations([
+          DeviceOrientation.landscapeLeft,
+          DeviceOrientation.landscapeRight,
+        ]);
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _exitFullscreenDesktop() async {
+    if (_isLandscapeLocked) {
+      await _restoreDeviceOrientation();
+    }
+    if (mounted) {
+      setState(() {
+        _isDesktopFullscreen = false;
+      });
+    }
+  }
+
+  Future<void> _restoreDeviceOrientation() async {
+    _isLandscapeLocked = false;
+    if (!kIsWeb && (Platform.isIOS || Platform.isAndroid)) {
+      try {
+        await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+        await SystemChrome.setPreferredOrientations(DeviceOrientation.values);
+      } catch (_) {}
     }
   }
 
@@ -187,7 +330,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
   }
 
   // ===========================================================================
-  // Remote Desktop Stream Management (WebSocket + HTTP Fallback)
+  // Remote Desktop Stream Management (WebSocket + HTTP/WAN Fallback)
   // ===========================================================================
 
   Future<void> _startDesktopStream() async {
@@ -200,13 +343,11 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
       _desktopError = null;
     });
 
-    // If peer is across a different network (WAN Cloud Tunnel), stream via WAN RPC polling immediately
     if (!peer.isLanReachable) {
       _startHttpPollingFallback();
       return;
     }
 
-    // Try WebSocket real-time stream first, with HTTP polling fallback
     try {
       final ws = await WebSocket.connect(peer.wsUrl)
           .timeout(const Duration(seconds: 3));
@@ -321,6 +462,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
       } catch (_) {}
     }
     _isStreamingDesktop = false;
+    _isDragLocked = false;
     if (notify && mounted) {
       setState(() {});
     }
@@ -350,17 +492,22 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
   }) async {
     final peer = selectedPeer;
     if (peer == null) return;
+    final clampedX = nx.clamp(0.0, 1.0);
+    final clampedY = ny.clamp(0.0, 1.0);
     setState(() {
-      _lastTapNormalized = Offset(nx, ny);
+      _virtualCursorNx = clampedX;
+      _virtualCursorNy = clampedY;
     });
+    // Always target full OS desktop unless user explicitly selected 'app' only
+    final targetMode = _captureMode == 'app' ? 'app' : 'desktop';
     final payload = {
       'action': 'mouse',
       'type': type,
-      'nx': nx,
-      'ny': ny,
+      'nx': clampedX,
+      'ny': clampedY,
       'deltaX': deltaX,
       'deltaY': deltaY,
-      'targetMode': _activeRemoteMode,
+      'targetMode': targetMode,
     };
     final ws = _activeWs;
     if (ws != null && ws.readyState == WebSocket.open) {
@@ -369,7 +516,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
       await _mesh.sendRemoteControlCommand(peer, payload);
       if (_isStreamingDesktop) {
         Future<void>.delayed(
-          const Duration(milliseconds: 90),
+          const Duration(milliseconds: 80),
           _pollSingleFrame,
         );
       }
@@ -379,10 +526,11 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
   Future<void> _sendRemoteKey(String keyName) async {
     final peer = selectedPeer;
     if (peer == null) return;
+    final targetMode = _captureMode == 'app' ? 'app' : 'desktop';
     final payload = {
       'action': 'key',
       'key': keyName,
-      'targetMode': _activeRemoteMode,
+      'targetMode': targetMode,
     };
     final ws = _activeWs;
     if (ws != null && ws.readyState == WebSocket.open) {
@@ -391,7 +539,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
       await _mesh.sendRemoteControlCommand(peer, payload);
       if (_isStreamingDesktop) {
         Future<void>.delayed(
-          const Duration(milliseconds: 90),
+          const Duration(milliseconds: 80),
           _pollSingleFrame,
         );
       }
@@ -402,11 +550,12 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
     final peer = selectedPeer;
     final text = _remoteInputController.text;
     if (peer == null || text.isEmpty) return;
+    final targetMode = _captureMode == 'app' ? 'app' : 'desktop';
     final payload = {
       'action': 'text',
       'text': text,
       'submit': submit,
-      'targetMode': _activeRemoteMode,
+      'targetMode': targetMode,
     };
     final ws = _activeWs;
     if (ws != null && ws.readyState == WebSocket.open) {
@@ -656,9 +805,14 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                     size: 20,
                   ),
                   const SizedBox(width: 8),
-                  const Text(
-                    '跨网络云端互通设置（异地 / 4G/5G / 不同 Wi-Fi）',
-                    style: TextStyle(fontSize: 15.5, fontWeight: FontWeight.w700),
+                  const Flexible(
+                    child: Text(
+                      '跨网络云端互通设置（异地 / 4G/5G / 不同 Wi-Fi）',
+                      style: TextStyle(
+                        fontSize: 15.5,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
                   ),
                 ],
               ),
@@ -881,13 +1035,15 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
 
     final screenWidth = MediaQuery.sizeOf(context).width;
     final isWide = screenWidth >= 900;
+    final hideMobileTopBars =
+        !isWide && _workspaceTabIndex == 0 && _isMobileHeaderCollapsed;
 
     return Scaffold(
       backgroundColor: VideoPlatformTheme.bgPrimary,
       body: Column(
         children: [
-          _buildTopIdentityBar(isWide: isWide),
-          if (!isWide) _buildMobilePeerHorizontalStrip(),
+          if (!hideMobileTopBars) _buildTopIdentityBar(isWide: isWide),
+          if (!isWide && !hideMobileTopBars) _buildMobilePeerHorizontalStrip(),
           Expanded(
             child: Row(
               children: [
@@ -899,7 +1055,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                 Expanded(
                   child: Column(
                     children: [
-                      _buildWorkspaceTabBar(),
+                      _buildWorkspaceTabBar(isWide: isWide),
                       Expanded(
                         child: _buildActiveWorkspacePane(),
                       ),
@@ -916,173 +1072,200 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
 
   Widget _buildTopIdentityBar({required bool isWide}) {
     final onlineCount = _mesh.peers.where((p) => p.isOnline).length;
+    final needsOsPermission = !kIsWeb &&
+        ((Platform.isMacOS &&
+                (!_osHasScreenCapture || !_osHasAccessibility)) ||
+            (Platform.isAndroid && !_osHasAccessibility));
+
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
       decoration: BoxDecoration(
         color: VideoPlatformTheme.bgElevated,
         border: Border(
           bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
         ),
       ),
-      child: Wrap(
-        spacing: 10,
-        runSpacing: 8,
-        alignment: WrapAlignment.spaceBetween,
-        crossAxisAlignment: WrapCrossAlignment.center,
+      child: Row(
         children: [
-          Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Container(
-                width: 36,
-                height: 36,
-                decoration: BoxDecoration(
-                  color: VideoPlatformTheme.accent.withValues(alpha: 0.16),
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(
-                    color: VideoPlatformTheme.accent.withValues(alpha: 0.4),
-                  ),
-                ),
-                child: Icon(
-                  Icons.hub_rounded,
-                  size: 20,
-                  color: VideoPlatformTheme.accent,
-                ),
+          Container(
+            width: 34,
+            height: 34,
+            decoration: BoxDecoration(
+              color: VideoPlatformTheme.accent.withValues(alpha: 0.16),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(
+                color: VideoPlatformTheme.accent.withValues(alpha: 0.4),
               ),
-              const SizedBox(width: 10),
-              Flexible(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+            ),
+            child: Icon(
+              Icons.hub_rounded,
+              size: 19,
+              color: VideoPlatformTheme.accent,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Flexible(
-                          child: Text(
-                            '本机：${_mesh.deviceName}',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: 14,
-                              fontWeight: FontWeight.w800,
-                              color: VideoPlatformTheme.textPrimary,
-                            ),
-                          ),
+                    Flexible(
+                      child: Text(
+                        '本机：${_mesh.deviceName}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 13.5,
+                          fontWeight: FontWeight.w800,
+                          color: VideoPlatformTheme.textPrimary,
                         ),
-                        const SizedBox(width: 4),
-                        InkWell(
-                          onTap: _showRenameDeviceDialog,
-                          borderRadius: BorderRadius.circular(4),
-                          child: Padding(
-                            padding: const EdgeInsets.all(3),
-                            child: Icon(
-                              Icons.edit_outlined,
-                              size: 14,
-                              color: VideoPlatformTheme.accent,
-                            ),
-                          ),
-                        ),
-                      ],
+                      ),
                     ),
-                    const SizedBox(height: 2),
-                    Text(
-                      '本机：${_mesh.localEndpoint} · 跨网配对码：${_mesh.pairingCode} (${_mesh.isWanConnected ? "跨网云端已连通" : (_mesh.wanEnabled ? "跨网连接中..." : "仅局域网")}) · 在线：$onlineCount 台',
-                      style: TextStyle(
-                        fontSize: 11.5,
-                        color: VideoPlatformTheme.textSecondary,
+                    const SizedBox(width: 4),
+                    InkWell(
+                      onTap: _showRenameDeviceDialog,
+                      borderRadius: BorderRadius.circular(4),
+                      child: Padding(
+                        padding: const EdgeInsets.all(3),
+                        child: Icon(
+                          Icons.edit_outlined,
+                          size: 14,
+                          color: VideoPlatformTheme.accent,
+                        ),
                       ),
                     ),
                   ],
                 ),
-              ),
-            ],
+                const SizedBox(height: 2),
+                Text(
+                  '本机：${_mesh.localEndpoint} · 跨网配对码：${_mesh.pairingCode} (${_mesh.isWanConnected ? "跨网已通" : (_mesh.wanEnabled ? "跨网连接中" : "仅局域网")}) · 在线：$onlineCount 台',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: VideoPlatformTheme.textSecondary,
+                  ),
+                ),
+              ],
+            ),
           ),
-          Wrap(
-            spacing: 8,
-            runSpacing: 6,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            children: [
-              ActionChip(
-                avatar: Icon(
-                  _mesh.isWanConnected
-                      ? Icons.public_rounded
-                      : Icons.vpn_key_rounded,
-                  size: 15,
-                  color: _mesh.isWanConnected
-                      ? const Color(0xFF22C55E)
-                      : VideoPlatformTheme.accent,
-                ),
-                label: Text(
-                  '跨网配对码: ${_mesh.pairingCode}',
-                  style: const TextStyle(
-                    fontSize: 11.5,
-                    fontWeight: FontWeight.w700,
+          const SizedBox(width: 10),
+          Flexible(
+            flex: 0,
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  ActionChip(
+                    visualDensity: VisualDensity.compact,
+                    avatar: Icon(
+                      _mesh.isWanConnected
+                          ? Icons.public_rounded
+                          : Icons.vpn_key_rounded,
+                      size: 14,
+                      color: _mesh.isWanConnected
+                          ? const Color(0xFF22C55E)
+                          : VideoPlatformTheme.accent,
+                    ),
+                    label: Text(
+                      '跨网配对码: ${_mesh.pairingCode}',
+                      style: const TextStyle(
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    onPressed: _showWanPairingCodeDialog,
                   ),
-                ),
-                onPressed: _showWanPairingCodeDialog,
-              ),
-              if (!kIsWeb &&
-                  Platform.isMacOS &&
-                  (!_macHasScreenCapture || !_macHasAccessibility))
-                ActionChip(
-                  avatar: const Icon(
-                    Icons.security_rounded,
-                    size: 15,
-                    color: Color(0xFFF59E0B),
+                  const SizedBox(width: 6),
+                  if (needsOsPermission) ...[
+                    ActionChip(
+                      visualDensity: VisualDensity.compact,
+                      avatar: const Icon(
+                        Icons.security_rounded,
+                        size: 14,
+                        color: Color(0xFFF59E0B),
+                      ),
+                      label: Text(
+                        Platform.isAndroid ? '开启安卓全设备远控无障碍' : '授权系统桌面与键鼠控制',
+                        style: const TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      onPressed: () async {
+                        final perms =
+                            await _mesh.checkMacDesktopPermissions(prompt: true);
+                        if (!mounted) return;
+                        setState(() {
+                          _osHasScreenCapture = perms['screenCapture'] == true;
+                          _osHasAccessibility = perms['accessibility'] == true;
+                        });
+                      },
+                    ),
+                    const SizedBox(width: 6),
+                  ],
+                  FilterChip(
+                    visualDensity: VisualDensity.compact,
+                    showCheckmark: false,
+                    selected: _mesh.allowRemoteControl,
+                    label: const Text(
+                      '允许被控',
+                      style: TextStyle(fontSize: 11.5),
+                    ),
+                    onSelected: (v) => _mesh.setAllowRemoteControl(v),
                   ),
-                  label: const Text(
-                    '授权系统桌面与键鼠控制',
-                    style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w700),
+                  const SizedBox(width: 6),
+                  if (_mesh.supportsNativeDesktopCapture) ...[
+                    FilterChip(
+                      visualDensity: VisualDensity.compact,
+                      showCheckmark: false,
+                      selected: _mesh.allowDesktopCapture,
+                      label: const Text(
+                        '共享全桌面',
+                        style: TextStyle(fontSize: 11.5),
+                      ),
+                      onSelected: (v) => _mesh.setAllowDesktopCapture(v),
+                    ),
+                    const SizedBox(width: 6),
+                  ],
+                  OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    onPressed: _showLocalQrDialog,
+                    icon: const Icon(Icons.qr_code_rounded, size: 14),
+                    label: const Text('二维码', style: TextStyle(fontSize: 11.5)),
                   ),
-                  onPressed: () async {
-                    final perms =
-                        await _mesh.checkMacDesktopPermissions(prompt: true);
-                    if (!mounted) return;
-                    setState(() {
-                      _macHasScreenCapture = perms['screenCapture'] == true;
-                      _macHasAccessibility = perms['accessibility'] == true;
-                    });
-                  },
-                ),
-              FilterChip(
-                selected: _mesh.allowRemoteControl,
-                label: const Text(
-                  '允许被控',
-                  style: TextStyle(fontSize: 11.5),
-                ),
-                onSelected: (v) => _mesh.setAllowRemoteControl(v),
-              ),
-              if (_mesh.supportsNativeDesktopCapture)
-                FilterChip(
-                  selected: _mesh.allowDesktopCapture,
-                  label: const Text(
-                    '共享全桌面',
-                    style: TextStyle(fontSize: 11.5),
+                  const SizedBox(width: 6),
+                  OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    onPressed: _showAddPeerDialog,
+                    icon: const Icon(Icons.add_link_rounded, size: 14),
+                    label: const Text('添加 IP', style: TextStyle(fontSize: 11.5)),
                   ),
-                  onSelected: (v) => _mesh.setAllowDesktopCapture(v),
-                ),
-              OutlinedButton.icon(
-                onPressed: _showLocalQrDialog,
-                icon: const Icon(Icons.qr_code_rounded, size: 15),
-                label: const Text('本机二维码', style: TextStyle(fontSize: 12)),
+                  const SizedBox(width: 6),
+                  FilledButton.tonalIcon(
+                    style: FilledButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    onPressed: () async {
+                      await _mesh.refreshDiscoveryNow();
+                      if (selectedPeer != null) {
+                        unawaited(_refreshRemoteSharedFiles());
+                      }
+                    },
+                    icon: const Icon(Icons.radar_rounded, size: 14),
+                    label: const Text('刷新扫描', style: TextStyle(fontSize: 11.5)),
+                  ),
+                ],
               ),
-              OutlinedButton.icon(
-                onPressed: _showAddPeerDialog,
-                icon: const Icon(Icons.add_link_rounded, size: 15),
-                label: const Text('添加设备 IP', style: TextStyle(fontSize: 12)),
-              ),
-              FilledButton.tonalIcon(
-                onPressed: () async {
-                  await _mesh.refreshDiscoveryNow();
-                  if (selectedPeer != null) {
-                    unawaited(_refreshRemoteSharedFiles());
-                  }
-                },
-                icon: const Icon(Icons.radar_rounded, size: 15),
-                label: const Text('扫描局域网', style: TextStyle(fontSize: 12)),
-              ),
-            ],
+            ),
           ),
         ],
       ),
@@ -1094,21 +1277,21 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
     if (peers.isEmpty) {
       return Container(
         width: double.infinity,
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
         color: VideoPlatformTheme.bgCard,
         child: Row(
           children: [
             Icon(
               Icons.wifi_find_rounded,
-              size: 16,
+              size: 15,
               color: VideoPlatformTheme.accent,
             ),
             const SizedBox(width: 8),
             Expanded(
               child: Text(
-                '正在自动扫描同一局域网下的流光客户端，也可点击右上角「添加设备 IP」手动连接',
+                '正在自动发现同局域网及同配对码跨网设备，也可点击「添加 IP」或「跨网配对码」连接',
                 style: TextStyle(
-                  fontSize: 11.5,
+                  fontSize: 11,
                   color: VideoPlatformTheme.textSecondary,
                 ),
               ),
@@ -1119,8 +1302,8 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
     }
 
     return Container(
-      height: 54,
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      height: 46,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       decoration: BoxDecoration(
         color: VideoPlatformTheme.bgCard,
         border: Border(
@@ -1135,15 +1318,16 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
           final p = peers[idx];
           final isSel = selectedPeer?.deviceId == p.deviceId;
           return InkWell(
-            borderRadius: BorderRadius.circular(20),
+            key: ValueKey('mobile_peer_${p.deviceId}'),
+            borderRadius: BorderRadius.circular(18),
             onTap: () => _selectPeer(p),
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 4),
               decoration: BoxDecoration(
                 color: isSel
                     ? VideoPlatformTheme.accent.withValues(alpha: 0.18)
                     : VideoPlatformTheme.bgElevated,
-                borderRadius: BorderRadius.circular(20),
+                borderRadius: BorderRadius.circular(18),
                 border: Border.all(
                   color: isSel
                       ? VideoPlatformTheme.accent
@@ -1154,8 +1338,8 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Container(
-                    width: 8,
-                    height: 8,
+                    width: 7,
+                    height: 7,
                     decoration: BoxDecoration(
                       color: p.isOnline
                           ? const Color(0xFF22C55E)
@@ -1163,19 +1347,19 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                       shape: BoxShape.circle,
                     ),
                   ),
-                  const SizedBox(width: 6),
+                  const SizedBox(width: 5),
                   Icon(
                     _platformIcon(p.platform, isTv: p.isTv),
-                    size: 15,
+                    size: 14,
                     color: isSel
                         ? VideoPlatformTheme.accent
                         : VideoPlatformTheme.textSecondary,
                   ),
-                  const SizedBox(width: 6),
+                  const SizedBox(width: 5),
                   Text(
-                    p.deviceName,
+                    '${p.deviceName} (${p.isLanReachable ? "内网" : "跨网"})',
                     style: TextStyle(
-                      fontSize: 12.5,
+                      fontSize: 12,
                       fontWeight: isSel ? FontWeight.w800 : FontWeight.w600,
                       color: isSel
                           ? VideoPlatformTheme.accent
@@ -1204,7 +1388,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Padding(
-            padding: const EdgeInsets.fromLTRB(14, 12, 12, 8),
+            padding: const EdgeInsets.fromLTRB(14, 10, 10, 6),
             child: Row(
               children: [
                 Icon(
@@ -1214,7 +1398,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                 ),
                 const SizedBox(width: 6),
                 Text(
-                  '发现的客户端 (${peers.length})',
+                  '互联客户端 (${peers.length})',
                   style: TextStyle(
                     fontSize: 12.5,
                     fontWeight: FontWeight.w800,
@@ -1256,7 +1440,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                           ),
                           const SizedBox(height: 6),
                           Text(
-                            '在同一局域网打开其它平台的「流光视频」即可自动发现；跨网段或 VPN 可点击「添加设备 IP」手动连接。',
+                            '同局域网或同「跨网配对码」下的客户端会自动出现在此处；也可点击下方按钮手动输入 IP 连接。',
                             textAlign: TextAlign.center,
                             style: TextStyle(
                               fontSize: 11.5,
@@ -1282,6 +1466,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                       final peer = peers[idx];
                       final isSel = selectedPeer?.deviceId == peer.deviceId;
                       return InkWell(
+                        key: ValueKey('desktop_peer_${peer.deviceId}'),
                         borderRadius: BorderRadius.circular(12),
                         onTap: () => _selectPeer(peer),
                         child: Container(
@@ -1422,7 +1607,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
     );
   }
 
-  Widget _buildWorkspaceTabBar() {
+  Widget _buildWorkspaceTabBar({required bool isWide}) {
     final peer = selectedPeer;
     final tabs = const [
       (icon: Icons.desktop_windows_rounded, label: '显示桌面 & 远控画面'),
@@ -1432,8 +1617,8 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
     ];
 
     return Container(
-      height: 48,
-      padding: const EdgeInsets.symmetric(horizontal: 14),
+      height: 44,
+      padding: const EdgeInsets.symmetric(horizontal: 10),
       decoration: BoxDecoration(
         color: VideoPlatformTheme.bgCard,
         border: Border(
@@ -1442,28 +1627,23 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
       ),
       child: Row(
         children: [
-          if (peer != null) ...[
-            Icon(
-              _platformIcon(peer.platform, isTv: peer.isTv),
-              size: 16,
-              color: VideoPlatformTheme.accent,
-            ),
-            const SizedBox(width: 6),
-            ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 160),
-              child: Text(
-                peer.deviceName,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w800,
-                  color: VideoPlatformTheme.textPrimary,
-                ),
+          if (!isWide && _workspaceTabIndex == 0)
+            IconButton(
+              visualDensity: VisualDensity.compact,
+              tooltip: _isMobileHeaderCollapsed ? '展开顶部设备栏' : '收起顶部设备栏以放大桌面',
+              onPressed: () {
+                setState(() {
+                  _isMobileHeaderCollapsed = !_isMobileHeaderCollapsed;
+                });
+              },
+              icon: Icon(
+                _isMobileHeaderCollapsed
+                    ? Icons.expand_more_rounded
+                    : Icons.expand_less_rounded,
+                size: 19,
+                color: VideoPlatformTheme.accent,
               ),
             ),
-            const SizedBox(width: 12),
-          ],
           Expanded(
             child: SingleChildScrollView(
               scrollDirection: Axis.horizontal,
@@ -1472,9 +1652,9 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                   final item = tabs[idx];
                   final selected = _workspaceTabIndex == idx;
                   return Padding(
-                    padding: const EdgeInsets.only(right: 8),
+                    padding: const EdgeInsets.only(right: 6),
                     child: InkWell(
-                      borderRadius: BorderRadius.circular(18),
+                      borderRadius: BorderRadius.circular(16),
                       onTap: () {
                         setState(() => _workspaceTabIndex = idx);
                         if (idx == 0 &&
@@ -1490,14 +1670,14 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                       },
                       child: Container(
                         padding: const EdgeInsets.symmetric(
-                          horizontal: 14,
-                          vertical: 7,
+                          horizontal: 12,
+                          vertical: 6,
                         ),
                         decoration: BoxDecoration(
                           color: selected
                               ? VideoPlatformTheme.accent
                               : VideoPlatformTheme.bgElevated,
-                          borderRadius: BorderRadius.circular(18),
+                          borderRadius: BorderRadius.circular(16),
                           border: Border.all(
                             color: selected
                                 ? VideoPlatformTheme.accent
@@ -1509,16 +1689,16 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                           children: [
                             Icon(
                               item.icon,
-                              size: 15,
+                              size: 14,
                               color: selected
                                   ? Colors.black
                                   : VideoPlatformTheme.textSecondary,
                             ),
-                            const SizedBox(width: 6),
+                            const SizedBox(width: 5),
                             Text(
                               item.label,
                               style: TextStyle(
-                                fontSize: 12.5,
+                                fontSize: 12,
                                 fontWeight: selected
                                     ? FontWeight.w800
                                     : FontWeight.w600,
@@ -1536,6 +1716,28 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
               ),
             ),
           ),
+          if (peer != null && isWide) ...[
+            const SizedBox(width: 10),
+            Icon(
+              _platformIcon(peer.platform, isTv: peer.isTv),
+              size: 16,
+              color: VideoPlatformTheme.accent,
+            ),
+            const SizedBox(width: 6),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 160),
+              child: Text(
+                peer.deviceName,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w800,
+                  color: VideoPlatformTheme.textPrimary,
+                ),
+              ),
+            ),
+          ],
         ],
       ),
     );
@@ -1557,187 +1759,225 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
   }
 
   // ===========================================================================
-  // Tab 0: Remote Desktop & Screen Viewer (`显示桌面`)
+  // Tab 0: Windows-Remote-Desktop Style Remote Desktop Viewer (`显示桌面 & 全设备控制`)
   // ===========================================================================
 
   Widget _buildRemoteDesktopPane() {
     final peer = selectedPeer;
     if (peer == null) {
       return _buildNoPeerSelectedPlaceholder(
-        title: '选择或添加一台客户端以查看远程桌面',
+        title: '选择或添加一台客户端以开启全设备远程桌面',
         subtitle:
-            '支持实时查看 macOS / Windows / Linux 系统全桌面，或查看 iOS / Android / 电视端的应用实时画面，并直接通过鼠标点击、拖拽、滚轮和键盘远程操控。',
+            '支持实时查看并控制对方整个操作系统桌面与所有软件（macOS / Windows / Linux 系统全桌面、Android 全设备屏幕及 iOS / Apple TV 画面），支持双指无级放大 1x~6x、Windows 远程桌面式虚拟触控板指针与横屏全屏操控。',
       );
     }
 
+    final isMobile = MediaQuery.sizeOf(context).width < 860;
+
     return Column(
       children: [
-        // Top desktop stream controls toolbar
+        // Compact single-line scrollable top toolbar (maximizes desktop viewport height on phones!)
         Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          height: 44,
+          padding: const EdgeInsets.symmetric(horizontal: 10),
           decoration: BoxDecoration(
             color: VideoPlatformTheme.bgElevated,
             border: Border(
               bottom: BorderSide(color: VideoPlatformTheme.borderSubtle),
             ),
           ),
-          child: Wrap(
-            spacing: 8,
-            runSpacing: 6,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            alignment: WrapAlignment.spaceBetween,
-            children: [
-              Wrap(
-                spacing: 8,
-                runSpacing: 6,
-                crossAxisAlignment: WrapCrossAlignment.center,
-                children: [
-                  FilledButton.icon(
-                    style: FilledButton.styleFrom(
-                      backgroundColor: _isStreamingDesktop
-                          ? const Color(0xFFEF4444)
-                          : VideoPlatformTheme.accent,
-                      foregroundColor:
-                          _isStreamingDesktop ? Colors.white : Colors.black,
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                FilledButton.icon(
+                  style: FilledButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    backgroundColor: _isStreamingDesktop
+                        ? const Color(0xFFEF4444)
+                        : VideoPlatformTheme.accent,
+                    foregroundColor:
+                        _isStreamingDesktop ? Colors.white : Colors.black,
+                  ),
+                  onPressed: () {
+                    if (_isStreamingDesktop) {
+                      _stopDesktopStream();
+                    } else {
+                      _startDesktopStream();
+                    }
+                  },
+                  icon: Icon(
+                    _isStreamingDesktop
+                        ? Icons.stop_circle_outlined
+                        : Icons.play_arrow_rounded,
+                    size: 16,
+                  ),
+                  label: Text(
+                    _isStreamingDesktop ? '停止远控' : '连接桌面',
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w800,
                     ),
-                    onPressed: () {
-                      if (_isStreamingDesktop) {
-                        _stopDesktopStream();
-                      } else {
-                        _startDesktopStream();
-                      }
-                    },
-                    icon: Icon(
-                      _isStreamingDesktop
-                          ? Icons.stop_circle_outlined
-                          : Icons.play_arrow_rounded,
-                      size: 17,
+                  ),
+                ),
+                const SizedBox(width: 8),
+
+                // One-tap Landscape Fullscreen Button (Crucial for Mobile Phones!)
+                FilledButton.tonalIcon(
+                  style: FilledButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                  ),
+                  onPressed: () =>
+                      _enterFullscreenDesktop(lockLandscape: isMobile),
+                  icon: const Icon(Icons.screen_rotation_rounded, size: 15),
+                  label: Text(
+                    isMobile ? '横屏全屏放大' : '全屏桌面',
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
                     ),
-                    label: Text(
-                      _isStreamingDesktop ? '停止画面同步' : '开启实时桌面',
-                      style: const TextStyle(
-                        fontSize: 12.5,
-                        fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(width: 8),
+
+                // Input mode toggle: Windows RDP Virtual Trackpad vs Direct Touch
+                ChoiceChip(
+                  visualDensity: VisualDensity.compact,
+                  showCheckmark: false,
+                  selected: _touchInputMode == 'trackpad',
+                  avatar: const Icon(Icons.mouse_rounded, size: 14),
+                  label: const Text(
+                    '触控板指针 (Win远桌模式)',
+                    style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w700),
+                  ),
+                  onSelected: (_) {
+                    setState(() => _touchInputMode = 'trackpad');
+                  },
+                ),
+                const SizedBox(width: 6),
+                ChoiceChip(
+                  visualDensity: VisualDensity.compact,
+                  showCheckmark: false,
+                  selected: _touchInputMode == 'direct',
+                  avatar: const Icon(Icons.touch_app_rounded, size: 14),
+                  label: const Text(
+                    '触屏直点',
+                    style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w700),
+                  ),
+                  onSelected: (_) {
+                    setState(() => _touchInputMode = 'direct');
+                  },
+                ),
+                const SizedBox(width: 8),
+
+                // Quick Zoom Multiplier Pills (1x, 1.5x, 2x, 3x, 4x, 铺满)
+                for (final z in const [1.0, 1.5, 2.0, 3.0, 4.0])
+                  Padding(
+                    padding: const EdgeInsets.only(right: 4),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(12),
+                      onTap: () => _setDesktopZoom(z),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: (_currentZoomScale - z).abs() < 0.22
+                              ? VideoPlatformTheme.accent
+                              : VideoPlatformTheme.bgCard,
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(
+                            color: (_currentZoomScale - z).abs() < 0.22
+                                ? VideoPlatformTheme.accent
+                                : VideoPlatformTheme.borderSubtle,
+                          ),
+                        ),
+                        child: Text(
+                          '${z == z.roundToDouble() ? z.toInt() : z}x',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w800,
+                            color: (_currentZoomScale - z).abs() < 0.22
+                                ? Colors.black
+                                : VideoPlatformTheme.textPrimary,
+                          ),
+                        ),
                       ),
                     ),
                   ),
-                  // Capture mode selector
-                  SegmentedButton<String>(
-                    segments: const [
-                      ButtonSegment(
-                        value: 'auto',
-                        label: Text('自动', style: TextStyle(fontSize: 11.5)),
-                      ),
-                      ButtonSegment(
+                FilterChip(
+                  visualDensity: VisualDensity.compact,
+                  showCheckmark: false,
+                  selected: _stretchToFill,
+                  label: const Text('铺满无黑边', style: TextStyle(fontSize: 11)),
+                  onSelected: (v) => setState(() => _stretchToFill = v),
+                ),
+                const SizedBox(width: 8),
+
+                // Capture source selector: defaults to 'desktop' (entire OS desktop & device)
+                DropdownButtonHideUnderline(
+                  child: DropdownButton<String>(
+                    value: _captureMode,
+                    isDense: true,
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w700,
+                      color: VideoPlatformTheme.accent,
+                    ),
+                    items: const [
+                      DropdownMenuItem(
                         value: 'desktop',
-                        label: Text('系统全桌面', style: TextStyle(fontSize: 11.5)),
+                        child: Text('🖥️ 控制整个系统桌面/设备'),
                       ),
-                      ButtonSegment(
+                      DropdownMenuItem(
                         value: 'app',
-                        label: Text('应用画面', style: TextStyle(fontSize: 11.5)),
+                        child: Text('📱 仅控制流光应用窗口'),
                       ),
                     ],
-                    selected: {_captureMode},
-                    onSelectionChanged: (sel) {
-                      setState(() => _captureMode = sel.first);
+                    onChanged: (v) {
+                      if (v == null) return;
+                      setState(() => _captureMode = v);
                       _updateStreamParams();
                     },
                   ),
-                  // Pointer click mode selector
-                  SegmentedButton<String>(
-                    segments: const [
-                      ButtonSegment(
-                        value: 'tap',
-                        label: Text('左键/单击', style: TextStyle(fontSize: 11.5)),
-                      ),
-                      ButtonSegment(
-                        value: 'double_tap',
-                        label: Text('双击', style: TextStyle(fontSize: 11.5)),
-                      ),
-                      ButtonSegment(
-                        value: 'right_click',
-                        label: Text('右键', style: TextStyle(fontSize: 11.5)),
-                      ),
-                      ButtonSegment(
-                        value: 'drag',
-                        label: Text('拖拽/滑动', style: TextStyle(fontSize: 11.5)),
-                      ),
+                ),
+                const SizedBox(width: 8),
+                DropdownButtonHideUnderline(
+                  child: DropdownButton<int>(
+                    value: _streamMaxWidth,
+                    isDense: true,
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      color: VideoPlatformTheme.textPrimary,
+                    ),
+                    items: const [
+                      DropdownMenuItem(value: 960, child: Text('960P 流畅')),
+                      DropdownMenuItem(value: 1280, child: Text('1280P 高清')),
+                      DropdownMenuItem(value: 1920, child: Text('1920P 原画')),
                     ],
-                    selected: {_pointerTool},
-                    onSelectionChanged: (sel) {
-                      setState(() => _pointerTool = sel.first);
+                    onChanged: (v) {
+                      if (v == null) return;
+                      setState(() => _streamMaxWidth = v);
+                      _updateStreamParams();
                     },
                   ),
-                ],
-              ),
-              Wrap(
-                spacing: 8,
-                crossAxisAlignment: WrapCrossAlignment.center,
-                children: [
-                  DropdownButtonHideUnderline(
-                    child: DropdownButton<int>(
-                      value: _streamFps,
-                      isDense: true,
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: VideoPlatformTheme.textPrimary,
-                      ),
-                      items: const [
-                        DropdownMenuItem(value: 2, child: Text('2 FPS (省流)')),
-                        DropdownMenuItem(value: 5, child: Text('5 FPS (均衡)')),
-                        DropdownMenuItem(value: 10, child: Text('10 FPS (流畅)')),
-                        DropdownMenuItem(value: 15, child: Text('15 FPS (极速)')),
-                      ],
-                      onChanged: (v) {
-                        if (v == null) return;
-                        setState(() => _streamFps = v);
-                        _updateStreamParams();
-                      },
-                    ),
-                  ),
-                  DropdownButtonHideUnderline(
-                    child: DropdownButton<int>(
-                      value: _streamMaxWidth,
-                      isDense: true,
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: VideoPlatformTheme.textPrimary,
-                      ),
-                      items: const [
-                        DropdownMenuItem(value: 960, child: Text('标清 960P')),
-                        DropdownMenuItem(value: 1280, child: Text('高清 1280P')),
-                        DropdownMenuItem(value: 1920, child: Text('超清 1920P')),
-                      ],
-                      onChanged: (v) {
-                        if (v == null) return;
-                        setState(() => _streamMaxWidth = v);
-                        _updateStreamParams();
-                      },
-                    ),
-                  ),
-                  IconButton(
-                    visualDensity: VisualDensity.compact,
-                    tooltip: '保存当前远程桌面截图',
-                    onPressed: _latestFrameBytes != null
-                        ? _saveCurrentDesktopSnapshot
-                        : null,
-                    icon: const Icon(Icons.camera_alt_outlined, size: 18),
-                  ),
-                  IconButton(
-                    visualDensity: VisualDensity.compact,
-                    tooltip: '全屏显示远程桌面',
-                    onPressed: () {
-                      setState(() => _isDesktopFullscreen = true);
-                    },
-                    icon: const Icon(Icons.fullscreen_rounded, size: 20),
-                  ),
-                ],
-              ),
-            ],
+                ),
+                const SizedBox(width: 6),
+                IconButton(
+                  visualDensity: VisualDensity.compact,
+                  tooltip: '保存远程桌面截图',
+                  onPressed: _latestFrameBytes != null
+                      ? _saveCurrentDesktopSnapshot
+                      : null,
+                  icon: const Icon(Icons.camera_alt_outlined, size: 17),
+                ),
+              ],
+            ),
           ),
         ),
 
-        // Interactive Remote Desktop Canvas
+        // Main Interactive Remote Desktop Viewport with Floating Windows-RDP Action Bar
         Expanded(
           child: Container(
             width: double.infinity,
@@ -1746,123 +1986,383 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
           ),
         ),
 
-        // Bottom Remote Keyboard & Quick Key Bar
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          decoration: BoxDecoration(
-            color: VideoPlatformTheme.bgElevated,
-            border: Border(
-              top: BorderSide(color: VideoPlatformTheme.borderSubtle),
+        // Bottom Windows-RDP Mouse & System Shortcut Dock
+        _buildBottomRdpControlDock(peer),
+      ],
+    );
+  }
+
+  Widget _buildBottomRdpControlDock(PeerDeviceNode peer) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: VideoPlatformTheme.bgElevated,
+        border: Border(
+          top: BorderSide(color: VideoPlatformTheme.borderSubtle),
+        ),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Row 1: Windows RDP Virtual Mouse Buttons + System Desktop Shortcuts
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                // Virtual Mouse Left / Double / Right / Drag Lock / Scroll Wheel
+                _buildMouseDockButton(
+                  label: '左键单击',
+                  icon: Icons.ads_click_rounded,
+                  highlighted: false,
+                  onTap: () => _sendRemotePointer(
+                    type: 'tap',
+                    nx: _virtualCursorNx,
+                    ny: _virtualCursorNy,
+                  ),
+                ),
+                _buildMouseDockButton(
+                  label: '双击打开',
+                  icon: Icons.touch_app_rounded,
+                  highlighted: false,
+                  onTap: () => _sendRemotePointer(
+                    type: 'double_tap',
+                    nx: _virtualCursorNx,
+                    ny: _virtualCursorNy,
+                  ),
+                ),
+                _buildMouseDockButton(
+                  label: '右键菜单',
+                  icon: Icons.more_horiz_rounded,
+                  highlighted: false,
+                  onTap: () => _sendRemotePointer(
+                    type: 'right_click',
+                    nx: _virtualCursorNx,
+                    ny: _virtualCursorNy,
+                  ),
+                ),
+                _buildMouseDockButton(
+                  label: _isDragLocked ? '松开拖拽' : '按住拖拽',
+                  icon: Icons.pan_tool_alt_rounded,
+                  highlighted: _isDragLocked,
+                  onTap: () {
+                    final next = !_isDragLocked;
+                    setState(() => _isDragLocked = next);
+                    _sendRemotePointer(
+                      type: next ? 'down' : 'up',
+                      nx: _virtualCursorNx,
+                      ny: _virtualCursorNy,
+                    );
+                  },
+                ),
+                _buildMouseDockButton(
+                  label: '滚轮上',
+                  icon: Icons.arrow_upward_rounded,
+                  highlighted: false,
+                  onTap: () => _sendRemotePointer(
+                    type: 'scroll',
+                    nx: _virtualCursorNx,
+                    ny: _virtualCursorNy,
+                    deltaY: 90,
+                  ),
+                ),
+                _buildMouseDockButton(
+                  label: '滚轮下',
+                  icon: Icons.arrow_downward_rounded,
+                  highlighted: false,
+                  onTap: () => _sendRemotePointer(
+                    type: 'scroll',
+                    nx: _virtualCursorNx,
+                    ny: _virtualCursorNy,
+                    deltaY: -90,
+                  ),
+                ),
+                _buildMouseDockButton(
+                  label: _showFloatingKeyboardBar ? '收起打字' : '打字输入',
+                  icon: Icons.keyboard_rounded,
+                  highlighted: _showFloatingKeyboardBar,
+                  onTap: () {
+                    setState(() {
+                      _showFloatingKeyboardBar = !_showFloatingKeyboardBar;
+                    });
+                  },
+                ),
+                const SizedBox(width: 6),
+                // System-wide Desktop Hotkeys (Controls the entire OS desktop!)
+                _buildQuickKeyChip(
+                  '显示桌面',
+                  'show_desktop',
+                  Icons.desktop_mac_outlined,
+                ),
+                _buildQuickKeyChip(
+                  '切换窗口 Alt+Tab',
+                  'alt+tab',
+                  Icons.dynamic_feed_rounded,
+                ),
+                _buildQuickKeyChip(
+                  '多任务视图',
+                  'mission_control',
+                  Icons.grid_view_rounded,
+                ),
+                _buildQuickKeyChip('复制', 'ctrl+c', Icons.copy_rounded),
+                _buildQuickKeyChip('粘贴', 'ctrl+v', Icons.paste_rounded),
+                _buildQuickKeyChip('全选', 'ctrl+a', Icons.select_all_rounded),
+                _buildQuickKeyChip('撤销', 'ctrl+z', Icons.undo_rounded),
+                _buildQuickKeyChip(
+                  '回车 Enter',
+                  'enter',
+                  Icons.keyboard_return_rounded,
+                ),
+                _buildQuickKeyChip('Esc/返回', 'back', Icons.close_rounded),
+                _buildQuickKeyChip('空格', 'space', Icons.space_bar_rounded),
+                _buildQuickKeyChip(
+                  '退格 ⌫',
+                  'backspace',
+                  Icons.backspace_outlined,
+                ),
+                _buildQuickKeyChip('Tab', 'tab', Icons.keyboard_tab_rounded),
+                _buildQuickKeyChip('⬆️', 'up', Icons.keyboard_arrow_up_rounded),
+                _buildQuickKeyChip(
+                  '⬇️',
+                  'down',
+                  Icons.keyboard_arrow_down_rounded,
+                ),
+                _buildQuickKeyChip(
+                  '⬅️',
+                  'left',
+                  Icons.keyboard_arrow_left_rounded,
+                ),
+                _buildQuickKeyChip(
+                  '➡️',
+                  'right',
+                  Icons.keyboard_arrow_right_rounded,
+                ),
+              ],
             ),
           ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: Row(
-                  children: [
-                    _buildQuickKeyChip('Esc / 返回', 'back', Icons.keyboard_return_rounded),
-                    _buildQuickKeyChip('确定 Enter', 'enter', Icons.check_circle_outline_rounded),
-                    _buildQuickKeyChip('播放/暂停 Space', 'space', Icons.play_circle_outline_rounded),
-                    _buildQuickKeyChip('上 ⬆️', 'up', Icons.keyboard_arrow_up_rounded),
-                    _buildQuickKeyChip('下 ⬇️', 'down', Icons.keyboard_arrow_down_rounded),
-                    _buildQuickKeyChip('左 ⬅️', 'left', Icons.keyboard_arrow_left_rounded),
-                    _buildQuickKeyChip('右 ➡️', 'right', Icons.keyboard_arrow_right_rounded),
-                    _buildQuickKeyChip('退格 ⌫', 'backspace', Icons.backspace_outlined),
-                    _buildQuickKeyChip('主界面', 'home', Icons.home_outlined),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 8),
-              Row(
-                children: [
-                  Expanded(
-                    child: SizedBox(
-                      height: 36,
-                      child: TextField(
-                        controller: _remoteInputController,
-                        onSubmitted: (_) => _sendRemoteText(submit: true),
-                        style: const TextStyle(fontSize: 13),
-                        decoration: const InputDecoration(
-                          hintText: '在此输入文字，一键填入对方正在输入的文本框或远程键盘...',
-                          prefixIcon: Icon(Icons.keyboard_alt_outlined, size: 17),
-                        ),
+
+          // Collapsible Remote Keyboard Input Bar (saves vertical space on phones when not typing)
+          if (_showFloatingKeyboardBar) ...[
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                Expanded(
+                  child: SizedBox(
+                    height: 34,
+                    child: TextField(
+                      controller: _remoteInputController,
+                      autofocus: true,
+                      onSubmitted: (_) => _sendRemoteText(submit: true),
+                      style: const TextStyle(fontSize: 13),
+                      decoration: const InputDecoration(
+                        hintText: '输入中英文直接打字到远端电脑/手机当前窗口...',
+                        prefixIcon: Icon(Icons.keyboard_alt_outlined, size: 16),
                       ),
                     ),
                   ),
-                  const SizedBox(width: 8),
-                  OutlinedButton(
-                    onPressed: () => _sendRemoteText(submit: false),
-                    child: const Text('仅填入', style: TextStyle(fontSize: 12)),
+                ),
+                const SizedBox(width: 6),
+                OutlinedButton(
+                  style: OutlinedButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
                   ),
-                  const SizedBox(width: 6),
-                  FilledButton.icon(
-                    onPressed: () => _sendRemoteText(submit: true),
-                    icon: const Icon(Icons.send_rounded, size: 14),
-                    label: const Text('填入并回车', style: TextStyle(fontSize: 12)),
+                  onPressed: () => _sendRemoteText(submit: false),
+                  child: const Text('发送文字', style: TextStyle(fontSize: 11.5)),
+                ),
+                const SizedBox(width: 4),
+                FilledButton(
+                  style: FilledButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
                   ),
-                ],
+                  onPressed: () => _sendRemoteText(submit: true),
+                  child: const Text('发送并回车', style: TextStyle(fontSize: 11.5)),
+                ),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMouseDockButton({
+    required String label,
+    required IconData icon,
+    required bool highlighted,
+    required VoidCallback onTap,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(right: 6),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(10),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(
+            color: highlighted
+                ? VideoPlatformTheme.accent
+                : VideoPlatformTheme.bgCard,
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color: highlighted
+                  ? Colors.white
+                  : VideoPlatformTheme.accent.withValues(alpha: 0.45),
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                icon,
+                size: 14,
+                color: highlighted ? Colors.black : VideoPlatformTheme.accent,
+              ),
+              const SizedBox(width: 4),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w800,
+                  color: highlighted
+                      ? Colors.black
+                      : VideoPlatformTheme.textPrimary,
+                ),
               ),
             ],
           ),
         ),
-      ],
+      ),
     );
   }
 
   Widget _buildQuickKeyChip(String label, String keyName, IconData icon) {
     return Padding(
-      padding: const EdgeInsets.only(right: 6),
+      padding: const EdgeInsets.only(right: 5),
       child: ActionChip(
         visualDensity: VisualDensity.compact,
-        avatar: Icon(icon, size: 14, color: VideoPlatformTheme.accent),
-        label: Text(label, style: const TextStyle(fontSize: 11.5)),
+        avatar: Icon(icon, size: 13, color: VideoPlatformTheme.accent),
+        label: Text(label, style: const TextStyle(fontSize: 11)),
         onPressed: () => _sendRemoteKey(keyName),
       ),
     );
   }
 
+  KeyEventResult _handleDesktopCanvasTvKeyEvent(
+    FocusNode node,
+    KeyEvent event,
+  ) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    final step = event is KeyRepeatEvent ? 0.045 : 0.025;
+    final k = event.logicalKey;
+    if (k == LogicalKeyboardKey.arrowUp) {
+      _virtualCursorNy = (_virtualCursorNy - step).clamp(0.0, 1.0);
+      _sendRemotePointer(
+        type: 'move',
+        nx: _virtualCursorNx,
+        ny: _virtualCursorNy,
+      );
+      return KeyEventResult.handled;
+    }
+    if (k == LogicalKeyboardKey.arrowDown) {
+      _virtualCursorNy = (_virtualCursorNy + step).clamp(0.0, 1.0);
+      _sendRemotePointer(
+        type: 'move',
+        nx: _virtualCursorNx,
+        ny: _virtualCursorNy,
+      );
+      return KeyEventResult.handled;
+    }
+    if (k == LogicalKeyboardKey.arrowLeft) {
+      _virtualCursorNx = (_virtualCursorNx - step).clamp(0.0, 1.0);
+      _sendRemotePointer(
+        type: 'move',
+        nx: _virtualCursorNx,
+        ny: _virtualCursorNy,
+      );
+      return KeyEventResult.handled;
+    }
+    if (k == LogicalKeyboardKey.arrowRight) {
+      _virtualCursorNx = (_virtualCursorNx + step).clamp(0.0, 1.0);
+      _sendRemotePointer(
+        type: 'move',
+        nx: _virtualCursorNx,
+        ny: _virtualCursorNy,
+      );
+      return KeyEventResult.handled;
+    }
+    if (k == LogicalKeyboardKey.select ||
+        k == LogicalKeyboardKey.enter ||
+        k == LogicalKeyboardKey.gameButtonA) {
+      _sendRemotePointer(
+        type: 'tap',
+        nx: _virtualCursorNx,
+        ny: _virtualCursorNy,
+      );
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
   Widget _buildInteractiveDesktopViewport(PeerDeviceNode peer) {
     if (_latestFrameBytes == null) {
       return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(20),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
               Icon(
                 Icons.desktop_windows_rounded,
-                size: 54,
-                color: VideoPlatformTheme.accent.withValues(alpha: 0.7),
+                size: 52,
+                color: VideoPlatformTheme.accent.withValues(alpha: 0.75),
               ),
-              const SizedBox(height: 14),
+              const SizedBox(height: 12),
               Text(
                 _isStreamingDesktop
-                    ? (_desktopError ?? '正在连接「${peer.deviceName}」的实时远程画面...')
-                    : '点击上方「开启实时桌面」查看并操控「${peer.deviceName}」',
+                    ? (_desktopError ?? '正在连接「${peer.deviceName}」的完整系统桌面...')
+                    : '点击「连接桌面」实时查看并操控「${peer.deviceName}」整个系统桌面',
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   fontSize: 14.5,
-                  fontWeight: FontWeight.w700,
+                  fontWeight: FontWeight.w800,
                   color: VideoPlatformTheme.textPrimary,
                 ),
               ),
               const SizedBox(height: 8),
               Text(
-                '支持系统级全桌面显示（macOS）与应用内实时画面（全平台 iOS / Android / TV / 桌面），画面内直接点击、拖拽、滚轮即可远程操控对方设备。',
+                '• 支持控制对方整个电脑/手机/电视桌面及所有第三方应用（不仅限本应用）\n'
+                '• 手机端默认采用「Windows 远程桌面触控板指针模式」：单指滑动精准移动鼠标指针、单击左键、双击打开、长按右键、双指无级放大 1x~6x，点击「横屏全屏放大」即可满屏操作',
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   fontSize: 12,
                   color: VideoPlatformTheme.textSecondary,
+                  height: 1.5,
                 ),
               ),
-              const SizedBox(height: 16),
+              const SizedBox(height: 14),
               if (!_isStreamingDesktop)
-                FilledButton.icon(
-                  onPressed: _startDesktopStream,
-                  icon: const Icon(Icons.play_arrow_rounded),
-                  label: const Text('立即开启远程桌面画面'),
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 8,
+                  alignment: WrapAlignment.center,
+                  children: [
+                    FilledButton.icon(
+                      onPressed: _startDesktopStream,
+                      icon: const Icon(Icons.play_arrow_rounded),
+                      label: const Text('立即连接远程桌面'),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: () {
+                        _startDesktopStream();
+                        _enterFullscreenDesktop(
+                          lockLandscape: MediaQuery.sizeOf(context).width < 860,
+                        );
+                      },
+                      icon: const Icon(Icons.screen_rotation_rounded, size: 17),
+                      label: const Text('连接并横屏全屏放大'),
+                    ),
+                  ],
                 ),
             ],
           ),
@@ -1874,147 +2374,327 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
         ? (_remoteScreenWidth / _remoteScreenHeight)
         : (16.0 / 9.0);
 
-    return Center(
-      child: AspectRatio(
-        aspectRatio: aspect,
-        child: LayoutBuilder(
-          builder: (ctx, constraints) {
-            final boxW = constraints.maxWidth;
-            final boxH = constraints.maxHeight;
+    return Focus(
+      focusNode: _desktopCanvasFocusNode,
+      onKeyEvent: _handleDesktopCanvasTvKeyEvent,
+      child: LayoutBuilder(
+        builder: (ctx, outerConstraints) {
+          final outerW = outerConstraints.maxWidth;
+          final outerH = outerConstraints.maxHeight;
 
-            Offset normalizeOffset(Offset local) {
-              return Offset(
-                (local.dx / (boxW > 0 ? boxW : 1)).clamp(0.0, 1.0),
-                (local.dy / (boxH > 0 ? boxH : 1)).clamp(0.0, 1.0),
-              );
+          // Compute exact canvas rect inside the viewport
+          double canvasW = outerW;
+          double canvasH = outerH;
+          if (!_stretchToFill && outerW > 0 && outerH > 0) {
+            if (outerW / outerH > aspect) {
+              canvasH = outerH;
+              canvasW = canvasH * aspect;
+            } else {
+              canvasW = outerW;
+              canvasH = canvasW / aspect;
             }
+          }
+          final canvasSize = Size(
+            canvasW > 0 ? canvasW : 320,
+            canvasH > 0 ? canvasH : 180,
+          );
 
-            return Listener(
-              onPointerSignal: (signal) {
-                if (signal is PointerScrollEvent) {
-                  final norm = normalizeOffset(signal.localPosition);
-                  _sendRemotePointer(
-                    type: 'scroll',
-                    nx: norm.dx,
-                    ny: norm.dy,
-                    deltaX: -signal.scrollDelta.dx,
-                    deltaY: -signal.scrollDelta.dy,
-                  );
-                }
-              },
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTapUp: (details) {
-                  final norm = normalizeOffset(details.localPosition);
-                  final effectiveType =
-                      _pointerTool == 'drag' ? 'tap' : _pointerTool;
-                  _sendRemotePointer(
-                    type: effectiveType,
-                    nx: norm.dx,
-                    ny: norm.dy,
-                  );
-                },
-                onSecondaryTapUp: (details) {
-                  final norm = normalizeOffset(details.localPosition);
-                  _sendRemotePointer(
-                    type: 'right_click',
-                    nx: norm.dx,
-                    ny: norm.dy,
-                  );
-                },
-                onDoubleTapDown: (details) {
-                  final norm = normalizeOffset(details.localPosition);
-                  _sendRemotePointer(
-                    type: 'double_tap',
-                    nx: norm.dx,
-                    ny: norm.dy,
-                  );
-                },
-                onPanStart: (details) {
-                  final norm = normalizeOffset(details.localPosition);
-                  _sendRemotePointer(
-                    type: 'down',
-                    nx: norm.dx,
-                    ny: norm.dy,
-                  );
-                },
-                onPanUpdate: (details) {
-                  final norm = normalizeOffset(details.localPosition);
-                  _sendRemotePointer(
-                    type: 'drag',
-                    nx: norm.dx,
-                    ny: norm.dy,
-                    deltaX: details.delta.dx,
-                    deltaY: details.delta.dy,
-                  );
-                },
-                onPanEnd: (_) {
-                  final last = _lastTapNormalized ?? const Offset(0.5, 0.5);
-                  _sendRemotePointer(
-                    type: 'up',
-                    nx: last.dx,
-                    ny: last.dy,
-                  );
-                },
-                child: Stack(
-                  fit: StackFit.expand,
-                  children: [
-                    Image.memory(
-                      _latestFrameBytes!,
-                      gaplessPlayback: true,
-                      fit: BoxFit.fill,
+          Offset sceneToNormalized(Offset localPoint) {
+            final scenePt = _zoomController.toScene(localPoint);
+            return Offset(
+              (scenePt.dx / canvasSize.width).clamp(0.0, 1.0),
+              (scenePt.dy / canvasSize.height).clamp(0.0, 1.0),
+            );
+          }
+
+          final isTrackpad = _touchInputMode == 'trackpad';
+
+          Widget desktopCanvas = SizedBox(
+            width: canvasSize.width,
+            height: canvasSize.height,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                Image.memory(
+                  _latestFrameBytes!,
+                  gaplessPlayback: true,
+                  fit: BoxFit.fill,
+                ),
+                // High-visibility Windows-RDP Virtual Mouse Pointer Cursor
+                Positioned(
+                  left: (_virtualCursorNx * canvasSize.width) - 4,
+                  top: (_virtualCursorNy * canvasSize.height) - 4,
+                  child: IgnorePointer(
+                    child: CustomPaint(
+                      size: const Size(28, 28),
+                      painter: _RdpVirtualCursorPainter(
+                        isDragLocked: _isDragLocked,
+                      ),
                     ),
-                    Positioned(
-                      left: 10,
-                      top: 10,
+                  ),
+                ),
+              ],
+            ),
+          );
+
+          return Center(
+            child: SizedBox(
+              width: canvasSize.width,
+              height: canvasSize.height,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  Listener(
+                    onPointerSignal: (signal) {
+                      if (signal is PointerScrollEvent) {
+                        final norm = isTrackpad
+                            ? Offset(_virtualCursorNx, _virtualCursorNy)
+                            : sceneToNormalized(signal.localPosition);
+                        _sendRemotePointer(
+                          type: 'scroll',
+                          nx: norm.dx,
+                          ny: norm.dy,
+                          deltaX: -signal.scrollDelta.dx,
+                          deltaY: -signal.scrollDelta.dy,
+                        );
+                      }
+                    },
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTapUp: (details) {
+                        _desktopCanvasFocusNode.requestFocus();
+                        if (isTrackpad) {
+                          // Trackpad mode: tap anywhere clicks at virtual mouse cursor!
+                          _sendRemotePointer(
+                            type: 'tap',
+                            nx: _virtualCursorNx,
+                            ny: _virtualCursorNy,
+                          );
+                        } else {
+                          final norm = sceneToNormalized(details.localPosition);
+                          final effectiveType =
+                              _pointerTool == 'drag' ? 'tap' : _pointerTool;
+                          _sendRemotePointer(
+                            type: effectiveType,
+                            nx: norm.dx,
+                            ny: norm.dy,
+                          );
+                        }
+                      },
+                      onDoubleTapDown: (details) {
+                        if (isTrackpad) {
+                          _sendRemotePointer(
+                            type: 'double_tap',
+                            nx: _virtualCursorNx,
+                            ny: _virtualCursorNy,
+                          );
+                        } else {
+                          final norm = sceneToNormalized(details.localPosition);
+                          _sendRemotePointer(
+                            type: 'double_tap',
+                            nx: norm.dx,
+                            ny: norm.dy,
+                          );
+                        }
+                      },
+                      onLongPressStart: (details) {
+                        HapticFeedback.mediumImpact();
+                        if (isTrackpad) {
+                          _sendRemotePointer(
+                            type: 'right_click',
+                            nx: _virtualCursorNx,
+                            ny: _virtualCursorNy,
+                          );
+                        } else {
+                          final norm = sceneToNormalized(details.localPosition);
+                          _sendRemotePointer(
+                            type: 'right_click',
+                            nx: norm.dx,
+                            ny: norm.dy,
+                          );
+                        }
+                      },
+                      onSecondaryTapUp: (details) {
+                        final norm = isTrackpad
+                            ? Offset(_virtualCursorNx, _virtualCursorNy)
+                            : sceneToNormalized(details.localPosition);
+                        _sendRemotePointer(
+                          type: 'right_click',
+                          nx: norm.dx,
+                          ny: norm.dy,
+                        );
+                      },
+                      onScaleStart: isTrackpad
+                          ? (details) {
+                              _lastTrackpadPanLocal = details.localFocalPoint;
+                            }
+                          : null,
+                      onScaleUpdate: isTrackpad
+                          ? (details) {
+                              if (details.pointerCount >= 2) {
+                                // Two-finger pinch zoom in Trackpad mode!
+                                final nextScale =
+                                    (_currentZoomScale * details.scale.clamp(0.92, 1.08))
+                                        .clamp(1.0, 6.0);
+                                _setDesktopZoom(
+                                  nextScale,
+                                  focalNormalized: Offset(
+                                    _virtualCursorNx,
+                                    _virtualCursorNy,
+                                  ),
+                                  viewportSize: canvasSize,
+                                );
+                                return;
+                              }
+                              // Single-finger trackpad slide: move virtual mouse cursor smoothly!
+                              final prev = _lastTrackpadPanLocal ??
+                                  details.localFocalPoint;
+                              final delta = details.localFocalPoint - prev;
+                              _lastTrackpadPanLocal = details.localFocalPoint;
+
+                              final effScale =
+                                  max(1.0, _currentZoomScale * 0.65);
+                              final dnx = (delta.dx / canvasSize.width) *
+                                  (_trackpadSensitivity / effScale);
+                              final dny = (delta.dy / canvasSize.height) *
+                                  (_trackpadSensitivity / effScale);
+                              setState(() {
+                                _virtualCursorNx =
+                                    (_virtualCursorNx + dnx).clamp(0.0, 1.0);
+                                _virtualCursorNy =
+                                    (_virtualCursorNy + dny).clamp(0.0, 1.0);
+                              });
+                              _autoPanZoomedViewportToFollowCursor(canvasSize);
+                              _sendRemotePointer(
+                                type: _isDragLocked ? 'drag' : 'move',
+                                nx: _virtualCursorNx,
+                                ny: _virtualCursorNy,
+                                deltaX: delta.dx,
+                                deltaY: delta.dy,
+                              );
+                            }
+                          : null,
+                      child: InteractiveViewer(
+                        transformationController: _zoomController,
+                        minScale: 1.0,
+                        maxScale: 6.0,
+                        panEnabled: !isTrackpad,
+                        scaleEnabled: !isTrackpad,
+                        child: desktopCanvas,
+                      ),
+                    ),
+                  ),
+
+                  // Top-left status & zoom badge
+                  Positioned(
+                    left: 8,
+                    top: 8,
+                    child: IgnorePointer(
                       child: Container(
                         padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
+                          horizontal: 9,
                           vertical: 4,
                         ),
                         decoration: BoxDecoration(
-                          color: Colors.black.withValues(alpha: 0.65),
-                          borderRadius: BorderRadius.circular(12),
+                          color: Colors.black.withValues(alpha: 0.68),
+                          borderRadius: BorderRadius.circular(10),
                           border: Border.all(
-                            color: Colors.white.withValues(alpha: 0.2),
+                            color: Colors.white.withValues(alpha: 0.18),
                           ),
                         ),
                         child: Text(
-                          '${peer.deviceName} · ${_activeRemoteMode == 'desktop' ? '系统全桌面' : '应用内画面'} (${_remoteScreenWidth}x$_remoteScreenHeight)',
+                          '${peer.deviceName} · ${_activeRemoteMode == 'desktop' ? '全系统桌面' : '应用窗口'} (${_remoteScreenWidth}x$_remoteScreenHeight) · ${_currentZoomScale.toStringAsFixed(1)}x · ${isTrackpad ? "触控板鼠标" : "直点"}',
                           style: const TextStyle(
-                            fontSize: 11,
+                            fontSize: 10.5,
                             color: Colors.white,
-                            fontWeight: FontWeight.w600,
+                            fontWeight: FontWeight.w700,
                           ),
                         ),
                       ),
                     ),
-                    if (_lastTapNormalized != null)
-                      Positioned(
-                        left: (_lastTapNormalized!.dx * boxW) - 10,
-                        top: (_lastTapNormalized!.dy * boxH) - 10,
-                        child: IgnorePointer(
-                          child: Container(
-                            width: 20,
-                            height: 20,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              color: VideoPlatformTheme.accent
-                                  .withValues(alpha: 0.35),
-                              border: Border.all(
-                                color: Colors.white,
-                                width: 2,
+                  ),
+
+                  // Floating Zoom In / Zoom Out / Reset buttons on the right edge
+                  Positioned(
+                    right: 8,
+                    bottom: 8,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 4,
+                        vertical: 2,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withValues(alpha: 0.72),
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(
+                          color: Colors.white.withValues(alpha: 0.22),
+                        ),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          IconButton(
+                            visualDensity: VisualDensity.compact,
+                            constraints: const BoxConstraints(
+                              minWidth: 30,
+                              minHeight: 30,
+                            ),
+                            padding: EdgeInsets.zero,
+                            tooltip: '缩小画面',
+                            onPressed: () => _setDesktopZoom(
+                              (_currentZoomScale - 0.5).clamp(1.0, 6.0),
+                              viewportSize: canvasSize,
+                            ),
+                            icon: const Icon(
+                              Icons.remove_circle_outline_rounded,
+                              size: 18,
+                              color: Colors.white,
+                            ),
+                          ),
+                          InkWell(
+                            onTap: () => _setDesktopZoom(
+                              1.0,
+                              viewportSize: canvasSize,
+                            ),
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(horizontal: 6),
+                              child: Text(
+                                '${_currentZoomScale.toStringAsFixed(1)}x',
+                                style: TextStyle(
+                                  fontSize: 11.5,
+                                  fontWeight: FontWeight.w800,
+                                  color: VideoPlatformTheme.accent,
+                                ),
                               ),
                             ),
                           ),
-                        ),
+                          IconButton(
+                            visualDensity: VisualDensity.compact,
+                            constraints: const BoxConstraints(
+                              minWidth: 30,
+                              minHeight: 30,
+                            ),
+                            padding: EdgeInsets.zero,
+                            tooltip: '放大桌面画面 (最高 6x)',
+                            onPressed: () => _setDesktopZoom(
+                              (_currentZoomScale + 0.6).clamp(1.0, 6.0),
+                              viewportSize: canvasSize,
+                            ),
+                            icon: const Icon(
+                              Icons.add_circle_outline_rounded,
+                              size: 18,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ],
                       ),
-                  ],
-                ),
+                    ),
+                  ),
+                ],
               ),
-            );
-          },
-        ),
+            ),
+          );
+        },
       ),
     );
   }
@@ -2024,32 +2704,109 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
     return Scaffold(
       backgroundColor: Colors.black,
       body: SafeArea(
-        child: Stack(
-          fit: StackFit.expand,
+        top: false,
+        bottom: false,
+        child: Column(
           children: [
-            if (peer != null) _buildInteractiveDesktopViewport(peer),
-            Positioned(
-              right: 16,
-              top: 16,
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
+            Expanded(
+              child: Stack(
+                fit: StackFit.expand,
                 children: [
-                  FilledButton.tonalIcon(
-                    onPressed: () => _sendRemoteKey('back'),
-                    icon: const Icon(Icons.arrow_back_rounded, size: 16),
-                    label: const Text('远程返回'),
-                  ),
-                  const SizedBox(width: 8),
-                  FilledButton.icon(
-                    onPressed: () {
-                      setState(() => _isDesktopFullscreen = false);
-                    },
-                    icon: const Icon(Icons.fullscreen_exit_rounded, size: 18),
-                    label: const Text('退出全屏'),
+                  if (peer != null) _buildInteractiveDesktopViewport(peer),
+                  // Floating top-right Windows-RDP control pill in Fullscreen mode
+                  Positioned(
+                    right: 12,
+                    top: 12,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withValues(alpha: 0.75),
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(
+                          color: Colors.white.withValues(alpha: 0.25),
+                        ),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          InkWell(
+                            onTap: () {
+                              setState(() {
+                                _touchInputMode = _touchInputMode == 'trackpad'
+                                    ? 'direct'
+                                    : 'trackpad';
+                              });
+                            },
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 4,
+                              ),
+                              child: Text(
+                                _touchInputMode == 'trackpad'
+                                    ? '🖱️ 触控板指针'
+                                    : '👆 触屏直点',
+                                style: TextStyle(
+                                  fontSize: 11.5,
+                                  fontWeight: FontWeight.w800,
+                                  color: VideoPlatformTheme.accent,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 4),
+                          InkWell(
+                            onTap: () => _setDesktopZoom(
+                              _currentZoomScale < 2.0 ? 2.2 : 1.0,
+                            ),
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 4,
+                              ),
+                              child: Text(
+                                _currentZoomScale < 2.0 ? '🔍 放大 2.2x' : '🔍 还原 1x',
+                                style: const TextStyle(
+                                  fontSize: 11.5,
+                                  fontWeight: FontWeight.w700,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 4),
+                          InkWell(
+                            onTap: _exitFullscreenDesktop,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 4,
+                              ),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFFEF4444),
+                                borderRadius: BorderRadius.circular(14),
+                              ),
+                              child: const Text(
+                                '退出全屏',
+                                style: TextStyle(
+                                  fontSize: 11.5,
+                                  fontWeight: FontWeight.w800,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
                   ),
                 ],
               ),
             ),
+            if (peer != null) _buildBottomRdpControlDock(peer),
           ],
         ),
       ),
@@ -2099,30 +2856,38 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                         size: 19,
                       ),
                       const SizedBox(width: 8),
-                      Text(
-                        '虚拟遥控器 (${peer.deviceName})',
-                        style: TextStyle(
-                          fontSize: 14.5,
-                          fontWeight: FontWeight.w800,
-                          color: VideoPlatformTheme.textPrimary,
+                      Expanded(
+                        child: Text(
+                          '全设备虚拟遥控器 (${peer.deviceName})',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 14.5,
+                            fontWeight: FontWeight.w800,
+                            color: VideoPlatformTheme.textPrimary,
+                          ),
                         ),
                       ),
                     ],
                   ),
                   const SizedBox(height: 16),
-                  // Top row: Back, Home, Menu/PlayPause
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                     children: [
                       _buildRemotePadButton(
                         icon: Icons.arrow_back_rounded,
-                        label: '返回',
+                        label: '返回/Esc',
                         onTap: () => _sendRemoteKey('back'),
                       ),
                       _buildRemotePadButton(
-                        icon: Icons.home_rounded,
-                        label: '首页',
-                        onTap: () => _sendRemoteKey('home'),
+                        icon: Icons.desktop_windows_rounded,
+                        label: '显示桌面',
+                        onTap: () => _sendRemoteKey('show_desktop'),
+                      ),
+                      _buildRemotePadButton(
+                        icon: Icons.grid_view_rounded,
+                        label: '切换窗口',
+                        onTap: () => _sendRemoteKey('alt+tab'),
                       ),
                       _buildRemotePadButton(
                         icon: Icons.play_arrow_rounded,
@@ -2132,7 +2897,6 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                     ],
                   ),
                   const SizedBox(height: 18),
-                  // D-Pad Cross
                   SizedBox(
                     width: 210,
                     height: 210,
@@ -2199,7 +2963,6 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                     ),
                   ),
                   const SizedBox(height: 14),
-                  // Media control row
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                     children: [
@@ -2239,7 +3002,6 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
             constraints: const BoxConstraints(minWidth: 320, maxWidth: 540),
             child: Column(
               children: [
-                // Remote Tab Switcher
                 Container(
                   width: double.infinity,
                   padding: const EdgeInsets.all(16),
@@ -2574,7 +3336,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
       borderRadius: BorderRadius.circular(12),
       onTap: onTap,
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
         decoration: BoxDecoration(
           color: VideoPlatformTheme.bgCard,
           borderRadius: BorderRadius.circular(12),
@@ -2588,7 +3350,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
             Text(
               label,
               style: TextStyle(
-                fontSize: 11.5,
+                fontSize: 11,
                 color: VideoPlatformTheme.textSecondary,
                 fontWeight: FontWeight.w600,
               ),
@@ -2630,7 +3392,6 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Top action bar
           Container(
             padding: const EdgeInsets.all(14),
             decoration: BoxDecoration(
@@ -2656,8 +3417,8 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                   children: [
                     Text(
                       peer != null
-                          ? '向「${peer.deviceName}」高速直连传文件（支持直接拖拽文件到窗口）'
-                          : '请先在左侧选择目标客户端设备',
+                          ? '向「${peer.deviceName}」传文件（${peer.connectionModeLabel}）'
+                          : '请先选择目标客户端设备',
                       style: TextStyle(
                         fontSize: 14,
                         fontWeight: FontWeight.w800,
@@ -2692,7 +3453,9 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                       icon: const Icon(Icons.perm_media_rounded, size: 16),
                       label: const Text('发送视频/图片'),
                     ),
-                    if (!kIsWeb && Platform.isMacOS && _localSaveDirPath.isNotEmpty)
+                    if (!kIsWeb &&
+                        Platform.isMacOS &&
+                        _localSaveDirPath.isNotEmpty)
                       OutlinedButton.icon(
                         onPressed: () {
                           NativeUtilsChannelHub.channel.invokeMethod(
@@ -2709,12 +3472,10 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
             ),
           ),
           const SizedBox(height: 12),
-
           Expanded(
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                // Left: Transfer Queue (Active & Completed)
                 Expanded(
                   flex: 5,
                   child: Container(
@@ -2753,7 +3514,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                           child: transfers.isEmpty
                               ? Center(
                                   child: Text(
-                                    '暂无文件传输记录\n支持大文件局域网满速直传',
+                                    '暂无文件传输记录\n支持局域网高速直传与跨网络云端加密互传',
                                     textAlign: TextAlign.center,
                                     style: TextStyle(
                                       fontSize: 12.5,
@@ -2895,8 +3656,6 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                   ),
                 ),
                 const SizedBox(width: 12),
-
-                // Right: Remote Peer Shared Files Browser (`拉取与直接播放远端文件`)
                 Expanded(
                   flex: 5,
                   child: Container(
@@ -3023,7 +3782,8 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                                                   ],
                                                 ),
                                               ),
-                                              if (item.isVideo || item.isAudio)
+                                              if ((item.isVideo || item.isAudio) &&
+                                                  (peer?.isLanReachable ?? false))
                                                 IconButton(
                                                   visualDensity:
                                                       VisualDensity.compact,
@@ -3098,7 +3858,6 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
 
     return Column(
       children: [
-        // Top chat target banner
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
           decoration: BoxDecoration(
@@ -3118,8 +3877,8 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
               Expanded(
                 child: Text(
                   peer != null
-                      ? '当前对话：${peer.deviceName} (${peer.host}:${peer.port}) · 支持发送文字、链接、剪贴板与文件'
-                      : '局域网广播消息（发送给所有在线客户端）',
+                      ? '当前对话：${peer.deviceName} (${peer.connectionModeLabel}) · 支持发送文字、链接、剪贴板与文件'
+                      : '全网广播消息（发送给同局域网及同配对码所有在线客户端）',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
@@ -3139,8 +3898,6 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
             ],
           ),
         ),
-
-        // Chat message history list
         Expanded(
           child: allMessages.isEmpty
               ? Center(
@@ -3182,8 +3939,6 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                   },
                 ),
         ),
-
-        // Bottom Compose Bar
         Container(
           padding: const EdgeInsets.all(10),
           decoration: BoxDecoration(
@@ -3225,7 +3980,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                     decoration: InputDecoration(
                       hintText: peer != null
                           ? '发送消息给「${peer.deviceName}」...'
-                          : '发送局域网广播消息...',
+                          : '发送跨端广播消息...',
                     ),
                   ),
                 ),
@@ -3403,7 +4158,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
       child: Padding(
         padding: const EdgeInsets.all(28),
         child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 460),
+          constraints: const BoxConstraints(maxWidth: 480),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -3444,9 +4199,14 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                     label: const Text('手动输入设备 IP 连接'),
                   ),
                   OutlinedButton.icon(
+                    onPressed: _showWanPairingCodeDialog,
+                    icon: const Icon(Icons.public_rounded, size: 16),
+                    label: Text('跨网配对码 (${_mesh.pairingCode})'),
+                  ),
+                  OutlinedButton.icon(
                     onPressed: _mesh.refreshDiscoveryNow,
                     icon: const Icon(Icons.radar_rounded, size: 16),
-                    label: const Text('重新扫描局域网'),
+                    label: const Text('重新扫描'),
                   ),
                 ],
               ),
@@ -3455,5 +4215,50 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
         ),
       ),
     );
+  }
+}
+
+/// Draws a Windows Remote Desktop style high-contrast Mouse Pointer Arrow + Target Dot.
+class _RdpVirtualCursorPainter extends CustomPainter {
+  final bool isDragLocked;
+
+  const _RdpVirtualCursorPainter({required this.isDragLocked});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final arrowPath = Path()
+      ..moveTo(4, 4)
+      ..lineTo(4, 22)
+      ..lineTo(9.5, 17.5)
+      ..lineTo(13.5, 25)
+      ..lineTo(16.5, 23.5)
+      ..lineTo(12.5, 16)
+      ..lineTo(19, 16)
+      ..close();
+
+    final shadowPaint = Paint()
+      ..color = Colors.black.withValues(alpha: 0.75)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 3.0
+      ..strokeJoin = StrokeJoin.round;
+
+    final fillPaint = Paint()
+      ..color = isDragLocked ? const Color(0xFFF59E0B) : Colors.white
+      ..style = PaintingStyle.fill;
+
+    final accentDotPaint = Paint()
+      ..color = isDragLocked
+          ? const Color(0xFFEF4444)
+          : const Color(0xFF38BDF8)
+      ..style = PaintingStyle.fill;
+
+    canvas.drawPath(arrowPath, shadowPaint);
+    canvas.drawPath(arrowPath, fillPaint);
+    canvas.drawCircle(const Offset(4, 4), 3.2, accentDotPaint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _RdpVirtualCursorPainter oldDelegate) {
+    return oldDelegate.isDragLocked != isDragLocked;
   }
 }

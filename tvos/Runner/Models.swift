@@ -11,6 +11,7 @@ enum TvMainSection: String, CaseIterable, Identifiable {
   case downloads = "下载嗅探"
   case mediaLibrary = "媒体库"
   case music = "流光音乐"
+  case peerMesh = "设备互联"
   case proxy = "代理加速"
   case settings = "系统设置"
 
@@ -25,6 +26,7 @@ enum TvMainSection: String, CaseIterable, Identifiable {
     case .downloads: return "arrow.down.circle.fill"
     case .mediaLibrary: return "externaldrive.fill.badge.play"
     case .music: return "opticaldisc.fill"
+    case .peerMesh: return "display.2"
     case .proxy: return "network.badge.shield.half.filled"
     case .settings: return "gearshape.fill"
     }
@@ -1818,4 +1820,59 @@ struct TvThemePalette: Identifiable, Hashable {
     presets.first(where: { $0.id == id }) ?? presets[0]
   }
 }
+
+// MARK: - Cross-Device Peer Mesh Models (设备互联)
+
+struct TvPeerDeviceNode: Identifiable, Hashable {
+  let deviceId: String
+  var deviceName: String
+  var platform: String
+  var host: String
+  var port: Int
+  var version: String
+  var activeRoute: String
+  var nowPlaying: String
+  var isManual: Bool
+  var viaRelay: Bool
+  var lastSeenAt: Date
+
+  var id: String { deviceId }
+  var baseUrl: String { "http://\(host):\(port)" }
+  var isOnline: Bool { Date().timeIntervalSince(lastSeenAt) < 60 }
+
+  var platformIconName: String {
+    let p = platform.lowercased()
+    if p.contains("mac") { return "laptopcomputer" }
+    if p.contains("win") { return "pc" }
+    if p.contains("linux") { return "terminal.fill" }
+    if p.contains("tv") { return "appletv.fill" }
+    if p.contains("ios") || p.contains("iphone") { return "iphone" }
+    if p.contains("ipad") { return "ipad.landscape" }
+    if p.contains("android") { return "smartphone" }
+    return "display.2"
+  }
+}
+
+struct TvPeerChatMessage: Identifiable, Hashable {
+  let id: String
+  let fromDeviceId: String
+  let fromDeviceName: String
+  let toDeviceId: String
+  let text: String
+  let timestamp: Date
+  let isOutgoing: Bool
+  let attachmentName: String?
+  let attachmentUrl: String?
+}
+
+struct TvPeerRemoteFileItem: Identifiable, Hashable {
+  let name: String
+  let path: String
+  let isDir: Bool
+  let size: Int64
+  let modifiedMs: Int64
+
+  var id: String { path }
+}
+
 

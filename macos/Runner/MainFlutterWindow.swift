@@ -54,6 +54,7 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
   private var cachedNowPlayingTrackTitle: String = ""
 
   override func awakeFromNib() {
+    Self.migrateSandboxedContainerPreferencesIfNeeded()
     let flutterViewController = FlutterViewController()
     self.contentViewController = flutterViewController
     self.title = "流光视频"
@@ -628,6 +629,26 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
     ])
   }
 
+  private static func migrateSandboxedContainerPreferencesIfNeeded() {
+    let home = NSHomeDirectory()
+    let containerPlistPath = "\(home)/Library/Containers/com.linsion.m3u8Client/Data/Library/Preferences/com.linsion.m3u8Client.plist"
+    guard FileManager.default.fileExists(atPath: containerPlistPath),
+          let dict = NSDictionary(contentsOfFile: containerPlistPath) as? [String: Any] else {
+      return
+    }
+    let defaults = UserDefaults.standard
+    var didMigrate = false
+    for (key, value) in dict where key.hasPrefix("flutter.") {
+      if defaults.object(forKey: key) == nil {
+        defaults.set(value, forKey: key)
+        didMigrate = true
+      }
+    }
+    if didMigrate {
+      defaults.synchronize()
+    }
+  }
+
   private func captureMacDesktopScreenJpeg(maxWidth: Int, quality: Int, result: @escaping FlutterResult) {
     let screenFrame = NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
     let mouseLoc = NSEvent.mouseLocation
@@ -637,14 +658,29 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
 
     DispatchQueue.global(qos: .userInteractive).async {
       let mainDisplayId = CGMainDisplayID()
-      guard let cgImage = CGDisplayCreateImage(mainDisplayId) else {
+      var cgImage = CGDisplayCreateImage(mainDisplayId)
+      if cgImage == nil {
+        let tmpPath = NSTemporaryDirectory() + "lg_desk_\(ProcessInfo.processInfo.processIdentifier).jpg"
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        proc.arguments = ["-x", "-C", "-t", "jpg", tmpPath]
+        try? proc.run()
+        proc.waitUntilExit()
+        if let nsImg = NSImage(contentsOfFile: tmpPath),
+           let tiff = nsImg.tiffRepresentation,
+           let rep = NSBitmapImageRep(data: tiff) {
+          cgImage = rep.cgImage
+        }
+        try? FileManager.default.removeItem(atPath: tmpPath)
+      }
+      guard let validCgImage = cgImage else {
         DispatchQueue.main.async {
           result(nil)
         }
         return
       }
-      let srcW = CGFloat(cgImage.width)
-      let srcH = CGFloat(cgImage.height)
+      let srcW = CGFloat(validCgImage.width)
+      let srcH = CGFloat(validCgImage.height)
       guard srcW > 0, srcH > 0 else {
         DispatchQueue.main.async {
           result(nil)
@@ -672,7 +708,7 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
         return
       }
       ctx.interpolationQuality = .medium
-      ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: CGFloat(dstW), height: CGFloat(dstH)))
+      ctx.draw(validCgImage, in: CGRect(x: 0, y: 0, width: CGFloat(dstW), height: CGFloat(dstH)))
 
       // Draw a high-visibility remote cursor indicator at current mouse position
       let cx = CGFloat(normX) * CGFloat(dstW)
@@ -794,8 +830,9 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
   }
 
   private func injectMacDesktopKeyEvent(args: [String: Any], result: @escaping FlutterResult) {
-    let keyName = ((args["key"] as? String) ?? "").lowercased()
+    let rawKey = ((args["key"] as? String) ?? "").lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
     let text = (args["text"] as? String) ?? ""
+    let explicitMods = (args["modifiers"] as? [String])?.map { $0.lowercased() } ?? []
 
     if !text.isEmpty {
       let utf16Chars = Array(text.utf16)
@@ -810,29 +847,81 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
       return
     }
 
+    // Parse compound shortcuts like "cmd+c", "ctrl+v", "alt+tab", "win+d", "show_desktop"
+    var flags: CGEventFlags = []
+    var baseKey = rawKey
+    if rawKey == "show_desktop" || rawKey == "win+d" {
+      baseKey = "f11"
+      flags.insert(.maskSecondaryFn)
+    } else if rawKey == "mission_control" || rawKey == "win+tab" {
+      baseKey = "up"
+      flags.insert(.maskControl)
+    } else if rawKey.contains("+") {
+      let parts = rawKey.split(separator: "+").map { String($0) }
+      baseKey = parts.last ?? rawKey
+      for mod in parts.dropLast() {
+        switch mod {
+        case "cmd", "meta", "win", "command":
+          flags.insert(.maskCommand)
+        case "ctrl", "control":
+          // On macOS, map standard Ctrl+C/V/X/A/Z/W shortcuts from Windows-style remote toolbar to Command
+          if ["c", "v", "x", "a", "z", "w", "q", "f", "s", "t", "r"].contains(baseKey) {
+            flags.insert(.maskCommand)
+          } else {
+            flags.insert(.maskControl)
+          }
+        case "alt", "option":
+          if baseKey == "tab" {
+            flags.insert(.maskCommand)
+          } else {
+            flags.insert(.maskAlternate)
+          }
+        case "shift":
+          flags.insert(.maskShift)
+        default:
+          break
+        }
+      }
+    }
+    for mod in explicitMods {
+      switch mod {
+      case "cmd", "meta", "win", "command":
+        flags.insert(.maskCommand)
+      case "ctrl", "control":
+        flags.insert(.maskControl)
+      case "alt", "option":
+        flags.insert(.maskAlternate)
+      case "shift":
+        flags.insert(.maskShift)
+      default:
+        break
+      }
+    }
+
     let keyCodeMap: [String: CGKeyCode] = [
-      "enter": 36,
-      "ok": 36,
-      "return": 36,
+      "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9,
+      "b": 11, "q": 12, "w": 13, "e": 14, "r": 15, "y": 16, "t": 17,
+      "1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23, "=": 24, "9": 25, "7": 26,
+      "-": 27, "8": 28, "0": 29, "]": 30, "o": 31, "u": 32, "[": 33, "i": 34, "p": 35,
+      "enter": 36, "ok": 36, "return": 36,
+      "l": 37, "j": 38, "k": 40, ";": 41, ",": 43, "/": 44, "n": 45, "m": 46, ".": 47,
       "tab": 48,
-      "space": 49,
-      "play_pause": 49,
+      "space": 49, "play_pause": 49,
       "backspace": 51,
-      "delete": 51,
-      "escape": 53,
-      "back": 53,
-      "left": 123,
-      "right": 124,
-      "down": 125,
-      "up": 126,
-      "home": 115,
-      "end": 119,
-      "pageup": 116,
-      "pagedown": 121
+      "delete": 117, "del": 117,
+      "escape": 53, "esc": 53, "back": 53,
+      "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97,
+      "f7": 98, "f8": 100, "f9": 101, "f10": 109, "f11": 103, "f12": 111,
+      "left": 123, "right": 124, "down": 125, "up": 126,
+      "home": 115, "end": 119, "pageup": 116, "pagedown": 121
     ]
-    if let code = keyCodeMap[keyName] {
+    if let code = keyCodeMap[baseKey] {
       if let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
          let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) {
+        if !flags.isEmpty {
+          down.flags = flags
+          up.flags = flags
+        }
         down.post(tap: .cghidEventTap)
         up.post(tap: .cghidEventTap)
       }
