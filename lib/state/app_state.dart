@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:package_info_plus/package_info_plus.dart';
@@ -245,8 +246,10 @@ class AppState extends ChangeNotifier {
   late final ProxyRoutingService proxyService;
 
   // Telegram Real-Time Notification Service & Reading / Navigation State
+  static const _prefTelegramChatTitlesKey = 'm3u8_tg_known_chat_titles_v1';
   late final TelegramNotificationService telegramNotifications;
   final Map<String, String> _knownTelegramChatTitles = {};
+  Timer? _persistTelegramTitlesTimer;
   bool _isTelegramViewActive = false;
   bool _isAppForeground = true;
   DateTime? _lastBackgroundedAt;
@@ -278,7 +281,7 @@ class AppState extends ChangeNotifier {
           _activeReadingTelegramAccountId == accountId &&
           _activeReadingTelegramPeer == peer,
       resolveChatTitle: (accountId, peer) =>
-          _knownTelegramChatTitles['$accountId|$peer'] ?? '',
+          resolveTelegramChatTitle(accountId, peer),
       onOpenNotification: (accountId, peer, messageId) {
         _pendingTelegramJumpTarget = (
           accountId: accountId,
@@ -302,15 +305,88 @@ class AppState extends ChangeNotifier {
   ({String accountId, String peer, int messageId})?
       get pendingTelegramJumpTarget => _pendingTelegramJumpTarget;
 
+  String resolveTelegramChatTitle(String accountId, String peer) {
+    final normPeer = TelegramChat.normalizePeerIdentifier(peer);
+    if (normPeer.isEmpty) return '';
+    final acc = accountId.trim().isNotEmpty ? accountId.trim() : 'default';
+    final exact = _knownTelegramChatTitles['$acc|$normPeer'];
+    if (exact != null &&
+        exact.isNotEmpty &&
+        !TelegramChat.isRawPeerIdentifier(exact)) {
+      return exact;
+    }
+    final global = _knownTelegramChatTitles['*|$normPeer'];
+    if (global != null &&
+        global.isNotEmpty &&
+        !TelegramChat.isRawPeerIdentifier(global)) {
+      return global;
+    }
+    return '';
+  }
+
+  /// Reverse-resolves a known `user:xxx` peer identifier from a display [title],
+  /// enabling click-to-private-chat on group members whose peer was learned earlier.
+  String resolveTelegramUserPeerByTitle(String accountId, String title) {
+    final clean = title.trim();
+    if (clean.isEmpty || TelegramChat.isRawPeerIdentifier(clean)) return '';
+    final acc = accountId.trim().isNotEmpty ? accountId.trim() : 'default';
+    final prefix = '$acc|user:';
+    for (final entry in _knownTelegramChatTitles.entries) {
+      if (entry.key.startsWith(prefix) && entry.value == clean) {
+        return entry.key.substring(acc.length + 1);
+      }
+    }
+    for (final entry in _knownTelegramChatTitles.entries) {
+      if (entry.key.startsWith('*|user:') && entry.value == clean) {
+        return entry.key.substring(2);
+      }
+    }
+    return '';
+  }
+
   void registerTelegramChatTitle(
     String accountId,
     String peer,
     String title,
   ) {
+    final normPeer = TelegramChat.normalizePeerIdentifier(peer);
     final clean = title.trim();
-    if (clean.isNotEmpty) {
-      _knownTelegramChatTitles['$accountId|$peer'] = clean;
+    if (normPeer.isEmpty ||
+        clean.isEmpty ||
+        TelegramChat.isRawPeerIdentifier(clean)) {
+      return;
     }
+    final acc = accountId.trim().isNotEmpty ? accountId.trim() : 'default';
+    final prevExact = _knownTelegramChatTitles['$acc|$normPeer'];
+    final prevGlobal = _knownTelegramChatTitles['*|$normPeer'];
+    if (prevExact == clean && prevGlobal == clean) return;
+    _knownTelegramChatTitles['$acc|$normPeer'] = clean;
+    _knownTelegramChatTitles['*|$normPeer'] = clean;
+    _schedulePersistTelegramChatTitles();
+  }
+
+  void _schedulePersistTelegramChatTitles() {
+    if (!kIsWeb && Platform.environment.containsKey('FLUTTER_TEST')) {
+      return;
+    }
+    _persistTelegramTitlesTimer?.cancel();
+    _persistTelegramTitlesTimer = Timer(const Duration(seconds: 2), () async {
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        if (_knownTelegramChatTitles.length > 3000) {
+          final excess = _knownTelegramChatTitles.length - 2400;
+          final removeKeys =
+              _knownTelegramChatTitles.keys.take(excess).toList();
+          for (final k in removeKeys) {
+            _knownTelegramChatTitles.remove(k);
+          }
+        }
+        await prefs.setString(
+          _prefTelegramChatTitlesKey,
+          jsonEncode(_knownTelegramChatTitles),
+        );
+      } catch (_) {}
+    });
   }
 
   bool get isTelegramViewActive => _isTelegramViewActive;
@@ -661,6 +737,19 @@ class AppState extends ChangeNotifier {
       _aiApiKey = prefs.getString(_prefAiApiKeyKey) ?? '';
       _aiBaseUrl = prefs.getString(_prefAiBaseUrlKey) ?? '';
       _aiModel = prefs.getString(_prefAiModelKey) ?? '';
+
+      final rawTgTitles = prefs.getString(_prefTelegramChatTitlesKey);
+      if (rawTgTitles != null && rawTgTitles.isNotEmpty) {
+        final decodedTitles = jsonDecode(rawTgTitles);
+        if (decodedTitles is Map) {
+          decodedTitles.forEach((k, v) {
+            final val = v?.toString().trim() ?? '';
+            if (val.isNotEmpty && !TelegramChat.isRawPeerIdentifier(val)) {
+              _knownTelegramChatTitles[k.toString()] = val;
+            }
+          });
+        }
+      }
 
       // Detect Android TV (Leanback) or Apple TV (tvOS / AirPlay)
       final tvInfo = await TvPlatformService.detectPlatformTvInfo();

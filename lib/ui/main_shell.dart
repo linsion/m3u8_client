@@ -11,6 +11,7 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../models/models.dart';
 import '../services/local_115_direct_service.dart';
+import '../services/peer_mesh_service.dart';
 import '../services/proxy_routing_service.dart';
 import '../state/app_state.dart';
 import 'screens/downloads_screen.dart';
@@ -18,6 +19,7 @@ import 'screens/library_history_screen.dart';
 import 'screens/live_tv_screen.dart';
 import 'screens/login_screen.dart';
 import 'screens/media_library_screen.dart';
+import 'screens/peer_mesh_screen.dart';
 import 'screens/proxy_server_screen.dart';
 import 'screens/settings_screen.dart';
 import 'screens/telegram_screen.dart';
@@ -57,7 +59,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   bool _isExitDialogShowing = false;
   final GlobalKey _sidebarContainerKey = GlobalKey();
   final Map<int, FocusNode> _sidebarTabFocusNodes = {
-    for (int i = 0; i <= 9; i++) i: FocusNode(debugLabel: 'SidebarTab_$i'),
+    for (int i = 0; i <= 10; i++) i: FocusNode(debugLabel: 'SidebarTab_$i'),
   };
 
   static bool _isUtilityTab(int index) => index == 6 || index == 8;
@@ -74,6 +76,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       7 => '终端命令行',
       8 => '偏好设置',
       9 => '流光音乐',
+      10 => '设备互联',
       _ => '影视片库',
     };
   }
@@ -122,6 +125,64 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
         _selectTab(5);
       }
     };
+    final mesh = PeerMeshService.instance;
+    mesh.addListener(_onPeerMeshUpdated);
+    mesh.getServerApi = () => widget.appState.api;
+    mesh.getActiveTabIndex = () => _selectedIndex;
+    mesh.getActiveTabName = () => _tabDisplayName(_selectedIndex);
+    mesh.getNowPlayingTitle =
+        () => widget.appState.miniPlayerSession?.title ?? '';
+    mesh.getIsPlaying = () => widget.appState.miniPlayerSession != null;
+    mesh.getIsTvMode = () => widget.appState.tvMode;
+    mesh.onRemoteSelectTab = (idx) {
+      if (mounted) {
+        _selectTab(idx);
+      }
+    };
+    mesh.onRemoteCommandReceived = (action, payload) {
+      if (!mounted) return;
+      if (action == 'cast_media') {
+        final url = (payload['url'] ?? '').toString().trim();
+        if (url.isEmpty) return;
+        final title = (payload['title'] ?? '远程推送视频').toString();
+        final senderName = (payload['senderName'] ?? '远程客户端').toString();
+        final posSec =
+            int.tryParse((payload['positionSec'] ?? 0).toString()) ?? 0;
+        final rawHeaders = payload['headers'];
+        final headers = <String, String>{};
+        if (rawHeaders is Map) {
+          rawHeaders.forEach((k, v) {
+            headers[k.toString()] = v.toString();
+          });
+        }
+        widget.appState.startMiniPlayer(
+          MiniPlayerSession(
+            title: title,
+            subtitle: '来自 $senderName 远程投屏',
+            streamUrl: url,
+            headers: headers,
+            initialPositionSeconds: posSec,
+          ),
+        );
+      } else if (action == 'media_command') {
+        final cmd = (payload['cmd'] ?? '').toString();
+        if (cmd == 'stop') {
+          widget.appState.closeMiniPlayer();
+        }
+      } else if (action == 'key_action') {
+        final k = (payload['key'] ?? '').toString();
+        if (k == 'back' || k == 'escape') {
+          _handleRootPop(widget.appState);
+        }
+      }
+    };
+    unawaited(() async {
+      await mesh.ensureInitialized();
+      await mesh.syncDefaultPairingCodeFromServer(
+        serverBaseUrl: widget.appState.serverConfig.baseUrl,
+        serverSecret: widget.appState.serverConfig.secret,
+      );
+    }());
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       widget.appState.updateTelegramReadingContext(
@@ -129,6 +190,12 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
         isAppForeground: true,
       );
     });
+  }
+
+  void _onPeerMeshUpdated() {
+    if (mounted) {
+      setState(() {});
+    }
   }
 
   void _selectTab(int index, {bool recordHistory = true}) {
@@ -161,6 +228,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    PeerMeshService.instance.removeListener(_onPeerMeshUpdated);
     if (widget.appState.onNavigateToTab != null) {
       widget.appState.onNavigateToTab = null;
     }
@@ -838,6 +906,8 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                       ),
                     if (!isImmersive)
                       _buildTelegramFloatingNotifications(state, isDesktop),
+                    if (!isImmersive)
+                      _buildPeerFloatingNotifications(state, isDesktop),
                     if (!isImmersive && _selectedIndex != 1)
                       Positioned(
                         top: isDesktop ? 64 : 52,
@@ -1450,6 +1520,14 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                       ),
                       const SizedBox(width: 4),
                       _buildTvNavTabButton(
+                        index: 10,
+                        icon: Icons.hub_rounded,
+                        label: '设备互联',
+                        badgeCount:
+                            PeerMeshService.instance.unreadMessageCount,
+                      ),
+                      const SizedBox(width: 4),
+                      _buildTvNavTabButton(
                         index: 8,
                         icon: Icons.settings_outlined,
                         label: '设置',
@@ -1950,6 +2028,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       7 => (Icons.terminal_rounded, '系统终端命令行'),
       8 => (Icons.settings_outlined, '偏好与媒体源设置'),
       9 => (Icons.album_rounded, '流光 Hi-Fi 云端音乐厅'),
+      10 => (Icons.hub_rounded, '设备互联 · 远程桌面与文件互传'),
       _ => (Icons.video_library_rounded, '流光视频'),
     };
     final isSubPage = _selectedIndex != 4;
@@ -2505,6 +2584,12 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                   const SizedBox(height: 8),
                   _buildSidebarSectionTitle('网络与系统'),
                   _buildSidebarItem(
+                    index: 10,
+                    icon: Icons.hub_rounded,
+                    label: '设备互联',
+                    badgeCount: PeerMeshService.instance.unreadMessageCount,
+                  ),
+                  _buildSidebarItem(
                     index: 6,
                     icon: Icons.swap_horiz_rounded,
                     label: '代理服务器',
@@ -2794,6 +2879,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       7 => '终端',
       8 => '设置',
       9 => '音乐',
+      10 => '互联',
       _ => '设置',
     };
 
@@ -3317,6 +3403,12 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                           '${state.history.length} 条记录 · ${state.favorites.length} 收藏',
                     ),
                     buildGridTile(
+                      tabIndex: 10,
+                      icon: Icons.hub_rounded,
+                      title: '设备互联与远控',
+                      subtitle: '远程桌面 · 传文件 · 跨端消息',
+                    ),
+                    buildGridTile(
                       tabIndex: 7,
                       icon: Icons.terminal_rounded,
                       title: '系统终端',
@@ -3645,9 +3737,123 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
         );
       case 9:
         return CloudMusicStandaloneScreen(appState: state);
+      case 10:
+        return PeerMeshScreen(appState: state);
       default:
         return VodHomeScreen(appState: state);
     }
+  }
+
+  Widget _buildPeerFloatingNotifications(AppState state, bool isDesktop) {
+    final mesh = PeerMeshService.instance;
+    final items = mesh.pendingToastMessages.take(3).toList();
+    if (items.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    return Positioned(
+      bottom: 72,
+      right: 16,
+      width: isDesktop ? 340 : 292,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: items.map((msg) {
+          return Padding(
+            key: ValueKey('peer_notif_${msg.id}'),
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Material(
+              color: const Color(0xF217212B),
+              elevation: 10,
+              shadowColor: Colors.black87,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+                side: BorderSide(
+                  color: VideoPlatformTheme.accent.withValues(alpha: 0.65),
+                  width: 1.2,
+                ),
+              ),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(12),
+                onTap: () {
+                  mesh.dismissToastMessage(msg.id);
+                  _selectTab(10);
+                },
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Container(
+                        width: 34,
+                        height: 34,
+                        decoration: BoxDecoration(
+                          color:
+                              VideoPlatformTheme.accent.withValues(alpha: 0.2),
+                          shape: BoxShape.circle,
+                        ),
+                        alignment: Alignment.center,
+                        child: Icon(
+                          msg.type == 'file'
+                              ? Icons.folder_shared_rounded
+                              : Icons.hub_rounded,
+                          size: 17,
+                          color: VideoPlatformTheme.accent,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              '设备互联 · 来自 ${msg.senderName}',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w700,
+                                color: VideoPlatformTheme.accent,
+                              ),
+                            ),
+                            const SizedBox(height: 3),
+                            Text(
+                              msg.text,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontSize: 12.5,
+                                color: Colors.white,
+                                height: 1.35,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      IconButton(
+                        visualDensity: VisualDensity.compact,
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(
+                          minWidth: 26,
+                          minHeight: 26,
+                        ),
+                        onPressed: () => mesh.dismissToastMessage(msg.id),
+                        icon: const Icon(
+                          Icons.close_rounded,
+                          size: 16,
+                          color: Colors.white60,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+        }).toList(),
+      ),
+    );
   }
 }
 

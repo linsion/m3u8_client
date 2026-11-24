@@ -2681,7 +2681,7 @@ class MainActivity : FlutterActivity() {
                         error.errorCode == PlaybackException.ERROR_CODE_AUDIO_TRACK_INIT_FAILED ||
                         error.errorCode == PlaybackException.ERROR_CODE_AUDIO_TRACK_WRITE_FAILED
 
-                    if (isAudioRendererError) {
+                    if (isAudioRendererError && !errText.contains("MediaCodecVideoRenderer", ignoreCase = true)) {
                         // Mark the currently selected audio track as rejected
                         val groups = exoPlayer.currentTracks.groups
                         for ((gIdx, g) in groups.withIndex()) {
@@ -2705,6 +2705,24 @@ class MainActivity : FlutterActivity() {
                             exoPlayer.playWhenReady = true
                             return
                         }
+                        finishWithCurrentPos("FALLBACK_MPV_SOFT_AUDIO")
+                        dismissNativeExoPlayerDialog()
+                        return
+                    }
+
+                    // 2) If video codec / container is unsupported by Android MediaCodec / ExoPlayer
+                    //    (e.g. RealVideo RV40/RMVB disguised as .mp4/.mkv, legacy DivX/WMV, etc.),
+                    //    seamlessly fall back to the full-codec libmpv FFmpeg software player!
+                    val isVideoOrContainerUnsupported =
+                        errText.contains("MediaCodecVideoRenderer", ignoreCase = true) ||
+                        errText.contains("rv40", ignoreCase = true) ||
+                        errText.contains("realvideo", ignoreCase = true) ||
+                        error.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED ||
+                        error.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES ||
+                        error.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ||
+                        error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED ||
+                        error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED
+                    if (isVideoOrContainerUnsupported) {
                         finishWithCurrentPos("FALLBACK_MPV_SOFT_AUDIO")
                         dismissNativeExoPlayerDialog()
                         return

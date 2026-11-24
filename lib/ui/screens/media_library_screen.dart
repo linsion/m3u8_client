@@ -193,9 +193,11 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
           if (item is Map) {
             final name = (item['name'] ?? '上传文件').toString();
             final path = item['path']?.toString();
-            final bytes = item['bytes'] is Uint8List
-                ? item['bytes'] as Uint8List
-                : null;
+            final rawB = item['bytes'];
+            final bytes =
+                (rawB is Uint8List && rawB.isNotEmpty) ? rawB : null;
+            final size =
+                (item['size'] as num?)?.toInt() ?? (bytes?.length ?? 0);
             if ((path != null && path.isNotEmpty) ||
                 (bytes != null && bytes.isNotEmpty)) {
               unawaited(
@@ -203,6 +205,7 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
                   fileName: name,
                   localFilePath: path,
                   rawBytes: bytes,
+                  expectedSize: size,
                   sourceLabel: '桌面拖拽上传',
                 ),
               );
@@ -463,6 +466,9 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
           subtitle: '${mount.name} · ${entry.formattedSize}',
         );
       case StorageSourceKind.smb:
+        if (forceRefresh) {
+          await SmbClientService.instance.resetAllSessions();
+        }
         final url = await SmbClientService.instance.buildLocalStreamUrl(
           mount,
           entry.path,
@@ -598,7 +604,8 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
               fallbackUrl: fallbackInitialUrl,
               headers: const <String, String>{},
               initialResolver: () => _resolveEntryEndpoint(entry),
-              refreshEndpoint: entry.sourceKind == StorageSourceKind.alist
+              refreshEndpoint: (entry.sourceKind == StorageSourceKind.alist ||
+                      entry.sourceKind == StorageSourceKind.smb)
                   ? () => _resolveEntryEndpoint(entry, forceRefresh: true)
                   : null,
               onEnterMiniPlayer: (posSec, url, headers, is115Playback) {
@@ -690,7 +697,8 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
             initialPosition: initialSeekPos,
             initialAudioTrackOrderIndex: initialAudioTrackOrderIdx,
             OpenedFromExoFallback: initialSeekPos != null || initialAudioTrackOrderIdx != null,
-            refreshEndpoint: entry.sourceKind == StorageSourceKind.alist
+            refreshEndpoint: (entry.sourceKind == StorageSourceKind.alist ||
+                    entry.sourceKind == StorageSourceKind.smb)
                 ? () => _resolveEntryEndpoint(entry, forceRefresh: true)
                 : null,
             fallback115: initial115 == null
@@ -994,9 +1002,9 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
             if (item is Map) {
               final name = (item['name'] ?? '文件').toString();
               final path = item['path']?.toString();
-              final bytes = item['bytes'] is Uint8List
-                  ? item['bytes'] as Uint8List
-                  : null;
+              final rawB = item['bytes'];
+              final bytes =
+                  (rawB is Uint8List && rawB.isNotEmpty) ? rawB : null;
               final size =
                   (item['size'] as num?)?.toInt() ?? (bytes?.length ?? 0);
               if ((path != null && path.isNotEmpty) ||
@@ -1150,6 +1158,9 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
         try {
           await widget.appState.api.login115WithCookie(
             Local115DirectService.instance.savedCookie,
+          );
+          await Local115DirectService.instance.ensureAccelerationFolderCid(
+            syncToServerApi: widget.appState.api,
           );
         } catch (_) {}
       }
@@ -1653,6 +1664,15 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
                 await File(e.path).copy(dstPath);
               }
             }
+            setState(() => _clipboard = null);
+            await _loadDirectory(dstDir);
+            return;
+          case StorageSourceKind.cloud115:
+            await Local115DirectService.instance.copyOrMove115Entries(
+              fids: clip.entries.map((e) => e.fid115.isNotEmpty ? e.fid115 : e.path),
+              targetCid: dstDir,
+              isMove: clip.isMove,
+            );
             setState(() => _clipboard = null);
             await _loadDirectory(dstDir);
             return;
@@ -4933,15 +4953,19 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
     );
     _playbackErrors = _player.stream.error.listen((message) {
       final clean = message.trim();
-      if (clean.isEmpty) return;
+      if (clean.isEmpty || _isResolvingInitial) return;
       final ignoreUntil = _ignoreErrorsUntil;
       if (ignoreUntil != null && DateTime.now().isBefore(ignoreUntil)) {
         return;
       }
       final hasStarted = _position > Duration.zero ||
           _duration > Duration.zero ||
+          _player.state.position > Duration.zero ||
+          _player.state.duration > Duration.zero ||
           (_player.state.width ?? 0) > 0 ||
-          (_player.state.height ?? 0) > 0;
+          (_player.state.height ?? 0) > 0 ||
+          _audioTracks.any((t) => t.id != 'auto' && t.id != 'no') ||
+          _subtitleTracks.isNotEmpty;
       if (hasStarted) return;
       final lower = clean.toLowerCase();
       final isNonFatal = lower.contains('error while decoding') ||
@@ -4959,7 +4983,9 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
           lower.contains('operation was aborted') ||
           lower.contains('audio device underrun') ||
           lower.contains('cannot set property') ||
-          lower.contains('unknown option');
+          lower.contains('unknown option') ||
+          lower.contains('stream ends prematurely') ||
+          lower.contains('invalid data found when processing input');
       if (isNonFatal) return;
       unawaited(_handlePlaybackError());
     });
@@ -5159,10 +5185,14 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
       //    expand probesize to 10MB and retry the current URL before switching routes!
       if (!_triedDeepProbe && _activeUrl.isNotEmpty) {
         _triedDeepProbe = true;
+        _ignoreErrorsUntil =
+            DateTime.now().add(const Duration(milliseconds: 1100));
         try {
           final dynamic platform = _player.platform;
           await platform.setProperty('demuxer-lavf-probesize', '10485760');
           await platform.setProperty('demuxer-lavf-analyzeduration', '5.0');
+          await _openActiveStream(position: position);
+          return;
         } catch (_) {}
       }
 
@@ -5234,6 +5264,24 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
     }
 
     if (!mounted || _reportedPlaybackError) return;
+    // Wait a brief grace period to make sure playback didn't recover or start asynchronously
+    // during demuxer range probing (e.g. SMB / MKV cue seeking at EOF).
+    await Future<void>.delayed(const Duration(milliseconds: 1200));
+    if (!mounted || _reportedPlaybackError) return;
+    final hasStartedNow = _isPlaying &&
+        (_position > Duration.zero ||
+            _duration > Duration.zero ||
+            _player.state.position > Duration.zero ||
+            _player.state.duration > Duration.zero ||
+            (_player.state.width ?? 0) > 0 ||
+            (_player.state.height ?? 0) > 0 ||
+            _audioTracks.any((t) => t.id != 'auto' && t.id != 'no') ||
+            _subtitleTracks.isNotEmpty);
+    if (hasStartedNow ||
+        _player.state.duration > Duration.zero ||
+        (_player.state.width ?? 0) > 0) {
+      return;
+    }
     _reportedPlaybackError = true;
     if (Platform.isAndroid && !widget.OpenedFromExoFallback) {
       await _openInEmbeddedExoPlayer();
@@ -5260,7 +5308,7 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
         'vd-lavc-check-hw-profile': 'yes',
         'vd-lavc-software-fallback': 'yes',
         'vd-lavc-dr': 'yes',
-        'vd-lavc-fast': 'yes',
+        'vd-lavc-fast': 'no',
         'vd-lavc-skiploopfilter': 'nonref',
         'vd-lavc-threads': '0',
         'ad-lavc-threads': '0',
@@ -5294,8 +5342,6 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
         'tls-verify': 'no',
         'stream-lavf-o':
             'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=5xx,reconnect_delay_max=3',
-        'demuxer-lavf-o':
-            'http_persistent=1,http_multiple=1,allowed_extensions=ALL,protocol_whitelist=file,http,https,httpproxy,tcp,tls,crypto,data,rtp,udp,subfile',
       };
       for (final entry in props.entries) {
         await platform.setProperty(entry.key, entry.value);

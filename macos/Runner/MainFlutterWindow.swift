@@ -1,5 +1,7 @@
+import ApplicationServices
 import AVKit
 import Cocoa
+import CoreGraphics
 import CoreImage
 import FlutterMacOS
 import GameController
@@ -104,6 +106,30 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
         self?.readMacClipboardImage(result: result)
       case "captureInteractiveScreenshot":
         self?.captureMacInteractiveScreenshot(result: result)
+      case "captureDesktopScreenJpeg":
+        let args = call.arguments as? [String: Any]
+        let maxWidth = (args?["maxWidth"] as? Int) ?? 1280
+        let quality = (args?["quality"] as? Int) ?? 72
+        self?.captureMacDesktopScreenJpeg(maxWidth: maxWidth, quality: quality, result: result)
+      case "checkDesktopPermissions":
+        self?.checkMacDesktopPermissions(prompt: false, result: result)
+      case "requestDesktopPermissions":
+        self?.checkMacDesktopPermissions(prompt: true, result: result)
+      case "injectDesktopMouseEvent":
+        let args = (call.arguments as? [String: Any]) ?? [:]
+        self?.injectMacDesktopMouseEvent(args: args, result: result)
+      case "injectDesktopKeyEvent":
+        let args = (call.arguments as? [String: Any]) ?? [:]
+        self?.injectMacDesktopKeyEvent(args: args, result: result)
+      case "revealFileInFinder":
+        let args = call.arguments as? [String: Any]
+        let path = (args?["path"] as? String) ?? ""
+        if !path.isEmpty {
+          NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+          result(true)
+        } else {
+          result(false)
+        }
       default:
         result(FlutterMethodNotImplemented)
       }
@@ -584,6 +610,236 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
         }
       }
     }
+  }
+
+  private func checkMacDesktopPermissions(prompt: Bool, result: @escaping FlutterResult) {
+    var hasScreenCapture = CGPreflightScreenCaptureAccess()
+    if prompt && !hasScreenCapture {
+      hasScreenCapture = CGRequestScreenCaptureAccess()
+    }
+    var hasAccessibility = AXIsProcessTrusted()
+    if prompt && !hasAccessibility {
+      let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+      hasAccessibility = AXIsProcessTrustedWithOptions(opts)
+    }
+    result([
+      "screenCapture": hasScreenCapture,
+      "accessibility": hasAccessibility
+    ])
+  }
+
+  private func captureMacDesktopScreenJpeg(maxWidth: Int, quality: Int, result: @escaping FlutterResult) {
+    let screenFrame = NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+    let mouseLoc = NSEvent.mouseLocation
+    let normX = max(0.0, min(1.0, (mouseLoc.x - screenFrame.origin.x) / max(1.0, screenFrame.width)))
+    // macOS NSEvent.mouseLocation has origin at bottom-left; normalize to top-left (0,0)
+    let normY = max(0.0, min(1.0, 1.0 - ((mouseLoc.y - screenFrame.origin.y) / max(1.0, screenFrame.height))))
+
+    DispatchQueue.global(qos: .userInteractive).async {
+      let mainDisplayId = CGMainDisplayID()
+      guard let cgImage = CGDisplayCreateImage(mainDisplayId) else {
+        DispatchQueue.main.async {
+          result(nil)
+        }
+        return
+      }
+      let srcW = CGFloat(cgImage.width)
+      let srcH = CGFloat(cgImage.height)
+      guard srcW > 0, srcH > 0 else {
+        DispatchQueue.main.async {
+          result(nil)
+        }
+        return
+      }
+      let targetMaxW = CGFloat(max(360, min(2560, maxWidth)))
+      let scale = min(1.0, targetMaxW / srcW)
+      let dstW = max(1, Int(srcW * scale))
+      let dstH = max(1, Int(srcH * scale))
+
+      let colorSpace = CGColorSpaceCreateDeviceRGB()
+      guard let ctx = CGContext(
+        data: nil,
+        width: dstW,
+        height: dstH,
+        bitsPerComponent: 8,
+        bytesPerRow: 0,
+        space: colorSpace,
+        bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+      ) else {
+        DispatchQueue.main.async {
+          result(nil)
+        }
+        return
+      }
+      ctx.interpolationQuality = .medium
+      ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: CGFloat(dstW), height: CGFloat(dstH)))
+
+      // Draw a high-visibility remote cursor indicator at current mouse position
+      let cx = CGFloat(normX) * CGFloat(dstW)
+      let cy = (1.0 - CGFloat(normY)) * CGFloat(dstH)
+      ctx.saveGState()
+      ctx.setFillColor(NSColor.systemCyan.withAlphaComponent(0.85).cgColor)
+      ctx.setStrokeColor(NSColor.white.cgColor)
+      ctx.setLineWidth(2.0)
+      let cursorRect = CGRect(x: cx - 6, y: cy - 6, width: 12, height: 12)
+      ctx.fillEllipse(in: cursorRect)
+      ctx.strokeEllipse(in: cursorRect)
+      ctx.restoreGState()
+
+      guard let scaledCg = ctx.makeImage() else {
+        DispatchQueue.main.async {
+          result(nil)
+        }
+        return
+      }
+      let bmp = NSBitmapImageRep(cgImage: scaledCg)
+      let compFactor = max(0.25, min(0.95, Double(quality) / 100.0))
+      guard let jpegData = bmp.representation(
+        using: .jpeg,
+        properties: [.compressionFactor: NSNumber(value: compFactor)]
+      ) else {
+        DispatchQueue.main.async {
+          result(nil)
+        }
+        return
+      }
+      DispatchQueue.main.async {
+        result([
+          "bytes": FlutterStandardTypedData(bytes: jpegData),
+          "width": dstW,
+          "height": dstH,
+          "cursorX": normX,
+          "cursorY": normY
+        ])
+      }
+    }
+  }
+
+  private func injectMacDesktopMouseEvent(args: [String: Any], result: @escaping FlutterResult) {
+    let type = (args["type"] as? String) ?? "tap"
+    let nx = max(0.0, min(1.0, (args["nx"] as? NSNumber)?.doubleValue ?? 0.5))
+    let ny = max(0.0, min(1.0, (args["ny"] as? NSNumber)?.doubleValue ?? 0.5))
+    let deltaX = (args["deltaX"] as? NSNumber)?.int32Value ?? 0
+    let deltaY = (args["deltaY"] as? NSNumber)?.int32Value ?? 0
+
+    let mainDisplay = CGMainDisplayID()
+    let bounds = CGDisplayBounds(mainDisplay)
+    let pt = CGPoint(
+      x: bounds.origin.x + CGFloat(nx) * bounds.width,
+      y: bounds.origin.y + CGFloat(ny) * bounds.height
+    )
+
+    switch type {
+    case "move":
+      CGWarpMouseCursorPosition(pt)
+      if let ev = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: pt, mouseButton: .left) {
+        ev.post(tap: .cghidEventTap)
+      }
+    case "down":
+      CGWarpMouseCursorPosition(pt)
+      if let ev = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: pt, mouseButton: .left) {
+        ev.post(tap: .cghidEventTap)
+      }
+    case "drag":
+      CGWarpMouseCursorPosition(pt)
+      if let ev = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDragged, mouseCursorPosition: pt, mouseButton: .left) {
+        ev.post(tap: .cghidEventTap)
+      }
+    case "up":
+      CGWarpMouseCursorPosition(pt)
+      if let ev = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) {
+        ev.post(tap: .cghidEventTap)
+      }
+    case "tap":
+      CGWarpMouseCursorPosition(pt)
+      if let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: pt, mouseButton: .left),
+         let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) {
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+      }
+    case "double_tap":
+      CGWarpMouseCursorPosition(pt)
+      for clickNum: Int64 in 1...2 {
+        if let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: pt, mouseButton: .left),
+           let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) {
+          down.setIntegerValueField(.mouseEventClickState, value: clickNum)
+          up.setIntegerValueField(.mouseEventClickState, value: clickNum)
+          down.post(tap: .cghidEventTap)
+          up.post(tap: .cghidEventTap)
+        }
+      }
+    case "right_click":
+      CGWarpMouseCursorPosition(pt)
+      if let down = CGEvent(mouseEventSource: nil, mouseType: .rightMouseDown, mouseCursorPosition: pt, mouseButton: .right),
+         let up = CGEvent(mouseEventSource: nil, mouseType: .rightMouseUp, mouseCursorPosition: pt, mouseButton: .right) {
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+      }
+    case "scroll":
+      CGWarpMouseCursorPosition(pt)
+      if let scrollEv = CGEvent(
+        scrollWheelEvent2Source: nil,
+        units: .pixel,
+        wheelCount: 2,
+        wheel1: deltaY,
+        wheel2: deltaX,
+        wheel3: 0
+      ) {
+        scrollEv.post(tap: .cghidEventTap)
+      }
+    default:
+      break
+    }
+    result(true)
+  }
+
+  private func injectMacDesktopKeyEvent(args: [String: Any], result: @escaping FlutterResult) {
+    let keyName = ((args["key"] as? String) ?? "").lowercased()
+    let text = (args["text"] as? String) ?? ""
+
+    if !text.isEmpty {
+      let utf16Chars = Array(text.utf16)
+      if let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+         let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) {
+        down.keyboardSetUnicodeString(stringLength: utf16Chars.count, unicodeString: utf16Chars)
+        up.keyboardSetUnicodeString(stringLength: utf16Chars.count, unicodeString: utf16Chars)
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+      }
+      result(true)
+      return
+    }
+
+    let keyCodeMap: [String: CGKeyCode] = [
+      "enter": 36,
+      "ok": 36,
+      "return": 36,
+      "tab": 48,
+      "space": 49,
+      "play_pause": 49,
+      "backspace": 51,
+      "delete": 51,
+      "escape": 53,
+      "back": 53,
+      "left": 123,
+      "right": 124,
+      "down": 125,
+      "up": 126,
+      "home": 115,
+      "end": 119,
+      "pageup": 116,
+      "pagedown": 121
+    ]
+    if let code = keyCodeMap[keyName] {
+      if let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
+         let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) {
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+      }
+      result(true)
+      return
+    }
+    result(false)
   }
 
   private func handleNotificationMethodCall(call: FlutterMethodCall, result: @escaping FlutterResult) {

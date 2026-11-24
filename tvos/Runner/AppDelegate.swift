@@ -5537,6 +5537,7 @@ struct TvTelegramConversationPaneView: View {
                 Text(
                   [
                     chat.kind.isEmpty ? (chat.broadcast ? "频道广播" : "会话") : chat.kind,
+                    appState.isGroupConversation(chat) ? "\(appState.collectTelegramGroupMembers(for: chat).count) 位成员" : nil,
                     "\(appState.telegramMessages.count) 条消息",
                     videoCount > 0 ? "\(videoCount) 视频" : nil,
                     photoCount > 0 ? "\(photoCount) 图片" : nil,
@@ -5964,7 +5965,7 @@ struct TvTelegramAlbumBubbleView: View {
   var body: some View {
     let first = albumMessages[0]
     let isOutgoing = first.outgoing && !chat.broadcast
-    let senderName = first.sender.isEmpty ? chat.title : first.sender
+    let senderName = appState.resolveDisplaySenderName(chat: chat, message: first)
     let senderColor = TvTelegramPalette.peerNameColor(senderName)
     let captionMsg = albumMessages.first(where: { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) ?? first
     let cols = (albumMessages.count == 2 || albumMessages.count == 4) ? 2 : 3
@@ -6144,7 +6145,7 @@ struct TvTelegramDocGroupBubbleView: View {
   var body: some View {
     let first = groupMessages[0]
     let isOutgoing = first.outgoing && !chat.broadcast
-    let senderName = first.sender.isEmpty ? chat.title : first.sender
+    let senderName = appState.resolveDisplaySenderName(chat: chat, message: first)
     let senderColor = TvTelegramPalette.peerNameColor(senderName)
     let allAudio = groupMessages.allSatisfy { $0.isAudio }
 
@@ -6221,7 +6222,7 @@ struct TvTelegramDocGroupBubbleView: View {
   }
 }
 
-/// Official Telegram Single Message Bubble (Left Incoming / Right Outgoing + Reply Quote + Rich Media + Bot Buttons)
+/// Official Telegram Single Message Bubble (Left Incoming / Right Outgoing + Reply Quote + Rich Media + Bot Buttons + Call & Service Cards)
 struct TvTelegramMessageBubbleView: View {
   @EnvironmentObject var appState: TvAppState
   let chat: TvTelegramChat
@@ -6230,180 +6231,263 @@ struct TvTelegramMessageBubbleView: View {
   var onCopyText: ((String) -> Void)? = nil
 
   var body: some View {
-    let isOutgoing = message.outgoing && !chat.broadcast
-    let isSelected = appState.telegramSelectedMessageIds.contains(message.id)
-    let senderName = message.sender.isEmpty ? chat.title : message.sender
-    let senderColor = TvTelegramPalette.peerNameColor(senderName)
+    let isPrivateChat = chat.peer.hasPrefix("user:")
+    let isCall = message.isPhoneCall || (message.text.trimmingCharacters(in: .whitespacesAndNewlines) == "[服务消息]" && isPrivateChat && message.attachment == nil)
+    let isService = !isCall && message.isServiceMessage && message.attachment == nil
 
-    let useChatPeer = chat.broadcast || chat.peer.hasPrefix("user:") || senderName == chat.title
-    let resolvedPeer = !message.senderPeer.isEmpty ? message.senderPeer : (useChatPeer ? chat.peer : senderName)
-    let resolvedAvatar = useChatPeer ? appState.resolvePeerAvatarUrl(for: chat) : message.senderAvatar
-    let resolvedPreview = !message.senderAvatar.isEmpty ? message.senderAvatar : (useChatPeer ? chat.avatar : "")
-
-    HStack(alignment: .bottom, spacing: 12) {
-      if !isOutgoing {
-        TvTelegramPeerAvatar(
-          peer: resolvedPeer,
-          title: senderName,
-          avatarUrl: resolvedAvatar,
-          previewAvatar: resolvedPreview,
-          isSelf: chat.isSelf,
-          size: 42,
-          fontSize: 16
-        )
-      } else {
-        Spacer(minLength: 140)
+    if isService {
+      let rawText = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+      let label = (rawText.isEmpty || rawText == "[服务消息]") ? "系统服务通知" : rawText
+      let timeStr = message.formattedBubbleTime
+      HStack {
+        Spacer()
+        HStack(spacing: 8) {
+          Image(systemName: "info.circle")
+            .font(.system(size: 15, weight: .semibold))
+            .foregroundColor(.white.opacity(0.75))
+          Text(timeStr.isEmpty ? label : "\(label) · \(timeStr)")
+            .font(.system(size: 15, weight: .medium))
+            .foregroundColor(.white)
+            .lineLimit(2)
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 8)
+        .background(TvTelegramPalette.datePillBg)
+        .clipShape(Capsule())
+        Spacer()
       }
+      .padding(.vertical, 4)
+    } else if isCall {
+      let isOutgoing = message.outgoing && !chat.broadcast
+      let callTitle = message.resolvedCallTitle(isPrivateUserChat: isPrivateChat)
+      let callSubtitle = message.resolvedCallSubtitle(isPrivateUserChat: isPrivateChat)
+      let isMissed = message.isMissedOrFailedCall || (!isOutgoing && message.text.trimmingCharacters(in: .whitespacesAndNewlines) == "[服务消息]" && isPrivateChat)
+      let accentColor = isMissed ? Color(red: 1.0, green: 0.32, blue: 0.32) : Color(red: 0.18, green: 0.75, blue: 0.44)
+      let iconName = message.isVideoCall ? "video.fill" : (isMissed ? "phone.arrow.down.left" : "phone.fill")
 
-      VStack(alignment: .leading, spacing: 10) {
-        // Sender Name Header
-        if !isOutgoing {
-          HStack(spacing: 8) {
-            Text(senderName)
-              .font(.system(size: 16, weight: .semibold))
-              .foregroundColor(senderColor)
+      HStack(alignment: .bottom, spacing: 12) {
+        if isOutgoing {
+          Spacer(minLength: 140)
+        }
+        HStack(spacing: 16) {
+          ZStack {
+            Circle()
+              .fill(accentColor.opacity(0.18))
+              .frame(width: 52, height: 52)
+            Image(systemName: iconName)
+              .font(.system(size: 22, weight: .bold))
+              .foregroundColor(accentColor)
+          }
+          VStack(alignment: .leading, spacing: 4) {
+            Text(callTitle)
+              .font(.system(size: 19, weight: .bold))
+              .foregroundColor(isMissed ? accentColor : TvTelegramPalette.textPrimary)
               .lineLimit(1)
-            if chat.broadcast {
-              Text("频道")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundColor(TvTelegramPalette.textMuted)
+            Text("\(callSubtitle) · \(message.formattedBubbleTime)")
+              .font(.system(size: 14))
+              .foregroundColor(TvTelegramPalette.textSecondary)
+              .lineLimit(1)
+          }
+          if !chat.readOnly {
+            Button {
+              appState.telegramReplyingTo = message
+            } label: {
+              Label("回复", systemImage: "arrowshape.turn.up.left")
             }
+            .buttonStyle(TvApplePillButtonStyle(compact: true))
           }
         }
+        .padding(18)
+        .background(
+          RoundedRectangle(cornerRadius: 20, style: .continuous)
+            .fill(isOutgoing ? TvTelegramPalette.bubbleOut : TvTelegramPalette.bubbleIn)
+        )
+        .overlay(
+          RoundedRectangle(cornerRadius: 20, style: .continuous)
+            .stroke(accentColor.opacity(0.28), lineWidth: 1)
+        )
+        if !isOutgoing {
+          Spacer(minLength: 140)
+        }
+      }
+    } else {
+      let isOutgoing = message.outgoing && !chat.broadcast
+      let isSelected = appState.telegramSelectedMessageIds.contains(message.id)
+      let senderName = appState.resolveDisplaySenderName(chat: chat, message: message)
+      let senderColor = TvTelegramPalette.peerNameColor(senderName)
 
-        // Reply Quote Banner (when replying to an earlier message)
-        if message.replyToId > 0 {
-          let quoted = appState.findMessage(byId: message.replyToId)
-          HStack(spacing: 10) {
-            RoundedRectangle(cornerRadius: 2)
-              .fill(TvTelegramPalette.tgBlueBright)
-              .frame(width: 3, height: 34)
-            VStack(alignment: .leading, spacing: 2) {
-              Text(quoted?.sender.isEmpty == false ? quoted!.sender : "引用回复 #\(message.replyToId)")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundColor(TvTelegramPalette.tgBlueBright)
+      let useChatPeer = chat.broadcast || chat.peer.hasPrefix("user:") || senderName == chat.title
+      let resolvedPeer = !message.senderPeer.isEmpty ? message.senderPeer : (useChatPeer ? chat.peer : senderName)
+      let resolvedAvatar = useChatPeer ? appState.resolvePeerAvatarUrl(for: chat) : message.senderAvatar
+      let resolvedPreview = !message.senderAvatar.isEmpty ? message.senderAvatar : (useChatPeer ? chat.avatar : "")
+
+      HStack(alignment: .bottom, spacing: 12) {
+        if !isOutgoing {
+          TvTelegramPeerAvatar(
+            peer: resolvedPeer,
+            title: senderName,
+            avatarUrl: resolvedAvatar,
+            previewAvatar: resolvedPreview,
+            isSelf: chat.isSelf,
+            size: 42,
+            fontSize: 16
+          )
+        } else {
+          Spacer(minLength: 140)
+        }
+
+        VStack(alignment: .leading, spacing: 10) {
+          // Sender Name Header
+          if !isOutgoing {
+            HStack(spacing: 8) {
+              Text(senderName)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundColor(senderColor)
                 .lineLimit(1)
-              Text(quoted?.text.isEmpty == false ? quoted!.text : (quoted?.attachment?.displayName ?? "原消息"))
-                .font(.system(size: 14))
-                .foregroundColor(TvTelegramPalette.textSecondary)
-                .lineLimit(1)
+              if chat.broadcast {
+                Text("频道")
+                  .font(.system(size: 12, weight: .medium))
+                  .foregroundColor(TvTelegramPalette.textMuted)
+              }
             }
           }
-          .padding(.horizontal, 10)
-          .padding(.vertical, 6)
-          .background(TvTelegramPalette.tgBlueBright.opacity(0.12))
-          .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        }
 
-        // Media Attachment Card (Video / Photo / Music / Voice / Document)
-        if let att = message.attachment {
-          TvTelegramAttachmentCardView(chat: chat, message: message, attachment: att)
-        }
+          // Reply Quote Banner (when replying to an earlier message)
+          if message.replyToId > 0 {
+            let quoted = appState.findMessage(byId: message.replyToId)
+            let quoteSender = quoted != nil ? appState.resolveDisplaySenderName(chat: chat, message: quoted!) : "引用回复 #\(message.replyToId)"
+            let quotePreview = quoted != nil ? quoted!.resolvedPreviewText(isPrivateUserChat: isPrivateChat) : ""
+            HStack(spacing: 10) {
+              RoundedRectangle(cornerRadius: 2)
+                .fill(TvTelegramPalette.tgBlueBright)
+                .frame(width: 3, height: 34)
+              VStack(alignment: .leading, spacing: 2) {
+                Text(quoteSender)
+                  .font(.system(size: 14, weight: .semibold))
+                  .foregroundColor(TvTelegramPalette.tgBlueBright)
+                  .lineLimit(1)
+                Text(!quotePreview.isEmpty ? quotePreview : (quoted?.attachment?.displayName ?? "原消息"))
+                  .font(.system(size: 14))
+                  .foregroundColor(TvTelegramPalette.textSecondary)
+                  .lineLimit(1)
+              }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(TvTelegramPalette.tgBlueBright.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+          }
 
-        // Message Text
-        if !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-          Text(message.text)
-            .font(.system(size: 19))
-            .foregroundColor(TvTelegramPalette.textPrimary)
-            .fixedSize(horizontal: false, vertical: true)
-        }
+          // Media Attachment Card (Video / Photo / Music / Voice / Document)
+          if let att = message.attachment {
+            TvTelegramAttachmentCardView(chat: chat, message: message, attachment: att)
+          }
 
-        // Inline Bot Keyboard Buttons
-        if !message.buttons.isEmpty {
-          VStack(spacing: 8) {
-            ForEach(Array(message.buttons.enumerated()), id: \.offset) { _, row in
-              HStack(spacing: 10) {
-                ForEach(row) { btn in
-                  Button(btn.text) {
-                    Task {
-                      let notice = await appState.api.pressTelegramButton(
-                        accountId: appState.activeTelegramAccountId,
-                        peer: chat.peer,
-                        messageId: message.id,
-                        button: btn
-                      )
-                      if !notice.isEmpty {
-                        appState.showToast(notice)
+          // Message Text
+          if !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            Text(message.text)
+              .font(.system(size: 19))
+              .foregroundColor(TvTelegramPalette.textPrimary)
+              .fixedSize(horizontal: false, vertical: true)
+          }
+
+          // Inline Bot Keyboard Buttons
+          if !message.buttons.isEmpty {
+            VStack(spacing: 8) {
+              ForEach(Array(message.buttons.enumerated()), id: \.offset) { _, row in
+                HStack(spacing: 10) {
+                  ForEach(row) { btn in
+                    Button(btn.text) {
+                      Task {
+                        let notice = await appState.api.pressTelegramButton(
+                          accountId: appState.activeTelegramAccountId,
+                          peer: chat.peer,
+                          messageId: message.id,
+                          button: btn
+                        )
+                        if !notice.isEmpty {
+                          appState.showToast(notice)
+                        }
+                        await appState.selectTelegramChat(chat)
                       }
-                      await appState.selectTelegramChat(chat)
                     }
+                    .buttonStyle(TvApplePillButtonStyle(compact: true))
                   }
-                  .buttonStyle(TvApplePillButtonStyle(compact: true))
                 }
               }
             }
           }
-        }
 
-        // Bubble Footer: Quick Actions + Timestamp + Outgoing Read Receipt
-        HStack(spacing: 12) {
-          if appState.telegramSelectionMode {
-            Button {
-              if isSelected {
-                appState.telegramSelectedMessageIds.remove(message.id)
-              } else {
-                appState.telegramSelectedMessageIds.insert(message.id)
-              }
-            } label: {
-              Label(isSelected ? "已勾选" : "勾选此条", systemImage: isSelected ? "checkmark.circle.fill" : "circle")
-            }
-            .buttonStyle(TvApplePillButtonStyle(isSelected: isSelected, compact: true))
-          } else {
-            if !chat.readOnly {
+          // Bubble Footer: Quick Actions + Timestamp + Outgoing Read Receipt
+          HStack(spacing: 12) {
+            if appState.telegramSelectionMode {
               Button {
-                appState.telegramReplyingTo = message
+                if isSelected {
+                  appState.telegramSelectedMessageIds.remove(message.id)
+                } else {
+                  appState.telegramSelectedMessageIds.insert(message.id)
+                }
               } label: {
-                Label("回复", systemImage: "arrowshape.turn.up.left")
+                Label(isSelected ? "已勾选" : "勾选此条", systemImage: isSelected ? "checkmark.circle.fill" : "circle")
+              }
+              .buttonStyle(TvApplePillButtonStyle(isSelected: isSelected, compact: true))
+            } else {
+              if !chat.readOnly {
+                Button {
+                  appState.telegramReplyingTo = message
+                } label: {
+                  Label("回复", systemImage: "arrowshape.turn.up.left")
+                }
+                .buttonStyle(TvApplePillButtonStyle(compact: true))
+              }
+
+              if !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Button {
+                  onCopyText?(message.text)
+                } label: {
+                  Label("复制", systemImage: "doc.on.doc")
+                }
+                .buttonStyle(TvApplePillButtonStyle(compact: true))
+              }
+
+              Button(action: onForward) {
+                Label("转发", systemImage: "arrowshape.turn.up.right")
               }
               .buttonStyle(TvApplePillButtonStyle(compact: true))
             }
 
-            if !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-              Button {
-                onCopyText?(message.text)
-              } label: {
-                Label("复制", systemImage: "doc.on.doc")
-              }
-              .buttonStyle(TvApplePillButtonStyle(compact: true))
+            Spacer()
+
+            Text(message.formattedBubbleTime)
+              .font(.system(size: 14))
+              .foregroundColor(isOutgoing ? Color(red: 0.58, green: 0.78, blue: 0.96) : TvTelegramPalette.textMuted)
+
+            if isOutgoing {
+              let isRead = appState.isOutgoingMessageRead(chat: chat, message: message)
+              Text(isRead ? "✓✓" : "✓")
+                .font(.system(size: 14, weight: .bold))
+                .foregroundColor(Color(red: 0.42, green: 0.85, blue: 0.98))
             }
-
-            Button(action: onForward) {
-              Label("转发", systemImage: "arrowshape.turn.up.right")
-            }
-            .buttonStyle(TvApplePillButtonStyle(compact: true))
-          }
-
-          Spacer()
-
-          Text(message.formattedBubbleTime)
-            .font(.system(size: 14))
-            .foregroundColor(isOutgoing ? Color(red: 0.58, green: 0.78, blue: 0.96) : TvTelegramPalette.textMuted)
-
-          if isOutgoing {
-            let isRead = appState.isOutgoingMessageRead(chat: chat, message: message)
-            Text(isRead ? "✓✓" : "✓")
-              .font(.system(size: 14, weight: .bold))
-              .foregroundColor(Color(red: 0.42, green: 0.85, blue: 0.98))
           }
         }
-      }
-      .padding(18)
-      .frame(maxWidth: 780, alignment: .leading)
-      .background(
-        RoundedRectangle(cornerRadius: 20, style: .continuous)
-          .fill(
-            isSelected
-              ? TvTelegramPalette.bubbleSelected
-              : (isOutgoing ? TvTelegramPalette.bubbleOut : TvTelegramPalette.bubbleIn)
-          )
-      )
-      .overlay(
-        RoundedRectangle(cornerRadius: 20, style: .continuous)
-          .stroke(isSelected ? TvTelegramPalette.tgBlueBright : Color.white.opacity(0.06), lineWidth: isSelected ? 2 : 1)
-      )
+        .padding(18)
+        .frame(maxWidth: 780, alignment: .leading)
+        .background(
+          RoundedRectangle(cornerRadius: 20, style: .continuous)
+            .fill(
+              isSelected
+                ? TvTelegramPalette.bubbleSelected
+                : (isOutgoing ? TvTelegramPalette.bubbleOut : TvTelegramPalette.bubbleIn)
+            )
+        )
+        .overlay(
+          RoundedRectangle(cornerRadius: 20, style: .continuous)
+            .stroke(isSelected ? TvTelegramPalette.tgBlueBright : Color.white.opacity(0.06), lineWidth: isSelected ? 2 : 1)
+        )
 
-      if !isOutgoing {
-        Spacer(minLength: 80)
+        if !isOutgoing {
+          Spacer(minLength: 80)
+        }
       }
     }
   }
@@ -6612,14 +6696,15 @@ struct TvTelegramBottomComposeBar: View {
     VStack(spacing: 0) {
       // Reply Preview Banner
       if let replyMsg = appState.telegramReplyingTo {
+        let replyPreview = replyMsg.resolvedPreviewText(isPrivateUserChat: chat.peer.hasPrefix("user:"))
         HStack(spacing: 12) {
           Image(systemName: "arrowshape.turn.up.left.fill")
             .foregroundColor(TvTelegramPalette.tgBlueBright)
           VStack(alignment: .leading, spacing: 2) {
-            Text("回复 \(replyMsg.sender.isEmpty ? chat.title : replyMsg.sender)")
+            Text("回复 \(appState.resolveDisplaySenderName(chat: chat, message: replyMsg))")
               .font(.system(size: 15, weight: .semibold))
               .foregroundColor(TvTelegramPalette.tgBlueBright)
-            Text(replyMsg.text.isEmpty ? (replyMsg.attachment?.displayName ?? "媒体消息") : replyMsg.text)
+            Text(replyPreview.isEmpty ? (replyMsg.attachment?.displayName ?? "媒体消息") : replyPreview)
               .font(.system(size: 14))
               .foregroundColor(TvTelegramPalette.textSecondary)
               .lineLimit(1)
@@ -6771,6 +6856,8 @@ struct TvTelegramRightInfoDrawerView: View {
 
   var body: some View {
     let isMuted = appState.isPeerMuted(chat)
+    let isGroupChat = appState.isGroupConversation(chat)
+    let groupMembers = isGroupChat ? appState.collectTelegramGroupMembers(for: chat) : []
     let visualItems = appState.telegramMessages.filter {
       if appState.telegramRightPanelTab == "photo" { return $0.isPhoto }
       return $0.isVideo
@@ -6781,7 +6868,7 @@ struct TvTelegramRightInfoDrawerView: View {
     VStack(spacing: 16) {
       // Top Header
       HStack {
-        Text("会话信息与共享媒体")
+        Text(isGroupChat ? "群组资料与成员" : "会话信息与共享媒体")
           .font(.system(size: 20, weight: .bold))
           .foregroundColor(TvTelegramPalette.textPrimary)
         Spacer()
@@ -6799,18 +6886,22 @@ struct TvTelegramRightInfoDrawerView: View {
       VStack(spacing: 10) {
         TvTelegramPeerAvatar(
           peer: chat.peer,
-          title: chat.title,
+          title: appState.resolveDisplayChatTitle(chat),
           avatarUrl: appState.resolvePeerAvatarUrl(for: chat),
           previewAvatar: chat.avatar,
           isSelf: chat.isSelf,
           size: 84,
           fontSize: 32
         )
-        Text(chat.title)
+        Text(appState.resolveDisplayChatTitle(chat))
           .font(.system(size: 22, weight: .bold))
           .foregroundColor(TvTelegramPalette.textPrimary)
           .lineLimit(1)
-        Text("\(chat.peer) · \(chat.kind.isEmpty ? (chat.broadcast ? "频道" : "会话") : chat.kind)")
+        Text(
+          isGroupChat
+            ? "\(chat.kind.isEmpty ? "群组" : chat.kind) · \(groupMembers.count) 位成员"
+            : "\(chat.peer) · \(chat.kind.isEmpty ? (chat.broadcast ? "频道" : "会话") : chat.kind)"
+        )
           .font(.system(size: 14))
           .foregroundColor(TvTelegramPalette.textSecondary)
           .lineLimit(1)
@@ -6834,9 +6925,12 @@ struct TvTelegramRightInfoDrawerView: View {
       }
       .padding(.horizontal, 16)
 
-      // Shared Media Tabs
+      // Shared Media & Group Members Tabs
       ScrollView(.horizontal, showsIndicators: false) {
         HStack(spacing: 8) {
+          if isGroupChat {
+            drawerTabButton("members", "成员 (\(groupMembers.count))")
+          }
           drawerTabButton("video", "视频")
           drawerTabButton("photo", "图片")
           drawerTabButton("music", "音乐")
@@ -6849,9 +6943,59 @@ struct TvTelegramRightInfoDrawerView: View {
         .fill(TvTelegramPalette.borderLine)
         .frame(height: 1)
 
-      // Shared Media Content
+      // Shared Media / Group Members Content
       ScrollView {
-        if appState.telegramRightPanelTab == "video" || appState.telegramRightPanelTab == "photo" {
+        if isGroupChat && appState.telegramRightPanelTab == "members" {
+          LazyVStack(spacing: 8) {
+            ForEach(groupMembers) { member in
+              Button {
+                appState.telegramInChatSearchOpen = true
+                appState.telegramMessageKeyword = member.name
+              } label: {
+                HStack(spacing: 12) {
+                  TvTelegramPeerAvatar(
+                    peer: member.peer.isEmpty ? member.name : member.peer,
+                    title: member.name,
+                    avatarUrl: appState.resolvePeerHdAvatarUrl(peer: member.peer, title: member.name, explicit: member.avatar),
+                    previewAvatar: appState.resolvePeerPreviewAvatar(peer: member.peer, title: member.name, explicit: member.avatar),
+                    isSelf: false,
+                    size: 46,
+                    fontSize: 18
+                  )
+                  VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 8) {
+                      Text(member.name)
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundColor(TvTelegramPalette.textPrimary)
+                        .lineLimit(1)
+                      Spacer()
+                      if !member.roleBadge.isEmpty {
+                        Text(member.roleBadge)
+                          .font(.system(size: 12, weight: .bold))
+                          .foregroundColor(TvTelegramPalette.tgBlueBright)
+                      }
+                    }
+                    HStack {
+                      Text(member.statusLabel)
+                        .font(.system(size: 13))
+                        .foregroundColor(member.isOnlineNow ? TvTelegramPalette.tgBlueBright : TvTelegramPalette.textSecondary)
+                      Spacer()
+                      if member.messageCount > 0 {
+                        Text("发言 \(member.messageCount) 条")
+                          .font(.system(size: 12))
+                          .foregroundColor(TvTelegramPalette.textMuted)
+                      }
+                    }
+                  }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+              }
+              .buttonStyle(TvAppleSurfaceButtonStyle(cornerRadius: 12))
+            }
+          }
+          .padding(14)
+        } else if appState.telegramRightPanelTab == "video" || appState.telegramRightPanelTab == "photo" {
           if visualItems.isEmpty {
             Text("当前暂无\(appState.telegramRightPanelTab == "photo" ? "图片" : "视频")记录")
               .foregroundColor(TvTelegramPalette.textMuted)

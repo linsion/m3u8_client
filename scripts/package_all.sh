@@ -117,6 +117,7 @@ if [[ -f "build/app/outputs/flutter-apk/app-release.apk" ]]; then
   echo "  ✓ Android TV Universal APK: ${DIST_DIR}/${APP_SLUG}-AndroidTV-Universal-v${VERSION}.apk"
 fi
 
+(cd android && ./gradlew --stop >/dev/null 2>&1 || true)
 flutter build apk --split-per-abi --release
 for abi in arm64-v8a armeabi-v7a x86_64; do
   ABI_APK="build/app/outputs/flutter-apk/app-${abi}-release.apk"
@@ -126,6 +127,7 @@ for abi in arm64-v8a armeabi-v7a x86_64; do
   fi
 done
 
+(cd android && ./gradlew --stop >/dev/null 2>&1 || true)
 flutter build appbundle --release
 if [[ -f "build/app/outputs/bundle/release/app-release.aab" ]]; then
   cp "build/app/outputs/bundle/release/app-release.aab" \

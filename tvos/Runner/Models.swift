@@ -876,6 +876,37 @@ struct TvTelegramChat: Identifiable, Hashable {
   let topMessageId: Int
   let readOutboxMaxId: Int
 
+  static func isRawPeerIdentifier(_ value: String) -> Bool {
+    let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !clean.isEmpty else { return false }
+    return clean.range(
+      of: #"^:?(user|chat|channel):\d+$"#,
+      options: [.regularExpression, .caseInsensitive]
+    ) != nil
+  }
+
+  static func normalizePeerIdentifier(_ value: String) -> String {
+    let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    if clean.hasPrefix(":") && isRawPeerIdentifier(clean) {
+      return String(clean.dropFirst())
+    }
+    return clean
+  }
+
+  static func friendlyFallbackTitle(forPeer peer: String, kind: String = "") -> String {
+    let norm = normalizePeerIdentifier(peer).lowercased()
+    if norm.hasPrefix("channel:") {
+      return kind.contains("群") ? "超级群会话" : "频道会话"
+    }
+    if norm.hasPrefix("chat:") {
+      return "群组会话"
+    }
+    if norm.hasPrefix("user:") {
+      return "Telegram 用户"
+    }
+    return "Telegram 会话"
+  }
+
   private static let hhmmFormatter: DateFormatter = {
     let fmt = DateFormatter()
     fmt.dateFormat = "HH:mm"
@@ -1166,6 +1197,105 @@ struct TvTelegramMessage: Identifiable, Hashable {
   var isMusic: Bool { attachment?.isMusic ?? false }
   var isVisualMedia: Bool { attachment?.isVisualMedia ?? false }
   var hasButtons: Bool { buttons.contains { !$0.isEmpty } }
+
+  var isPhoneCall: Bool {
+    let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !t.isEmpty else { return false }
+    return t.contains("未接来电")
+      || t.contains("未接通话")
+      || t.contains("未接视频通话")
+      || t.contains("未接语音通话")
+      || t.contains("已取消通话")
+      || t.contains("已取消语音通话")
+      || t.contains("已取消视频通话")
+      || t.contains("已拒绝通话")
+      || t.contains("已拒绝语音通话")
+      || t.contains("已拒绝视频通话")
+      || t.contains("对方忙线")
+      || t.contains("通话中断")
+      || t.hasPrefix("📞")
+      || t.hasPrefix("📹")
+      || t.hasPrefix("语音通话")
+      || t.hasPrefix("视频通话")
+  }
+
+  var isMissedOrFailedCall: Bool {
+    guard isPhoneCall else { return false }
+    let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return t.contains("未接")
+      || t.contains("已取消")
+      || t.contains("已拒绝")
+      || t.contains("忙线")
+      || t.contains("中断")
+  }
+
+  var isVideoCall: Bool {
+    let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return t.contains("视频通话") || t.hasPrefix("📹")
+  }
+
+  var isServiceMessage: Bool {
+    if isPhoneCall { return false }
+    let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    if t == "[服务消息]" { return true }
+    if attachment == nil && sender.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      if t.hasPrefix("📌") || t.hasPrefix("👤") || t.hasPrefix("✏️") || t.hasPrefix("🖼️")
+          || t.hasPrefix("✨") || t.hasPrefix("🧹") || t.hasPrefix("📸") || t.hasPrefix("👋")
+          || t.contains("置顶了一条消息") || t.contains("加入了群组") || t.contains("退出了群组") {
+        return true
+      }
+    }
+    return false
+  }
+
+  func resolvedCallTitle(isPrivateUserChat: Bool) -> String {
+    let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !t.isEmpty && t != "[服务消息]" {
+      return t
+        .replacingOccurrences(of: #"^[📞📹]\s*"#, with: "", options: .regularExpression)
+        .replacingOccurrences(of: #"\s*\([0-9:]+\)\s*$"#, with: "", options: .regularExpression)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    if t == "[服务消息]" && isPrivateUserChat {
+      return outgoing ? "已取消语音通话" : "未接来电 / 语音通话"
+    }
+    return outgoing ? "已取消语音通话" : "未接来电"
+  }
+
+  func resolvedCallSubtitle(isPrivateUserChat: Bool) -> String {
+    let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let range = t.range(of: #"\([0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?\)"#, options: .regularExpression) {
+      let dur = String(t[range]).trimmingCharacters(in: CharacterSet(charactersIn: "()"))
+      return "通话时长 \(dur)"
+    }
+    if t == "[服务消息]" && isPrivateUserChat {
+      return outgoing ? "拨出的通话" : "未接来电或通话记录"
+    }
+    if isMissedOrFailedCall {
+      return outgoing ? "对方未接听" : "未接听"
+    }
+    return isVideoCall ? "Telegram 视频通话" : "Telegram 语音通话"
+  }
+
+  func resolvedPreviewText(isPrivateUserChat: Bool) -> String {
+    let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    if isPhoneCall || (t == "[服务消息]" && isPrivateUserChat) {
+      let icon = isVideoCall ? "📹" : "📞"
+      return "\(icon) \(resolvedCallTitle(isPrivateUserChat: isPrivateUserChat))"
+    }
+    if t == "[服务消息]" {
+      return "系统服务消息"
+    }
+    if !t.isEmpty { return t }
+    if let att = attachment {
+      if att.isVideo { return "[视频] \(att.displayName)" }
+      if att.isPhoto { return "[图片] \(att.displayName)" }
+      if att.isVoiceMessage { return "[语音消息]" }
+      if att.isMusic { return "[音乐] \(att.musicTitle)" }
+      return "[文件] \(att.displayName)"
+    }
+    return ""
+  }
 
   var formattedDate: String {
     guard date > 0 else { return "" }

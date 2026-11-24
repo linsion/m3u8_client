@@ -332,6 +332,7 @@ final class TvAppState: ObservableObject {
   var knownTitleHdAvatarUrls: [String: String] = [:]
   var knownPeerPreviewAvatars: [String: String] = [:]
   var knownTitlePreviewAvatars: [String: String] = [:]
+  var knownTelegramChatTitles: [String: String] = [:]
   @Published var telegramAvatarRegistryVersion: Int = 0
   @Published var telegramQuickReplies: [String] = [
     "收到，谢谢！👍",
@@ -519,6 +520,9 @@ final class TvAppState: ObservableObject {
     self.localProgress = (UserDefaults.standard.dictionary(forKey: "tv_watch_progress") as? [String: Double]) ?? [:]
     if let mutedArr = UserDefaults.standard.stringArray(forKey: "tv_tg_muted_peers") {
       self.telegramMutedPeers = Set(mutedArr)
+    }
+    if let savedTitles = UserDefaults.standard.dictionary(forKey: "tv_tg_known_chat_titles_v1") as? [String: String] {
+      self.knownTelegramChatTitles = savedTitles
     }
     if let favLiveArr = UserDefaults.standard.stringArray(forKey: "tv_fav_live_channels") {
       self.favoriteLiveChannelIds = Set(favLiveArr)
@@ -2289,6 +2293,200 @@ final class TvAppState: ObservableObject {
     telegramMessages.first(where: { $0.id == id })
   }
 
+  func registerTelegramChatTitle(accountId: String, peer: String, title: String) {
+    let normPeer = TvTelegramChat.normalizePeerIdentifier(peer)
+    let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !normPeer.isEmpty, !clean.isEmpty, !TvTelegramChat.isRawPeerIdentifier(clean) else { return }
+    let acc = accountId.isEmpty ? "default" : accountId
+    knownTelegramChatTitles["\(acc)|\(normPeer)"] = clean
+    knownTelegramChatTitles["*|\(normPeer)"] = clean
+    defaults.set(knownTelegramChatTitles, forKey: "tv_tg_known_chat_titles_v1")
+  }
+
+  func resolveTelegramChatTitle(accountId: String, peer: String) -> String {
+    let normPeer = TvTelegramChat.normalizePeerIdentifier(peer)
+    guard !normPeer.isEmpty else { return "" }
+    let acc = accountId.isEmpty ? "default" : accountId
+    if let exact = knownTelegramChatTitles["\(acc)|\(normPeer)"],
+       !exact.isEmpty,
+       !TvTelegramChat.isRawPeerIdentifier(exact) {
+      return exact
+    }
+    if let global = knownTelegramChatTitles["*|\(normPeer)"],
+       !global.isEmpty,
+       !TvTelegramChat.isRawPeerIdentifier(global) {
+      return global
+    }
+    return ""
+  }
+
+  func resolveDisplayChatTitle(_ chat: TvTelegramChat) -> String {
+    let clean = chat.title.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !clean.isEmpty && !TvTelegramChat.isRawPeerIdentifier(clean) {
+      return clean
+    }
+    let known = resolveTelegramChatTitle(accountId: activeTelegramAccountId, peer: chat.peer)
+    if !known.isEmpty && !TvTelegramChat.isRawPeerIdentifier(known) {
+      return known
+    }
+    let normPeer = TvTelegramChat.normalizePeerIdentifier(chat.peer)
+    if let found = telegramChats.first(where: {
+      TvTelegramChat.normalizePeerIdentifier($0.peer) == normPeer
+        && !$0.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        && !TvTelegramChat.isRawPeerIdentifier($0.title)
+    }) {
+      return found.title
+    }
+    return TvTelegramChat.friendlyFallbackTitle(forPeer: chat.peer, kind: chat.kind)
+  }
+
+  func resolveDisplaySenderName(chat: TvTelegramChat, message: TvTelegramMessage) -> String {
+    let chatTitle = resolveDisplayChatTitle(chat)
+    let rawSender = message.sender.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !rawSender.isEmpty && !TvTelegramChat.isRawPeerIdentifier(rawSender) {
+      return rawSender
+    }
+    let candidatePeer = !message.senderPeer.isEmpty
+      ? TvTelegramChat.normalizePeerIdentifier(message.senderPeer)
+      : TvTelegramChat.normalizePeerIdentifier(rawSender)
+    if !candidatePeer.isEmpty {
+      let known = resolveTelegramChatTitle(accountId: activeTelegramAccountId, peer: candidatePeer)
+      if !known.isEmpty && !TvTelegramChat.isRawPeerIdentifier(known) {
+        return known
+      }
+      if let found = telegramChats.first(where: {
+        TvTelegramChat.normalizePeerIdentifier($0.peer) == candidatePeer
+          && !$0.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+          && !TvTelegramChat.isRawPeerIdentifier($0.title)
+      }) {
+        return found.title
+      }
+      for acc in telegramAccounts where !acc.userId.isEmpty && "user:\(acc.userId)" == candidatePeer {
+        let accName = acc.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !accName.isEmpty && !TvTelegramChat.isRawPeerIdentifier(accName) {
+          return accName
+        }
+      }
+    }
+    if message.outgoing && !chat.broadcast {
+      return "我"
+    }
+    return chatTitle
+  }
+
+  func isGroupConversation(_ chat: TvTelegramChat) -> Bool {
+    let norm = TvTelegramChat.normalizePeerIdentifier(chat.peer)
+    if norm.hasPrefix("chat:") { return true }
+    if norm.hasPrefix("channel:") && !chat.broadcast { return true }
+    if chat.kind.contains("群") { return true }
+    return false
+  }
+
+  struct TvGroupMemberItem: Identifiable {
+    let id: String
+    let name: String
+    let peer: String
+    let avatar: String
+    let lastActiveDate: Int
+    let messageCount: Int
+    let isSelf: Bool
+    let roleBadge: String
+
+    var isOnlineNow: Bool {
+      if isSelf { return true }
+      if lastActiveDate <= 0 { return false }
+      let nowSec = Int(Date().timeIntervalSince1970)
+      return (nowSec - lastActiveDate) <= 300
+    }
+
+    var statusLabel: String {
+      if isSelf { return "在线" }
+      if lastActiveDate <= 0 { return "最近在线" }
+      let nowSec = Int(Date().timeIntervalSince1970)
+      let diff = nowSec - lastActiveDate
+      if diff <= 300 { return "在线" }
+      if diff < 3600 { return "\(max(1, diff / 60)) 分钟前在线" }
+      return "最近在线"
+    }
+  }
+
+  func collectTelegramGroupMembers(for chat: TvTelegramChat) -> [TvGroupMemberItem] {
+    var byKey: [String: TvGroupMemberItem] = [:]
+    let chatTitle = resolveDisplayChatTitle(chat)
+    var selfName = "我"
+    var selfPeer = ""
+    var selfAvatar = ""
+    if let acc = telegramAccounts.first(where: { $0.id == activeTelegramAccountId }) {
+      let n = acc.name.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !n.isEmpty && n != "Telegram" && !TvTelegramChat.isRawPeerIdentifier(n) {
+        selfName = n
+      }
+      if !acc.userId.isEmpty {
+        selfPeer = "user:\(acc.userId)"
+      }
+      selfAvatar = acc.avatar
+    }
+    var selfLastDate = 0
+    var selfCount = 0
+
+    for m in telegramMessages {
+      if m.outgoing && !chat.broadcast {
+        selfCount += 1
+        if m.date > selfLastDate { selfLastDate = m.date }
+        continue
+      }
+      if m.isServiceMessage && m.sender.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        continue
+      }
+      let resolvedName = resolveDisplaySenderName(chat: chat, message: m).trimmingCharacters(in: .whitespacesAndNewlines)
+      if resolvedName.isEmpty { continue }
+      let key = resolvedName.lowercased()
+      let isAnonAdmin = (resolvedName == chatTitle)
+      let peer = !m.senderPeer.isEmpty ? TvTelegramChat.normalizePeerIdentifier(m.senderPeer) : ""
+      let avatar = !m.senderAvatar.isEmpty ? m.senderAvatar : (isAnonAdmin ? chat.avatar : "")
+      if let old = byKey[key] {
+        byKey[key] = TvGroupMemberItem(
+          id: key,
+          name: old.name,
+          peer: !old.peer.isEmpty ? old.peer : peer,
+          avatar: !old.avatar.isEmpty ? old.avatar : avatar,
+          lastActiveDate: max(old.lastActiveDate, m.date),
+          messageCount: old.messageCount + 1,
+          isSelf: false,
+          roleBadge: isAnonAdmin ? "匿名管理员" : (old.messageCount + 1 >= 5 ? "活跃成员" : "")
+        )
+      } else {
+        byKey[key] = TvGroupMemberItem(
+          id: key,
+          name: resolvedName,
+          peer: peer,
+          avatar: avatar,
+          lastActiveDate: m.date,
+          messageCount: 1,
+          isSelf: false,
+          roleBadge: isAnonAdmin ? "匿名管理员" : ""
+        )
+      }
+    }
+
+    byKey["__self__"] = TvGroupMemberItem(
+      id: "__self__",
+      name: selfName,
+      peer: selfPeer,
+      avatar: selfAvatar,
+      lastActiveDate: selfLastDate > 0 ? selfLastDate : Int(Date().timeIntervalSince1970),
+      messageCount: selfCount,
+      isSelf: true,
+      roleBadge: "我"
+    )
+
+    return byKey.values.sorted { a, b in
+      if a.isOnlineNow != b.isOnlineNow { return a.isOnlineNow && !b.isOnlineNow }
+      if a.lastActiveDate != b.lastActiveDate { return a.lastActiveDate > b.lastActiveDate }
+      return a.messageCount > b.messageCount
+    }
+  }
+
   /// Returns the High-Definition (HD) avatar URL (`/api/telegram/avatar`) when available, falling back to inline preview
   func resolvePeerAvatarUrl(for chat: TvTelegramChat) -> String {
     if chat.canRequestHdAvatar {
@@ -2473,8 +2671,36 @@ final class TvAppState: ObservableObject {
     for rawChat in res.chats {
       var chat = rawChat
       let peerKey = "\(accountId)|\(chat.peer)"
-      let cleanTitle = chat.title.trimmingCharacters(in: .whitespacesAndNewlines)
-      let titleKey = cleanTitle.isEmpty ? "" : "\(accountId)|\(cleanTitle)"
+      var cleanTitle = chat.title.trimmingCharacters(in: .whitespacesAndNewlines)
+      if cleanTitle.isEmpty || TvTelegramChat.isRawPeerIdentifier(cleanTitle) {
+        let known = resolveTelegramChatTitle(accountId: accountId, peer: chat.peer)
+        cleanTitle = (!known.isEmpty && !TvTelegramChat.isRawPeerIdentifier(known))
+          ? known
+          : TvTelegramChat.friendlyFallbackTitle(forPeer: chat.peer, kind: chat.kind)
+        chat = TvTelegramChat(
+          peer: chat.peer,
+          title: cleanTitle,
+          kind: chat.kind,
+          preview: chat.preview,
+          avatar: chat.avatar,
+          avatarPhotoId: chat.avatarPhotoId,
+          avatarDcId: chat.avatarDcId,
+          date: chat.date,
+          unread: chat.unread,
+          readOnly: chat.readOnly,
+          broadcast: chat.broadcast,
+          isSelf: chat.isSelf,
+          isContact: chat.isContact,
+          muted: chat.muted,
+          topMessageId: chat.topMessageId,
+          readOutboxMaxId: chat.readOutboxMaxId
+        )
+      } else {
+        registerTelegramChatTitle(accountId: accountId, peer: chat.peer, title: cleanTitle)
+      }
+      let titleKey = (cleanTitle.isEmpty || TvTelegramChat.isRawPeerIdentifier(cleanTitle))
+        ? ""
+        : "\(accountId)|\(cleanTitle)"
 
       if !chat.avatar.isEmpty && chat.avatar != "<null>" {
         knownPeerPreviewAvatars[peerKey] = chat.avatar
@@ -2552,6 +2778,10 @@ final class TvAppState: ObservableObject {
   }
 
   func selectTelegramChat(_ chat: TvTelegramChat) async {
+    let isGroup = chat.peer.hasPrefix("chat:") || (chat.peer.hasPrefix("channel:") && !chat.broadcast) || chat.kind.contains("群")
+    if selectedTelegramChat?.peer != chat.peer {
+      telegramRightPanelTab = isGroup ? "members" : "video"
+    }
     selectedTelegramChat = chat
     telegramReplyingTo = nil
     telegramSelectionMode = false
@@ -2559,10 +2789,66 @@ final class TvAppState: ObservableObject {
     isLoadingTelegram = true
     defer { isLoadingTelegram = false }
     let res = await api.fetchTelegramMessages(accountId: activeTelegramAccountId, peer: chat.peer, offsetId: 0)
-    self.telegramMessages = res.messages
+    let normalized = res.messages.map { m -> TvTelegramMessage in
+      let rawSender = m.sender.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !rawSender.isEmpty && !TvTelegramChat.isRawPeerIdentifier(rawSender) {
+        if chat.peer.hasPrefix("user:") && !m.outgoing && rawSender != "收藏夹" {
+          registerTelegramChatTitle(accountId: activeTelegramAccountId, peer: chat.peer, title: rawSender)
+        }
+        return m
+      }
+      if rawSender.isEmpty && (m.isServiceMessage || m.isPhoneCall) {
+        return m
+      }
+      let resolved = resolveDisplaySenderName(chat: chat, message: m)
+      if !resolved.isEmpty && !TvTelegramChat.isRawPeerIdentifier(resolved) {
+        return TvTelegramMessage(
+          id: m.id,
+          date: m.date,
+          sender: resolved,
+          senderPeer: m.senderPeer,
+          senderAvatar: m.senderAvatar,
+          text: m.text,
+          outgoing: m.outgoing,
+          groupedId: m.groupedId,
+          replyToId: m.replyToId,
+          links: m.links,
+          buttons: m.buttons,
+          attachment: m.attachment
+        )
+      }
+      return m
+    }
+    self.telegramMessages = normalized
     self.nextTelegramMessageOffset = res.nextOffset
+    if let lastMsg = normalized.last {
+      let fallbackPrev = lastMsg.resolvedPreviewText(isPrivateUserChat: chat.peer.hasPrefix("user:"))
+      if !fallbackPrev.isEmpty,
+         let idx = telegramChats.firstIndex(where: { $0.peer == chat.peer }),
+         (telegramChats[idx].preview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || lastMsg.id >= telegramChats[idx].topMessageId) {
+        let old = telegramChats[idx]
+        telegramChats[idx] = TvTelegramChat(
+          peer: old.peer,
+          title: old.title,
+          kind: old.kind,
+          preview: fallbackPrev,
+          avatar: old.avatar,
+          avatarPhotoId: old.avatarPhotoId,
+          avatarDcId: old.avatarDcId,
+          date: old.date,
+          unread: old.unread,
+          readOnly: old.readOnly,
+          broadcast: old.broadcast,
+          isSelf: old.isSelf,
+          isContact: old.isContact,
+          muted: old.muted,
+          topMessageId: max(old.topMessageId, lastMsg.id),
+          readOutboxMaxId: old.readOutboxMaxId
+        )
+      }
+    }
     if chat.unread > 0 {
-      await markChatAsRead(chat, maxId: res.messages.last?.id ?? 0)
+      await markChatAsRead(chat, maxId: normalized.last?.id ?? 0)
     }
   }
 
@@ -6256,6 +6542,18 @@ final class TvAppState: ObservableObject {
           await loadFiles(path: fileListing.path)
           return
 
+        case .cloud115:
+          let fids = clip.entries.map { $0.fid115.isEmpty ? $0.path : $0.fid115 }
+          try await TvLocal115DirectClient.shared.copyOrMove115Entries(
+            fids: fids,
+            targetCid: dstDir,
+            isMove: clip.operation == .move
+          )
+          fileClipboard = nil
+          showToast("✓ 已在 115 网盘内\(clip.operation == .move ? "移动" : "复制") \(clip.entries.count) 个项目")
+          await loadFiles(path: fileListing.path)
+          return
+
         default:
           break
         }
@@ -6672,7 +6970,34 @@ final class TvAppState: ObservableObject {
           detail: "✓ 已通过 SMB 上传至 \(mount.name)"
         )
 
-      case .server, .cloud115:
+      case .cloud115:
+        try await TvLocal115DirectClient.shared.uploadDataTo115(
+          parentCid: dir,
+          fileName: fileName,
+          fileData: fileData
+        ) { sent, total in
+          let elapsed = max(0.15, Date().timeIntervalSince1970 - startTime)
+          Task { @MainActor [weak self] in
+            self?.updateTransferTaskProgress(
+              id: transferId,
+              transferredBytes: sent,
+              totalBytes: total,
+              speedBytesPerSec: Double(sent) / elapsed,
+              status: .running,
+              detail: "正在直传至 115 网盘..."
+            )
+          }
+        }
+        updateTransferTaskProgress(
+          id: transferId,
+          transferredBytes: totalBytes,
+          totalBytes: totalBytes,
+          speedBytesPerSec: Double(totalBytes) / max(0.2, Date().timeIntervalSince1970 - startTime),
+          status: .completed,
+          detail: "✓ 已直传至 115 网盘"
+        )
+
+      case .server:
         // Always save a copy to Apple TV local cache first so it can be served or played immediately
         let cacheRelPath = TvRemoteStorageClient.joinPath("/", fileName)
         let cacheUrl = Self.resolveLocalOfflineUrl(relativePath: cacheRelPath)

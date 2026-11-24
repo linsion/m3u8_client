@@ -1,10 +1,12 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:m3u8_client/models/models.dart';
 import 'package:m3u8_client/services/api_client.dart';
 import 'package:m3u8_client/services/local_115_direct_service.dart';
+import 'package:m3u8_client/services/remote_storage_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class _FixtureApiClient extends Fake implements HttpClient {
@@ -221,6 +223,8 @@ void main() {
   final downloadCalls = <String>[];
   final deleteCalls = <Map<String, String>>[];
   final renameCalls = <Map<String, String>>[];
+  final copyCalls = <Map<String, String>>[];
+  final moveCalls = <Map<String, String>>[];
   String? redirectCookie;
   String? exchangeToken;
   bool showAccelerationFiles = false;
@@ -241,7 +245,9 @@ void main() {
       final cid = request.uri.queryParameters['cid'];
       final readForm =
           path == '/webapi.115.com/rb/delete' ||
-          path == '/webapi.115.com/files/batch_rename';
+          path == '/webapi.115.com/files/batch_rename' ||
+          path == '/webapi.115.com/files/copy' ||
+          path == '/webapi.115.com/files/move';
       final form =
           readForm
               ? Uri.splitQueryString(await utf8.decoder.bind(request).join())
@@ -249,6 +255,29 @@ void main() {
       if (!readForm) await request.drain<void>();
       final response = request.response;
       switch (path) {
+        case '/webapi.115.com/files/copy':
+          copyCalls.add(form);
+          response.write('{"state":true}');
+        case '/webapi.115.com/files/move':
+          moveCalls.add(form);
+          response.write('{"state":true}');
+        case '/uplb.115.com/3.0/gettoken.php':
+          response.write(
+            jsonEncode({
+              'StatusCode': '200',
+              'AccessKeyId': 'STS.TESTKEY',
+              'AccessKeySecret': 'test-secret',
+              'SecurityToken': 'sts-token-123',
+              'Expiration': '2026-12-31T23:59:59Z',
+            }),
+          );
+        case '/fhnfile.oss-cn-shenzhen.aliyuncs.com/test_obj_key':
+          response.write(
+            jsonEncode({
+              'state': true,
+              'data': {'pick_code': 'oss_uploaded_pc', 'file_id': '888'},
+            }),
+          );
         case '/proapi.115.com/app/chrome/downurl':
           downloadCalls.add('${request.method} $path');
           response.statusCode = HttpStatus.found;
@@ -564,6 +593,86 @@ void main() {
         'Authorization': 'Bearer media-token',
         'Referer': 'https://media.test/',
       });
+    },
+  );
+
+  test(
+    '115 supports in-drive copy/move and RemoteStorageService routes cloud115 uploads to Local115DirectService instead of server /api/files/upload',
+    () async {
+      copyCalls.clear();
+      moveCalls.clear();
+      await service.copyOrMove115Entries(
+        fids: const ['20', '30'],
+        targetCid: '10',
+        isMove: false,
+      );
+      expect(copyCalls, [
+        {'pid': '10', 'fid[0]': '20', 'fid[1]': '30'},
+      ]);
+
+      await service.copyOrMove115Entries(
+        fids: const ['20'],
+        targetCid: '0',
+        isMove: true,
+      );
+      expect(moveCalls, [
+        {'pid': '0', 'fid[0]': '20', 'move_notsame': '1'},
+      ]);
+
+      // Verify RemoteStorageService.uploadWithProgress for cloud115 routes directly to 115 initupload.php
+      // (which returns HTTP 503 in this fixture) rather than calling the server /api/files/upload endpoint!
+      const mount115 = StorageMount(
+        id: 'builtin_115',
+        name: '115网盘',
+        kind: StorageSourceKind.cloud115,
+        rootPath: '0',
+      );
+      await expectLater(
+        RemoteStorageService.instance.uploadWithProgress(
+          targetMount: mount115,
+          targetDir: '10',
+          fileName: 'TestUpload.mp4',
+          rawBytes: Uint8List.fromList([1, 2, 3, 4, 5, 6, 7, 8]),
+          isCancelled: () => false,
+          onProgress: (_, __, ___) {},
+        ),
+        throwsA(
+          isA<ApiException>().having(
+            (e) => e.message,
+            'message',
+            contains('115 初始化上传失败（HTTP 503）'),
+          ),
+        ),
+      );
+
+      // Verify when both localFilePath and empty rawBytes (Uint8List(0)) are passed
+      // (as macOS native file picker does for >8MB files), it hashes the actual file
+      // on disk rather than hashing the empty Uint8List(0)!
+      final tmpFile = File(
+        '${Directory.systemTemp.path}/test_115_nonempty_${DateTime.now().millisecondsSinceEpoch}.bin',
+      );
+      await tmpFile.writeAsBytes([10, 20, 30, 40, 50, 60]);
+      addTearDown(() async {
+        if (await tmpFile.exists()) await tmpFile.delete();
+      });
+      await expectLater(
+        RemoteStorageService.instance.uploadWithProgress(
+          targetMount: mount115,
+          targetDir: '10',
+          fileName: 'LargeFile.dmg',
+          localFilePath: tmpFile.path,
+          rawBytes: Uint8List(0),
+          isCancelled: () => false,
+          onProgress: (_, __, ___) {},
+        ),
+        throwsA(
+          isA<ApiException>().having(
+            (e) => e.message,
+            'message',
+            contains('115 初始化上传失败（HTTP 503）'),
+          ),
+        ),
+      );
     },
   );
 }

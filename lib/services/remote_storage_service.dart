@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import '../models/models.dart';
 import 'api_client.dart';
+import 'local_115_direct_service.dart';
 import 'smb_client_service.dart';
 
 /// Unified AList / OpenList v3 + Standard WebDAV Remote Storage & Streaming Upload/Download Client
@@ -913,6 +914,19 @@ class RemoteStorageService {
         fileName: fileName,
         byteStream: openByteStream(),
         totalBytes: totalBytes,
+        isCancelled: isCancelled,
+        onProgress: onProgress,
+      );
+      return;
+    }
+
+    // 3c. 115 Cloud Drive Direct Upload (v4.0 Instant Upload + Aliyun OSS Signed PUT)
+    if (targetMount.kind == StorageSourceKind.cloud115) {
+      await Local115DirectService.instance.uploadFileTo115WithProgress(
+        parentCid: targetDir,
+        fileName: fileName,
+        localFilePath: localFilePath,
+        rawBytes: rawBytes,
         isCancelled: isCancelled,
         onProgress: onProgress,
       );

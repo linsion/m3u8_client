@@ -8,6 +8,7 @@ import 'package:media_kit/media_kit.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import 'services/desktop_config_backup_service.dart';
+import 'services/peer_mesh_service.dart';
 import 'services/tv_platform_service.dart';
 import 'state/app_state.dart';
 import 'ui/main_shell.dart';
@@ -79,6 +80,10 @@ class M3u8VideoClientApp extends StatelessWidget {
             Widget content = child ?? const SizedBox.shrink();
             content = _TvRemoteKeyInterceptor(
               appState: appState,
+              child: content,
+            );
+            content = RepaintBoundary(
+              key: PeerMeshService.instance.rootRepaintBoundaryKey,
               child: content,
             );
             final mq = MediaQuery.of(context);

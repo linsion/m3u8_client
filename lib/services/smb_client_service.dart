@@ -18,9 +18,85 @@ class SmbClientService {
   static final SmbClientService instance = SmbClientService._();
 
   final Map<String, StorageMount> _registeredMounts = {};
+  final Map<String, String> _sniffedMimeCache = {};
+  final Map<String, List<_Smb2Connection>> _idleConnections = {};
   HttpServer? _proxyServer;
   int _proxyPort = 0;
   Future<int>? _startingServer;
+
+  String _poolKey(
+    String host,
+    int port,
+    String share,
+    String username,
+    String password,
+    String domainHint,
+  ) =>
+      '${host.toLowerCase()}:$port:${share.toLowerCase()}:$username:$domainHint:${password.hashCode}';
+
+  Future<_Smb2Connection> _acquirePooledConnection({
+    required String host,
+    required int port,
+    required String share,
+    required String username,
+    required String password,
+    required String domainHint,
+  }) async {
+    final key = _poolKey(host, port, share, username, password, domainHint);
+    final list = _idleConnections[key];
+    while (list != null && list.isNotEmpty) {
+      final candidate = list.removeLast();
+      if (!candidate.isClosed &&
+          DateTime.now().difference(candidate.lastUsedAt).inSeconds < 25) {
+        candidate.lastUsedAt = DateTime.now();
+        return candidate;
+      }
+      unawaited(candidate.close());
+    }
+    final conn = await _Smb2Connection.connectAndAuthenticate(
+      host: host,
+      port: port,
+      username: username,
+      password: password,
+      domainHint: domainHint,
+    );
+    try {
+      await conn.treeConnect(share);
+      conn.lastUsedAt = DateTime.now();
+      return conn;
+    } catch (_) {
+      await conn.close();
+      rethrow;
+    }
+  }
+
+  void _releasePooledConnection({
+    required String host,
+    required int port,
+    required String share,
+    required String username,
+    required String password,
+    required String domainHint,
+    required _Smb2Connection conn,
+  }) {
+    if (conn.isClosed) return;
+    final key = _poolKey(host, port, share, username, password, domainHint);
+    final list = _idleConnections.putIfAbsent(key, () => <_Smb2Connection>[]);
+    if (list.length >= 4) {
+      final oldest = list.removeAt(0);
+      unawaited(oldest.close());
+    }
+    conn.lastUsedAt = DateTime.now();
+    list.add(conn);
+  }
+
+  Future<void> _clearConnectionPool() async {
+    final all = _idleConnections.values.expand((e) => e).toList();
+    _idleConnections.clear();
+    for (final c in all) {
+      unawaited(c.close());
+    }
+  }
 
   void registerMount(StorageMount mount) {
     if (mount.kind == StorageSourceKind.smb) {
@@ -227,6 +303,7 @@ class SmbClientService {
   /// Verifies that the local SMB HTTP Range gateway (`127.0.0.1:<port>`) is alive
   /// when returning from background or OS sleep, restarting it if needed.
   Future<void> resetAllSessions() async {
+    await _clearConnectionPool();
     final srv = _proxyServer;
     final port = _proxyPort;
     if (srv == null || port <= 0) return;
@@ -250,6 +327,57 @@ class SmbClientService {
         unawaited(_ensureProxyServerStarted().catchError((_) => 0));
       }
     }
+  }
+
+  static String? sniffContainerMimeType(Uint8List head) {
+    if (head.length < 12) return null;
+    // Matroska / WebM EBML header: 1A 45 DF A3
+    if (head[0] == 0x1A &&
+        head[1] == 0x45 &&
+        head[2] == 0xDF &&
+        head[3] == 0xA3) {
+      return 'video/x-matroska';
+    }
+    // RealMedia (.rm / .rmvb): ".RMF" (2E 52 4D 46)
+    if (head[0] == 0x2E &&
+        head[1] == 0x52 &&
+        head[2] == 0x4D &&
+        head[3] == 0x46) {
+      return 'application/vnd.rn-realmedia';
+    }
+    // AVI / WAV: "RIFF" .... "AVI "
+    if (head[0] == 0x52 &&
+        head[1] == 0x49 &&
+        head[2] == 0x46 &&
+        head[3] == 0x46 &&
+        head[8] == 0x41 &&
+        head[9] == 0x56 &&
+        head[10] == 0x49 &&
+        head[11] == 0x20) {
+      return 'video/x-msvideo';
+    }
+    // FLV: "FLV\x01"
+    if (head[0] == 0x46 &&
+        head[1] == 0x4C &&
+        head[2] == 0x56 &&
+        head[3] == 0x01) {
+      return 'video/x-flv';
+    }
+    // Ogg: "OggS"
+    if (head[0] == 0x4F &&
+        head[1] == 0x67 &&
+        head[2] == 0x67 &&
+        head[3] == 0x53) {
+      return 'video/ogg';
+    }
+    // ISO Base Media / MP4 / MOV: "ftyp" at offset 4
+    if (head[4] == 0x66 &&
+        head[5] == 0x74 &&
+        head[6] == 0x79 &&
+        head[7] == 0x70) {
+      return 'video/mp4';
+    }
+    return null;
   }
 
   Future<void> _handleProxyHttpRequest(HttpRequest req) async {
@@ -277,17 +405,33 @@ class SmbClientService {
         return;
       }
 
-      final conn = await _Smb2Connection.connectAndAuthenticate(
+      _Smb2Connection conn = await _acquirePooledConnection(
         host: target.host,
         port: target.port,
+        share: target.share,
         username: mount.username,
         password: mount.password,
         domainHint: mount.token,
       );
       Uint8List? fileId;
+      var canReturnToPool = true;
       try {
-        await conn.treeConnect(target.share);
-        final opened = await conn.openFileForRead(target.relPath);
+        ({Uint8List fileId, int fileSize, bool isDir}) opened;
+        try {
+          opened = await conn.openFileForRead(target.relPath);
+        } catch (_) {
+          // Pooled connection may have been closed by SMB server idle timeout; reconnect once
+          await conn.close();
+          conn = await _Smb2Connection.connectAndAuthenticate(
+            host: target.host,
+            port: target.port,
+            username: mount.username,
+            password: mount.password,
+            domainHint: mount.token,
+          );
+          await conn.treeConnect(target.share);
+          opened = await conn.openFileForRead(target.relPath);
+        }
         fileId = opened.fileId;
         final totalSize = opened.fileSize;
 
@@ -334,14 +478,34 @@ class SmbClientService {
         }
 
         final contentLength = totalSize > 0 ? (end - start + 1) : 0;
+        final chunkSize = conn.safeReadChunkSize;
+        Uint8List? prefetchedFirstChunk;
+        final cacheKey = '${mount.id}:${target.virtualPath}';
+        String mimeType =
+            _sniffedMimeCache[cacheKey] ?? _guessMimeType(target.relPath);
+        if (req.method.toUpperCase() != 'HEAD' &&
+            contentLength > 0 &&
+            start == 0) {
+          final firstReadLen = math.min(contentLength, chunkSize);
+          prefetchedFirstChunk = await conn.readFileChunk(
+            fileId: fileId,
+            offset: 0,
+            length: firstReadLen,
+          );
+          final sniffed = sniffContainerMimeType(prefetchedFirstChunk);
+          if (sniffed != null) {
+            mimeType = sniffed;
+            _sniffedMimeCache[cacheKey] = sniffed;
+          }
+        }
+
         req.response.statusCode =
             isPartial ? HttpStatus.partialContent : HttpStatus.ok;
         req.response.headers.set(
           HttpHeaders.contentTypeHeader,
-          _guessMimeType(target.relPath),
+          mimeType,
         );
         req.response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
-        req.response.headers.set(HttpHeaders.connectionHeader, 'close');
         req.response.headers.contentLength = contentLength;
         if (isPartial && totalSize > 0) {
           req.response.headers.set(
@@ -358,7 +522,6 @@ class SmbClientService {
 
         int offset = start;
         int remaining = contentLength;
-        final chunkSize = conn.safeReadChunkSize;
         var clientDisconnected = false;
         unawaited(
           req.response.done.then<void>(
@@ -366,6 +529,16 @@ class SmbClientService {
             onError: (Object _) => clientDisconnected = true,
           ),
         );
+        if (prefetchedFirstChunk != null &&
+            prefetchedFirstChunk.isNotEmpty &&
+            !clientDisconnected) {
+          LocalProxyTunnelBridge.recordDownstreamBytes(
+            prefetchedFirstChunk.length,
+          );
+          req.response.add(prefetchedFirstChunk);
+          offset += prefetchedFirstChunk.length;
+          remaining -= prefetchedFirstChunk.length;
+        }
         while (remaining > 0 && !clientDisconnected) {
           final int toRead = math.min(remaining, chunkSize);
           final chunk = await conn.readFileChunk(
@@ -383,13 +556,30 @@ class SmbClientService {
           await req.response.flush();
         }
         await req.response.close();
+      } catch (_) {
+        canReturnToPool = false;
+        rethrow;
       } finally {
         if (fileId != null) {
           try {
             await conn.closeFile(fileId);
-          } catch (_) {}
+          } catch (_) {
+            canReturnToPool = false;
+          }
         }
-        await conn.close();
+        if (canReturnToPool && !conn.isClosed) {
+          _releasePooledConnection(
+            host: target.host,
+            port: target.port,
+            share: target.share,
+            username: mount.username,
+            password: mount.password,
+            domainHint: mount.token,
+            conn: conn,
+          );
+        } else {
+          await conn.close();
+        }
       }
     } catch (_) {
       try {
@@ -480,7 +670,12 @@ class SmbClientService {
       final rawEntries = await conn.queryDirectory(target.relPath);
       final entries = <FileEntry>[];
       for (final item in rawEntries) {
-        if (item.name == '.' || item.name == '..') continue;
+        if (item.name == '.' ||
+            item.name == '..' ||
+            item.name == '.DS_Store' ||
+            item.name.startsWith('._')) {
+          continue;
+        }
         final itemVirtualPath =
             RemoteStorageService.joinPath(target.virtualPath, item.name);
         String ext = '';
@@ -758,6 +953,8 @@ class _Smb2Connection {
   int _maxReadSize = 65536;
   int _maxWriteSize = 65536;
   Uint8List? _signingKey;
+  bool isClosed = false;
+  DateTime lastUsedAt = DateTime.now();
 
   _Smb2Connection._(this.host, this.port, this._socket)
       : _reader = StreamIterator<Uint8List>(_socket);
@@ -797,6 +994,7 @@ class _Smb2Connection {
   }
 
   Future<void> close() async {
+    isClosed = true;
     try {
       await _reader.cancel();
     } catch (_) {}

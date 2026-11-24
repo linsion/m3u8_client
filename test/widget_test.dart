@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -10,11 +11,14 @@ import 'package:m3u8_client/main.dart';
 import 'package:m3u8_client/models/models.dart';
 import 'package:m3u8_client/services/api_client.dart';
 import 'package:m3u8_client/services/m3u8_ad_remover.dart';
+import 'package:m3u8_client/services/peer_mesh_service.dart';
 import 'package:m3u8_client/services/proxy_routing_service.dart';
+import 'package:m3u8_client/services/smb_client_service.dart';
 import 'package:m3u8_client/services/telegram_notification_service.dart';
 import 'package:m3u8_client/state/app_state.dart';
 import 'package:m3u8_client/ui/screens/downloads_screen.dart';
 import 'package:m3u8_client/ui/screens/library_history_screen.dart';
+import 'package:m3u8_client/ui/screens/peer_mesh_screen.dart';
 import 'package:m3u8_client/ui/screens/proxy_server_screen.dart';
 import 'package:m3u8_client/ui/screens/telegram_screen.dart';
 import 'package:m3u8_client/ui/theme.dart';
@@ -2280,6 +2284,61 @@ proxies:
 
     expect(find.text('高频轮询兜底同步的新消息'), findsWidgets);
 
+    // 4. Inject a real-time SSE message with raw 'user:1001' / ':user:1001' sender and verify
+    // it immediately resolves to the real username ('测试好友') without ever displaying 'user:1001'
+    final rawSenderSsePayload = jsonEncode({
+      'type': 'new_message',
+      'account_id': 'default',
+      'peer': 'user:1001',
+      'chat_title': 'user:1001',
+      'new_message': true,
+      'message_id': 107,
+      'message': {
+        'id': 107,
+        'date': 1700000300,
+        'sender': ':user:1001',
+        'text': '短消息更新不带用户实体',
+        'outgoing': false,
+      },
+    });
+    appState.telegramNotifications.injectSseEventForTesting(
+      'update',
+      rawSenderSsePayload,
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 20));
+
+    expect(find.text('短消息更新不带用户实体'), findsWidgets);
+    expect(find.text('user:1001'), findsNothing);
+    expect(find.text(':user:1001'), findsNothing);
+    expect(find.text('测试好友'), findsWidgets);
+
+    // 5. Inject a missed call / service message ('[服务消息]' in 1-on-1 user chat) and verify
+    // it renders as a Call Card ('未接来电 / 语音通话') and updates the chat preview
+    final missedCallSsePayload = jsonEncode({
+      'type': 'new_message',
+      'account_id': 'default',
+      'peer': 'user:1001',
+      'chat_title': 'user:1001',
+      'new_message': true,
+      'message_id': 108,
+      'message': {
+        'id': 108,
+        'date': 1700000400,
+        'sender': '',
+        'text': '[服务消息]',
+        'outgoing': false,
+      },
+    });
+    appState.telegramNotifications.injectSseEventForTesting(
+      'update',
+      missedCallSsePayload,
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 20));
+
+    expect(find.textContaining('未接来电'), findsWidgets);
+
     appState.dispose();
   });
 
@@ -2926,6 +2985,211 @@ proxies:
         contains('https://ukzyvod3.ukubf5.com/20261121/seg001.ts'),
       );
       expect(unwrapped.contains('/api/vod/proxy'), isFalse);
+    },
+  );
+
+  test(
+    'SmbClientService.sniffContainerMimeType detects Matroska/RMVB disguised inside .mp4 files',
+    () {
+      // Matroska EBML magic header: 1A 45 DF A3 (as in 69号特工詹森之丹麦馅饼 1973 中文字幕.mp4)
+      final mkvHeader = Uint8List.fromList([
+        0x1A, 0x45, 0xDF, 0xA3, 0xA3, 0x42, 0x86, 0x81,
+        0x01, 0x42, 0xF7, 0x81, 0x01, 0x42, 0xF2, 0x81,
+      ]);
+      expect(
+        SmbClientService.sniffContainerMimeType(mkvHeader),
+        'video/x-matroska',
+      );
+
+      // Standard MP4 ftyp box at offset 4
+      final mp4Header = Uint8List.fromList([
+        0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70,
+        0x69, 0x73, 0x6F, 0x6D, 0x00, 0x00, 0x02, 0x00,
+      ]);
+      expect(
+        SmbClientService.sniffContainerMimeType(mp4Header),
+        'video/mp4',
+      );
+    },
+  );
+
+  testWidgets(
+    'TelegramScreen displays official Group Members count in header and renders Group Members drawer tab',
+    (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1440, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      SharedPreferences.setMockInitialValues({});
+      final fakeApi = _FakeTelegramApiClient();
+      final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      fakeApi.serverChats = [
+        TelegramChat(
+          peer: 'channel:9001',
+          title: '流光4K影迷交流群',
+          kind: '超级群',
+          preview: '大家晚上好',
+          date: nowSec,
+          unread: 0,
+          readOnly: false,
+          broadcast: false,
+          topMessageId: 503,
+        ),
+      ];
+      fakeApi.serverMessagesByPeer['channel:9001'] = [
+        TelegramMessage(
+          id: 501,
+          date: nowSec - 60,
+          sender: '阿杰',
+          text: '求推荐一部丹麦老电影',
+          outgoing: false,
+        ),
+        TelegramMessage(
+          id: 502,
+          date: nowSec - 30,
+          sender: '林夕',
+          text: '69号特工詹森已经修复可以正常播放了',
+          outgoing: false,
+        ),
+        TelegramMessage(
+          id: 503,
+          date: nowSec - 10,
+          sender: '我',
+          text: '收到！',
+          outgoing: true,
+        ),
+      ];
+
+      final appState = AppState(customApi: fakeApi);
+      addTearDown(appState.dispose);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: VideoPlatformTheme.buildTheme(),
+          home: Scaffold(
+            body: TelegramScreen(appState: appState),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+      await tester.pump(const Duration(milliseconds: 50));
+      await tester.pump(const Duration(milliseconds: 50));
+
+      // Refresh the chat list so the newly configured group chat replaces any static session cache
+      await tester.tap(find.byIcon(Icons.refresh_rounded).first);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+      await tester.pump(const Duration(milliseconds: 50));
+
+      // Header subtitle and action button show 3 group members (阿杰, 林夕, 测试账号/我)
+      expect(find.textContaining('3 位成员'), findsWidgets);
+      expect(find.text('成员 (3)'), findsOneWidget);
+
+      // Click the '成员 (3)' button in the top header to open the official Group Info & Members panel
+      await tester.tap(find.text('成员 (3)'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 200));
+
+      expect(find.text('群组资料与成员'), findsOneWidget);
+      expect(find.text('共享媒体 (0)'), findsOneWidget);
+      expect(find.text('阿杰'), findsWidgets);
+      expect(find.text('林夕'), findsWidgets);
+    },
+  );
+
+  testWidgets(
+    'PeerMeshScreen renders remote desktop, remote control, file transfer, and chat tabs',
+    (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(1280, 820));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      SharedPreferences.setMockInitialValues({});
+      final appState = AppState();
+      addTearDown(appState.dispose);
+
+      final node = PeerDeviceNode.fromJson(
+        {
+          'deviceId': 'peer_test_mac',
+          'deviceName': '书房 Mac mini',
+          'platform': 'macos',
+          'host': '192.168.1.66',
+          'port': 18190,
+          'isTv': false,
+          'activeTabIndex': 0,
+          'activeTabName': '影视片库',
+          'nowPlayingTitle': '星际穿越 4K',
+          'isPlaying': true,
+          'supportsDesktopCapture': true,
+          'lastSeenAtMs': DateTime.now().millisecondsSinceEpoch,
+        },
+      );
+      expect(node.deviceName, '书房 Mac mini');
+      expect(node.platformLabel, 'macOS');
+      expect(node.isOnline, isTrue);
+      expect(node.connectionModeLabel, '局域网直连');
+
+      final wanNode = node.copyWith(isLanReachable: false);
+      expect(wanNode.connectionModeLabel, '跨网云端互通');
+
+      final code1 = PeerMeshService.deriveDefaultPairingCode(
+        serverBaseUrl: 'https://jp2.linsionwinwin.top:8081/',
+        serverSecret: 'my_secret',
+      );
+      final code2 = PeerMeshService.deriveDefaultPairingCode(
+        serverBaseUrl: 'https://jp2.linsionwinwin.top:8081',
+        serverSecret: 'my_secret',
+      );
+      expect(code1, equals(code2));
+      expect(code1, startsWith('LG-'));
+
+      final key32 = Uint8List.fromList(List<int>.generate(32, (i) => i + 7));
+      const sampleJson =
+          '{"wanKind":"presence","deviceName":"5G 手机客户端","platform":"ios"}';
+      final encrypted = PeerMeshService.encryptWanPayload(sampleJson, key32);
+      final decrypted = PeerMeshService.decryptWanPayload(encrypted, key32);
+      expect(decrypted, equals(sampleJson));
+
+      final wrongKey = Uint8List.fromList(List<int>.generate(32, (i) => i + 9));
+      expect(PeerMeshService.decryptWanPayload(encrypted, wrongKey), isNull);
+
+      final chatMsg = PeerChatMessage.fromJson({
+        'id': 'msg_1',
+        'senderId': 'peer_test_mac',
+        'senderName': '书房 Mac mini',
+        'senderPlatform': 'macos',
+        'targetId': 'all',
+        'text': '测试跨端消息与视频链接 https://example.com/live.m3u8',
+        'type': 'text',
+        'timestampMs': DateTime.now().millisecondsSinceEpoch,
+      });
+      expect(chatMsg.senderName, '书房 Mac mini');
+      expect(chatMsg.text, contains('https://example.com/live.m3u8'));
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: VideoPlatformTheme.buildTheme('midnight_cyan'),
+          home: PeerMeshScreen(appState: appState),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(find.text('显示桌面 & 远控画面'), findsOneWidget);
+      expect(find.text('遥控播控 & 投屏'), findsOneWidget);
+      expect(find.text('传输文件 & 远端库'), findsOneWidget);
+      expect(find.text('发送消息 & 聊天'), findsOneWidget);
+
+      await tester.tap(find.text('传输文件 & 远端库'));
+      await tester.pump();
+      expect(find.textContaining('文件传输队列'), findsOneWidget);
+
+      await tester.tap(find.text('发送消息 & 聊天'));
+      await tester.pump();
+      expect(find.text('发送'), findsOneWidget);
     },
   );
 }

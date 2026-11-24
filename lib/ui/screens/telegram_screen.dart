@@ -178,6 +178,68 @@ const List<_TgEmojiCategory> _kTelegramEmojiCategories = [
   ),
 ];
 
+/// Represents a Group / Supergroup participant aggregated from conversation messages
+/// and known peer entities, displayed in the official Telegram Group Info & Members panel.
+class _TelegramGroupMember {
+  final String key;
+  final String name;
+  final String peer;
+  final String avatar;
+  final int lastActiveDate;
+  final int messageCount;
+  final bool isSelf;
+  final bool isCreatorOrAdmin;
+  final String customTitle;
+
+  const _TelegramGroupMember({
+    required this.key,
+    required this.name,
+    this.peer = '',
+    this.avatar = '',
+    this.lastActiveDate = 0,
+    this.messageCount = 0,
+    this.isSelf = false,
+    this.isCreatorOrAdmin = false,
+    this.customTitle = '',
+  });
+
+  bool get isOnlineNow {
+    if (isSelf) return true;
+    if (lastActiveDate <= 0) return false;
+    final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    return (nowSec - lastActiveDate) <= 300;
+  }
+
+  String get statusLabel {
+    if (isSelf) return '在线';
+    if (lastActiveDate <= 0) return '最近在线';
+    final now = DateTime.now();
+    final nowSec = now.millisecondsSinceEpoch ~/ 1000;
+    final diffSec = nowSec - lastActiveDate;
+    if (diffSec <= 300) return '在线';
+    if (diffSec < 3600) {
+      final mins = (diffSec ~/ 60).clamp(1, 59);
+      return '$mins 分钟前在线';
+    }
+    final dt = DateTime.fromMillisecondsSinceEpoch(lastActiveDate * 1000);
+    final hh = dt.hour.toString().padLeft(2, '0');
+    final mm = dt.minute.toString().padLeft(2, '0');
+    if (dt.year == now.year && dt.month == now.month && dt.day == now.day) {
+      return '今天 $hh:$mm 在线';
+    }
+    final yesterday = now.subtract(const Duration(days: 1));
+    if (dt.year == yesterday.year &&
+        dt.month == yesterday.month &&
+        dt.day == yesterday.day) {
+      return '昨天 $hh:$mm 在线';
+    }
+    if (diffSec <= 7 * 86400) {
+      return '最近在线 · ${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')} $hh:$mm';
+    }
+    return '最后上线于 ${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')}';
+  }
+}
+
 /// Official Telegram Desktop / Telegram macOS color palette tokens
 class _TgPalette {
   final bool isDark;
@@ -331,6 +393,9 @@ class _TelegramScreenState extends State<TelegramScreen> {
   bool _showInChatSearch = false;
   String _mediaTypeFilter = 'all'; // all, video, photo, file, link
   bool _showRightInfoPanel = false;
+  String _rightInfoTab = 'auto'; // 'auto', 'members', 'media'
+  String _memberSearchQuery = '';
+  bool _isScanningMoreMembers = false;
   bool _isDialogsSidebarCollapsed = false;
 
   TelegramMessage? _replyingToMessage;
@@ -348,6 +413,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
   final TextEditingController _chatSearchCtrl = TextEditingController();
   final TextEditingController _msgSearchCtrl = TextEditingController();
+  final TextEditingController _memberSearchCtrl = TextEditingController();
   final TextEditingController _composeController = TextEditingController();
   final TextEditingController _emojiSearchCtrl = TextEditingController();
   final ScrollController _chatListScrollController = ScrollController();
@@ -620,10 +686,16 @@ class _TelegramScreenState extends State<TelegramScreen> {
         'telegram://${parts[0]}/${parts[1]}/${target.messageId}',
       );
     } else {
+      final knownTitle = widget.appState.resolveTelegramChatTitle(
+        _activeAccountId,
+        target.peer,
+      );
       await _selectChat(
         TelegramChat(
           peer: target.peer,
-          title: target.peer,
+          title: knownTitle.isNotEmpty
+              ? knownTitle
+              : TelegramChat.friendlyFallbackTitleForPeer(target.peer),
         ),
       );
     }
@@ -680,6 +752,25 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
     // 1. Update chat list preview, topMessageId, date & unread in real time
     if (msg != null && event.peer.isNotEmpty) {
+      if (event.chatTitle.trim().isNotEmpty &&
+          !TelegramChat.isRawPeerIdentifier(event.chatTitle)) {
+        widget.appState.registerTelegramChatTitle(
+          _activeAccountId,
+          event.peer,
+          event.chatTitle.trim(),
+        );
+      }
+      if (event.peer.startsWith('user:') &&
+          !msg.outgoing &&
+          msg.sender.trim().isNotEmpty &&
+          !TelegramChat.isRawPeerIdentifier(msg.sender) &&
+          msg.sender.trim() != '收藏夹') {
+        widget.appState.registerTelegramChatTitle(
+          _activeAccountId,
+          event.peer,
+          msg.sender.trim(),
+        );
+      }
       final idx = _chats.indexWhere((c) => c.peer == event.peer);
       if (idx >= 0) {
         final existing = _chats[idx];
@@ -688,18 +779,28 @@ class _TelegramScreenState extends State<TelegramScreen> {
         if (isNewer) {
           final isCurrentlyReading =
               activeChat?.peer == event.peer && !_showScrollToBottomBtn;
-          final rawPreview = msg.text.trim().isNotEmpty
-              ? msg.text.trim()
-              : (msg.attachment != null
-                  ? '[${msg.attachment!.displayName}]'
-                  : existing.preview);
+          final resolvedPreview = msg.resolvedPreviewText(
+            isPrivateUserChat: event.peer.startsWith('user:'),
+          );
+          final rawPreview = resolvedPreview.isNotEmpty
+              ? resolvedPreview
+              : existing.preview;
           final preview = rawPreview.characters.take(120).toString();
           final nextUnread = isCurrentlyReading
               ? 0
               : (event.newMessage && !msg.outgoing
                   ? existing.unread + 1
                   : existing.unread);
+          final resolvedChatTitle =
+              (!TelegramChat.isRawPeerIdentifier(existing.title) &&
+                      existing.title.trim().isNotEmpty)
+                  ? existing.title
+                  : ((!TelegramChat.isRawPeerIdentifier(event.chatTitle) &&
+                          event.chatTitle.trim().isNotEmpty)
+                      ? event.chatTitle.trim()
+                      : _resolveDisplayChatTitle(existing));
           final updatedChat = existing.copyWith(
+            title: resolvedChatTitle,
             topMessageId: msg.id > existing.topMessageId
                 ? msg.id
                 : existing.topMessageId,
@@ -718,14 +819,24 @@ class _TelegramScreenState extends State<TelegramScreen> {
           });
         }
       } else if (event.newMessage) {
-        final rawPreview = msg.text.trim().isNotEmpty
-            ? msg.text.trim()
-            : (msg.attachment != null
-                ? '[${msg.attachment!.displayName}]'
-                : '');
-        final newTitle = event.chatTitle.trim().isNotEmpty
-            ? event.chatTitle.trim()
-            : (msg.sender.trim().isNotEmpty ? msg.sender.trim() : event.peer);
+        final rawPreview = msg.resolvedPreviewText(
+          isPrivateUserChat: event.peer.startsWith('user:'),
+        );
+        final candidateTitle =
+            (!TelegramChat.isRawPeerIdentifier(event.chatTitle) &&
+                    event.chatTitle.trim().isNotEmpty)
+                ? event.chatTitle.trim()
+                : ((!msg.outgoing &&
+                        !TelegramChat.isRawPeerIdentifier(msg.sender) &&
+                        msg.sender.trim().isNotEmpty)
+                    ? msg.sender.trim()
+                    : widget.appState.resolveTelegramChatTitle(
+                        _activeAccountId,
+                        event.peer,
+                      ));
+        final newTitle = candidateTitle.isNotEmpty
+            ? candidateTitle
+            : TelegramChat.friendlyFallbackTitleForPeer(event.peer);
         final inserted = TelegramChat(
           peer: event.peer,
           title: newTitle,
@@ -759,12 +870,27 @@ class _TelegramScreenState extends State<TelegramScreen> {
       final peerKey = _peerReadKey(event.peer);
       final cached = _cachedMessagesByPeer[peerKey];
       if (cached != null) {
+        final bgChat = _chats.cast<TelegramChat?>().firstWhere(
+              (c) => c != null && c.peer == event.peer,
+              orElse: () => TelegramChat(
+                peer: event.peer,
+                title: widget.appState.resolveTelegramChatTitle(
+                  _activeAccountId,
+                  event.peer,
+                ),
+              ),
+            )!;
         final nextList = List<TelegramMessage>.from(cached.messages);
         final existingIdx = nextList.indexWhere((m) => m.id == msg.id);
+        final normalizedMsg = _normalizeIncomingMessageSender(
+          bgChat,
+          msg,
+          previous: existingIdx >= 0 ? nextList[existingIdx] : null,
+        );
         if (existingIdx >= 0) {
-          nextList[existingIdx] = msg;
+          nextList[existingIdx] = normalizedMsg;
         } else {
-          nextList.add(msg);
+          nextList.add(normalizedMsg);
           nextList.sort((a, b) => a.id.compareTo(b.id));
         }
         _cachedMessagesByPeer[peerKey] = (
@@ -805,16 +931,21 @@ class _TelegramScreenState extends State<TelegramScreen> {
           }
         }
         final existingIdx = nextMessages.indexWhere((m) => m.id == msg.id);
-        if (!msg.hasRenderableContent) {
+        final normalizedMsg = _normalizeIncomingMessageSender(
+          activeChat,
+          msg,
+          previous: existingIdx >= 0 ? nextMessages[existingIdx] : null,
+        );
+        if (!normalizedMsg.hasRenderableContent) {
           if (existingIdx >= 0) {
             nextMessages.removeAt(existingIdx);
             changed = true;
           }
         } else if (existingIdx >= 0) {
-          nextMessages[existingIdx] = msg;
+          nextMessages[existingIdx] = normalizedMsg;
           changed = true;
         } else {
-          nextMessages.add(msg);
+          nextMessages.add(normalizedMsg);
           nextMessages.sort((a, b) => a.id.compareTo(b.id));
           changed = true;
         }
@@ -1100,6 +1231,357 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
   String _peerReadKey(String peer) => '$_activeAccountId|$peer';
 
+  /// Resolves a clean, human-readable display title for [chat], ensuring raw
+  /// `user:xxx` / `chat:xxx` / `channel:xxx` strings are never shown in the UI.
+  String _resolveDisplayChatTitle(TelegramChat chat) {
+    final cleanTitle = chat.title.trim();
+    if (cleanTitle.isNotEmpty && !TelegramChat.isRawPeerIdentifier(cleanTitle)) {
+      return cleanTitle;
+    }
+    final fromAppState = widget.appState
+        .resolveTelegramChatTitle(_activeAccountId, chat.peer)
+        .trim();
+    if (fromAppState.isNotEmpty &&
+        !TelegramChat.isRawPeerIdentifier(fromAppState)) {
+      return fromAppState;
+    }
+    final normPeer = TelegramChat.normalizePeerIdentifier(chat.peer);
+    for (final c in _chats) {
+      if (TelegramChat.normalizePeerIdentifier(c.peer) == normPeer) {
+        final t = c.title.trim();
+        if (t.isNotEmpty && !TelegramChat.isRawPeerIdentifier(t)) {
+          return t;
+        }
+      }
+    }
+    for (final acc in _accounts) {
+      if (acc.userId.isNotEmpty && 'user:${acc.userId}' == normPeer) {
+        final accName = acc.name.trim();
+        if (accName.isNotEmpty && !TelegramChat.isRawPeerIdentifier(accName)) {
+          return accName;
+        }
+      }
+    }
+    return TelegramChat.friendlyFallbackTitleForPeer(
+      chat.peer,
+      kind: chat.kind,
+    );
+  }
+
+  /// Resolves the sender's display name for [msg] in [chat], replacing any raw
+  /// `user:xxx` / `:user:xxx` identifier with the real user name.
+  String _resolveDisplaySenderName(
+    TelegramChat chat,
+    TelegramMessage msg, {
+    List<TelegramMessage>? messagePool,
+  }) {
+    final chatTitle = _resolveDisplayChatTitle(chat);
+    final rawSender = msg.sender.trim();
+    if (rawSender.isNotEmpty && !TelegramChat.isRawPeerIdentifier(rawSender)) {
+      return rawSender;
+    }
+    final normSenderPeer = TelegramChat.normalizePeerIdentifier(rawSender);
+    if (normSenderPeer.isNotEmpty) {
+      final fromAppState = widget.appState
+          .resolveTelegramChatTitle(_activeAccountId, normSenderPeer)
+          .trim();
+      if (fromAppState.isNotEmpty &&
+          !TelegramChat.isRawPeerIdentifier(fromAppState)) {
+        return fromAppState;
+      }
+      for (final c in _chats) {
+        if (TelegramChat.normalizePeerIdentifier(c.peer) == normSenderPeer) {
+          final t = c.title.trim();
+          if (t.isNotEmpty && !TelegramChat.isRawPeerIdentifier(t)) {
+            return t;
+          }
+        }
+      }
+      for (final acc in _accounts) {
+        if (acc.userId.isNotEmpty && 'user:${acc.userId}' == normSenderPeer) {
+          final accName = acc.name.trim();
+          if (accName.isNotEmpty && !TelegramChat.isRawPeerIdentifier(accName)) {
+            return accName;
+          }
+        }
+      }
+    }
+
+    if (msg.outgoing && !chat.broadcast) {
+      for (final acc in _accounts) {
+        if (acc.id == _activeAccountId) {
+          final accName = acc.name.trim();
+          if (accName.isNotEmpty &&
+              accName != 'Telegram' &&
+              !TelegramChat.isRawPeerIdentifier(accName)) {
+            return accName;
+          }
+        }
+      }
+      return '我';
+    }
+
+    final normChatPeer = TelegramChat.normalizePeerIdentifier(chat.peer);
+    if (normSenderPeer == normChatPeer ||
+        normChatPeer.startsWith('user:') ||
+        chat.broadcast) {
+      return chatTitle;
+    }
+
+    final pool = messagePool ?? _messages;
+    for (final m in pool) {
+      if (m.id == msg.id) {
+        final s = m.sender.trim();
+        if (s.isNotEmpty && !TelegramChat.isRawPeerIdentifier(s)) {
+          return s;
+        }
+      }
+    }
+
+    return chatTitle;
+  }
+
+  /// Returns `true` when [chat] is a Telegram Group or Supergroup (not a 1-on-1 user chat
+  /// and not a broadcast-only channel).
+  bool _isGroupConversation(TelegramChat chat) {
+    final norm = TelegramChat.normalizePeerIdentifier(chat.peer);
+    if (norm.startsWith('chat:')) return true;
+    if (norm.startsWith('channel:') && !chat.broadcast) return true;
+    final kind = chat.kind.trim();
+    if (kind.contains('群')) return true;
+    return false;
+  }
+
+  /// Aggregates all known participants for a group [chat] from loaded messages,
+  /// current account info, and known user peers, sorted in official Telegram order:
+  /// online / self / admins first, then by most recent activity timestamp.
+  List<_TelegramGroupMember> _collectGroupMembers(
+    TelegramChat chat, {
+    List<TelegramMessage>? messagePool,
+  }) {
+    final pool = messagePool ?? _messages;
+    final byKey = <String, _TelegramGroupMember>{};
+    final chatTitle = _resolveDisplayChatTitle(chat);
+
+    // 1. Always include current logged-in user ('我') as a group member
+    String selfName = '我';
+    String selfPeer = '';
+    String selfAvatar = '';
+    for (final acc in _accounts) {
+      if (acc.id == _activeAccountId) {
+        final n = acc.name.trim();
+        if (n.isNotEmpty &&
+            n != 'Telegram' &&
+            !TelegramChat.isRawPeerIdentifier(n)) {
+          selfName = n;
+        }
+        if (acc.userId.trim().isNotEmpty) {
+          selfPeer = 'user:${acc.userId.trim()}';
+        }
+        break;
+      }
+    }
+    if (selfPeer.isNotEmpty) {
+      for (final c in _chats) {
+        if (TelegramChat.normalizePeerIdentifier(c.peer) == selfPeer || c.self) {
+          if (c.avatar.isNotEmpty) selfAvatar = c.avatar;
+          break;
+        }
+      }
+    }
+
+    int selfLastDate = 0;
+    int selfMsgCount = 0;
+
+    // 2. Scan all loaded messages in the group to discover members, avatars, and activity
+    for (final m in pool) {
+      if (m.outgoing && !chat.broadcast) {
+        selfMsgCount++;
+        if (m.date > selfLastDate) selfLastDate = m.date;
+        if (m.senderAvatar.isNotEmpty && selfAvatar.isEmpty) {
+          selfAvatar = m.senderAvatar;
+        }
+        continue;
+      }
+      if (m.isServiceMessage && m.sender.trim().isEmpty) continue;
+      final resolvedName =
+          _resolveDisplaySenderName(chat, m, messagePool: pool).trim();
+      if (resolvedName.isEmpty) continue;
+
+      final isGroupAdminAnon = resolvedName == chatTitle;
+      final memberKey = resolvedName.toLowerCase();
+
+      String peer = '';
+      String avatar = m.senderAvatar;
+      final rawSender = m.sender.trim();
+      if (TelegramChat.isRawPeerIdentifier(rawSender)) {
+        peer = TelegramChat.normalizePeerIdentifier(rawSender);
+      } else {
+        peer = widget.appState.resolveTelegramUserPeerByTitle(
+          _activeAccountId,
+          resolvedName,
+        );
+      }
+      if (peer.isEmpty || avatar.isEmpty) {
+        for (final c in _chats) {
+          if (c.peer.startsWith('user:') &&
+              _resolveDisplayChatTitle(c).toLowerCase() == memberKey) {
+            if (peer.isEmpty) {
+              peer = TelegramChat.normalizePeerIdentifier(c.peer);
+            }
+            if (avatar.isEmpty && c.avatar.isNotEmpty) {
+              avatar = c.avatar;
+            }
+            break;
+          }
+        }
+      }
+      if (avatar.isEmpty && isGroupAdminAnon && chat.avatar.isNotEmpty) {
+        avatar = chat.avatar;
+      }
+
+      final existing = byKey[memberKey];
+      if (existing == null) {
+        byKey[memberKey] = _TelegramGroupMember(
+          key: memberKey,
+          name: resolvedName,
+          peer: peer,
+          avatar: avatar,
+          lastActiveDate: m.date,
+          messageCount: 1,
+          isSelf: false,
+          isCreatorOrAdmin: isGroupAdminAnon,
+          customTitle: isGroupAdminAnon ? '匿名管理员' : '',
+        );
+      } else {
+        byKey[memberKey] = _TelegramGroupMember(
+          key: memberKey,
+          name: existing.name,
+          peer: existing.peer.isNotEmpty ? existing.peer : peer,
+          avatar: existing.avatar.isNotEmpty ? existing.avatar : avatar,
+          lastActiveDate:
+              m.date > existing.lastActiveDate ? m.date : existing.lastActiveDate,
+          messageCount: existing.messageCount + 1,
+          isSelf: false,
+          isCreatorOrAdmin: existing.isCreatorOrAdmin || isGroupAdminAnon,
+          customTitle: existing.customTitle.isNotEmpty
+              ? existing.customTitle
+              : (isGroupAdminAnon ? '匿名管理员' : ''),
+        );
+      }
+    }
+
+    byKey['__self__'] = _TelegramGroupMember(
+      key: '__self__',
+      name: selfName,
+      peer: selfPeer,
+      avatar: selfAvatar,
+      lastActiveDate: selfLastDate > 0
+          ? selfLastDate
+          : (DateTime.now().millisecondsSinceEpoch ~/ 1000),
+      messageCount: selfMsgCount,
+      isSelf: true,
+      isCreatorOrAdmin: false,
+      customTitle: '我',
+    );
+
+    final list = byKey.values.toList();
+    list.sort((a, b) {
+      if (a.isOnlineNow != b.isOnlineNow) {
+        return a.isOnlineNow ? -1 : 1;
+      }
+      if (a.isCreatorOrAdmin != b.isCreatorOrAdmin) {
+        return a.isCreatorOrAdmin ? -1 : 1;
+      }
+      if (b.lastActiveDate != a.lastActiveDate) {
+        return b.lastActiveDate.compareTo(a.lastActiveDate);
+      }
+      return b.messageCount.compareTo(a.messageCount);
+    });
+    return list;
+  }
+
+  /// Background-loads additional message history pages to discover more group members
+  /// when the user clicks "加载更多群成员" in the Group Members panel.
+  Future<void> _scanMoreGroupMembers() async {
+    if (_isScanningMoreMembers || _nextMessageOffset <= 0 || _selectedChat == null) {
+      return;
+    }
+    setState(() => _isScanningMoreMembers = true);
+    try {
+      for (int i = 0; i < 3; i++) {
+        if (!mounted || _nextMessageOffset <= 0 || _selectedChat == null) break;
+        await _loadMessages(loadOlder: true, silent: true);
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isScanningMoreMembers = false);
+      }
+    }
+  }
+
+  /// Normalizes an incoming [msg] before storing it in `_messages` or cache,
+  /// preserving previously resolved sender names and learning real user names.
+  TelegramMessage _normalizeIncomingMessageSender(
+    TelegramChat chat,
+    TelegramMessage msg, {
+    TelegramMessage? previous,
+    List<TelegramMessage>? messagePool,
+  }) {
+    final rawSender = msg.sender.trim();
+    if (rawSender.isNotEmpty && !TelegramChat.isRawPeerIdentifier(rawSender)) {
+      if (chat.peer.startsWith('user:') &&
+          !msg.outgoing &&
+          rawSender != '收藏夹') {
+        widget.appState.registerTelegramChatTitle(
+          _activeAccountId,
+          chat.peer,
+          rawSender,
+        );
+      }
+      if (previous != null &&
+          TelegramChat.isRawPeerIdentifier(previous.sender)) {
+        widget.appState.registerTelegramChatTitle(
+          _activeAccountId,
+          TelegramChat.normalizePeerIdentifier(previous.sender),
+          rawSender,
+        );
+      }
+      return msg;
+    }
+
+    if (previous != null) {
+      final prevSender = previous.sender.trim();
+      if (prevSender.isNotEmpty &&
+          !TelegramChat.isRawPeerIdentifier(prevSender)) {
+        if (rawSender.isNotEmpty &&
+            TelegramChat.isRawPeerIdentifier(rawSender)) {
+          widget.appState.registerTelegramChatTitle(
+            _activeAccountId,
+            TelegramChat.normalizePeerIdentifier(rawSender),
+            prevSender,
+          );
+        }
+        return msg.copyWith(sender: prevSender);
+      }
+    }
+
+    // Do not overwrite empty sender on service messages (so service messages stay centered)
+    if (rawSender.isEmpty && (msg.isServiceMessage || msg.isPhoneCall)) {
+      return msg;
+    }
+
+    final resolved = _resolveDisplaySenderName(
+      chat,
+      msg,
+      messagePool: messagePool,
+    );
+    if (resolved.isNotEmpty && !TelegramChat.isRawPeerIdentifier(resolved)) {
+      return msg.copyWith(sender: resolved);
+    }
+    return msg;
+  }
+
   int _effectiveReadOutboxMaxId(TelegramChat chat) {
     final peerKey = _peerReadKey(chat.peer);
     final cached = _outboxReadMaxIdByPeer[peerKey] ?? 0;
@@ -1138,8 +1620,28 @@ class _TelegramScreenState extends State<TelegramScreen> {
       } else if (cachedOutboxMax > chat.readOutboxMaxId) {
         chat = chat.copyWith(readOutboxMaxId: cachedOutboxMax);
       }
-      final cleanTitle = chat.title.trim();
-      final titleKey = cleanTitle.isNotEmpty
+      var cleanTitle = chat.title.trim();
+      if (cleanTitle.isEmpty || TelegramChat.isRawPeerIdentifier(cleanTitle)) {
+        final resolved = widget.appState
+            .resolveTelegramChatTitle(_activeAccountId, chat.peer)
+            .trim();
+        cleanTitle = (resolved.isNotEmpty &&
+                !TelegramChat.isRawPeerIdentifier(resolved))
+            ? resolved
+            : TelegramChat.friendlyFallbackTitleForPeer(
+                chat.peer,
+                kind: chat.kind,
+              );
+        chat = chat.copyWith(title: cleanTitle);
+      } else {
+        widget.appState.registerTelegramChatTitle(
+          _activeAccountId,
+          chat.peer,
+          cleanTitle,
+        );
+      }
+      final titleKey = cleanTitle.isNotEmpty &&
+              !TelegramChat.isRawPeerIdentifier(cleanTitle)
           ? '$_activeAccountId|$cleanTitle'
           : '';
       if (chat.avatar.isNotEmpty) {
@@ -1154,12 +1656,18 @@ class _TelegramScreenState extends State<TelegramScreen> {
         }
       }
 
-      if (cleanTitle.isNotEmpty) {
-        widget.appState.registerTelegramChatTitle(
-          _activeAccountId,
-          chat.peer,
-          cleanTitle,
-        );
+      if (chat.preview.trim().isEmpty) {
+        final cachedMsgs = _cachedMessagesByPeer[peerKey];
+        if (cachedMsgs != null && cachedMsgs.messages.isNotEmpty) {
+          final fallbackPreview = cachedMsgs.messages.last.resolvedPreviewText(
+            isPrivateUserChat: chat.peer.startsWith('user:'),
+          );
+          if (fallbackPreview.isNotEmpty) {
+            chat = chat.copyWith(
+              preview: fallbackPreview.characters.take(120).toString(),
+            );
+          }
+        }
       }
       if (chat.muted) {
         widget.appState.telegramNotifications.recordServerChatMuteState(
@@ -1466,6 +1974,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
     _inlinePlaybackOwner.dispose();
     _chatSearchCtrl.dispose();
     _msgSearchCtrl.dispose();
+    _memberSearchCtrl.dispose();
     _composeController.dispose();
     _emojiSearchCtrl.dispose();
     _chatListScrollController.dispose();
@@ -1967,8 +2476,14 @@ class _TelegramScreenState extends State<TelegramScreen> {
             for (var i = 0; i < nextMessages.length; i++)
               nextMessages[i].id: i,
           };
-          for (final m in msgRes.messages) {
-            final idx = indexById[m.id];
+          for (final rawM in msgRes.messages) {
+            final idx = indexById[rawM.id];
+            final m = _normalizeIncomingMessageSender(
+              activeChat,
+              rawM,
+              previous: idx != null ? nextMessages[idx] : null,
+              messagePool: nextMessages,
+            );
             if (idx == null) {
               // If an outgoing message was just confirmed, remove matching optimistic placeholder
               if (m.outgoing) {
@@ -1992,6 +2507,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
             } else {
               final prev = nextMessages[idx];
               if (prev.text != m.text ||
+                  prev.sender != m.sender ||
                   prev.buttons.length != m.buttons.length ||
                   prev.attachment?.url != m.attachment?.url) {
                 nextMessages[idx] = m;
@@ -2003,13 +2519,16 @@ class _TelegramScreenState extends State<TelegramScreen> {
             nextMessages.sort((a, b) => a.id.compareTo(b.id));
             setState(() {
               _messages = nextMessages;
-              if (hasNewer) {
+              if (hasNewer ||
+                  (_chats.any(
+                    (c) =>
+                        c.peer == activeChat.peer &&
+                        c.preview.trim().isEmpty,
+                  ))) {
                 final lastReal = msgRes.messages.last;
-                final rawPreview = lastReal.text.trim().isNotEmpty
-                    ? lastReal.text.trim()
-                    : (lastReal.attachment != null
-                        ? '[${lastReal.attachment!.displayName}]'
-                        : '');
+                final rawPreview = lastReal.resolvedPreviewText(
+                  isPrivateUserChat: activeChat.peer.startsWith('user:'),
+                );
                 final chatIdx =
                     _chats.indexWhere((c) => c.peer == activeChat.peer);
                 if (chatIdx >= 0) {
@@ -2542,6 +3061,9 @@ class _TelegramScreenState extends State<TelegramScreen> {
     if (_selectedChat?.peer != chat.peer) {
       _inlinePlaybackOwner.value = null;
       _isHeaderDangerActionExpanded = false;
+      _rightInfoTab = 'auto';
+      _memberSearchQuery = '';
+      _memberSearchCtrl.clear();
     }
     _userExitedChat = false;
     _saveCurrentDraft();
@@ -2638,11 +3160,20 @@ class _TelegramScreenState extends State<TelegramScreen> {
       int addedOlderCount = 0;
       bool shouldChainLoadOlder = false;
       final prevLastId = _messages.isNotEmpty ? _messages.last.id : 0;
+      final normalizedIncoming = res.messages
+          .map(
+            (m) => _normalizeIncomingMessageSender(
+              chat,
+              m,
+              messagePool: res.messages,
+            ),
+          )
+          .toList();
       setState(() {
         if (loadOlder) {
           final prevOffset = _nextMessageOffset;
           final existingIds = _messages.map((m) => m.id).toSet();
-          final olderIncoming = res.messages
+          final olderIncoming = normalizedIncoming
               .where((m) => !existingIds.contains(m.id))
               .toList();
           addedOlderCount = olderIncoming.length;
@@ -2655,7 +3186,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
           }
           if (res.nextOffset <= 1 ||
               res.nextOffset >= prevOffset ||
-              (olderIncoming.isEmpty && res.messages.isNotEmpty)) {
+              (olderIncoming.isEmpty && normalizedIncoming.isNotEmpty)) {
             _nextMessageOffset = 0;
           } else {
             _nextMessageOffset = res.nextOffset;
@@ -2667,8 +3198,13 @@ class _TelegramScreenState extends State<TelegramScreen> {
           final byId = <int, TelegramMessage>{
             for (final m in _messages) m.id: m,
           };
-          for (final m in res.messages) {
-            byId[m.id] = m;
+          for (final m in normalizedIncoming) {
+            byId[m.id] = _normalizeIncomingMessageSender(
+              chat,
+              m,
+              previous: byId[m.id],
+              messagePool: _messages,
+            );
           }
           final merged = byId.values.toList()
             ..sort((a, b) => a.id.compareTo(b.id));
@@ -2677,8 +3213,24 @@ class _TelegramScreenState extends State<TelegramScreen> {
             _nextMessageOffset = res.nextOffset;
           }
         } else {
-          _messages = List<TelegramMessage>.from(res.messages);
+          _messages = List<TelegramMessage>.from(normalizedIncoming);
           _nextMessageOffset = res.nextOffset > 1 ? res.nextOffset : 0;
+        }
+        if (_messages.isNotEmpty) {
+          final lastMsg = _messages.last;
+          final fallbackPreview = lastMsg.resolvedPreviewText(
+            isPrivateUserChat: chat.peer.startsWith('user:'),
+          );
+          final chatIdx = _chats.indexWhere((c) => c.peer == chat.peer);
+          if (chatIdx >= 0 &&
+              (_chats[chatIdx].preview.trim().isEmpty ||
+                  lastMsg.id >= _chats[chatIdx].topMessageId)) {
+            if (fallbackPreview.isNotEmpty) {
+              _chats[chatIdx] = _chats[chatIdx].copyWith(
+                preview: fallbackPreview.characters.take(120).toString(),
+              );
+            }
+          }
         }
         _isLoadingMessages = false;
       });
@@ -3763,8 +4315,11 @@ class _TelegramScreenState extends State<TelegramScreen> {
     int successCount = 0;
 
     for (final m in messagesToForward) {
-      final senderLabel =
-          m.sender.isNotEmpty ? m.sender : (sourceChat?.title ?? '会话');
+      final senderLabel = sourceChat != null
+          ? _resolveDisplaySenderName(sourceChat, m)
+          : (m.sender.isNotEmpty && !TelegramChat.isRawPeerIdentifier(m.sender)
+              ? m.sender
+              : '会话');
       final header = '📤 [转发自 $senderLabel]';
       final bodyText = [
         header,
@@ -4609,7 +5164,9 @@ class _TelegramScreenState extends State<TelegramScreen> {
                 .toString()
                 .substring(0, 19)
             : '';
-        final who = m.outgoing ? '我' : (m.sender.isNotEmpty ? m.sender : chat.title);
+        final who = m.outgoing
+            ? '我'
+            : _resolveDisplaySenderName(chat, m, messagePool: targetMsgs);
         sb.writeln('### [$dt] **$who** (#${m.id})');
         if (m.attachment != null) {
           sb.writeln(
@@ -6616,7 +7173,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
                                         children: [
                                       _buildPeerAvatar(
                                         chat.peer,
-                                        chat.title,
+                                        _resolveDisplayChatTitle(chat),
                                         avatar: chat.avatar,
                                         isSelf: chat.self,
                                         size: isMobile ? 52 : 48,
@@ -6667,7 +7224,9 @@ class _TelegramScreenState extends State<TelegramScreen> {
                                                   children: [
                                                     Flexible(
                                                       child: Text(
-                                                        chat.title,
+                                                        _resolveDisplayChatTitle(
+                                                          chat,
+                                                        ),
                                                         maxLines: 1,
                                                         overflow: TextOverflow
                                                             .ellipsis,
@@ -6923,6 +7482,11 @@ class _TelegramScreenState extends State<TelegramScreen> {
         _messages.where((m) => m.attachment?.isPhoto ?? false).length;
     final musicCount =
         _messages.where((m) => m.attachment?.isMusic ?? false).length;
+    final isGroupChat = _isGroupConversation(chat);
+    final groupMembers =
+        isGroupChat ? _collectGroupMembers(chat) : const <_TelegramGroupMember>[];
+    final onlineMemberCount =
+        groupMembers.where((m) => m.isOnlineNow).length;
 
     return Column(
       children: [
@@ -7021,7 +7585,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
                                 children: [
                                   _buildPeerAvatar(
                                     chat.peer,
-                                    chat.title,
+                                    _resolveDisplayChatTitle(chat),
                                     avatar: chat.avatar,
                                     isSelf: chat.self,
                                     size: 38,
@@ -7036,7 +7600,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
                                           MainAxisAlignment.center,
                                       children: [
                                         Text(
-                                          chat.title,
+                                          _resolveDisplayChatTitle(chat),
                                           maxLines: 1,
                                           overflow: TextOverflow.ellipsis,
                                           style: TextStyle(
@@ -7054,6 +7618,11 @@ class _TelegramScreenState extends State<TelegramScreen> {
                                               '频道广播'
                                             else
                                               '会话',
+                                            if (isGroupChat &&
+                                                groupMembers.isNotEmpty)
+                                              onlineMemberCount > 0
+                                                  ? '${groupMembers.length} 位成员 ($onlineMemberCount 人在线)'
+                                                  : '${groupMembers.length} 位成员',
                                             '${_messages.length} 条消息',
                                             if (videoCount > 0)
                                               '$videoCount 个视频',
@@ -7124,8 +7693,17 @@ class _TelegramScreenState extends State<TelegramScreen> {
                           ),
                           onSelected: (action) async {
                             switch (action) {
+                              case 'members':
+                                setState(() {
+                                  _rightInfoTab = 'members';
+                                  _showRightInfoPanel = true;
+                                });
+                                break;
                               case 'info':
-                                setState(() => _showRightInfoPanel = true);
+                                setState(() {
+                                  _rightInfoTab = 'media';
+                                  _showRightInfoPanel = true;
+                                });
                                 break;
                               case 'mute':
                                 await widget.appState.telegramNotifications
@@ -7171,6 +7749,28 @@ class _TelegramScreenState extends State<TelegramScreen> {
                             }
                           },
                           itemBuilder: (_) => [
+                            if (isGroupChat)
+                              PopupMenuItem(
+                                value: 'members',
+                                child: Row(
+                                  children: [
+                                    Icon(
+                                      Icons.group_rounded,
+                                      size: 18,
+                                      color: tg.tgBlueBright,
+                                    ),
+                                    const SizedBox(width: 10),
+                                    Text(
+                                      '查看群成员 (${groupMembers.length})',
+                                      style: TextStyle(
+                                        fontSize: 13.5,
+                                        fontWeight: FontWeight.w600,
+                                        color: tg.textPrimary,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
                             PopupMenuItem(
                               value: 'info',
                               child: Row(
@@ -7361,6 +7961,34 @@ class _TelegramScreenState extends State<TelegramScreen> {
                         ),
                         const SizedBox(width: 4),
                         _buildMediaFilterChip(tg, 'file', '文件'),
+                        if (isGroupChat) ...[
+                          const SizedBox(width: 6),
+                          _buildTvFocusableActionChip(
+                            icon: Icons.group_rounded,
+                            label: '成员 (${groupMembers.length})',
+                            tooltip: '查看群成员列表',
+                            textColor: (_showRightInfoPanel &&
+                                    _rightInfoTab != 'media')
+                                ? Colors.white
+                                : tg.tgBlueBright,
+                            bgColor: (_showRightInfoPanel &&
+                                    _rightInfoTab != 'media')
+                                ? tg.tgBlueBright
+                                : tg.tgBlueBright.withValues(alpha: 0.14),
+                            compact: true,
+                            onTap: () {
+                              setState(() {
+                                if (_showRightInfoPanel &&
+                                    _rightInfoTab != 'media') {
+                                  _showRightInfoPanel = false;
+                                } else {
+                                  _rightInfoTab = 'members';
+                                  _showRightInfoPanel = true;
+                                }
+                              });
+                            },
+                          ),
+                        ],
                         const SizedBox(width: 6),
                         Builder(
                           builder: (_) {
@@ -8338,7 +8966,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
   ) {
     final first = albumMessages.first;
     final isOutgoing = first.outgoing && !chat.broadcast;
-    final senderName = first.sender.isNotEmpty ? first.sender : chat.title;
+    final senderName = _resolveDisplaySenderName(chat, first);
     final senderColor = _TgPalette.peerNameColor(senderName);
     final timeStr = _formatBubbleTime(first.date);
     final captionMsg = albumMessages.firstWhere(
@@ -9230,7 +9858,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
     final first = groupMessages.first;
     final last = groupMessages.last;
     final isOutgoing = first.outgoing && !chat.broadcast;
-    final senderName = first.sender.isNotEmpty ? first.sender : chat.title;
+    final senderName = _resolveDisplaySenderName(chat, first);
     final senderColor = _TgPalette.peerNameColor(senderName);
     final timeStr = _formatBubbleTime(last.date);
     final captionMsg = groupMessages.firstWhere(
@@ -9441,16 +10069,298 @@ class _TelegramScreenState extends State<TelegramScreen> {
     );
   }
 
-  /// Authentic Telegram Message Bubble (Left for incoming/channel, Right for outgoing)
-  Widget _buildTelegramMessageBubble(
+  /// Official Telegram Voice / Video Call Card (Missed Call `未接来电`, Cancelled/Declined Call, Completed Call)
+  Widget _buildTelegramCallBubble(
     _TgPalette tg,
     TelegramChat chat,
     TelegramMessage msg,
   ) {
     final isOutgoing = msg.outgoing && !chat.broadcast;
     final isSelected = _selectedMessageIds.contains(msg.id);
+    final isPrivateChat = chat.peer.startsWith('user:');
+    final callTitle = msg.resolvedCallTitle(isPrivateUserChat: isPrivateChat);
+    final callSubtitle = msg.resolvedCallSubtitle(
+      isPrivateUserChat: isPrivateChat,
+    );
+    final isMissed = msg.isMissedOrFailedCall ||
+        (!isOutgoing && msg.text.trim() == '[服务消息]' && isPrivateChat);
+    final isVideo = msg.isVideoCall;
+    final timeStr = _formatBubbleTime(msg.date);
+    final senderName = _resolveDisplaySenderName(chat, msg);
+
+    final accentColor = isMissed
+        ? const Color(0xFFFF5252)
+        : const Color(0xFF2EBE70);
+
+    final callIcon = isVideo
+        ? (isMissed ? Icons.missed_video_call_rounded : Icons.videocam_rounded)
+        : (isMissed
+            ? (isOutgoing
+                ? Icons.phone_forwarded_rounded
+                : Icons.phone_missed_rounded)
+            : (isOutgoing
+                ? Icons.phone_callback_rounded
+                : Icons.call_received_rounded));
+
+    final bubbleColor = isSelected
+        ? tg.bubbleSelected
+        : (isOutgoing ? tg.bubbleOut : tg.bubbleIn);
+
+    final borderRadius = BorderRadius.only(
+      topLeft: const Radius.circular(14),
+      topRight: const Radius.circular(14),
+      bottomLeft: Radius.circular(isOutgoing ? 14 : 4),
+      bottomRight: Radius.circular(isOutgoing ? 4 : 14),
+    );
+
+    final card = Container(
+      constraints: const BoxConstraints(minWidth: 220, maxWidth: 340),
+      padding: const EdgeInsets.fromLTRB(12, 10, 14, 10),
+      decoration: BoxDecoration(
+        color: bubbleColor,
+        borderRadius: borderRadius,
+        border: Border.all(
+          color: accentColor.withValues(alpha: 0.25),
+          width: 1.0,
+        ),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x14000000),
+            blurRadius: 3,
+            offset: Offset(0, 1),
+          ),
+        ],
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 42,
+            height: 42,
+            decoration: BoxDecoration(
+              color: accentColor.withValues(alpha: 0.16),
+              shape: BoxShape.circle,
+            ),
+            alignment: Alignment.center,
+            child: Icon(
+              callIcon,
+              size: 22,
+              color: accentColor,
+            ),
+          ),
+          const SizedBox(width: 12),
+          Flexible(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  callTitle,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                    color: isMissed ? accentColor : tg.textPrimary,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      isOutgoing
+                          ? Icons.call_made_rounded
+                          : Icons.call_received_rounded,
+                      size: 13,
+                      color: isMissed ? accentColor : tg.textSecondary,
+                    ),
+                    const SizedBox(width: 4),
+                    Flexible(
+                      child: Text(
+                        '$callSubtitle · $timeStr',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          color: tg.textSecondary,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          if (!chat.readOnly) ...[
+            const SizedBox(width: 10),
+            IconButton(
+              visualDensity: VisualDensity.compact,
+              tooltip: '快速回复消息',
+              onPressed: () {
+                setState(() => _replyingToMessage = msg);
+                _saveCurrentDraft();
+                _composeFocusNode.requestFocus();
+              },
+              icon: Icon(
+                Icons.reply_rounded,
+                size: 18,
+                color: tg.tgBlueBright,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+
+    final showLeftSenderAvatar = !isOutgoing &&
+        (!_isMobileLayout ||
+            (!chat.broadcast &&
+                !chat.peer.startsWith('user:') &&
+                !chat.self));
+
+    return GestureDetector(
+      onTap: () {
+        _markChatAsRead(
+          chat,
+          latestMessageDate: msg.date,
+          maxMessageId: msg.id,
+        );
+        if (_selectionMode) {
+          setState(() {
+            if (isSelected) {
+              _selectedMessageIds.remove(msg.id);
+            } else {
+              _selectedMessageIds.add(msg.id);
+            }
+          });
+        } else if (!chat.readOnly) {
+          setState(() => _replyingToMessage = msg);
+          _saveCurrentDraft();
+          _composeFocusNode.requestFocus();
+        }
+      },
+      onSecondaryTapDown: (details) =>
+          _showMessageContextMenu(tg, chat, msg, details.globalPosition),
+      onLongPressStart: (details) =>
+          _showMessageContextMenu(tg, chat, msg, details.globalPosition),
+      child: Row(
+        mainAxisAlignment:
+            isOutgoing ? MainAxisAlignment.end : MainAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          if (_selectionMode)
+            Padding(
+              padding: const EdgeInsets.only(right: 10, bottom: 8),
+              child: Icon(
+                isSelected
+                    ? Icons.check_circle_rounded
+                    : Icons.radio_button_unchecked_rounded,
+                size: 22,
+                color: isSelected ? tg.tgBlueBright : Colors.white70,
+              ),
+            ),
+          if (showLeftSenderAvatar) ...[
+            _buildPeerAvatar(
+              chat.broadcast ||
+                      senderName == _resolveDisplayChatTitle(chat) ||
+                      chat.peer.startsWith('user:')
+                  ? chat.peer
+                  : senderName,
+              senderName,
+              avatar: msg.senderAvatar.isNotEmpty
+                  ? msg.senderAvatar
+                  : chat.avatar,
+              isSelf: chat.self,
+              size: 34,
+              fontSize: 13,
+            ),
+            const SizedBox(width: 8),
+          ],
+          Flexible(child: card),
+        ],
+      ),
+    );
+  }
+
+  /// Official Telegram Centered System / Service Event Pill (Pin, Join, Leave, Title Change, etc.)
+  Widget _buildTelegramServicePill(
+    _TgPalette tg,
+    TelegramChat chat,
+    TelegramMessage msg,
+  ) {
+    final timeStr = _formatBubbleTime(msg.date);
+    final rawText = msg.text.trim();
+    final label = (rawText.isEmpty || rawText == '[服务消息]')
+        ? '系统服务通知'
+        : rawText;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Center(
+        child: GestureDetector(
+          onSecondaryTapDown: (details) =>
+              _showMessageContextMenu(tg, chat, msg, details.globalPosition),
+          onLongPressStart: (details) =>
+              _showMessageContextMenu(tg, chat, msg, details.globalPosition),
+          child: Container(
+            constraints: const BoxConstraints(maxWidth: 460),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 5),
+            decoration: BoxDecoration(
+              color: tg.datePillBg,
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(
+                  Icons.info_outline_rounded,
+                  size: 13.5,
+                  color: Colors.white70,
+                ),
+                const SizedBox(width: 6),
+                Flexible(
+                  child: Text(
+                    timeStr.isNotEmpty ? '$label · $timeStr' : label,
+                    textAlign: TextAlign.center,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Authentic Telegram Message Bubble (Left for incoming/channel, Right for outgoing)
+  Widget _buildTelegramMessageBubble(
+    _TgPalette tg,
+    TelegramChat chat,
+    TelegramMessage msg,
+  ) {
+    final isPrivateChat = chat.peer.startsWith('user:');
+    if (msg.isPhoneCall ||
+        (msg.text.trim() == '[服务消息]' &&
+            isPrivateChat &&
+            msg.attachment == null)) {
+      return _buildTelegramCallBubble(tg, chat, msg);
+    }
+    if (msg.isServiceMessage && msg.attachment == null) {
+      return _buildTelegramServicePill(tg, chat, msg);
+    }
+
+    final isOutgoing = msg.outgoing && !chat.broadcast;
+    final isSelected = _selectedMessageIds.contains(msg.id);
     final att = msg.attachment;
-    final senderName = msg.sender.isNotEmpty ? msg.sender : chat.title;
+    final senderName = _resolveDisplaySenderName(chat, msg);
     final senderColor = _TgPalette.peerNameColor(senderName);
     final timeStr = _formatBubbleTime(msg.date);
 
@@ -10096,12 +11006,16 @@ class _TelegramScreenState extends State<TelegramScreen> {
           (m) => m != null && m.id == replyToId,
           orElse: () => null,
         );
-    final quoteSender = (original != null && original.sender.isNotEmpty)
-        ? original.sender
-        : (original != null && original.outgoing ? '我' : '消息 #$replyToId');
+    final quoteSender = original != null
+        ? _resolveDisplaySenderName(chat, original)
+        : '消息 #$replyToId';
     final quoteText = original != null
-        ? (original.text.trim().isNotEmpty
-            ? original.text.trim()
+        ? (original.resolvedPreviewText(
+                  isPrivateUserChat: chat.peer.startsWith('user:'),
+                ).isNotEmpty
+            ? original.resolvedPreviewText(
+                isPrivateUserChat: chat.peer.startsWith('user:'),
+              )
             : (original.attachment?.displayName ?? '媒体消息'))
         : '原消息 #$replyToId';
 
@@ -10528,13 +11442,15 @@ class _TelegramScreenState extends State<TelegramScreen> {
         if (result.message != null && result.message!.id > 0) {
           final updated = result.message!;
           final idx = _messages.indexWhere((m) => m.id == updated.id);
+          final normalized = _normalizeIncomingMessageSender(
+            chat,
+            updated,
+            previous: idx >= 0 ? _messages[idx] : null,
+          );
           if (idx >= 0) {
-            final prev = _messages[idx];
-            _messages[idx] = updated.sender.isEmpty && prev.sender.isNotEmpty
-                ? updated.copyWith(sender: prev.sender)
-                : updated;
+            _messages[idx] = normalized;
           } else {
-            _messages.add(updated);
+            _messages.add(normalized);
             _messages.sort((a, b) => a.id.compareTo(b.id));
           }
         }
@@ -11951,7 +12867,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          '回复 ${_replyingToMessage!.sender.isNotEmpty ? _replyingToMessage!.sender : chat.title}',
+                          '回复 ${_resolveDisplaySenderName(chat, _replyingToMessage!)}',
                           style: TextStyle(
                             fontSize: 12,
                             fontWeight: FontWeight.w600,
@@ -11959,8 +12875,16 @@ class _TelegramScreenState extends State<TelegramScreen> {
                           ),
                         ),
                         Text(
-                          _replyingToMessage!.text.isNotEmpty
-                              ? _replyingToMessage!.text
+                          _replyingToMessage!
+                                  .resolvedPreviewText(
+                                    isPrivateUserChat:
+                                        chat.peer.startsWith('user:'),
+                                  )
+                                  .isNotEmpty
+                              ? _replyingToMessage!.resolvedPreviewText(
+                                  isPrivateUserChat:
+                                      chat.peer.startsWith('user:'),
+                                )
                               : (_replyingToMessage!.attachment?.displayName ??
                                   '[媒体消息]'),
                           maxLines: 1,
@@ -13149,11 +14073,31 @@ class _TelegramScreenState extends State<TelegramScreen> {
     );
   }
 
-  /// Right-hand Official Telegram "Chat Info & Shared Media" Panel
+  /// Right-hand Official Telegram "Group Info & Members / Shared Media" Panel
   Widget _buildRightChatInfoPanel(_TgPalette tg, TelegramChat chat) {
     final mediaMessages = _messages
         .where((m) => m.attachment != null && m.attachment!.url.isNotEmpty)
         .toList();
+    final isGroupChat = _isGroupConversation(chat);
+    final groupMembers =
+        isGroupChat ? _collectGroupMembers(chat) : const <_TelegramGroupMember>[];
+    final onlineCount = groupMembers.where((m) => m.isOnlineNow).length;
+    final activeTab = isGroupChat
+        ? (_rightInfoTab == 'media' ? 'media' : 'members')
+        : 'media';
+    final displayTitle = _resolveDisplayChatTitle(chat);
+
+    final memberQuery = _memberSearchQuery.trim().toLowerCase();
+    final filteredMembers = memberQuery.isEmpty
+        ? groupMembers
+        : groupMembers
+            .where(
+              (m) =>
+                  m.name.toLowerCase().contains(memberQuery) ||
+                  m.peer.toLowerCase().contains(memberQuery) ||
+                  m.customTitle.toLowerCase().contains(memberQuery),
+            )
+            .toList();
 
     return Container(
       color: tg.sidebarBg,
@@ -13181,7 +14125,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
                 ),
                 const SizedBox(width: 4),
                 Text(
-                  '会话信息与媒体',
+                  isGroupChat ? '群组资料与成员' : '会话信息与媒体',
                   style: TextStyle(
                     fontSize: 14,
                     fontWeight: FontWeight.w600,
@@ -13204,20 +14148,20 @@ class _TelegramScreenState extends State<TelegramScreen> {
           ),
           // Peer profile summary
           Padding(
-            padding: const EdgeInsets.all(18),
+            padding: const EdgeInsets.fromLTRB(18, 16, 18, 14),
             child: Column(
               children: [
                 _buildPeerAvatar(
                   chat.peer,
-                  chat.title,
+                  displayTitle,
                   avatar: chat.avatar,
                   isSelf: chat.self,
-                  size: 68,
+                  size: 66,
                   fontSize: 24,
                 ),
                 const SizedBox(height: 10),
                 Text(
-                  chat.title,
+                  displayTitle,
                   textAlign: TextAlign.center,
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
@@ -13229,11 +14173,14 @@ class _TelegramScreenState extends State<TelegramScreen> {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  '${chat.kind.isNotEmpty ? chat.kind : "Telegram 会话"} · ID: ${chat.peer}',
-                  style: TextStyle(fontSize: 11.5, color: tg.textSecondary),
+                  isGroupChat
+                      ? '${chat.kind.isNotEmpty ? chat.kind : "群组"} · ${groupMembers.length} 位成员${onlineCount > 0 ? " ($onlineCount 人在线)" : ""}'
+                      : '${chat.kind.isNotEmpty ? chat.kind : "Telegram 会话"} · ID: ${chat.peer}',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 12, color: tg.textSecondary),
                 ),
                 if (chat.conversationActionLabel.isNotEmpty) ...[
-                  const SizedBox(height: 12),
+                  const SizedBox(height: 10),
                   SizedBox(
                     width: double.infinity,
                     child: _buildTvFocusableActionChip(
@@ -13249,8 +14196,8 @@ class _TelegramScreenState extends State<TelegramScreen> {
                     ),
                   ),
                 ],
-                if (mediaMessages.isNotEmpty) ...[
-                  const SizedBox(height: 12),
+                if (activeTab == 'media' && mediaMessages.isNotEmpty) ...[
+                  const SizedBox(height: 10),
                   SizedBox(
                     width: double.infinity,
                     child: _buildTvFocusableActionChip(
@@ -13282,153 +14229,726 @@ class _TelegramScreenState extends State<TelegramScreen> {
               ],
             ),
           ),
-          Divider(height: 1, color: tg.borderLine),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(14, 10, 14, 6),
-            child: Text(
-              '共享媒体列表 (${mediaMessages.length})',
-              style: TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
-                color: tg.textSecondary,
+          // Official Telegram Profile Section Tabs: [成员 (X)] | [共享媒体 (Y)]
+          if (isGroupChat)
+            Container(
+              decoration: BoxDecoration(
+                border: Border(
+                  top: BorderSide(color: tg.borderLine),
+                  bottom: BorderSide(color: tg.borderLine),
+                ),
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: InkWell(
+                      onTap: () => setState(() => _rightInfoTab = 'members'),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(vertical: 10),
+                        decoration: BoxDecoration(
+                          border: Border(
+                            bottom: BorderSide(
+                              color: activeTab == 'members'
+                                  ? tg.tgBlueBright
+                                  : Colors.transparent,
+                              width: 2.5,
+                            ),
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(
+                              Icons.group_rounded,
+                              size: 16,
+                              color: activeTab == 'members'
+                                  ? tg.tgBlueBright
+                                  : tg.textSecondary,
+                            ),
+                            const SizedBox(width: 6),
+                            Text(
+                              '成员 (${groupMembers.length})',
+                              style: TextStyle(
+                                fontSize: 12.5,
+                                fontWeight: activeTab == 'members'
+                                    ? FontWeight.w600
+                                    : FontWeight.w500,
+                                color: activeTab == 'members'
+                                    ? tg.tgBlueBright
+                                    : tg.textSecondary,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                  Expanded(
+                    child: InkWell(
+                      onTap: () => setState(() => _rightInfoTab = 'media'),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(vertical: 10),
+                        decoration: BoxDecoration(
+                          border: Border(
+                            bottom: BorderSide(
+                              color: activeTab == 'media'
+                                  ? tg.tgBlueBright
+                                  : Colors.transparent,
+                              width: 2.5,
+                            ),
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(
+                              Icons.perm_media_outlined,
+                              size: 15,
+                              color: activeTab == 'media'
+                                  ? tg.tgBlueBright
+                                  : tg.textSecondary,
+                            ),
+                            const SizedBox(width: 6),
+                            Text(
+                              '共享媒体 (${mediaMessages.length})',
+                              style: TextStyle(
+                                fontSize: 12.5,
+                                fontWeight: activeTab == 'media'
+                                    ? FontWeight.w600
+                                    : FontWeight.w500,
+                                color: activeTab == 'media'
+                                    ? tg.tgBlueBright
+                                    : tg.textSecondary,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            )
+          else ...[
+            Divider(height: 1, color: tg.borderLine),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 10, 14, 6),
+              child: Text(
+                '共享媒体列表 (${mediaMessages.length})',
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: tg.textSecondary,
+                ),
               ),
             ),
-          ),
-          Expanded(
-            child: mediaMessages.isEmpty
-                ? Center(
-                    child: Text(
-                      '当前已加载消息中无媒体附件',
-                      style: TextStyle(fontSize: 12, color: tg.textMuted),
+          ],
+          if (activeTab == 'members') ...[
+            // Official Telegram Group Member Search Box
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 10, 10, 6),
+              child: Container(
+                height: 34,
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                decoration: BoxDecoration(
+                  color: tg.searchFill,
+                  borderRadius: BorderRadius.circular(17),
+                ),
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.search_rounded,
+                      size: 16,
+                      color: tg.textMuted,
                     ),
-                  )
-                : ListView.separated(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 10,
-                      vertical: 6,
-                    ),
-                    itemCount: mediaMessages.length,
-                    separatorBuilder: (_, __) => const SizedBox(height: 6),
-                    itemBuilder: (_, idx) {
-                      final m = mediaMessages[idx];
-                      final att = m.attachment!;
-                      final isVideo = att.isVideo;
-                      final isPhoto = att.isPhoto;
-                      final isAudio = att.isAudio;
-                      final isMusic = att.isMusic;
-                      final isAudioActive =
-                          isAudio && _isAudioTrackActive(chat, m);
-                      final dlKey = '$_activeAccountId:${att.url}';
-                      final isQueueing = _pendingDownloads.contains(dlKey);
-                      final isQueued = _isUrlQueuedOrInTasks(att.url);
-                      final isFailed = _failedDownloads.contains(dlKey);
-                      return ListTile(
-                        dense: true,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        tileColor: isAudioActive
-                            ? tg.tgBlueBright.withValues(alpha: 0.14)
-                            : tg.searchFill,
-                        leading: Icon(
-                          isVideo
-                              ? Icons.play_circle_fill_rounded
-                              : (isPhoto
-                                  ? Icons.image_rounded
-                                  : (isAudio
-                                      ? (isAudioActive && _isAudioPlaying
-                                          ? Icons.pause_circle_filled_rounded
-                                          : Icons.music_note_rounded)
-                                      : Icons.insert_drive_file_rounded)),
-                          color: tg.tgBlueBright,
-                          size: 26,
-                        ),
-                        title: Text(
-                          isMusic ? att.musicTitle : att.displayName,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: TextField(
+                        controller: _memberSearchCtrl,
+                        onChanged: (v) =>
+                            setState(() => _memberSearchQuery = v),
+                        style: TextStyle(fontSize: 12.5, color: tg.textPrimary),
+                        decoration: InputDecoration(
+                          filled: false,
+                          border: InputBorder.none,
+                          enabledBorder: InputBorder.none,
+                          focusedBorder: InputBorder.none,
+                          isDense: true,
+                          hintText: '搜索群成员...',
+                          hintStyle: TextStyle(
                             fontSize: 12,
-                            fontWeight: isAudioActive
-                                ? FontWeight.w600
-                                : FontWeight.w400,
-                            color: isAudioActive
-                                ? tg.tgBlueBright
-                                : tg.textPrimary,
+                            color: tg.textMuted,
                           ),
+                          contentPadding: EdgeInsets.zero,
                         ),
-                        subtitle: Text(
-                          [
-                            if (isMusic) att.musicPerformer,
-                            if (att.duration > 0 && isAudio)
-                              _formatDurationClock(att.duration),
-                            if (att.formattedSize.isNotEmpty) att.formattedSize,
-                            if (isQueued) '已加入下载队列 ✓',
-                            if (isFailed) '添加失败 · 点击重试',
-                          ].join(' · '),
-                          style: TextStyle(
-                            fontSize: 11,
-                            color: isQueued
-                                ? const Color(0xFF4ECC5E)
-                                : (isFailed
-                                    ? const Color(0xFFFF6B6B)
-                                    : tg.textMuted),
-                          ),
-                        ),
-                        trailing: IconButton(
-                          icon: AnimatedSwitcher(
-                            duration: const Duration(milliseconds: 200),
-                            transitionBuilder: (child, anim) =>
-                                ScaleTransition(scale: anim, child: child),
-                            child: isQueueing
-                                ? SizedBox(
-                                    key: const ValueKey('info_q_loading'),
-                                    width: 15,
-                                    height: 15,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
-                                      color: tg.tgBlueBright,
-                                    ),
-                                  )
-                                : Icon(
-                                    key: ValueKey(
-                                      'info_q_${isQueued}_$isFailed',
-                                    ),
-                                    isQueued
-                                        ? Icons.check_circle_rounded
-                                        : (isFailed
-                                            ? Icons.error_outline_rounded
-                                            : Icons.cloud_download_outlined),
-                                    size: 18,
-                                    color: isQueued
-                                        ? const Color(0xFF4ECC5E)
-                                        : (isFailed
-                                            ? const Color(0xFFFF6B6B)
-                                            : tg.tgBlueBright),
-                                  ),
-                          ),
-                          onPressed: isQueueing
-                              ? null
-                              : () => _queueTelegramDownload(
-                                    url: att.url,
-                                    name: att.displayName,
-                                  ),
-                        ),
+                      ),
+                    ),
+                    if (_memberSearchQuery.isNotEmpty)
+                      GestureDetector(
                         onTap: () {
-                          if (att.isVisualMedia) {
-                            _openMediaGalleryViewer(chat, m);
-                          } else if (isAudio) {
-                            _togglePlayAudioMessage(chat, m);
-                          } else if (_canPreviewTelegramFile(att)) {
-                            _openFilePreviewDialog(chat, m);
-                          }
+                          _memberSearchCtrl.clear();
+                          setState(() => _memberSearchQuery = '');
                         },
-                      );
-                    },
-                  ),
-          ),
+                        child: Icon(
+                          Icons.close_rounded,
+                          size: 15,
+                          color: tg.textMuted,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+            Expanded(
+              child: filteredMembers.isEmpty
+                  ? Center(
+                      child: Text(
+                        '未找到匹配的群成员',
+                        style: TextStyle(fontSize: 12, color: tg.textMuted),
+                      ),
+                    )
+                  : ListView.builder(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 4,
+                      ),
+                      itemCount: filteredMembers.length +
+                          (_nextMessageOffset > 0 ? 1 : 0),
+                      itemBuilder: (ctx, idx) {
+                        if (idx == filteredMembers.length) {
+                          return Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 8,
+                            ),
+                            child: InkWell(
+                              borderRadius: BorderRadius.circular(10),
+                              onTap: _isScanningMoreMembers
+                                  ? null
+                                  : _scanMoreGroupMembers,
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 12,
+                                  vertical: 9,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: tg.searchFill,
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                child: Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    if (_isScanningMoreMembers) ...[
+                                      SizedBox(
+                                        width: 13,
+                                        height: 13,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 1.8,
+                                          color: tg.tgBlueBright,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Text(
+                                        '正在扫描历史消息中的群成员...',
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          color: tg.tgBlueBright,
+                                        ),
+                                      ),
+                                    ] else ...[
+                                      Icon(
+                                        Icons.person_search_rounded,
+                                        size: 16,
+                                        color: tg.tgBlueBright,
+                                      ),
+                                      const SizedBox(width: 6),
+                                      Text(
+                                        '加载更多群成员',
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w600,
+                                          color: tg.tgBlueBright,
+                                        ),
+                                      ),
+                                    ],
+                                  ],
+                                ),
+                              ),
+                            ),
+                          );
+                        }
+                        final member = filteredMembers[idx];
+                        return _buildGroupMemberListTile(tg, chat, member);
+                      },
+                    ),
+            ),
+          ] else
+            Expanded(
+              child: mediaMessages.isEmpty
+                  ? Center(
+                      child: Text(
+                        '当前已加载消息中无媒体附件',
+                        style: TextStyle(fontSize: 12, color: tg.textMuted),
+                      ),
+                    )
+                  : ListView.separated(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      itemCount: mediaMessages.length,
+                      separatorBuilder: (_, __) => const SizedBox(height: 6),
+                      itemBuilder: (_, idx) {
+                        final m = mediaMessages[idx];
+                        final att = m.attachment!;
+                        final isVideo = att.isVideo;
+                        final isPhoto = att.isPhoto;
+                        final isAudio = att.isAudio;
+                        final isMusic = att.isMusic;
+                        final isAudioActive =
+                            isAudio && _isAudioTrackActive(chat, m);
+                        final dlKey = '$_activeAccountId:${att.url}';
+                        final isQueueing = _pendingDownloads.contains(dlKey);
+                        final isQueued = _isUrlQueuedOrInTasks(att.url);
+                        final isFailed = _failedDownloads.contains(dlKey);
+                        return ListTile(
+                          dense: true,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          tileColor: isAudioActive
+                              ? tg.tgBlueBright.withValues(alpha: 0.14)
+                              : tg.searchFill,
+                          leading: Icon(
+                            isVideo
+                                ? Icons.play_circle_fill_rounded
+                                : (isPhoto
+                                    ? Icons.image_rounded
+                                    : (isAudio
+                                        ? (isAudioActive && _isAudioPlaying
+                                            ? Icons.pause_circle_filled_rounded
+                                            : Icons.music_note_rounded)
+                                        : Icons.insert_drive_file_rounded)),
+                            color: tg.tgBlueBright,
+                            size: 26,
+                          ),
+                          title: Text(
+                            isMusic ? att.musicTitle : att.displayName,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: isAudioActive
+                                  ? FontWeight.w600
+                                  : FontWeight.w400,
+                              color: isAudioActive
+                                  ? tg.tgBlueBright
+                                  : tg.textPrimary,
+                            ),
+                          ),
+                          subtitle: Text(
+                            [
+                              if (isMusic) att.musicPerformer,
+                              if (att.duration > 0 && isAudio)
+                                _formatDurationClock(att.duration),
+                              if (att.formattedSize.isNotEmpty)
+                                att.formattedSize,
+                              if (isQueued) '已加入下载队列 ✓',
+                              if (isFailed) '添加失败 · 点击重试',
+                            ].join(' · '),
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: isQueued
+                                  ? const Color(0xFF4ECC5E)
+                                  : (isFailed
+                                      ? const Color(0xFFFF6B6B)
+                                      : tg.textMuted),
+                            ),
+                          ),
+                          trailing: IconButton(
+                            icon: AnimatedSwitcher(
+                              duration: const Duration(milliseconds: 200),
+                              transitionBuilder: (child, anim) =>
+                                  ScaleTransition(scale: anim, child: child),
+                              child: isQueueing
+                                  ? SizedBox(
+                                      key: const ValueKey('info_q_loading'),
+                                      width: 15,
+                                      height: 15,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: tg.tgBlueBright,
+                                      ),
+                                    )
+                                  : Icon(
+                                      key: ValueKey(
+                                        'info_q_${isQueued}_$isFailed',
+                                      ),
+                                      isQueued
+                                          ? Icons.check_circle_rounded
+                                          : (isFailed
+                                              ? Icons.error_outline_rounded
+                                              : Icons.cloud_download_outlined),
+                                      size: 18,
+                                      color: isQueued
+                                          ? const Color(0xFF4ECC5E)
+                                          : (isFailed
+                                              ? const Color(0xFFFF6B6B)
+                                              : tg.tgBlueBright),
+                                    ),
+                            ),
+                            onPressed: isQueueing
+                                ? null
+                                : () => _queueTelegramDownload(
+                                      url: att.url,
+                                      name: att.displayName,
+                                    ),
+                          ),
+                          onTap: () {
+                            if (att.isVisualMedia) {
+                              _openMediaGalleryViewer(chat, m);
+                            } else if (isAudio) {
+                              _togglePlayAudioMessage(chat, m);
+                            } else if (_canPreviewTelegramFile(att)) {
+                              _openFilePreviewDialog(chat, m);
+                            }
+                          },
+                        );
+                      },
+                    ),
+            ),
         ],
       ),
+    );
+  }
+
+  /// Renders a single Group Member row in official Telegram Desktop / iOS / Android style:
+  /// Circular avatar + online status dot, bold display name, right-aligned role/custom title badge,
+  /// activity status (`在线` in Telegram blue or `最近在线`), and click/context actions.
+  Widget _buildGroupMemberListTile(
+    _TgPalette tg,
+    TelegramChat groupChat,
+    _TelegramGroupMember member,
+  ) {
+    final isOnline = member.isOnlineNow;
+    final nameColor = _TgPalette.peerNameColor(member.name);
+    final badgeText = member.customTitle.isNotEmpty
+        ? member.customTitle
+        : (member.isCreatorOrAdmin
+            ? '管理员'
+            : (member.messageCount >= 5 ? '活跃成员' : ''));
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(10),
+          onTap: () => _showGroupMemberActionSheet(tg, groupChat, member),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 7),
+            child: Row(
+              children: [
+                Stack(
+                  clipBehavior: Clip.none,
+                  children: [
+                    _buildPeerAvatar(
+                      member.peer.isNotEmpty ? member.peer : member.name,
+                      member.name,
+                      avatar: member.avatar,
+                      isSelf: false,
+                      size: 42,
+                      fontSize: 15,
+                    ),
+                    if (isOnline)
+                      Positioned(
+                        right: 0,
+                        bottom: 0,
+                        child: Container(
+                          width: 11.5,
+                          height: 11.5,
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF4ECC5E),
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: tg.sidebarBg,
+                              width: 2,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+                const SizedBox(width: 11),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              member.name,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 13.5,
+                                fontWeight: FontWeight.w600,
+                                color: tg.textPrimary,
+                              ),
+                            ),
+                          ),
+                          if (badgeText.isNotEmpty) ...[
+                            const SizedBox(width: 6),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 6,
+                                vertical: 1.5,
+                              ),
+                              decoration: BoxDecoration(
+                                color: member.isCreatorOrAdmin
+                                    ? tg.tgBlueBright.withValues(alpha: 0.16)
+                                    : nameColor.withValues(alpha: 0.14),
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                              child: Text(
+                                badgeText,
+                                style: TextStyle(
+                                  fontSize: 10.5,
+                                  fontWeight: FontWeight.w600,
+                                  color: member.isCreatorOrAdmin
+                                      ? tg.tgBlueBright
+                                      : nameColor,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                      const SizedBox(height: 2.5),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              member.statusLabel,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 11.5,
+                                fontWeight: isOnline
+                                    ? FontWeight.w500
+                                    : FontWeight.w400,
+                                color: isOnline
+                                    ? tg.tgBlueBright
+                                    : tg.textSecondary,
+                              ),
+                            ),
+                          ),
+                          if (member.messageCount > 0)
+                            Text(
+                              '发言 ${member.messageCount} 条',
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: tg.textMuted,
+                              ),
+                            ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Opens official Telegram member quick-action sheet:
+  /// - View all messages from this member in the group
+  /// - Mention `@Name` in the compose box
+  /// - Open 1-on-1 private chat (if `user:xxx` peer is known or in `_chats`)
+  /// - Copy member name
+  Future<void> _showGroupMemberActionSheet(
+    _TgPalette tg,
+    TelegramChat groupChat,
+    _TelegramGroupMember member,
+  ) async {
+    TelegramChat? directUserChat;
+    for (final c in _chats) {
+      if (member.peer.isNotEmpty &&
+          TelegramChat.normalizePeerIdentifier(c.peer) == member.peer) {
+        directUserChat = c;
+        break;
+      }
+      if (c.peer.startsWith('user:') &&
+          _resolveDisplayChatTitle(c).toLowerCase() ==
+              member.name.toLowerCase()) {
+        directUserChat = c;
+        break;
+      }
+    }
+    if (directUserChat == null && member.peer.startsWith('user:')) {
+      directUserChat = TelegramChat(
+        peer: member.peer,
+        title: member.name,
+        kind: '联系人',
+        avatar: member.avatar,
+      );
+    }
+
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: tg.sidebarBg,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (sheetCtx) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(
+                  children: [
+                    _buildPeerAvatar(
+                      member.peer.isNotEmpty ? member.peer : member.name,
+                      member.name,
+                      avatar: member.avatar,
+                      isSelf: false,
+                      size: 48,
+                      fontSize: 18,
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            member.name,
+                            style: TextStyle(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w600,
+                              color: tg.textPrimary,
+                            ),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            [
+                              member.statusLabel,
+                              if (member.messageCount > 0)
+                                '本群发言 ${member.messageCount} 条',
+                              if (member.peer.isNotEmpty) member.peer,
+                            ].join(' · '),
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: member.isOnlineNow
+                                  ? tg.tgBlueBright
+                                  : tg.textSecondary,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Divider(height: 1, color: tg.borderLine),
+                ListTile(
+                  leading: Icon(
+                    Icons.forum_outlined,
+                    color: tg.tgBlueBright,
+                    size: 20,
+                  ),
+                  title: Text(
+                    '查看「${member.name}」在本群的发言',
+                    style: TextStyle(fontSize: 13.5, color: tg.textPrimary),
+                  ),
+                  onTap: () {
+                    Navigator.of(sheetCtx).pop();
+                    setState(() {
+                      _showInChatSearch = true;
+                      _msgSearchCtrl.text = member.name;
+                      _messageFilter = member.name;
+                      if (_isMobileLayout) {
+                        _showRightInfoPanel = false;
+                      }
+                    });
+                  },
+                ),
+                if (!groupChat.readOnly && !member.isSelf)
+                  ListTile(
+                    leading: Icon(
+                      Icons.alternate_email_rounded,
+                      color: tg.tgBlueBright,
+                      size: 20,
+                    ),
+                    title: Text(
+                      '在输入框中 @${member.name}',
+                      style: TextStyle(fontSize: 13.5, color: tg.textPrimary),
+                    ),
+                    onTap: () {
+                      Navigator.of(sheetCtx).pop();
+                      final mention = '@${member.name} ';
+                      final cur = _composeController.text;
+                      final next = cur.isEmpty || cur.endsWith(' ')
+                          ? '$cur$mention'
+                          : '$cur $mention';
+                      setState(() {
+                        if (_isMobileLayout) {
+                          _showRightInfoPanel = false;
+                        }
+                        _composeController.value = TextEditingValue(
+                          text: next,
+                          selection: TextSelection.collapsed(
+                            offset: next.length,
+                          ),
+                        );
+                      });
+                      _composeFocusNode.requestFocus();
+                    },
+                  ),
+                if (directUserChat != null && !member.isSelf)
+                  ListTile(
+                    leading: Icon(
+                      Icons.send_rounded,
+                      color: tg.tgBlueBright,
+                      size: 20,
+                    ),
+                    title: Text(
+                      '发私信给「${member.name}」',
+                      style: TextStyle(fontSize: 13.5, color: tg.textPrimary),
+                    ),
+                    onTap: () {
+                      Navigator.of(sheetCtx).pop();
+                      setState(() => _showRightInfoPanel = false);
+                      _selectChat(directUserChat!);
+                    },
+                  ),
+                ListTile(
+                  leading: Icon(
+                    Icons.copy_rounded,
+                    color: tg.textSecondary,
+                    size: 20,
+                  ),
+                  title: Text(
+                    '复制成员名称',
+                    style: TextStyle(fontSize: 13.5, color: tg.textPrimary),
+                  ),
+                  onTap: () {
+                    Navigator.of(sheetCtx).pop();
+                    Clipboard.setData(ClipboardData(text: member.name));
+                    _showDownloadHud('已复制：${member.name}', state: 'success');
+                  },
+                ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 }

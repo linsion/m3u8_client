@@ -1735,6 +1735,40 @@ class TelegramFolder {
 
 class TelegramChat {
   static final RegExp _positiveIntRegex = RegExp(r'^[1-9][0-9]*$');
+  static final RegExp _rawPeerIdentifierRegex = RegExp(
+    r'^:?(user|chat|channel):\d+$',
+    caseSensitive: false,
+  );
+
+  /// Returns true if [value] is a raw Telegram peer identifier such as `user:123456` or `:user:123456`.
+  static bool isRawPeerIdentifier(String value) {
+    final clean = value.trim();
+    return clean.isNotEmpty && _rawPeerIdentifierRegex.hasMatch(clean);
+  }
+
+  /// Strips any leading `:` from a raw peer identifier (e.g. `:user:123` -> `user:123`).
+  static String normalizePeerIdentifier(String value) {
+    final clean = value.trim();
+    if (clean.startsWith(':') && _rawPeerIdentifierRegex.hasMatch(clean)) {
+      return clean.substring(1);
+    }
+    return clean;
+  }
+
+  /// Human-readable fallback title when only a raw `user:xxx` / `chat:xxx` / `channel:xxx` ID is known.
+  static String friendlyFallbackTitleForPeer(String peer, {String kind = ''}) {
+    final norm = normalizePeerIdentifier(peer).toLowerCase();
+    if (norm.startsWith('channel:')) {
+      return kind.contains('群') ? '超级群会话' : '频道会话';
+    }
+    if (norm.startsWith('chat:')) {
+      return '群组会话';
+    }
+    if (norm.startsWith('user:')) {
+      return 'Telegram 用户';
+    }
+    return 'Telegram 会话';
+  }
 
   final String peer;
   final String title;
@@ -2125,6 +2159,10 @@ class TelegramMessage {
   final List<String> links;
   final List<List<TelegramMessageButton>> buttons;
   final TelegramAttachment? attachment;
+  final String actionType;
+  final String callReason;
+  final int callDuration;
+  final bool callVideo;
 
   const TelegramMessage({
     required this.id,
@@ -2139,15 +2177,182 @@ class TelegramMessage {
     this.links = const [],
     this.buttons = const [],
     this.attachment,
+    this.actionType = '',
+    this.callReason = '',
+    this.callDuration = 0,
+    this.callVideo = false,
   });
 
   bool get hasButtons => buttons.any((row) => row.isNotEmpty);
+
+  /// True if this message is a voice/video call record (e.g. Missed Call `未接来电`, cancelled/declined call, or completed call).
+  bool get isPhoneCall {
+    final act = actionType.toLowerCase();
+    if (act.contains('call') || callReason.isNotEmpty || callDuration > 0) {
+      return true;
+    }
+    final t = text.trim();
+    if (t.isEmpty) return false;
+    return t.contains('未接来电') ||
+        t.contains('未接通话') ||
+        t.contains('未接视频通话') ||
+        t.contains('未接语音通话') ||
+        t.contains('已取消通话') ||
+        t.contains('已取消语音通话') ||
+        t.contains('已取消视频通话') ||
+        t.contains('已拒绝通话') ||
+        t.contains('已拒绝语音通话') ||
+        t.contains('已拒绝视频通话') ||
+        t.contains('对方忙线') ||
+        t.contains('通话中断') ||
+        t.startsWith('📞') ||
+        t.startsWith('📹') ||
+        RegExp(
+          r'^(语音通话|视频通话|通话时长|Missed Call|Outgoing Call|Incoming Call|Cancelled Call|Declined Call)',
+          caseSensitive: false,
+        ).hasMatch(t);
+  }
+
+  /// True if this call was missed, declined, busy, or cancelled without connecting.
+  bool get isMissedOrFailedCall {
+    if (!isPhoneCall) return false;
+    final r = callReason.toLowerCase();
+    if (r.contains('missed') || r.contains('busy') || r.contains('disconnect')) {
+      return true;
+    }
+    if (r.contains('hangup') && callDuration <= 0) {
+      return true;
+    }
+    final t = text.trim();
+    return t.contains('未接') ||
+        t.contains('已取消') ||
+        t.contains('已拒绝') ||
+        t.contains('忙线') ||
+        t.contains('中断') ||
+        t.toLowerCase().contains('missed') ||
+        t.toLowerCase().contains('declined') ||
+        t.toLowerCase().contains('cancelled');
+  }
+
+  /// True if this call is a video call (`视频通话`).
+  bool get isVideoCall {
+    if (callVideo) return true;
+    final t = text.trim();
+    return t.contains('视频通话') || t.startsWith('📹');
+  }
+
+  /// True if this message is a Telegram service/system notification (`[服务消息]`, pin message, member join/leave, etc.).
+  bool get isServiceMessage {
+    if (isPhoneCall) return false;
+    final act = actionType.trim().toLowerCase();
+    if (act.isNotEmpty && act != 'message') return true;
+    final t = text.trim();
+    if (t == '[服务消息]') return true;
+    if (attachment == null && sender.trim().isEmpty) {
+      if (t.startsWith('📌') ||
+          t.startsWith('👤') ||
+          t.startsWith('✏️') ||
+          t.startsWith('🖼️') ||
+          t.startsWith('✨') ||
+          t.startsWith('🧹') ||
+          t.startsWith('📸') ||
+          t.startsWith('👋') ||
+          t.contains('置顶了一条消息') ||
+          t.contains('加入了群组') ||
+          t.contains('退出了群组') ||
+          t.contains('清空了聊天记录') ||
+          t.contains('截取了聊天屏幕')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// Human-readable primary title for a call or service message.
+  /// Note: In 1-on-1 user chats (`peer.startsWith('user:')`), when the backend returns generic `"[服务消息]"`
+  /// with `sender: ""`, it is almost always a Phone/Video Call (`MessageActionPhoneCall` such as `未接来电`)!
+  String resolvedCallTitle({required bool isPrivateUserChat}) {
+    final t = text.trim();
+    if (t.isNotEmpty && t != '[服务消息]') {
+      return t
+          .replaceFirst(RegExp(r'^[📞📹]\s*'), '')
+          .replaceFirst(RegExp(r'\s*\([0-9:]+\)\s*$'), '')
+          .trim();
+    }
+    final callLabel = isVideoCall ? '视频通话' : '语音通话';
+    final r = callReason.toLowerCase();
+    if (r.contains('missed')) {
+      return outgoing ? '已取消$callLabel' : (isVideoCall ? '未接视频通话' : '未接来电');
+    }
+    if (r.contains('busy')) {
+      return outgoing ? '对方忙线' : '未接来电 (忙线)';
+    }
+    if (r.contains('disconnect')) {
+      return '通话中断';
+    }
+    if (callDuration > 0) {
+      return callLabel;
+    }
+    if (t == '[服务消息]' && isPrivateUserChat) {
+      return outgoing ? '已取消语音通话' : '未接来电 / 语音通话';
+    }
+    return outgoing ? '已取消$callLabel' : '未接来电';
+  }
+
+  /// Human-readable subtitle for a call card (duration or call status).
+  String resolvedCallSubtitle({required bool isPrivateUserChat}) {
+    if (callDuration > 0) {
+      final m = (callDuration ~/ 60).toString().padLeft(2, '0');
+      final s = (callDuration % 60).toString().padLeft(2, '0');
+      return '通话时长 $m:$s';
+    }
+    final durMatch = RegExp(r'\(([0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)\)').firstMatch(text);
+    if (durMatch != null) {
+      return '通话时长 ${durMatch.group(1)}';
+    }
+    if (text.trim() == '[服务消息]' && isPrivateUserChat) {
+      return outgoing ? '拨出的通话' : '未接来电或通话记录';
+    }
+    if (isMissedOrFailedCall) {
+      return outgoing ? '对方未接听' : '未接听，点击可回复消息';
+    }
+    return isVideoCall ? 'Telegram 视频通话' : 'Telegram 语音通话';
+  }
+
+  /// Human-readable preview text for the dialog sidebar and notifications.
+  String resolvedPreviewText({required bool isPrivateUserChat}) {
+    final t = text.trim();
+    if (isPhoneCall || (t == '[服务消息]' && isPrivateUserChat)) {
+      final icon = isVideoCall ? '📹' : '📞';
+      final title = resolvedCallTitle(isPrivateUserChat: isPrivateUserChat);
+      if (callDuration > 0) {
+        final m = (callDuration ~/ 60).toString().padLeft(2, '0');
+        final s = (callDuration % 60).toString().padLeft(2, '0');
+        return '$icon $title ($m:$s)';
+      }
+      return '$icon $title';
+    }
+    if (t == '[服务消息]') {
+      return '系统服务消息';
+    }
+    if (t.isNotEmpty) return t;
+    if (attachment != null && attachment!.isValid) {
+      if (attachment!.isVideo) return '[视频] ${attachment!.displayName}';
+      if (attachment!.isPhoto) return '[图片] ${attachment!.displayName}';
+      if (attachment!.isVoiceMessage) return '[语音消息]';
+      if (attachment!.isMusic) return '[音乐] ${attachment!.musicTitle}';
+      return '[文件] ${attachment!.displayName}';
+    }
+    return '';
+  }
 
   bool get hasRenderableContent =>
       text.trim().isNotEmpty ||
       (attachment != null && attachment!.isValid) ||
       hasButtons ||
-      links.isNotEmpty;
+      links.isNotEmpty ||
+      isPhoneCall ||
+      isServiceMessage;
 
   TelegramMessage copyWith({
     int? id,
@@ -2162,6 +2367,10 @@ class TelegramMessage {
     List<String>? links,
     List<List<TelegramMessageButton>>? buttons,
     TelegramAttachment? attachment,
+    String? actionType,
+    String? callReason,
+    int? callDuration,
+    bool? callVideo,
   }) {
     return TelegramMessage(
       id: id ?? this.id,
@@ -2176,6 +2385,10 @@ class TelegramMessage {
       links: links ?? this.links,
       buttons: buttons ?? this.buttons,
       attachment: attachment ?? this.attachment,
+      actionType: actionType ?? this.actionType,
+      callReason: callReason ?? this.callReason,
+      callDuration: callDuration ?? this.callDuration,
+      callVideo: callVideo ?? this.callVideo,
     );
   }
 
@@ -2261,7 +2474,9 @@ class TelegramMessage {
     return TelegramMessage(
       id: int.tryParse((json['id'] ?? 0).toString()) ?? 0,
       date: int.tryParse((json['date'] ?? 0).toString()) ?? 0,
-      sender: (json['sender'] ?? '').toString(),
+      sender: TelegramChat.normalizePeerIdentifier(
+        (json['sender'] ?? '').toString(),
+      ),
       senderAvatar: (json['sender_avatar'] ?? json['avatar'] ?? '')
           .toString()
           .trim(),
@@ -2273,6 +2488,14 @@ class TelegramMessage {
       links: links,
       buttons: buttons,
       attachment: (parsedAtt != null && parsedAtt.isValid) ? parsedAtt : null,
+      actionType: (json['action'] ?? json['service_type'] ?? json['kind'] ?? '')
+          .toString()
+          .trim(),
+      callReason: (json['call_reason'] ?? json['reason'] ?? '').toString().trim(),
+      callDuration:
+          int.tryParse((json['call_duration'] ?? json['duration'] ?? 0).toString()) ??
+              0,
+      callVideo: json['call_video'] == true || json['video_call'] == true,
     );
   }
 }

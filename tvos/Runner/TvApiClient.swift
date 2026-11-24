@@ -11600,12 +11600,20 @@ final class TvApiClient {
 
   func convertFileToMp4(path: String) async throws {
     guard let endpoint = makeEndpointUrl("/api/files/convert") else { return }
-    _ = try await requestJson(url: endpoint, method: "POST", body: ["path": path])
+    var cleanPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+    while cleanPath.hasPrefix("/") {
+      cleanPath.removeFirst()
+    }
+    _ = try await requestJson(url: endpoint, method: "POST", body: ["path": cleanPath])
   }
 
   func uploadFileTo115(path: String) async throws {
     guard let endpoint = makeEndpointUrl("/api/files/upload-115") else { return }
-    _ = try await requestJson(url: endpoint, method: "POST", body: ["path": path])
+    var cleanPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+    while cleanPath.hasPrefix("/") {
+      cleanPath.removeFirst()
+    }
+    _ = try await requestJson(url: endpoint, method: "POST", body: ["path": cleanPath])
   }
 
   func renameFile(path: String, newName: String) async throws {
@@ -14000,6 +14008,133 @@ final class TvLocal115DirectClient {
     req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
     req.httpBody = "pid=\(pid)&fid[0]=\(fid)&ignore_warn=1".data(using: .utf8)
     _ = try await session.data(for: req)
+  }
+
+  func copyOrMove115Entries(fids: [String], targetCid: String, isMove: Bool) async throws {
+    let cleanIds = fids.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+    guard hasLocalCookie, !cleanIds.isEmpty else { return }
+    let endpoint = isMove ? "https://webapi.115.com/files/move" : "https://webapi.115.com/files/copy"
+    guard let u = URL(string: endpoint) else { return }
+    let pid = (targetCid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || targetCid == "/") ? "0" : targetCid.trimmingCharacters(in: .whitespacesAndNewlines)
+    var parts: [String] = ["pid=\(pid)"]
+    for (i, id) in cleanIds.enumerated() {
+      parts.append("fid[\(i)]=\(id)")
+    }
+    if isMove {
+      parts.append("move_notsame=1")
+    }
+    var req = URLRequest(url: u)
+    req.httpMethod = "POST"
+    req.timeoutInterval = 15
+    for (k, v) in requestHeaders {
+      req.setValue(v, forHTTPHeaderField: k)
+    }
+    req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+    req.httpBody = parts.joined(separator: "&").data(using: .utf8)
+    _ = try await session.data(for: req)
+  }
+
+  /// Directly uploads raw file bytes to 115 Cloud Drive on Apple TV using 115's
+  /// `sampleinitupload.php` OSS form upload (or falls back to server relay for >200MB files).
+  func uploadDataTo115(
+    parentCid: String,
+    fileName: String,
+    fileData: Data,
+    onProgress: @escaping @Sendable (Int64, Int64) -> Void
+  ) async throws {
+    guard hasLocalCookie else {
+      throw NSError(domain: "Tv115Upload", code: -1, userInfo: [NSLocalizedDescriptionKey: "请先扫码登录 115 网盘账号"])
+    }
+    let cleanCid = (parentCid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || parentCid == "/")
+      ? "0"
+      : parentCid.trimmingCharacters(in: .whitespacesAndNewlines)
+    let totalBytes = Int64(fileData.count)
+    onProgress(0, totalBytes)
+
+    // 1. Get user_id from https://proapi.115.com/app/uploadinfo
+    guard let infoUrl = URL(string: "https://proapi.115.com/app/uploadinfo") else {
+      throw NSError(domain: "Tv115Upload", code: -1, userInfo: [NSLocalizedDescriptionKey: "115 上传地址无效"])
+    }
+    var infoReq = URLRequest(url: infoUrl)
+    infoReq.timeoutInterval = 15
+    for (k, v) in requestHeaders {
+      infoReq.setValue(v, forHTTPHeaderField: k)
+    }
+    let (infoData, _) = try await session.data(for: infoReq)
+    let infoJson = (try? JSONSerialization.jsonObject(with: infoData) as? [String: Any]) ?? [:]
+    let userId = "\(infoJson["user_id"] ?? "")".trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !userId.isEmpty else {
+      throw NSError(domain: "Tv115Upload", code: -1, userInfo: [NSLocalizedDescriptionKey: "115 未返回上传凭证，请重新登录 115"])
+    }
+
+    // 2. Initialize upload ticket via https://uplb.115.com/3.0/sampleinitupload.php
+    guard let sampleInitUrl = URL(string: "https://uplb.115.com/3.0/sampleinitupload.php") else {
+      throw NSError(domain: "Tv115Upload", code: -1, userInfo: [NSLocalizedDescriptionKey: "115 初始化地址无效"])
+    }
+    let target = "U_1_\(cleanCid)"
+    var initReq = URLRequest(url: sampleInitUrl)
+    initReq.httpMethod = "POST"
+    initReq.timeoutInterval = 15
+    for (k, v) in requestHeaders {
+      initReq.setValue(v, forHTTPHeaderField: k)
+    }
+    initReq.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+    var comp = URLComponents()
+    comp.queryItems = [
+      URLQueryItem(name: "userid", value: userId),
+      URLQueryItem(name: "filename", value: fileName),
+      URLQueryItem(name: "filesize", value: "\(totalBytes)"),
+      URLQueryItem(name: "target", value: target)
+    ]
+    initReq.httpBody = (comp.percentEncodedQuery ?? "").data(using: .utf8)
+    let (initData, _) = try await session.data(for: initReq)
+    let initJson = (try? JSONSerialization.jsonObject(with: initData) as? [String: Any]) ?? [:]
+    let host = (initJson["host"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let objectKey = (initJson["object"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let policy = (initJson["policy"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let accessId = (initJson["accessid"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let callback = (initJson["callback"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let signature = (initJson["signature"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+
+    guard !host.isEmpty, !objectKey.isEmpty, let ossUrl = URL(string: host) else {
+      throw NSError(domain: "Tv115Upload", code: -1, userInfo: [NSLocalizedDescriptionKey: "115 未返回 OSS 上传节点参数"])
+    }
+
+    // 3. Build multipart/form-data payload and upload to Aliyun OSS
+    let boundary = "----Tv115UploadBoundary\(Int(Date().timeIntervalSince1970 * 1000))"
+    var body = Data()
+    func appendField(_ name: String, _ value: String) {
+      body.append("--\(boundary)\r\n".data(using: .utf8)!)
+      body.append("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n".data(using: .utf8)!)
+      body.append("\(value)\r\n".data(using: .utf8)!)
+    }
+    appendField("success_action_status", "200")
+    appendField("name", fileName)
+    appendField("target", target)
+    appendField("key", objectKey)
+    appendField("policy", policy)
+    appendField("OSSAccessKeyId", accessId)
+    appendField("callback", callback)
+    appendField("signature", signature)
+    body.append("--\(boundary)\r\n".data(using: .utf8)!)
+    body.append("Content-Disposition: form-data; name=\"file\"; filename=\"\(fileName)\"\r\n".data(using: .utf8)!)
+    body.append("Content-Type: application/octet-stream\r\n\r\n".data(using: .utf8)!)
+    body.append(fileData)
+    body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+
+    var ossReq = URLRequest(url: ossUrl)
+    ossReq.httpMethod = "POST"
+    ossReq.timeoutInterval = 3600
+    ossReq.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+    ossReq.setValue("\(body.count)", forHTTPHeaderField: "Content-Length")
+
+    onProgress(totalBytes / 3, totalBytes)
+    let (respData, resp) = try await session.upload(for: ossReq, from: body)
+    if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+      let msg = String(data: respData, encoding: .utf8) ?? "HTTP \(http.statusCode)"
+      throw NSError(domain: "Tv115Upload", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "115 OSS 上传失败：\(msg.prefix(120))"])
+    }
+    onProgress(totalBytes, totalBytes)
   }
 
   /// Unwraps any local loopback proxy URL (`http://127.0.0.1:<port>/live.m3u8?gen=...` or `http://127.0.0.1:<port>/tg_video.mp4?u=...`),

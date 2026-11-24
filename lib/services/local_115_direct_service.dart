@@ -3900,6 +3900,407 @@ class Local115DirectService extends ChangeNotifier {
     });
   }
 
+  /// Copies or moves 115 files/folders directly within 115 Cloud Drive (`/files/copy` or `/files/move`).
+  Future<void> copyOrMove115Entries({
+    required Iterable<String> fids,
+    required String targetCid,
+    required bool isMove,
+  }) async {
+    final ids = fids.map(_validate115FileId).toSet().toList();
+    if (ids.isEmpty) return;
+    final pid = (targetCid.trim().isEmpty || targetCid.trim() == '/')
+        ? '0'
+        : targetCid.trim();
+    if (pid != '0') {
+      _validate115FileId(pid);
+    }
+    await _post115FileOperation(isMove ? '/files/move' : '/files/copy', {
+      'pid': pid,
+      for (var i = 0; i < ids.length; i++) 'fid[$i]': ids[i],
+      if (isMove) 'move_notsame': '1',
+    });
+  }
+
+  /// Directly uploads a local file or byte array into 115 Cloud Drive (`parentCid`)
+  /// using 115's official v4.0 Upload Protocol (`initupload.php` instant SHA1 upload +
+  /// Aliyun OSS signed PUT / `sampleinitupload.php` fallback) with real-time progress.
+  Future<String> uploadFileTo115WithProgress({
+    required String parentCid,
+    required String fileName,
+    String? localFilePath,
+    Uint8List? rawBytes,
+    required bool Function() isCancelled,
+    required void Function(int sentBytes, int totalBytes, double speed)
+        onProgress,
+  }) async {
+    await ensureInitialized();
+    if (!hasLocalCookie) {
+      throw const ApiException('请先扫码或粘贴 Cookie 登录 115 网盘账号');
+    }
+    final cleanName = fileName.trim();
+    if (cleanName.isEmpty) {
+      throw const ApiException('上传文件名不能为空');
+    }
+    final cleanCid = (parentCid.trim().isEmpty || parentCid.trim() == '/')
+        ? '0'
+        : parentCid.trim();
+    if (cleanCid != '0') {
+      _validate115FileId(cleanCid);
+    }
+
+    File? fileObj;
+    int totalBytes = rawBytes?.length ?? 0;
+    if (localFilePath != null && localFilePath.isNotEmpty) {
+      fileObj = File(localFilePath);
+      if (!await fileObj.exists()) {
+        throw ApiException('待上传文件不存在：$localFilePath');
+      }
+      totalBytes = await fileObj.length();
+    }
+    if (totalBytes <= 0 && (rawBytes == null || rawBytes.isEmpty)) {
+      throw const ApiException('待上传文件为空 (0 字节)');
+    }
+
+    final startedAtMs = DateTime.now().millisecondsSinceEpoch;
+
+    // 1. Fetch 115 upload credentials (`user_id` & `userkey`)
+    final info = await _getJson(Uri.https('proapi.115.com', '/app/uploadinfo'));
+    final userId = info is Map ? info['user_id']?.toString() ?? '' : '';
+    final userKey = info is Map ? info['userkey']?.toString() ?? '' : '';
+    if (userId.isEmpty || userKey.isEmpty) {
+      throw const ApiException('115 未返回有效的上传凭证，请重新登录 115 账号');
+    }
+
+    if (isCancelled()) throw const ApiException('用户已取消上传');
+
+    // 2. Compute full-file SHA-1 (upper-case hex) and MD5 (base64)
+    final hashes = await _computeLocalFileSha1AndMd5(
+      fileObj: fileObj,
+      rawBytes: rawBytes,
+      totalBytes: totalBytes,
+      isCancelled: isCancelled,
+    );
+    final fileHash = hashes.sha1Hex;
+    final contentMd5Base64 = hashes.md5Base64;
+
+    final protocol = Cloud115UploadProtocol();
+    final target = 'U_1_$cleanCid';
+    final inner = sha1.convert(utf8.encode('$userId$fileHash${target}0'));
+    final signature = sha1
+        .convert(utf8.encode('$userKey${inner}000000'))
+        .toString()
+        .toUpperCase();
+    final userHash = md5.convert(utf8.encode(userId));
+    const appVersion = '27.0.5.7';
+
+    Future<Map<String, dynamic>> callInitUpload({
+      String signKey = '',
+      String signValue = '',
+    }) async {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final token = md5.convert(
+        utf8.encode(
+          'Qclm8MGWUv59TnrR0XPg$fileHash$totalBytes$signKey$signValue'
+          '$userId$now$userHash$appVersion',
+        ),
+      );
+      final form = Uri(
+        queryParameters: {
+          'appid': '0',
+          'appversion': appVersion,
+          'userid': userId,
+          'filename': cleanName,
+          'filesize': totalBytes.toString(),
+          'fileid': fileHash,
+          'target': target,
+          'sig': signature,
+          't': now.toString(),
+          'token': token.toString(),
+          if (signKey.isNotEmpty) 'sign_key': signKey,
+          if (signValue.isNotEmpty) 'sign_val': signValue,
+        },
+      ).query;
+      final uri = Uri.https('uplb.115.com', '/4.0/initupload.php', {
+        'k_ec': protocol.encodeToken(now),
+      });
+      const timeout = Duration(seconds: 20);
+      final request = await _httpClient.postUrl(uri).timeout(timeout);
+      request.followRedirects = false;
+      requestHeaders.forEach(request.headers.set);
+      request.headers.contentType = ContentType(
+        'application',
+        'x-www-form-urlencoded',
+      );
+      final payload = protocol.encrypt(form);
+      request.contentLength = payload.length;
+      request.add(payload);
+      final response = await request.close().timeout(timeout);
+      if (response.statusCode != HttpStatus.ok) {
+        await response.drain<void>().timeout(timeout);
+        throw ApiException('115 初始化上传失败（HTTP ${response.statusCode}）');
+      }
+      final bytes = BytesBuilder(copy: false);
+      await for (final chunk in response.timeout(timeout)) {
+        bytes.add(chunk);
+        if (bytes.length > 1024 * 1024) {
+          throw const ApiException('115 返回了异常的上传初始化响应');
+        }
+      }
+      return protocol.decodeResponse(bytes.takeBytes());
+    }
+
+    var initResult = await callInitUpload();
+    if (initResult['status']?.toString() == '7') {
+      final signKey = initResult['sign_key']?.toString() ?? '';
+      final range = RegExp(r'^(\d+)-(\d+)$')
+          .firstMatch(initResult['sign_check']?.toString() ?? '');
+      final start = int.tryParse(range?[1] ?? '');
+      final end = int.tryParse(range?[2] ?? '');
+      if (signKey.isEmpty ||
+          start == null ||
+          end == null ||
+          end < start ||
+          end >= totalBytes) {
+        throw const ApiException('115 返回了无效的秒传分段校验范围');
+      }
+      final rangeSha1 = await _computeLocalRangeSha1(
+        fileObj: fileObj,
+        rawBytes: rawBytes,
+        start: start,
+        end: end,
+      );
+      initResult = await callInitUpload(
+        signKey: signKey,
+        signValue: rangeSha1,
+      );
+    }
+
+    final statusStr = initResult['status']?.toString() ?? '';
+    // Status 2 = Instant Upload (秒传成功!)
+    if (statusStr == '2') {
+      final elapsedSec =
+          ((DateTime.now().millisecondsSinceEpoch - startedAtMs) / 1000.0)
+              .clamp(0.05, 86400.0);
+      onProgress(totalBytes, totalBytes, totalBytes / elapsedSec);
+      return initResult['pickcode']?.toString() ?? '';
+    }
+
+    if (statusStr != '1') {
+      final msg = initResult['statusmsg']?.toString().trim() ?? '';
+      throw ApiException(
+        msg.isNotEmpty ? '115 上传初始化失败：$msg' : '115 上传初始化未通过 (status=$statusStr)',
+      );
+    }
+
+    final bucket = initResult['bucket']?.toString().trim() ?? '';
+    final object = initResult['object']?.toString().trim() ?? '';
+    String callbackStr = '';
+    String callbackVarStr = '';
+    final cbField = initResult['callback'];
+    if (cbField is Map) {
+      callbackStr = cbField['callback']?.toString() ?? '';
+      callbackVarStr = cbField['callback_var']?.toString() ?? '';
+    }
+    if (bucket.isEmpty || object.isEmpty || callbackStr.isEmpty) {
+      throw const ApiException('115 未返回有效的 OSS 上传存储桶参数');
+    }
+
+    // 3. Fetch OSS STS token from `https://uplb.115.com/3.0/gettoken.php`
+    final tokenInfo =
+        await _getJson(Uri.https('uplb.115.com', '/3.0/gettoken.php'));
+    final accessKeyId =
+        tokenInfo is Map ? tokenInfo['AccessKeyId']?.toString() ?? '' : '';
+    final accessKeySecret =
+        tokenInfo is Map ? tokenInfo['AccessKeySecret']?.toString() ?? '' : '';
+    final securityToken =
+        tokenInfo is Map ? tokenInfo['SecurityToken']?.toString() ?? '' : '';
+    if (accessKeyId.isEmpty ||
+        accessKeySecret.isEmpty ||
+        securityToken.isEmpty) {
+      throw const ApiException('115 未返回有效的 OSS 上传令牌 (gettoken.php)');
+    }
+
+    // 4. Sign & stream PUT directly to Aliyun OSS (`https://<bucket>.oss-cn-shenzhen.aliyuncs.com/<object>`)
+    final ossDate = HttpDate.format(DateTime.now().toUtc());
+    const contentType = 'application/octet-stream';
+    final callbackB64 = base64Encode(utf8.encode(callbackStr));
+    final callbackVarB64 = base64Encode(utf8.encode(callbackVarStr));
+    final canonicalOssHeaders =
+        'x-oss-callback:$callbackB64\n'
+        'x-oss-callback-var:$callbackVarB64\n'
+        'x-oss-security-token:$securityToken\n';
+    final canonicalResource = '/$bucket/$object';
+    final stringToSign =
+        'PUT\n$contentMd5Base64\n$contentType\n$ossDate\n'
+        '$canonicalOssHeaders$canonicalResource';
+    final hmacSha1 = Hmac(sha1, utf8.encode(accessKeySecret));
+    final ossSig = base64Encode(hmacSha1.convert(utf8.encode(stringToSign)).bytes);
+    final authorization = 'OSS $accessKeyId:$ossSig';
+
+    final endpointHost = (tokenInfo is Map &&
+            (tokenInfo[' endpoint'] ?? tokenInfo['Endpoint']) != null)
+        ? (tokenInfo['Endpoint'] ?? tokenInfo[' endpoint'])
+            .toString()
+            .replaceFirst(RegExp(r'^https?://'), '')
+            .trim()
+        : 'oss-cn-shenzhen.aliyuncs.com';
+    final ossHost =
+        endpointHost.isEmpty ? 'oss-cn-shenzhen.aliyuncs.com' : endpointHost;
+    final ossUri = Uri(
+      scheme: 'https',
+      host: '$bucket.$ossHost',
+      path: '/$object',
+    );
+
+    Stream<List<int>> openByteStream() {
+      if (fileObj != null) {
+        return fileObj.openRead();
+      }
+      return Stream<List<int>>.fromIterable(_chunkRawBytes(rawBytes!, 65536));
+    }
+
+    final req = await _httpClient
+        .openUrl('PUT', ossUri)
+        .timeout(const Duration(seconds: 30));
+    req.bufferOutput = false;
+    req.followRedirects = false;
+    req.headers.set('Date', ossDate);
+    req.headers.set(HttpHeaders.contentTypeHeader, contentType);
+    req.headers.set('Content-MD5', contentMd5Base64);
+    req.headers.set('x-oss-callback', callbackB64);
+    req.headers.set('x-oss-callback-var', callbackVarB64);
+    req.headers.set('x-oss-security-token', securityToken);
+    req.headers.set(HttpHeaders.authorizationHeader, authorization);
+    req.headers.set(HttpHeaders.userAgentHeader, 'aliyun-sdk-go/2.2.6');
+    req.contentLength = totalBytes;
+
+    int sent = 0;
+    int lastReportMs = 0;
+    final trackedStream = openByteStream().transform<List<int>>(
+      StreamTransformer<List<int>, List<int>>.fromHandlers(
+        handleData: (chunk, sink) {
+          if (isCancelled()) {
+            sink.addError(const ApiException('用户已取消上传'));
+            return;
+          }
+          sink.add(chunk);
+          sent += chunk.length;
+          final nowMs = DateTime.now().millisecondsSinceEpoch;
+          if (nowMs - lastReportMs >= 100 || sent >= totalBytes) {
+            lastReportMs = nowMs;
+            final elapsedSec =
+                ((nowMs - startedAtMs) / 1000.0).clamp(0.05, 86400.0);
+            onProgress(sent, totalBytes, sent / elapsedSec);
+          }
+        },
+      ),
+    );
+
+    await req.addStream(trackedStream);
+    final resp = await req.close();
+    final respBodyBytes =
+        await resp.fold<List<int>>(<int>[], (acc, b) => acc..addAll(b));
+    final respText = utf8.decode(respBodyBytes, allowMalformed: true).trim();
+    if (resp.statusCode < 200 || resp.statusCode >= 300) {
+      throw ApiException(
+        '115 OSS 上传失败 (HTTP ${resp.statusCode}): ${respText.length > 160 ? respText.substring(0, 160) : respText}',
+        statusCode: resp.statusCode,
+      );
+    }
+
+    String pickcode = '';
+    if (respText.startsWith('{')) {
+      try {
+        final decoded = jsonDecode(respText);
+        if (decoded is Map<String, dynamic>) {
+          final st = decoded['state'];
+          if (st == false || st?.toString() == '0') {
+            final errMsg =
+                (decoded['error'] ?? decoded['message'] ?? '115 上传回调校验失败')
+                    .toString();
+            throw ApiException(errMsg);
+          }
+          final data = decoded['data'];
+          if (data is Map) {
+            pickcode = (data['pick_code'] ?? data['pickcode'] ?? '').toString();
+          }
+        }
+      } catch (e) {
+        if (e is ApiException) rethrow;
+      }
+    }
+
+    final elapsedSec =
+        ((DateTime.now().millisecondsSinceEpoch - startedAtMs) / 1000.0)
+            .clamp(0.05, 86400.0);
+    onProgress(totalBytes, totalBytes, totalBytes / elapsedSec);
+    return pickcode;
+  }
+
+  static Iterable<List<int>> _chunkRawBytes(
+    Uint8List bytes,
+    int chunkSize,
+  ) sync* {
+    for (int i = 0; i < bytes.length; i += chunkSize) {
+      final end = (i + chunkSize < bytes.length) ? i + chunkSize : bytes.length;
+      yield Uint8List.sublistView(bytes, i, end);
+    }
+  }
+
+  Future<({String sha1Hex, String md5Base64})> _computeLocalFileSha1AndMd5({
+    required File? fileObj,
+    required Uint8List? rawBytes,
+    required int totalBytes,
+    required bool Function() isCancelled,
+  }) async {
+    if (fileObj == null && rawBytes != null && rawBytes.isNotEmpty) {
+      if (isCancelled()) throw const ApiException('用户已取消上传');
+      final s1 = sha1.convert(rawBytes).toString().toUpperCase();
+      final m5 = base64Encode(md5.convert(rawBytes).bytes);
+      return (sha1Hex: s1, md5Base64: m5);
+    }
+    if (fileObj == null) {
+      throw const ApiException('无法读取待上传文件数据');
+    }
+    final sha1Ctrl = StreamController<List<int>>();
+    final md5Ctrl = StreamController<List<int>>();
+    final sha1Future = sha1.bind(sha1Ctrl.stream).first;
+    final md5Future = md5.bind(md5Ctrl.stream).first;
+    try {
+      await for (final chunk in fileObj.openRead()) {
+        if (isCancelled()) {
+          throw const ApiException('用户已取消上传');
+        }
+        sha1Ctrl.add(chunk);
+        md5Ctrl.add(chunk);
+      }
+    } finally {
+      await sha1Ctrl.close();
+      await md5Ctrl.close();
+    }
+    final s1Digest = await sha1Future;
+    final m5Digest = await md5Future;
+    return (
+      sha1Hex: s1Digest.toString().toUpperCase(),
+      md5Base64: base64Encode(m5Digest.bytes),
+    );
+  }
+
+  Future<String> _computeLocalRangeSha1({
+    required File? fileObj,
+    required Uint8List? rawBytes,
+    required int start,
+    required int end,
+  }) async {
+    if (fileObj == null && rawBytes != null && rawBytes.isNotEmpty) {
+      final slice = Uint8List.sublistView(rawBytes, start, end + 1);
+      return sha1.convert(slice).toString().toUpperCase();
+    }
+    final stream = fileObj!.openRead(start, end + 1);
+    final digest = await sha1.bind(stream).first;
+    return digest.toString().toUpperCase();
+  }
+
   static final _valid115FileId = RegExp(r'^[1-9][0-9]*$');
 
   static String _validate115FileId(String fid) {

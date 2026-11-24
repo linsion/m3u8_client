@@ -32,7 +32,8 @@ class TelegramNotificationService extends ChangeNotifier {
     r'^(user|chat|channel):[1-9]\d*$',
   );
   static final RegExp _rawPeerTitleRegex = RegExp(
-    r'^(user|chat|channel):\d+$',
+    r'^:?(user|chat|channel):\d+$',
+    caseSensitive: false,
   );
 
   final ApiClient Function() _apiProvider;
@@ -598,17 +599,30 @@ class TelegramNotificationService extends ChangeNotifier {
             : (message.sender.trim().isNotEmpty
                 ? message.sender.trim()
                 : 'Telegram 新消息'));
-    final title =
-        _rawPeerTitleRegex.hasMatch(rawTitle) ? 'Telegram 新消息' : rawTitle;
+    final title = _rawPeerTitleRegex.hasMatch(rawTitle)
+        ? 'Telegram 新消息'
+        : rawTitle;
 
-    final rawText = message.text.trim();
-    final contentText = (rawText.isNotEmpty && !rawText.startsWith('[暂不支持'))
-        ? rawText
+    final isPrivateChat = event.peer.startsWith('user:');
+    final resolvedMsgPreview =
+        message.resolvedPreviewText(isPrivateUserChat: isPrivateChat).trim();
+    final contentText = (resolvedMsgPreview.isNotEmpty &&
+            !resolvedMsgPreview.startsWith('[暂不支持'))
+        ? resolvedMsgPreview
         : (message.attachment?.displayName.isNotEmpty == true
             ? '[${message.attachment!.isVideo ? "视频" : (message.attachment!.isPhoto ? "图片" : "文件")}] ${message.attachment!.displayName}'
             : '收到一条新消息');
 
-    final senderClean = message.sender.trim();
+    var senderClean = message.sender.trim();
+    if (_rawPeerTitleRegex.hasMatch(senderClean)) {
+      final resolvedSender = _resolveChatTitle(
+        account.id,
+        TelegramChat.normalizePeerIdentifier(senderClean),
+      ).trim();
+      senderClean = _rawPeerTitleRegex.hasMatch(resolvedSender)
+          ? ''
+          : resolvedSender;
+    }
     final senderPrefix = (senderClean.isNotEmpty &&
             senderClean != title &&
             !_rawPeerTitleRegex.hasMatch(senderClean))

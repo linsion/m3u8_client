@@ -2826,7 +2826,10 @@ class ApiClient {
 
   /// Convert a TS video file to MP4 on the server
   Future<void> convertFileToMp4(String filePath) async {
-    final cleanPath = filePath.trim();
+    var cleanPath = filePath.trim();
+    while (cleanPath.startsWith('/')) {
+      cleanPath = cleanPath.substring(1);
+    }
     try {
       await _postJson('/api/files/convert', body: {'path': cleanPath});
     } on ApiException catch (e) {
@@ -2845,7 +2848,10 @@ class ApiClient {
 
   /// Upload a server file to 115 Cloud Drive
   Future<void> uploadFileTo115(String filePath) async {
-    final cleanPath = filePath.trim();
+    var cleanPath = filePath.trim();
+    while (cleanPath.startsWith('/')) {
+      cleanPath = cleanPath.substring(1);
+    }
     try {
       await _postJson('/api/files/upload-115', body: {'path': cleanPath});
     } on ApiException catch (e) {
