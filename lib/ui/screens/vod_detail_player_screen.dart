@@ -52,9 +52,6 @@ class VodDetailPlayerScreen extends StatefulWidget {
 }
 
 class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
-  static const MethodChannel _nativeUtilsChannel =
-      MethodChannel('com.linsion.m3u8_client/native_utils');
-
   late final Player _player;
   late final VideoController _videoController;
 
@@ -2547,6 +2544,88 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
     }
   }
 
+  final Set<String> _adding115DownloadKeys = <String>{};
+  final Set<String> _done115DownloadKeys = <String>{};
+  final Set<String> _failed115DownloadKeys = <String>{};
+
+  Future<void> _downloadCurrentEpisodeTo115() async {
+    final detail = _detail;
+    final ep = _currentEpisode;
+    final resolved = _resolvedPlayback;
+    if (detail == null || ep == null) return;
+    final epKey = _episodeDownloadKey(ep);
+    if (_adding115DownloadKeys.contains(epKey)) return;
+
+    final authed = await ensure115AuthenticatedForDownload(
+      context: context,
+      api: widget.appState.api,
+    );
+    if (!authed || !mounted) return;
+
+    setState(() {
+      _adding115DownloadKeys.add(epKey);
+      _failed115DownloadKeys.remove(epKey);
+    });
+
+    String downloadUrl = resolved?.directUrl ?? '';
+    Map<String, String> headers = resolved?.headers ?? {};
+
+    if (downloadUrl.isEmpty) {
+      try {
+        final r = await widget.appState.api.resolveVodPlayback(
+          _activeSource,
+          playGroup: ep.groupName,
+          episodeUrl: ep.rawUrl,
+        );
+        downloadUrl = r.directUrl;
+        headers = r.headers;
+      } catch (e) {
+        if (!mounted) return;
+        setState(() {
+          _adding115DownloadKeys.remove(epKey);
+          _failed115DownloadKeys.add(epKey);
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('解析下载地址失败：$e')),
+        );
+        return;
+      }
+    }
+
+    if (!mounted) return;
+    final taskName = detail.playGroups.any((g) => g.episodes.length > 1)
+        ? '${detail.vodName} - ${ep.title}'
+        : detail.vodName;
+
+    final res = await trigger115CloudDownload(
+      context: context,
+      api: widget.appState.api,
+      downloadUrl: downloadUrl,
+      fileName: taskName,
+      headers: headers,
+      videoContext: {
+        'source': _activeSource.librarySourceKey,
+        'vod_id': detail.vodId,
+        'vod_name': detail.vodName,
+        'episode': ep.title,
+        'line': ep.groupName,
+      },
+    );
+    if (!mounted) return;
+    setState(() {
+      _adding115DownloadKeys.remove(epKey);
+      if (res.ok) {
+        _done115DownloadKeys.add(epKey);
+        _failed115DownloadKeys.remove(epKey);
+      } else {
+        _failed115DownloadKeys.add(epKey);
+      }
+    });
+    if (res.ok) {
+      await widget.appState.refreshDownloadTasks(silent: true);
+    }
+  }
+
   void _onProxyNodeSwitched(String statusMessage) {
     if (!mounted) return;
     _lastVodRouteSignature = _computeVodRouteSignature();
@@ -2701,14 +2780,17 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                         FilledButton.icon(
                           onPressed: () async {
                             try {
-                              final res = await _nativeUtilsChannel
-                                  .invokeMethod<dynamic>('pickFiles', {
-                                'allowMultiple': false,
-                              });
-                              if (res is List && res.isNotEmpty) {
-                                final path = res.first.toString().trim();
+                              final res =
+                                  await NativeUtilsChannelHub.pickSystemFiles(
+                                mediaOnly: false,
+                                allowMultiple: false,
+                              );
+                              if (res != null && res.isNotEmpty) {
+                                final path =
+                                    (res.first['path'] ?? '').toString().trim();
                                 if (path.isNotEmpty) {
-                                  final name = path.split('/').last;
+                                  final name =
+                                      path.split(RegExp(r'[/\\]')).last;
                                   await _player.setSubtitleTrack(
                                     SubtitleTrack.uri(
                                       Uri.file(path).toString(),
@@ -3252,6 +3334,90 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                   onPressed:
                       isSubmitting ? null : () => Navigator.of(ctx).pop(),
                   child: const Text('取消'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: isSubmitting || selectedIndices.isEmpty
+                      ? null
+                      : () async {
+                          final authed =
+                              await ensure115AuthenticatedForDownload(
+                            context: context,
+                            api: widget.appState.api,
+                          );
+                          if (!authed) return;
+                          setDialogState(() {
+                            isSubmitting = true;
+                            processedCount = 0;
+                          });
+                          var successCount = 0;
+                          final sorted = selectedIndices.toList()..sort();
+                          const batchSize = 3;
+                          for (var i = 0; i < sorted.length; i += batchSize) {
+                            final chunk = sorted.skip(i).take(batchSize);
+                            await Future.wait(
+                              chunk.map((epIdx) async {
+                                if (epIdx < 0 ||
+                                    epIdx >= group.episodes.length) {
+                                  return;
+                                }
+                                final ep = group.episodes[epIdx];
+                                try {
+                                  final r = await widget.appState.api
+                                      .resolveVodPlayback(
+                                    _activeSource,
+                                    playGroup: ep.groupName,
+                                    episodeUrl: ep.rawUrl,
+                                  );
+                                  if (r.directUrl.isNotEmpty && mounted) {
+                                    final res = await trigger115CloudDownload(
+                                      context: context,
+                                      api: widget.appState.api,
+                                      downloadUrl: r.directUrl,
+                                      fileName:
+                                          '${detail.vodName} - ${ep.title}',
+                                      headers: r.headers,
+                                      videoContext: {
+                                        'source':
+                                            _activeSource.librarySourceKey,
+                                        'vod_id': detail.vodId,
+                                        'vod_name': detail.vodName,
+                                        'episode': ep.title,
+                                        'line': ep.groupName,
+                                      },
+                                      showSnackBar: false,
+                                    );
+                                    if (res.ok) {
+                                      successCount++;
+                                    }
+                                  }
+                                } catch (_) {
+                                } finally {
+                                  processedCount++;
+                                  if (ctx.mounted) {
+                                    setDialogState(() {});
+                                  }
+                                }
+                              }),
+                            );
+                          }
+                          await widget.appState.refreshDownloadTasks(
+                            silent: true,
+                          );
+                          if (ctx.mounted) {
+                            Navigator.of(ctx).pop();
+                          }
+                          if (mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text(
+                                  '☁️ 已成功批量提交 $successCount 个 115云下载任务',
+                                ),
+                              ),
+                            );
+                          }
+                        },
+                  icon: const Icon(Icons.cloud_download_rounded, size: 16),
+                  label: Text('批量115云下载 (${selectedIndices.length})'),
                 ),
                 FilledButton.icon(
                   onPressed: isSubmitting || selectedIndices.isEmpty
@@ -6915,6 +7081,38 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
             activeColor: const Color(0xFF22C55E),
             onTap: (ep == null || isAdding) ? null : _downloadCurrentEpisode,
           ),
+          const SizedBox(width: 8),
+          Builder(
+            builder: (_) {
+              final isAdding115 =
+                  epKey.isNotEmpty && _adding115DownloadKeys.contains(epKey);
+              final isDone115 =
+                  epKey.isNotEmpty && _done115DownloadKeys.contains(epKey);
+              final isFailed115 =
+                  epKey.isNotEmpty && _failed115DownloadKeys.contains(epKey);
+              return buildActionPill(
+                icon: isDone115
+                    ? Icons.check_circle_rounded
+                    : (isFailed115
+                        ? Icons.error_outline_rounded
+                        : Icons.cloud_download_rounded),
+                label: isAdding115
+                    ? '115提交中...'
+                    : (isDone115
+                        ? '已存115 ✓'
+                        : (isFailed115 ? '115失败·重试' : '115云下载')),
+                highlighted: isDone115 || isFailed115,
+                activeColor: isDone115
+                    ? const Color(0xFF22C55E)
+                    : (isFailed115
+                        ? VideoPlatformTheme.danger
+                        : const Color(0xFF38BDF8)),
+                onTap: (ep == null || isAdding115)
+                    ? null
+                    : _downloadCurrentEpisodeTo115,
+              );
+            },
+          ),
           if (detail != null && detail.playGroups.isNotEmpty) ...[
             const SizedBox(width: 8),
             buildActionPill(
@@ -7305,6 +7503,65 @@ class _VodDetailPlayerScreenState extends State<VodDetailPlayerScreen> {
                               ? 'l_done'
                               : (isFailed ? 'l_err' : 'l_idle')),
                     ),
+                  ),
+                ),
+              );
+            },
+          ),
+          // 115 Cloud Download current episode with animated status feedback
+          Builder(
+            builder: (_) {
+              final ep = _currentEpisode;
+              final epKey = ep == null ? '' : _episodeDownloadKey(ep);
+              final isAdding115 =
+                  epKey.isNotEmpty && _adding115DownloadKeys.contains(epKey);
+              final isDone115 =
+                  epKey.isNotEmpty && _done115DownloadKeys.contains(epKey);
+              final isFailed115 =
+                  epKey.isNotEmpty && _failed115DownloadKeys.contains(epKey);
+              return OutlinedButton.icon(
+                style: OutlinedButton.styleFrom(
+                  side: isDone115
+                      ? const BorderSide(color: Color(0xFF22C55E))
+                      : (isFailed115
+                          ? BorderSide(color: VideoPlatformTheme.danger)
+                          : null),
+                ),
+                onPressed: (ep == null || isAdding115)
+                    ? null
+                    : _downloadCurrentEpisodeTo115,
+                icon: isAdding115
+                    ? const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Color(0xFF38BDF8),
+                        ),
+                      )
+                    : Icon(
+                        isDone115
+                            ? Icons.check_circle_rounded
+                            : (isFailed115
+                                ? Icons.error_outline_rounded
+                                : Icons.cloud_download_rounded),
+                        size: 16,
+                        color: isDone115
+                            ? const Color(0xFF22C55E)
+                            : (isFailed115
+                                ? VideoPlatformTheme.danger
+                                : const Color(0xFF38BDF8)),
+                      ),
+                label: Text(
+                  isAdding115
+                      ? '115提交中...'
+                      : (isDone115
+                          ? '已存115 ✓'
+                          : (isFailed115 ? '115失败·重试' : '115云下载')),
+                  style: TextStyle(
+                    color: isDone115
+                        ? const Color(0xFF22C55E)
+                        : (isFailed115 ? VideoPlatformTheme.danger : null),
                   ),
                 ),
               );

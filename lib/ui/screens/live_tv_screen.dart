@@ -5526,15 +5526,14 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
                     TextButton.icon(
                       onPressed: () async {
                         try {
-                          const channel = MethodChannel(
-                            'com.linsion.m3u8_client/native_utils',
+                          final res =
+                              await NativeUtilsChannelHub.pickSystemFiles(
+                            mediaOnly: false,
+                            allowMultiple: false,
                           );
-                          final res = await channel.invokeMethod<dynamic>(
-                            'pickFiles',
-                            {'allowMultiple': false},
-                          );
-                          if (res is List && res.isNotEmpty) {
-                            final path = res.first.toString().trim();
+                          if (res != null && res.isNotEmpty) {
+                            final path =
+                                (res.first['path'] ?? '').toString().trim();
                             if (path.isNotEmpty) {
                               final fileName =
                                   path.split(RegExp(r'[/\\]')).last;

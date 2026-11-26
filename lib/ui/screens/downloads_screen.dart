@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -13,6 +12,7 @@ import '../../state/app_state.dart';
 import '../theme.dart';
 import '../widgets/cloud_music_player.dart';
 import '../widgets/mobile_edge_swipe_back.dart';
+import '../widgets/video_115_accelerate_button.dart';
 import '../widgets/video_download_speed_badge.dart';
 
 class DownloadsScreen extends StatefulWidget {
@@ -42,6 +42,10 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
     super.initState();
     _checkClipboardForVideoLink();
   }
+
+  final Set<String> _pending115TaskIds = <String>{};
+  final Set<String> _completed115TaskIds = <String>{};
+  final Set<String> _failed115TaskIds = <String>{};
 
   @override
   void dispose() {
@@ -248,6 +252,86 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
                       isSubmitting ? null : () => Navigator.of(ctx).pop(),
                   child: const Text('取消'),
                 ),
+                OutlinedButton.icon(
+                  onPressed: isSubmitting
+                      ? null
+                      : () async {
+                          final rawLines = textCtrl.text
+                              .split(RegExp(r'\r?\n'))
+                              .map((l) => l.trim())
+                              .where((l) => l.isNotEmpty)
+                              .toList();
+                          if (rawLines.isEmpty) return;
+                          final authed =
+                              await ensure115AuthenticatedForDownload(
+                            context: context,
+                            api: widget.appState.api,
+                          );
+                          if (!authed) return;
+
+                          setDialogState(() {
+                            isSubmitting = true;
+                            submittedCount = 0;
+                          });
+
+                          final prefix = prefixCtrl.text.trim();
+                          final headers = <String, String>{
+                            if (refererCtrl.text.trim().isNotEmpty)
+                              'Referer': refererCtrl.text.trim(),
+                          };
+
+                          for (var i = 0; i < rawLines.length; i++) {
+                            final line = rawLines[i];
+                            String name = '';
+                            String url = line;
+                            if (line.contains('\$')) {
+                              final idx = line.indexOf('\$');
+                              name = line.substring(0, idx).trim();
+                              url = line.substring(idx + 1).trim();
+                            } else if (line.contains(',') &&
+                                line.indexOf(',') < line.indexOf('http')) {
+                              final idx = line.indexOf(',');
+                              name = line.substring(0, idx).trim();
+                              url = line.substring(idx + 1).trim();
+                            }
+                            if (url.isEmpty) continue;
+                            if (name.isEmpty) {
+                              name =
+                                  '第${(i + 1).toString().padLeft(2, '0')}集';
+                            }
+                            if (prefix.isNotEmpty && !name.startsWith(prefix)) {
+                              name = '$prefix - $name';
+                            }
+                            if (!mounted) break;
+                            final res = await trigger115CloudDownload(
+                              context: context,
+                              api: widget.appState.api,
+                              downloadUrl: url,
+                              fileName: name,
+                              headers: headers,
+                              showSnackBar: false,
+                            );
+                            if (res.ok) {
+                              submittedCount++;
+                              if (ctx.mounted) setDialogState(() {});
+                            }
+                          }
+
+                          await widget.appState.refreshDownloadTasks();
+                          if (ctx.mounted) Navigator.of(ctx).pop();
+                          if (mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text(
+                                  '☁️ 已批量提交 $submittedCount 个 115云下载任务',
+                                ),
+                              ),
+                            );
+                          }
+                        },
+                  icon: const Icon(Icons.cloud_download_rounded, size: 16),
+                  label: const Text('批量115云下载'),
+                ),
                 FilledButton.icon(
                   onPressed: isSubmitting
                       ? null
@@ -325,9 +409,6 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
         );
       },
     );
-    textCtrl.dispose();
-    prefixCtrl.dispose();
-    refererCtrl.dispose();
   }
 
   Future<void> _showCreateTaskDialog() async {
@@ -581,6 +662,32 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
                                       },
                                     ),
                                     IconButton(
+                                      tooltip: '115云下载此视频流',
+                                      visualDensity: VisualDensity.compact,
+                                      icon: const Icon(
+                                        Icons.cloud_download_rounded,
+                                        size: 17,
+                                        color: Color(0xFF38BDF8),
+                                      ),
+                                      onPressed: () async {
+                                        final taskName = c.title.isNotEmpty
+                                            ? c.title
+                                            : (nameCtrl.text.trim().isNotEmpty
+                                                ? nameCtrl.text.trim()
+                                                : '嗅探视频_${DateTime.now().millisecondsSinceEpoch ~/ 1000}');
+                                        Navigator.of(ctx).pop();
+                                        await trigger115CloudDownload(
+                                          context: context,
+                                          api: widget.appState.api,
+                                          downloadUrl: c.url,
+                                          fileName: taskName,
+                                          headers: c.headers,
+                                        );
+                                        await widget.appState
+                                            .refreshDownloadTasks();
+                                      },
+                                    ),
+                                    IconButton(
                                       tooltip: '复制 cURL 命令 (含防盗链 Header)',
                                       visualDensity: VisualDensity.compact,
                                       icon: const Icon(
@@ -669,6 +776,52 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
                   onPressed:
                       isSubmitting ? null : () => Navigator.of(ctx).pop(),
                   child: const Text('取消'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: isSubmitting
+                      ? null
+                      : () async {
+                          final rawUrl = urlCtrl.text.trim();
+                          if (rawUrl.isEmpty) {
+                            setDialogState(() => dialogError = '请输入下载链接');
+                            return;
+                          }
+                          final taskName = nameCtrl.text.trim().isNotEmpty
+                              ? nameCtrl.text.trim()
+                              : '视频下载_${DateTime.now().millisecondsSinceEpoch ~/ 1000}';
+                          final headers = <String, String>{};
+                          if (refererCtrl.text.trim().isNotEmpty) {
+                            headers['Referer'] = refererCtrl.text.trim();
+                          }
+                          if (uaCtrl.text.trim().isNotEmpty) {
+                            headers['User-Agent'] = uaCtrl.text.trim();
+                          }
+
+                          setDialogState(() {
+                            isSubmitting = true;
+                            dialogError = null;
+                          });
+                          final res = await trigger115CloudDownload(
+                            context: context,
+                            api: widget.appState.api,
+                            downloadUrl: rawUrl,
+                            fileName: taskName,
+                            headers: headers,
+                          );
+                          if (res.ok) {
+                            await widget.appState.refreshDownloadTasks();
+                            if (ctx.mounted) Navigator.of(ctx).pop();
+                          } else {
+                            if (ctx.mounted) {
+                              setDialogState(() {
+                                isSubmitting = false;
+                                dialogError = res.message;
+                              });
+                            }
+                          }
+                        },
+                  icon: const Icon(Icons.cloud_download_rounded, size: 16),
+                  label: const Text('115云下载'),
                 ),
                 FilledButton.icon(
                   onPressed: isSubmitting
@@ -1231,6 +1384,30 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
                   },
                   icon: const Icon(Icons.play_arrow_rounded, size: 16),
                   label: const Text('直接播放'),
+                ),
+                const SizedBox(width: 6),
+                OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                  ),
+                  onPressed: () async {
+                    final url = _sniffedClipboardUrl!;
+                    setState(() {
+                      _dismissedClipboardUrl = url;
+                      _sniffedClipboardUrl = null;
+                    });
+                    final name =
+                        '剪贴板嗅探_${DateTime.now().millisecondsSinceEpoch ~/ 1000}';
+                    await trigger115CloudDownload(
+                      context: context,
+                      api: widget.appState.api,
+                      downloadUrl: url,
+                      fileName: name,
+                    );
+                    await widget.appState.refreshDownloadTasks();
+                  },
+                  icon: const Icon(Icons.cloud_download_rounded, size: 15),
+                  label: const Text('115云下载'),
                 ),
                 const SizedBox(width: 6),
                 FilledButton.icon(
@@ -1882,7 +2059,17 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
                       ),
                       onPressed: localSavePct != null
                           ? null
-                          : () => _saveTaskToLocalOffline(task),
+                          : () {
+                              final savedPath = _localOfflinePathByTaskId[task.id];
+                              if (savedPath != null &&
+                                  File(savedPath).existsSync()) {
+                                NativeUtilsChannelHub.revealOrOpenLocalPath(
+                                  savedPath,
+                                );
+                              } else {
+                                _saveTaskToLocalOffline(task);
+                              }
+                            },
                       icon: Icon(
                         hasLocalOffline
                             ? Icons.offline_pin_rounded
@@ -1898,32 +2085,206 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
                         style: const TextStyle(fontSize: 12),
                       ),
                     ),
-                    OutlinedButton.icon(
-                      style: OutlinedButton.styleFrom(
-                        visualDensity: VisualDensity.compact,
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 9,
-                          vertical: 4,
-                        ),
-                      ),
-                      onPressed: () async {
-                        try {
-                          await widget.appState.api.uploadTaskTo115(task.id);
-                          if (mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(content: Text('已触发上传 115 网盘')),
-                            );
-                          }
-                        } catch (e) {
-                          if (mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(content: Text('上传 115 失败：$e')),
-                            );
-                          }
-                        }
+                    Builder(
+                      builder: (_) {
+                        final isPending115 =
+                            task.uploading115 ||
+                            _pending115TaskIds.contains(task.id);
+                        final isDone115 =
+                            task.uploaded115 ||
+                            _completed115TaskIds.contains(task.id);
+                        final isFailed115 = _failed115TaskIds.contains(task.id);
+                        return OutlinedButton.icon(
+                          style: OutlinedButton.styleFrom(
+                            visualDensity: VisualDensity.compact,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 9,
+                              vertical: 4,
+                            ),
+                            side: isDone115
+                                ? BorderSide(color: VideoPlatformTheme.success)
+                                : (isFailed115
+                                    ? BorderSide(
+                                        color: VideoPlatformTheme.danger,
+                                      )
+                                    : null),
+                          ),
+                          onPressed: (isDone115 || isPending115)
+                              ? null
+                              : () async {
+                                  final authed =
+                                      await ensure115AuthenticatedForDownload(
+                                    context: context,
+                                    api: widget.appState.api,
+                                  );
+                                  if (!authed || !mounted) return;
+                                  setState(() {
+                                    _pending115TaskIds.add(task.id);
+                                    _failed115TaskIds.remove(task.id);
+                                  });
+                                  try {
+                                    await widget.appState.api
+                                        .uploadTaskTo115(task.id);
+                                    await widget.appState
+                                        .refreshDownloadTasks();
+                                    if (mounted) {
+                                      setState(() {
+                                        _pending115TaskIds.remove(task.id);
+                                        _completed115TaskIds.add(task.id);
+                                      });
+                                      ScaffoldMessenger.of(context)
+                                          .showSnackBar(
+                                        const SnackBar(
+                                          content: Text(
+                                            '☁️ 已启动 115云下载 (转存至 115 网盘)',
+                                          ),
+                                        ),
+                                      );
+                                    }
+                                  } catch (e) {
+                                    if (mounted) {
+                                      setState(() {
+                                        _pending115TaskIds.remove(task.id);
+                                        _failed115TaskIds.add(task.id);
+                                      });
+                                      ScaffoldMessenger.of(context)
+                                          .showSnackBar(
+                                        SnackBar(
+                                          content: Text('115云下载失败：$e'),
+                                        ),
+                                      );
+                                    }
+                                  }
+                                },
+                          icon: isPending115
+                              ? SizedBox(
+                                  width: 13,
+                                  height: 13,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 1.8,
+                                    color: VideoPlatformTheme.accent,
+                                  ),
+                                )
+                              : Icon(
+                                  isDone115
+                                      ? Icons.check_circle_rounded
+                                      : (isFailed115
+                                          ? Icons.error_outline_rounded
+                                          : Icons.cloud_upload_outlined),
+                                  size: 15,
+                                  color: isDone115
+                                      ? VideoPlatformTheme.success
+                                      : (isFailed115
+                                          ? VideoPlatformTheme.danger
+                                          : null),
+                                ),
+                          label: Text(
+                            isPending115
+                                ? '115转存中...'
+                                : (isDone115
+                                    ? '已存115 ✓'
+                                    : (isFailed115 ? '115失败·重试' : '115云下载')),
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: isDone115
+                                  ? VideoPlatformTheme.success
+                                  : (isFailed115
+                                      ? VideoPlatformTheme.danger
+                                      : null),
+                            ),
+                          ),
+                        );
                       },
-                      icon: const Icon(Icons.cloud_upload_outlined, size: 15),
-                      label: const Text('上传115', style: TextStyle(fontSize: 12)),
+                    ),
+                  ] else ...[
+                    Builder(
+                      builder: (_) {
+                        final isPending115 =
+                            task.uploading115 ||
+                            _pending115TaskIds.contains(task.id);
+                        final isDone115 =
+                            task.uploaded115 ||
+                            _completed115TaskIds.contains(task.id);
+                        final isFailed115 = _failed115TaskIds.contains(task.id);
+                        return OutlinedButton.icon(
+                          style: OutlinedButton.styleFrom(
+                            visualDensity: VisualDensity.compact,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 9,
+                              vertical: 4,
+                            ),
+                            side: isDone115
+                                ? BorderSide(color: VideoPlatformTheme.success)
+                                : (isFailed115
+                                    ? BorderSide(
+                                        color: VideoPlatformTheme.danger,
+                                      )
+                                    : null),
+                          ),
+                          onPressed: isPending115
+                              ? null
+                              : () async {
+                                  setState(() {
+                                    _pending115TaskIds.add(task.id);
+                                    _failed115TaskIds.remove(task.id);
+                                  });
+                                  final res = await trigger115CloudDownload(
+                                    context: context,
+                                    api: widget.appState.api,
+                                    downloadUrl: task.url,
+                                    fileName: task.name,
+                                  );
+                                  if (!mounted) return;
+                                  setState(() {
+                                    _pending115TaskIds.remove(task.id);
+                                    if (res.ok) {
+                                      _completed115TaskIds.add(task.id);
+                                      _failed115TaskIds.remove(task.id);
+                                    } else {
+                                      _failed115TaskIds.add(task.id);
+                                    }
+                                  });
+                                  await widget.appState.refreshDownloadTasks();
+                                },
+                          icon: isPending115
+                              ? SizedBox(
+                                  width: 13,
+                                  height: 13,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 1.8,
+                                    color: VideoPlatformTheme.accent,
+                                  ),
+                                )
+                              : Icon(
+                                  isDone115
+                                      ? Icons.check_circle_rounded
+                                      : (isFailed115
+                                          ? Icons.error_outline_rounded
+                                          : Icons.cloud_download_rounded),
+                                  size: 15,
+                                  color: isDone115
+                                      ? VideoPlatformTheme.success
+                                      : (isFailed115
+                                          ? VideoPlatformTheme.danger
+                                          : null),
+                                ),
+                          label: Text(
+                            isPending115
+                                ? '115提交中...'
+                                : (isDone115
+                                    ? '已存115 ✓'
+                                    : (isFailed115 ? '115失败·重试' : '115云下载')),
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: isDone115
+                                  ? VideoPlatformTheme.success
+                                  : (isFailed115
+                                      ? VideoPlatformTheme.danger
+                                      : null),
+                            ),
+                          ),
+                        );
+                      },
                     ),
                   ],
                   if (task.isFailed)
@@ -2431,12 +2792,12 @@ class _DirectVideoPlayerDialogState extends State<_DirectVideoPlayerDialog> {
 
   Future<void> _pickExternalSubtitleFile(BuildContext sheetCtx) async {
     try {
-      const channel = MethodChannel('com.linsion.m3u8_client/native_utils');
-      final res = await channel.invokeMethod<dynamic>('pickFiles', {
-        'allowMultiple': false,
-      });
-      if (res is List && res.isNotEmpty) {
-        final path = res.first.toString().trim();
+      final res = await NativeUtilsChannelHub.pickSystemFiles(
+        mediaOnly: false,
+        allowMultiple: false,
+      );
+      if (res != null && res.isNotEmpty) {
+        final path = (res.first['path'] ?? '').toString().trim();
         if (path.isNotEmpty) {
           final name = path.split(RegExp(r'[/\\]')).last;
           final sub = SubtitleTrack.uri(

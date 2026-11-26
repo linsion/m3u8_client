@@ -468,7 +468,7 @@ class VideoPlatformTheme {
         secondaryLabelStyle: const TextStyle(
           fontSize: 12,
           height: 1.2,
-          fontWeight: FontWeight.w700,
+          fontWeight: FontWeight.w600,
           color: Colors.white,
         ),
       ),

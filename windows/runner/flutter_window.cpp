@@ -1,12 +1,25 @@
 #include "flutter_window.h"
 
+#include <algorithm>
+using std::max;
+using std::min;
 #include <commdlg.h>
 #include <flutter/standard_method_codec.h>
+#include <objidl.h>
+#include <gdiplus.h>
+#include <mmsystem.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
 
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "winmm.lib")
+
 #include <atomic>
+#include <cctype>
+#include <cmath>
+#include <cstring>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -326,13 +339,35 @@ class WinFileDropTarget final : public IDropTarget {
   bool is_entered_;
 };
 
-std::vector<std::wstring> ShowWinGetOpenFileNameFallback(bool media_only) {
+HWND CreateTopmostDialogOwnerWindow(HWND reference_hwnd) {
+  int x = 200;
+  int y = 200;
+  if (reference_hwnd && ::IsWindow(reference_hwnd)) {
+    RECT rc = {};
+    if (::GetWindowRect(reference_hwnd, &rc)) {
+      x = rc.left + 40;
+      y = rc.top + 40;
+    }
+  }
+  HWND owner = ::CreateWindowExW(
+      WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"STATIC", L"",
+      WS_POPUP, x, y, 1, 1, nullptr, nullptr, ::GetModuleHandleW(nullptr),
+      nullptr);
+  if (owner) {
+    ::ShowWindow(owner, SW_SHOWNA);
+    ::SetForegroundWindow(owner);
+  }
+  return owner;
+}
+
+std::vector<std::wstring> ShowWinGetOpenFileNameFallback(bool media_only,
+                                                         HWND owner_hwnd) {
   std::vector<std::wstring> selected_paths;
   std::vector<wchar_t> buffer(32768, L'\0');
 
   OPENFILENAMEW ofn = {};
   ofn.lStructSize = sizeof(OPENFILENAMEW);
-  ofn.hwndOwner = nullptr;
+  ofn.hwndOwner = owner_hwnd;
   ofn.lpstrFile = buffer.data();
   ofn.nMaxFile = static_cast<DWORD>(buffer.size());
   if (media_only) {
@@ -369,13 +404,19 @@ std::vector<std::wstring> ShowWinGetOpenFileNameFallback(bool media_only) {
   return selected_paths;
 }
 
-std::vector<std::wstring> ShowWinFileOpenDialog(bool media_only) {
+std::vector<std::wstring> ShowWinFileOpenDialog(bool media_only,
+                                                HWND reference_hwnd) {
+  HWND owner_hwnd = CreateTopmostDialogOwnerWindow(reference_hwnd);
   std::vector<std::wstring> selected_paths;
   IFileOpenDialog* dialog = nullptr;
   HRESULT hr = ::CoCreateInstance(CLSID_FileOpenDialog, nullptr,
                                   CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
   if (FAILED(hr) || !dialog) {
-    return ShowWinGetOpenFileNameFallback(media_only);
+    selected_paths = ShowWinGetOpenFileNameFallback(media_only, owner_hwnd);
+    if (owner_hwnd) {
+      ::DestroyWindow(owner_hwnd);
+    }
+    return selected_paths;
   }
 
   DWORD options = 0;
@@ -399,10 +440,7 @@ std::vector<std::wstring> ShowWinFileOpenDialog(bool media_only) {
     dialog->SetFileTypes(1, filters);
   }
 
-  // Pass nullptr as parent_hwnd on this dedicated background STA thread so the
-  // dialog runs on its own message queue without ever locking or disabling the
-  // Flutter UI window or causing cross-thread SendMessage deadlocks.
-  HRESULT show_hr = dialog->Show(nullptr);
+  HRESULT show_hr = dialog->Show(owner_hwnd);
   if (SUCCEEDED(show_hr)) {
     IShellItemArray* items = nullptr;
     if (SUCCEEDED(dialog->GetResults(&items)) && items) {
@@ -424,10 +462,17 @@ std::vector<std::wstring> ShowWinFileOpenDialog(bool media_only) {
     }
   } else if (show_hr != HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
     dialog->Release();
-    return ShowWinGetOpenFileNameFallback(media_only);
+    selected_paths = ShowWinGetOpenFileNameFallback(media_only, owner_hwnd);
+    if (owner_hwnd) {
+      ::DestroyWindow(owner_hwnd);
+    }
+    return selected_paths;
   }
 
   dialog->Release();
+  if (owner_hwnd) {
+    ::DestroyWindow(owner_hwnd);
+  }
   return selected_paths;
 }
 
@@ -440,6 +485,395 @@ void EnableWindowDragMessages(HWND hwnd) {
   ::ChangeWindowMessageFilterEx(hwnd, WM_COPYDATA, MSGFLT_ALLOW, nullptr);
   ::ChangeWindowMessageFilterEx(hwnd, 0x0049 /*WM_COPYGLOBALDATA*/,
                                 MSGFLT_ALLOW, nullptr);
+}
+
+void EnsureGdiPlusInitialized() {
+  static std::atomic<bool> initialized{false};
+  if (!initialized.exchange(true)) {
+    Gdiplus::GdiplusStartupInput input;
+    ULONG_PTR token = 0;
+    Gdiplus::GdiplusStartup(&token, &input, nullptr);
+  }
+}
+
+bool GetJpegEncoderClsid(CLSID* out_clsid) {
+  static bool cached = false;
+  static CLSID cached_clsid = {};
+  if (cached) {
+    *out_clsid = cached_clsid;
+    return true;
+  }
+  UINT num = 0;
+  UINT size = 0;
+  Gdiplus::GetImageEncodersSize(&num, &size);
+  if (size == 0) {
+    return false;
+  }
+  std::vector<uint8_t> buf(size);
+  auto* info = reinterpret_cast<Gdiplus::ImageCodecInfo*>(buf.data());
+  if (Gdiplus::GetImageEncoders(num, size, info) != Gdiplus::Ok) {
+    return false;
+  }
+  for (UINT i = 0; i < num; ++i) {
+    if ( info[i].MimeType && wcscmp(info[i].MimeType, L"image/jpeg") == 0) {
+      cached_clsid = info[i].Clsid;
+      cached = true;
+      *out_clsid = cached_clsid;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool CaptureWinDesktopJpegBytes(int max_width,
+                                int quality,
+                                std::vector<uint8_t>* out_bytes,
+                                int* out_w,
+                                int* out_h,
+                                double* out_cx,
+                                double* out_cy) {
+  EnsureGdiPlusInitialized();
+  int src_w = ::GetSystemMetrics(SM_CXSCREEN);
+  int src_h = ::GetSystemMetrics(SM_CYSCREEN);
+  if (src_w <= 0 || src_h <= 0) {
+    return false;
+  }
+  int clamped_max_w = max(480, min(2560, max_width));
+  double scale = min(1.0, static_cast<double>(clamped_max_w) / src_w);
+  int dst_w = max(1, static_cast<int>(std::round(src_w * scale)));
+  int dst_h = max(1, static_cast<int>(std::round(src_h * scale)));
+
+  HDC screen_dc = ::GetDC(nullptr);
+  if (!screen_dc) {
+    return false;
+  }
+  HDC mem_dc = ::CreateCompatibleDC(screen_dc);
+  if (!mem_dc) {
+    ::ReleaseDC(nullptr, screen_dc);
+    return false;
+  }
+  HBITMAP bmp = ::CreateCompatibleBitmap(screen_dc, dst_w, dst_h);
+  if (!bmp) {
+    ::DeleteDC(mem_dc);
+    ::ReleaseDC(nullptr, screen_dc);
+    return false;
+  }
+  HGDIOBJ old_obj = ::SelectObject(mem_dc, bmp);
+  ::SetStretchBltMode(mem_dc, HALFTONE);
+  ::SetBrushOrgEx(mem_dc, 0, 0, nullptr);
+  BOOL blt_ok = ::StretchBlt(mem_dc, 0, 0, dst_w, dst_h, screen_dc, 0, 0,
+                             src_w, src_h, SRCCOPY | CAPTUREBLT);
+
+  POINT cur_pt = {src_w / 2, src_h / 2};
+  ::GetCursorPos(&cur_pt);
+  double norm_x =
+      max(0.0, min(1.0, static_cast<double>(cur_pt.x) / max(1, src_w)));
+  double norm_y =
+      max(0.0, min(1.0, static_cast<double>(cur_pt.y) / max(1, src_h)));
+  int cx = static_cast<int>(std::round(norm_x * dst_w));
+  int cy = static_cast<int>(std::round(norm_y * dst_h));
+
+  // Draw actual Windows cursor icon + cyan indicator ring
+  CURSORINFO ci = {};
+  ci.cbSize = sizeof(ci);
+  if (::GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING) && ci.hCursor) {
+    ::DrawIconEx(mem_dc, cx, cy, ci.hCursor, 0, 0, 0, nullptr, DI_NORMAL);
+  }
+  HPEN pen = ::CreatePen(PS_SOLID, 2, RGB(56, 189, 248));
+  HGDIOBJ old_pen = ::SelectObject(mem_dc, pen);
+  HGDIOBJ old_brush = ::SelectObject(mem_dc, ::GetStockObject(HOLLOW_BRUSH));
+  ::Ellipse(mem_dc, cx - 7, cy - 7, cx + 7, cy + 7);
+  ::SelectObject(mem_dc, old_brush);
+  ::SelectObject(mem_dc, old_pen);
+  ::DeleteObject(pen);
+
+  ::SelectObject(mem_dc, old_obj);
+  ::DeleteDC(mem_dc);
+  ::ReleaseDC(nullptr, screen_dc);
+
+  if (!blt_ok) {
+    ::DeleteObject(bmp);
+    return false;
+  }
+
+  CLSID jpeg_clsid = {};
+  if (!GetJpegEncoderClsid(&jpeg_clsid)) {
+    ::DeleteObject(bmp);
+    return false;
+  }
+
+  bool encoded_ok = false;
+  {
+    Gdiplus::Bitmap gdi_bmp(bmp, nullptr);
+    IStream* stream = nullptr;
+    if (SUCCEEDED(::CreateStreamOnHGlobal(nullptr, TRUE, &stream)) && stream) {
+      ULONG q = static_cast<ULONG>(max(25, min(95, quality)));
+      Gdiplus::EncoderParameters ep = {};
+      ep.Count = 1;
+      ep.Parameter[0].Guid = Gdiplus::EncoderQuality;
+      ep.Parameter[0].Type = Gdiplus::EncoderParameterValueTypeLong;
+      ep.Parameter[0].NumberOfValues = 1;
+      ep.Parameter[0].Value = &q;
+
+      if (gdi_bmp.Save(stream, &jpeg_clsid, &ep) == Gdiplus::Ok) {
+        HGLOBAL hmem = nullptr;
+        if (SUCCEEDED(::GetHGlobalFromStream(stream, &hmem)) && hmem) {
+          STATSTG stat = {};
+          if (SUCCEEDED(stream->Stat(&stat, STATFLAG_NONAME)) &&
+              stat.cbSize.QuadPart > 0) {
+            size_t len = static_cast<size_t>(stat.cbSize.QuadPart);
+            void* ptr = ::GlobalLock(hmem);
+            if (ptr) {
+              out_bytes->resize(len);
+              std::memcpy(out_bytes->data(), ptr, len);
+              ::GlobalUnlock(hmem);
+              encoded_ok = true;
+            }
+          }
+        }
+      }
+      stream->Release();
+    }
+  }
+  ::DeleteObject(bmp);
+
+  if (encoded_ok) {
+    *out_w = dst_w;
+    *out_h = dst_h;
+    *out_cx = norm_x;
+    *out_cy = norm_y;
+  }
+  return encoded_ok;
+}
+
+bool InjectWinDesktopMouse(const std::string& type,
+                           double nx,
+                           double ny,
+                           int delta_x,
+                           int delta_y) {
+  int sw = max(1, ::GetSystemMetrics(SM_CXSCREEN));
+  int sh = max(1, ::GetSystemMetrics(SM_CYSCREEN));
+  double clamped_nx = max(0.0, min(1.0, nx));
+  double clamped_ny = max(0.0, min(1.0, ny));
+  int px = static_cast<int>(std::round(clamped_nx * (sw - 1)));
+  int py = static_cast<int>(std::round(clamped_ny * (sh - 1)));
+  LONG abs_x = static_cast<LONG>(std::round(clamped_nx * 65535.0));
+  LONG abs_y = static_cast<LONG>(std::round(clamped_ny * 65535.0));
+
+  ::SetCursorPos(px, py);
+
+  auto send_mouse_flags = [&](DWORD flags, DWORD mouse_data = 0) {
+    INPUT inp = {};
+    inp.type = INPUT_MOUSE;
+    inp.mi.dx = abs_x;
+    inp.mi.dy = abs_y;
+    inp.mi.mouseData = mouse_data;
+    inp.mi.dwFlags = flags | MOUSEEVENTF_ABSOLUTE;
+    ::SendInput(1, &inp, sizeof(INPUT));
+  };
+
+  send_mouse_flags(MOUSEEVENTF_MOVE);
+
+  if (type == "move" || type == "drag") {
+    return true;
+  }
+  if (type == "down") {
+    send_mouse_flags(MOUSEEVENTF_LEFTDOWN);
+    return true;
+  }
+  if (type == "up") {
+    send_mouse_flags(MOUSEEVENTF_LEFTUP);
+    return true;
+  }
+  if (type == "tap") {
+    send_mouse_flags(MOUSEEVENTF_LEFTDOWN);
+    send_mouse_flags(MOUSEEVENTF_LEFTUP);
+    return true;
+  }
+  if (type == "double_tap") {
+    send_mouse_flags(MOUSEEVENTF_LEFTDOWN);
+    send_mouse_flags(MOUSEEVENTF_LEFTUP);
+    send_mouse_flags(MOUSEEVENTF_LEFTDOWN);
+    send_mouse_flags(MOUSEEVENTF_LEFTUP);
+    return true;
+  }
+  if (type == "right_click") {
+    send_mouse_flags(MOUSEEVENTF_RIGHTDOWN);
+    send_mouse_flags(MOUSEEVENTF_RIGHTUP);
+    return true;
+  }
+  if (type == "scroll") {
+    if (delta_y != 0) {
+      send_mouse_flags(MOUSEEVENTF_WHEEL,
+                       static_cast<DWORD>(static_cast<int>(delta_y * 3)));
+    }
+    if (delta_x != 0) {
+      send_mouse_flags(MOUSEEVENTF_HWHEEL,
+                       static_cast<DWORD>(static_cast<int>(delta_x * 3)));
+    }
+    return true;
+  }
+  return true;
+}
+
+void SendWinVirtualKeyChord( const std::vector<WORD>& mods, WORD main_vk) {
+  std::vector<INPUT> inputs;
+  for (WORD m : mods) {
+    INPUT inp = {};
+    inp.type = INPUT_KEYBOARD;
+    inp.ki.wVk = m;
+    inputs.push_back(inp);
+  }
+  if (main_vk != 0) {
+    INPUT down = {};
+    down.type = INPUT_KEYBOARD;
+    down.ki.wVk = main_vk;
+    inputs.push_back(down);
+
+    INPUT up = {};
+    up.type = INPUT_KEYBOARD;
+    up.ki.wVk = main_vk;
+    up.ki.dwFlags = KEYEVENTF_KEYUP;
+    inputs.push_back(up);
+  }
+  for (auto it = mods.rbegin(); it != mods.rend(); ++it) {
+    INPUT inp = {};
+    inp.type = INPUT_KEYBOARD;
+    inp.ki.wVk = *it;
+    inp.ki.dwFlags = KEYEVENTF_KEYUP;
+    inputs.push_back(inp);
+  }
+  if (!inputs.empty()) {
+    ::SendInput(static_cast<UINT>(inputs.size()), inputs.data(),
+                sizeof(INPUT));
+  }
+}
+
+bool InjectWinDesktopKey(const std::string& raw_key,
+                         const std::string& text_utf8,
+                         HWND app_hwnd) {
+  if (!text_utf8.empty()) {
+    int wlen =
+        ::MultiByteToWideChar(CP_UTF8, 0, text_utf8.c_str(), -1, nullptr, 0);
+    if (wlen <= 1) {
+      return false;
+    }
+    std::wstring wstr(static_cast<size_t>(wlen) - 1, L'\0');
+    ::MultiByteToWideChar(CP_UTF8, 0, text_utf8.c_str(), -1, wstr.data(),
+                          wlen);
+    std::vector<INPUT> inputs;
+    inputs.reserve(wstr.size() * 2);
+    for (wchar_t ch : wstr) {
+      INPUT down = {};
+      down.type = INPUT_KEYBOARD;
+      down.ki.wScan = ch;
+      down.ki.dwFlags = KEYEVENTF_UNICODE;
+      inputs.push_back(down);
+
+      INPUT up = {};
+      up.type = INPUT_KEYBOARD;
+      up.ki.wScan = ch;
+      up.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+      inputs.push_back(up);
+    }
+    ::SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
+    return true;
+  }
+
+  std::string key;
+  key.reserve(raw_key.size());
+  for (unsigned char c : raw_key) {
+    if (!std::isspace(c)) {
+      key.push_back(static_cast<char>(std::tolower(c)));
+    }
+  }
+  if (key.empty()) {
+    return false;
+  }
+
+  if (key == "minimize_app" || key == "hide_app") {
+    if (app_hwnd && ::IsWindow(app_hwnd)) {
+      ::ShowWindow(app_hwnd, SW_MINIMIZE);
+    }
+    return true;
+  }
+  if (key == "show_desktop" || key == "win+d") {
+    if (app_hwnd && ::IsWindow(app_hwnd)) {
+      ::ShowWindow(app_hwnd, SW_MINIMIZE);
+    }
+    SendWinVirtualKeyChord({VK_LWIN}, 'D');
+    return true;
+  }
+  if (key == "mission_control" || key == "win+tab") {
+    SendWinVirtualKeyChord({VK_LWIN}, VK_TAB);
+    return true;
+  }
+
+  std::vector<WORD> mods;
+  std::string base_key = key;
+  size_t plus_pos = 0;
+  while ((plus_pos = base_key.find('+')) != std::string::npos) {
+    std::string mod = base_key.substr(0, plus_pos);
+    base_key.erase(0, plus_pos + 1);
+    if (mod == "ctrl" || mod == "control" || mod == "cmd" || mod == "command") {
+      mods.push_back(VK_CONTROL);
+    } else if (mod == "alt" || mod == "option") {
+      mods.push_back(VK_MENU);
+    } else if (mod == "shift") {
+      mods.push_back(VK_SHIFT);
+    } else if (mod == "win" || mod == "meta") {
+      mods.push_back(VK_LWIN);
+    }
+  }
+
+  WORD vk = 0;
+  if (base_key == "enter" || base_key == "ok" || base_key == "return") {
+    vk = VK_RETURN;
+  } else if (base_key == "back" || base_key == "escape" || base_key == "esc") {
+    vk = VK_ESCAPE;
+  } else if (base_key == "tab") {
+    vk = VK_TAB;
+  } else if (base_key == "space" || base_key == "play_pause") {
+    vk = VK_SPACE;
+  } else if (base_key == "backspace") {
+    vk = VK_BACK;
+  } else if (base_key == "delete" || base_key == "del") {
+    vk = VK_DELETE;
+  } else if (base_key == "up") {
+    vk = VK_UP;
+  } else if (base_key == "down") {
+    vk = VK_DOWN;
+  } else if (base_key == "left") {
+    vk = VK_LEFT;
+  } else if (base_key == "right") {
+    vk = VK_RIGHT;
+  } else if (base_key == "home") {
+    vk = VK_HOME;
+  } else if (base_key == "end") {
+    vk = VK_END;
+  } else if (base_key == "pageup") {
+    vk = VK_PRIOR;
+  } else if (base_key == "pagedown") {
+    vk = VK_NEXT;
+  } else if (base_key.size() == 1) {
+    char ch = base_key[0];
+    if (ch >= 'a' && ch <= 'z') {
+      vk = static_cast<WORD>(ch - 'a' + 'A');
+    } else if (ch >= '0' && ch <= '9') {
+      vk = static_cast<WORD>(ch);
+    }
+  } else if (base_key.size() >= 2 && base_key[0] == 'f') {
+    int fn = std::atoi(base_key.c_str() + 1);
+    if (fn >= 1 && fn <= 12) {
+      vk = static_cast<WORD>(VK_F1 + (fn - 1));
+    }
+  }
+
+  if (vk != 0 || !mods.empty()) {
+    SendWinVirtualKeyChord(mods, vk);
+    return true;
+  }
+  return false;
 }
 
 }  // namespace
@@ -562,10 +996,11 @@ bool FlutterWindow::OnCreate() {
           auto* payload = new PickFilesResultPayload();
           payload->result = std::move(result);
 
-          std::thread([target_hwnd, media_only, alive_flag, payload]() {
+          std::thread([this, target_hwnd, media_only, alive_flag, payload]() {
             HRESULT hr_com =
                 ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-            std::vector<std::wstring> paths = ShowWinFileOpenDialog(media_only);
+            std::vector<std::wstring> paths =
+                ShowWinFileOpenDialog(media_only, target_hwnd);
             for (const auto& p : paths) {
               if (payload->items.size() >= 10) {
                 break;
@@ -581,9 +1016,289 @@ bool FlutterWindow::OnCreate() {
                                  reinterpret_cast<LPARAM>(payload))) {
                 return;
               }
+              is_picking_files_.store(false);
             }
             delete payload;
           }).detach();
+          return;
+        }
+        if (call.method_name() == "revealFileInFinder") {
+          std::string path_utf8;
+          if (const auto* map =
+                  std::get_if<flutter::EncodableMap>(call.arguments())) {
+            auto it = map->find(flutter::EncodableValue("path"));
+            if (it != map->end()) {
+              if (const auto* s = std::get_if<std::string>(&it->second)) {
+                path_utf8 = *s;
+              }
+            }
+          }
+          if (!path_utf8.empty()) {
+            int wlen = ::MultiByteToWideChar(CP_UTF8, 0, path_utf8.c_str(), -1,
+                                             nullptr, 0);
+            if (wlen > 1) {
+              std::wstring wpath(static_cast<size_t>(wlen) - 1, L'\0');
+              ::MultiByteToWideChar(CP_UTF8, 0, path_utf8.c_str(), -1,
+                                    wpath.data(), wlen);
+              for (auto& ch : wpath) {
+                if (ch == L'/') ch = L'\\';
+              }
+              DWORD attr = ::GetFileAttributesW(wpath.c_str());
+              if (attr != INVALID_FILE_ATTRIBUTES &&
+                  (attr & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+                std::wstring param = L"/select,\"" + wpath + L"\"";
+                ::ShellExecuteW(nullptr, L"open", L"explorer.exe",
+                                param.c_str(), nullptr, SW_SHOWNORMAL);
+              } else {
+                ::ShellExecuteW(nullptr, L"open", L"explorer.exe",
+                                wpath.c_str(), nullptr, SW_SHOWNORMAL);
+              }
+              result->Success(flutter::EncodableValue(true));
+              return;
+            }
+          }
+          result->Success(flutter::EncodableValue(false));
+          return;
+        }
+        if (call.method_name() == "captureDesktopScreenJpeg") {
+          int max_width = 1280;
+          int quality = 72;
+          if (const auto* map =
+                  std::get_if<flutter::EncodableMap>(call.arguments())) {
+            auto it_w = map->find(flutter::EncodableValue("maxWidth"));
+            if (it_w != map->end()) {
+              if (const auto* v = std::get_if<int32_t>(&it_w->second)) {
+                max_width = *v;
+              } else if (const auto* v64 =
+                             std::get_if<int64_t>(&it_w->second)) {
+                max_width = static_cast<int>(*v64);
+              }
+            }
+            auto it_q = map->find(flutter::EncodableValue("quality"));
+            if (it_q != map->end()) {
+              if (const auto* v = std::get_if<int32_t>(&it_q->second)) {
+                quality = *v;
+              } else if (const auto* v64 =
+                             std::get_if<int64_t>(&it_q->second)) {
+                quality = static_cast<int>(*v64);
+              }
+            }
+          }
+          std::vector<uint8_t> jpeg_bytes;
+          int out_w = 1280;
+          int out_h = 720;
+          double out_cx = 0.5;
+          double out_cy = 0.5;
+          if (CaptureWinDesktopJpegBytes(max_width, quality, &jpeg_bytes,
+                                         &out_w, &out_h, &out_cx, &out_cy) &&
+              !jpeg_bytes.empty()) {
+            flutter::EncodableMap resp;
+            resp[flutter::EncodableValue("bytes")] =
+                flutter::EncodableValue(std::move(jpeg_bytes));
+            resp[flutter::EncodableValue("width")] =
+                flutter::EncodableValue(out_w);
+            resp[flutter::EncodableValue("height")] =
+                flutter::EncodableValue(out_h);
+            resp[flutter::EncodableValue("cursorX")] =
+                flutter::EncodableValue(out_cx);
+            resp[flutter::EncodableValue("cursorY")] =
+                flutter::EncodableValue(out_cy);
+            result->Success(flutter::EncodableValue(resp));
+          } else {
+            result->Success(flutter::EncodableValue());
+          }
+          return;
+        }
+        if (call.method_name() == "injectDesktopMouseEvent") {
+          std::string type = "tap";
+          double nx = 0.5;
+          double ny = 0.5;
+          int delta_x = 0;
+          int delta_y = 0;
+          if (const auto* map =
+                  std::get_if<flutter::EncodableMap>(call.arguments())) {
+            auto it_t = map->find(flutter::EncodableValue("type"));
+            if (it_t != map->end()) {
+              if (const auto* s = std::get_if<std::string>(&it_t->second)) {
+                type = *s;
+              }
+            }
+            auto read_double = [&](const char* k, double def_val) -> double {
+              auto it = map->find(flutter::EncodableValue(k));
+              if (it == map->end()) return def_val;
+              if (const auto* d = std::get_if<double>(&it->second)) return *d;
+              if (const auto* i = std::get_if<int32_t>(&it->second))
+                return static_cast<double>(*i);
+              if (const auto* i64 = std::get_if<int64_t>(&it->second))
+                return static_cast<double>(*i64);
+              return def_val;
+            };
+            nx = read_double("nx", 0.5);
+            ny = read_double("ny", 0.5);
+            delta_x = static_cast<int>(std::round(read_double("deltaX", 0.0)));
+            delta_y = static_cast<int>(std::round(read_double("deltaY", 0.0)));
+          }
+          bool ok = InjectWinDesktopMouse(type, nx, ny, delta_x, delta_y);
+          result->Success(flutter::EncodableValue(ok));
+          return;
+        }
+        if (call.method_name() == "injectDesktopKeyEvent") {
+          std::string key;
+          std::string text;
+          if (const auto* map =
+                  std::get_if<flutter::EncodableMap>(call.arguments())) {
+            auto it_k = map->find(flutter::EncodableValue("key"));
+            if (it_k != map->end()) {
+              if (const auto* s = std::get_if<std::string>(&it_k->second)) {
+                key = *s;
+              }
+            }
+            auto it_t = map->find(flutter::EncodableValue("text"));
+            if (it_t != map->end()) {
+              if (const auto* s = std::get_if<std::string>(&it_t->second)) {
+                text = *s;
+              }
+            }
+          }
+          bool ok = InjectWinDesktopKey(key, text, GetHandle());
+          result->Success(flutter::EncodableValue(ok));
+          return;
+        }
+        if (call.method_name() == "minimizeAppWindow") {
+          HWND hwnd = GetHandle();
+          if (hwnd && ::IsWindow(hwnd)) {
+            ::ShowWindow(hwnd, SW_MINIMIZE);
+            result->Success(flutter::EncodableValue(true));
+          } else {
+            result->Success(flutter::EncodableValue(false));
+          }
+          return;
+        }
+        if (call.method_name() == "checkDesktopPermissions" ||
+            call.method_name() == "requestDesktopPermissions") {
+          flutter::EncodableMap resp;
+          resp[flutter::EncodableValue("screenCapture")] =
+              flutter::EncodableValue(true);
+          resp[flutter::EncodableValue("accessibility")] =
+              flutter::EncodableValue(true);
+          result->Success(flutter::EncodableValue(resp));
+          return;
+        }
+        if (call.method_name() == "startVoiceRecording") {
+          ::mciSendStringW(L"close lg_tg_voice", nullptr, 0, nullptr);
+          MCIERROR err = ::mciSendStringW(
+              L"open new Type waveaudio Alias lg_tg_voice", nullptr, 0,
+              nullptr);
+          if (err == 0) {
+            ::mciSendStringW(
+                L"set lg_tg_voice time format ms bitspersample 16 channels 1 "
+                L"samplespersec 16000",
+                nullptr, 0, nullptr);
+            err = ::mciSendStringW(L"record lg_tg_voice", nullptr, 0, nullptr);
+          }
+          flutter::EncodableMap resp;
+          if (err == 0) {
+            resp[flutter::EncodableValue("ok")] =
+                flutter::EncodableValue(true);
+            resp[flutter::EncodableValue("mimeType")] =
+                flutter::EncodableValue("audio/wav");
+          } else {
+            resp[flutter::EncodableValue("ok")] =
+                flutter::EncodableValue(false);
+            resp[flutter::EncodableValue("error")] =
+                flutter::EncodableValue("无法开启麦克风录音设备");
+          }
+          result->Success(flutter::EncodableValue(resp));
+          return;
+        }
+        if (call.method_name() == "stopVoiceRecording") {
+          ::mciSendStringW(L"stop lg_tg_voice", nullptr, 0, nullptr);
+          wchar_t temp_dir[MAX_PATH] = {};
+          ::GetTempPathW(MAX_PATH, temp_dir);
+          std::wstring file_name =
+              L"voice_" + std::to_wstring(::GetTickCount64()) + L".wav";
+          std::wstring full_path = std::wstring(temp_dir) + file_name;
+          std::wstring save_cmd =
+              L"save lg_tg_voice \"" + full_path + L"\"";
+          MCIERROR err =
+              ::mciSendStringW(save_cmd.c_str(), nullptr, 0, nullptr);
+          ::mciSendStringW(L"close lg_tg_voice", nullptr, 0, nullptr);
+          if (err == 0) {
+            std::ifstream ifs(full_path, std::ios::binary | std::ios::ate);
+            if (ifs.is_open()) {
+              auto sz = ifs.tellg();
+              if (sz > 0) {
+                std::vector<uint8_t> bytes(static_cast<size_t>(sz));
+                ifs.seekg(0, std::ios::beg);
+                ifs.read(reinterpret_cast<char*>(bytes.data()), sz);
+                ifs.close();
+                flutter::EncodableMap resp;
+                resp[flutter::EncodableValue("ok")] =
+                    flutter::EncodableValue(true);
+                resp[flutter::EncodableValue("path")] =
+                    flutter::EncodableValue(Utf8FromUtf16(full_path.c_str()));
+                resp[flutter::EncodableValue("name")] =
+                    flutter::EncodableValue(Utf8FromUtf16(file_name.c_str()));
+                resp[flutter::EncodableValue("mimeType")] =
+                    flutter::EncodableValue("audio/wav");
+                resp[flutter::EncodableValue("size")] =
+                    flutter::EncodableValue(static_cast<int64_t>(sz));
+                resp[flutter::EncodableValue("bytes")] =
+                    flutter::EncodableValue(std::move(bytes));
+                result->Success(flutter::EncodableValue(resp));
+                return;
+              }
+            }
+          }
+          result->Success(flutter::EncodableValue());
+          return;
+        }
+        if (call.method_name() == "cancelVoiceRecording") {
+          ::mciSendStringW(L"stop lg_tg_voice", nullptr, 0, nullptr);
+          ::mciSendStringW(L"close lg_tg_voice", nullptr, 0, nullptr);
+          result->Success(flutter::EncodableValue(true));
+          return;
+        }
+        if (call.method_name() == "recognizeVoiceToText") {
+          // Trigger Windows native Voice Typing (Win + H) if no wave file or alongside wave file
+          SendWinVirtualKeyChord({VK_LWIN}, 'H');
+          flutter::EncodableMap resp;
+          resp[flutter::EncodableValue("ok")] = flutter::EncodableValue(true);
+          resp[flutter::EncodableValue("text")] = flutter::EncodableValue("");
+          resp[flutter::EncodableValue("dictationTriggered")] =
+              flutter::EncodableValue(true);
+          result->Success(flutter::EncodableValue(resp));
+          return;
+        }
+        if (call.method_name() == "reportIncomingSystemCall") {
+          HWND hwnd = GetHandle();
+          if (hwnd && ::IsWindow(hwnd)) {
+            FLASHWINFO fwi = {};
+            fwi.cbSize = sizeof(FLASHWINFO);
+            fwi.hwnd = hwnd;
+            fwi.dwFlags = FLASHW_ALL | FLASHW_TIMERNOFG;
+            fwi.uCount = 6;
+            fwi.dwTimeout = 0;
+            ::FlashWindowEx(&fwi);
+          }
+          ::MessageBeep(MB_ICONINFORMATION);
+          flutter::EncodableMap resp;
+          resp[flutter::EncodableValue("ok")] = flutter::EncodableValue(true);
+          resp[flutter::EncodableValue("callKit")] =
+              flutter::EncodableValue(false);
+          result->Success(flutter::EncodableValue(resp));
+          return;
+        }
+        if (call.method_name() == "startOutgoingSystemCall") {
+          flutter::EncodableMap resp;
+          resp[flutter::EncodableValue("ok")] = flutter::EncodableValue(true);
+          resp[flutter::EncodableValue("callKit")] =
+              flutter::EncodableValue(false);
+          result->Success(flutter::EncodableValue(resp));
+          return;
+        }
+        if (call.method_name() == "endSystemCall") {
+          result->Success(flutter::EncodableValue(true));
           return;
         }
         result->NotImplemented();

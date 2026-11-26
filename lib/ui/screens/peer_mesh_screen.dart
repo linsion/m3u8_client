@@ -12,6 +12,7 @@ import '../../services/peer_mesh_service.dart';
 import '../../services/tv_platform_service.dart';
 import '../../state/app_state.dart';
 import '../theme.dart';
+import '../widgets/video_115_accelerate_button.dart';
 
 class PeerMeshScreen extends StatefulWidget {
   final AppState appState;
@@ -39,9 +40,10 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
   bool _showFloatingKeyboardBar = false;
   String _captureMode = 'desktop'; // Default to full system desktop ('desktop', 'auto', 'app')
   String _activeRemoteMode = 'desktop';
-  final int _streamFps = 6;
+  final int _streamFps = 15;
   int _streamMaxWidth = 1280;
-  final int _streamQuality = 74;
+  final int _streamQuality = 72;
+  bool _autoMinimizeRemoteApp = true;
 
   // Windows-Remote-Desktop Style Input & Zoom State
   // 'trackpad' = Windows RDP Virtual Trackpad Pointer (best for mobile phones & TV)
@@ -49,8 +51,13 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
   String _touchInputMode = 'trackpad';
   final String _pointerTool = 'tap'; // 'tap', 'double_tap', 'right_click', 'drag'
   bool _isDragLocked = false; // Hold left mouse button down for window dragging / text selection
+  bool _isDirectDragging = false;
   double _virtualCursorNx = 0.5;
   double _virtualCursorNy = 0.5;
+  final ValueNotifier<Offset> _cursorPosNotifier =
+      ValueNotifier<Offset>(const Offset(0.5, 0.5));
+  final ValueNotifier<Uint8List?> _frameBytesNotifier =
+      ValueNotifier<Uint8List?>(null);
   final double _trackpadSensitivity = 1.35;
   double _currentZoomScale = 1.0;
   bool _stretchToFill = false;
@@ -67,11 +74,25 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
   String? _desktopError;
   Offset? _lastTrackpadPanLocal;
 
+  // Outgoing pointer move/drag/scroll coalescing state (prevents socket & process flooding)
+  Timer? _pointerThrottleTimer;
+  Map<String, dynamic>? _pendingPointerPayload;
+  int _lastPointerSentAtMs = 0;
+  bool _sendingHttpPointer = false;
+
   final TextEditingController _remoteInputController = TextEditingController();
   final TextEditingController _castUrlController = TextEditingController();
   final TextEditingController _castTitleController = TextEditingController();
   final TextEditingController _chatInputController = TextEditingController();
   final ScrollController _chatScrollController = ScrollController();
+  final ScrollController _topBarScrollController = ScrollController();
+  final ScrollController _tabBarScrollController = ScrollController();
+  final ScrollController _peersSidebarScrollController = ScrollController();
+  final ScrollController _rdpTopToolbarScrollController = ScrollController();
+  final ScrollController _rdpBottomDockScrollController = ScrollController();
+  final ScrollController _remoteControlScrollController = ScrollController();
+  final ScrollController _transfersScrollController = ScrollController();
+  final ScrollController _remoteFilesScrollController = ScrollController();
 
   // Remote Shared Files State
   List<PeerSharedFileItem> _remoteFiles = const [];
@@ -107,6 +128,10 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
     }
   }
 
+  final Set<String> _pending115Keys = <String>{};
+  final Set<String> _completed115Keys = <String>{};
+  final Set<String> _failed115Keys = <String>{};
+
   Future<void> _initAsync() async {
     await _mesh.ensureInitialized();
     final dir = await _mesh.getPeerDownloadsDirectory();
@@ -133,6 +158,9 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
       _restoreDeviceOrientation();
     }
     _stopDesktopStream(notify: false);
+    _pointerThrottleTimer?.cancel();
+    _cursorPosNotifier.dispose();
+    _frameBytesNotifier.dispose();
     _zoomController.removeListener(_onZoomMatrixChanged);
     _zoomController.dispose();
     _desktopCanvasFocusNode.dispose();
@@ -144,6 +172,14 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
     _castTitleController.dispose();
     _chatInputController.dispose();
     _chatScrollController.dispose();
+    _topBarScrollController.dispose();
+    _tabBarScrollController.dispose();
+    _peersSidebarScrollController.dispose();
+    _rdpTopToolbarScrollController.dispose();
+    _rdpBottomDockScrollController.dispose();
+    _remoteControlScrollController.dispose();
+    _transfersScrollController.dispose();
+    _remoteFilesScrollController.dispose();
     super.dispose();
   }
 
@@ -362,6 +398,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
         'maxWidth': _streamMaxWidth,
         'quality': _streamQuality,
         'fps': _streamFps,
+        'minimizeApp': _captureMode == 'desktop' && _autoMinimizeRemoteApp,
       }));
       ws.listen(
         (data) {
@@ -374,16 +411,27 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                 final b64 = (map['data'] ?? '').toString();
                 if (b64.isNotEmpty) {
                   final bytes = base64Decode(b64);
-                  setState(() {
-                    _latestFrameBytes = bytes;
-                    _activeRemoteMode =
-                        (map['mode'] ?? _captureMode).toString();
-                    _remoteScreenWidth =
-                        int.tryParse((map['width'] ?? 1280).toString()) ?? 1280;
-                    _remoteScreenHeight =
-                        int.tryParse((map['height'] ?? 720).toString()) ?? 720;
-                    _desktopError = null;
-                  });
+                  final nextMode = (map['mode'] ?? _captureMode).toString();
+                  final nextW =
+                      int.tryParse((map['width'] ?? 1280).toString()) ?? 1280;
+                  final nextH =
+                      int.tryParse((map['height'] ?? 720).toString()) ?? 720;
+                  final wasNull = _latestFrameBytes == null;
+                  final metaChanged = wasNull ||
+                      _activeRemoteMode != nextMode ||
+                      _remoteScreenWidth != nextW ||
+                      _remoteScreenHeight != nextH ||
+                      _desktopError != null;
+                  _latestFrameBytes = bytes;
+                  _frameBytesNotifier.value = bytes;
+                  if (metaChanged) {
+                    setState(() {
+                      _activeRemoteMode = nextMode;
+                      _remoteScreenWidth = nextW;
+                      _remoteScreenHeight = nextH;
+                      _desktopError = null;
+                    });
+                  }
                 }
               }
             } catch (_) {}
@@ -411,8 +459,19 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
 
   void _startHttpPollingFallback() {
     _pollingTimer?.cancel();
+    final peer = selectedPeer;
+    if (peer != null &&
+        _captureMode == 'desktop' &&
+        _autoMinimizeRemoteApp) {
+      unawaited(
+        _mesh.sendRemoteControlCommand(peer, {
+          'action': 'minimize_app',
+          'targetMode': 'desktop',
+        }),
+      );
+    }
     unawaited(_pollSingleFrame());
-    final intervalMs = (1000 ~/ _streamFps.clamp(1, 12)).clamp(110, 1000);
+    final intervalMs = (1000 ~/ _streamFps.clamp(1, 20)).clamp(55, 1000);
     _pollingTimer = Timer.periodic(
       Duration(milliseconds: intervalMs),
       (_) => unawaited(_pollSingleFrame()),
@@ -433,13 +492,22 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
       );
       if (!mounted || !_isStreamingDesktop) return;
       if (frame != null) {
-        setState(() {
-          _latestFrameBytes = frame.bytes;
-          _activeRemoteMode = frame.captureMode;
-          _remoteScreenWidth = frame.width;
-          _remoteScreenHeight = frame.height;
-          _desktopError = null;
-        });
+        final wasNull = _latestFrameBytes == null;
+        final metaChanged = wasNull ||
+            _activeRemoteMode != frame.captureMode ||
+            _remoteScreenWidth != frame.width ||
+            _remoteScreenHeight != frame.height ||
+            _desktopError != null;
+        _latestFrameBytes = frame.bytes;
+        _frameBytesNotifier.value = frame.bytes;
+        if (metaChanged) {
+          setState(() {
+            _activeRemoteMode = frame.captureMode;
+            _remoteScreenWidth = frame.width;
+            _remoteScreenHeight = frame.height;
+            _desktopError = null;
+          });
+        }
       } else if (_latestFrameBytes == null) {
         setState(() {
           _desktopError = '暂未获取到「${peer.deviceName}」的远程画面，请确认对方在线';
@@ -453,6 +521,9 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
   void _stopDesktopStream({bool notify = true}) {
     _pollingTimer?.cancel();
     _pollingTimer = null;
+    _pointerThrottleTimer?.cancel();
+    _pointerThrottleTimer = null;
+    _pendingPointerPayload = null;
     final ws = _activeWs;
     _activeWs = null;
     if (ws != null) {
@@ -463,6 +534,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
     }
     _isStreamingDesktop = false;
     _isDragLocked = false;
+    _isDirectDragging = false;
     if (notify && mounted) {
       setState(() {});
     }
@@ -477,9 +549,44 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
         'maxWidth': _streamMaxWidth,
         'quality': _streamQuality,
         'fps': _streamFps,
+        'minimizeApp': _captureMode == 'desktop' && _autoMinimizeRemoteApp,
       }));
     } else if (_isStreamingDesktop) {
       _startHttpPollingFallback();
+    }
+  }
+
+  void _updateLocalVirtualCursor(double nx, double ny) {
+    final clampedX = nx.clamp(0.0, 1.0);
+    final clampedY = ny.clamp(0.0, 1.0);
+    _virtualCursorNx = clampedX;
+    _virtualCursorNy = clampedY;
+    _cursorPosNotifier.value = Offset(clampedX, clampedY);
+  }
+
+  Future<void> _dispatchPointerPayloadNow(
+    PeerDeviceNode peer,
+    Map<String, dynamic> payload,
+  ) async {
+    _lastPointerSentAtMs = DateTime.now().millisecondsSinceEpoch;
+    final ws = _activeWs;
+    if (ws != null && ws.readyState == WebSocket.open) {
+      ws.add(jsonEncode(payload));
+      return;
+    }
+    if (_sendingHttpPointer &&
+        (payload['type'] == 'move' || payload['type'] == 'drag')) {
+      _pendingPointerPayload = payload;
+      return;
+    }
+    _sendingHttpPointer = true;
+    try {
+      await _mesh.sendRemoteControlCommand(peer, payload);
+      if (_isStreamingDesktop && payload['type'] != 'move') {
+        unawaited(_pollSingleFrame());
+      }
+    } finally {
+      _sendingHttpPointer = false;
     }
   }
 
@@ -494,13 +601,11 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
     if (peer == null) return;
     final clampedX = nx.clamp(0.0, 1.0);
     final clampedY = ny.clamp(0.0, 1.0);
-    setState(() {
-      _virtualCursorNx = clampedX;
-      _virtualCursorNy = clampedY;
-    });
+    _updateLocalVirtualCursor(clampedX, clampedY);
+
     // Always target full OS desktop unless user explicitly selected 'app' only
     final targetMode = _captureMode == 'app' ? 'app' : 'desktop';
-    final payload = {
+    final payload = <String, dynamic>{
       'action': 'mouse',
       'type': type,
       'nx': clampedX,
@@ -509,18 +614,36 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
       'deltaY': deltaY,
       'targetMode': targetMode,
     };
-    final ws = _activeWs;
-    if (ws != null && ws.readyState == WebSocket.open) {
-      ws.add(jsonEncode(payload));
-    } else {
-      await _mesh.sendRemoteControlCommand(peer, payload);
-      if (_isStreamingDesktop) {
-        Future<void>.delayed(
-          const Duration(milliseconds: 80),
-          _pollSingleFrame,
+
+    // Coalesce high-frequency move / drag / scroll events (~22ms throttle = ~45Hz)
+    if (type == 'move' || type == 'drag' || type == 'scroll') {
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      final elapsed = nowMs - _lastPointerSentAtMs;
+      if (elapsed >= 22 && _pointerThrottleTimer == null && !_sendingHttpPointer) {
+        unawaited(_dispatchPointerPayloadNow(peer, payload));
+      } else {
+        _pendingPointerPayload = payload;
+        _pointerThrottleTimer ??= Timer(
+          Duration(milliseconds: max(6, 22 - elapsed)),
+          () {
+            _pointerThrottleTimer = null;
+            final pending = _pendingPointerPayload;
+            _pendingPointerPayload = null;
+            final activePeer = selectedPeer;
+            if (pending != null && activePeer != null && mounted) {
+              unawaited(_dispatchPointerPayloadNow(activePeer, pending));
+            }
+          },
         );
       }
+      return;
     }
+
+    // Discrete click / down / up events: cancel pending move and dispatch immediately
+    _pointerThrottleTimer?.cancel();
+    _pointerThrottleTimer = null;
+    _pendingPointerPayload = null;
+    await _dispatchPointerPayloadNow(peer, payload);
   }
 
   Future<void> _sendRemoteKey(String keyName) async {
@@ -588,6 +711,24 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
     });
   }
 
+  Future<void> _openReceiveFolder() async {
+    var targetDir = _localSaveDirPath.trim();
+    if (targetDir.isEmpty) {
+      try {
+        final dir = await _mesh.getPeerDownloadsDirectory();
+        targetDir = dir.path;
+        if (mounted && _localSaveDirPath != targetDir) {
+          setState(() => _localSaveDirPath = targetDir);
+        }
+      } catch (_) {}
+    }
+    if (targetDir.isEmpty) return;
+    await NativeUtilsChannelHub.revealOrOpenLocalPath(
+      targetDir,
+      isDirectory: true,
+    );
+  }
+
   Future<void> _pickAndSendFilesToPeer({required bool mediaOnly}) async {
     final peer = selectedPeer;
     if (peer == null) {
@@ -597,28 +738,26 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
       return;
     }
     try {
-      final res = await NativeUtilsChannelHub.channel.invokeMethod<dynamic>(
-        'pickFiles',
-        {'mediaOnly': mediaOnly},
+      final res = await NativeUtilsChannelHub.pickSystemFiles(
+        mediaOnly: mediaOnly,
+        allowMultiple: true,
       );
-      if (res is List && res.isNotEmpty) {
+      if (res != null && res.isNotEmpty) {
         for (final item in res) {
-          if (item is Map) {
-            final name = (item['name'] ?? '传输文件').toString();
-            final path = item['path']?.toString();
-            final rawB = item['bytes'];
-            final bytes =
-                (rawB is Uint8List && rawB.isNotEmpty) ? rawB : null;
-            if ((path != null && path.isNotEmpty) || bytes != null) {
-              unawaited(
-                _mesh.sendFileToPeer(
-                  peer: peer,
-                  fileName: name,
-                  localFilePath: path,
-                  rawBytes: bytes,
-                ),
-              );
-            }
+          final name = (item['name'] ?? '传输文件').toString();
+          final path = item['path']?.toString();
+          final rawB = item['bytes'];
+          final bytes =
+              (rawB is Uint8List && rawB.isNotEmpty) ? rawB : null;
+          if ((path != null && path.isNotEmpty) || bytes != null) {
+            unawaited(
+              _mesh.sendFileToPeer(
+                peer: peer,
+                fileName: name,
+                localFilePath: path,
+                rawBytes: bytes,
+              ),
+            );
           }
         }
       }
@@ -648,14 +787,14 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text('已保存远程桌面截图：${file.path}'),
-          action: (!kIsWeb && Platform.isMacOS)
+          action: (!kIsWeb &&
+                  (Platform.isMacOS ||
+                      Platform.isWindows ||
+                      Platform.isLinux))
               ? SnackBarAction(
-                  label: '在访达中查看',
+                  label: Platform.isMacOS ? '在访达中查看' : '打开所在文件夹',
                   onPressed: () {
-                    NativeUtilsChannelHub.channel.invokeMethod(
-                      'revealFileInFinder',
-                      {'path': file.path},
-                    );
+                    NativeUtilsChannelHub.revealOrOpenLocalPath(file.path);
                   },
                 )
               : null,
@@ -1156,6 +1295,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
           Flexible(
             flex: 0,
             child: SingleChildScrollView(
+              controller: _topBarScrollController,
               scrollDirection: Axis.horizontal,
               child: Row(
                 mainAxisSize: MainAxisSize.min,
@@ -1214,7 +1354,10 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                     selected: _mesh.allowRemoteControl,
                     label: const Text(
                       '允许被控',
-                      style: TextStyle(fontSize: 11.5),
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w700,
+                      ),
                     ),
                     onSelected: (v) => _mesh.setAllowRemoteControl(v),
                   ),
@@ -1226,7 +1369,10 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                       selected: _mesh.allowDesktopCapture,
                       label: const Text(
                         '共享全桌面',
-                        style: TextStyle(fontSize: 11.5),
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w700,
+                        ),
                       ),
                       onSelected: (v) => _mesh.setAllowDesktopCapture(v),
                     ),
@@ -1238,7 +1384,13 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                     ),
                     onPressed: _showLocalQrDialog,
                     icon: const Icon(Icons.qr_code_rounded, size: 14),
-                    label: const Text('二维码', style: TextStyle(fontSize: 11.5)),
+                    label: const Text(
+                      '二维码',
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
                   ),
                   const SizedBox(width: 6),
                   OutlinedButton.icon(
@@ -1247,7 +1399,13 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                     ),
                     onPressed: _showAddPeerDialog,
                     icon: const Icon(Icons.add_link_rounded, size: 14),
-                    label: const Text('添加 IP', style: TextStyle(fontSize: 11.5)),
+                    label: const Text(
+                      '添加 IP',
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
                   ),
                   const SizedBox(width: 6),
                   FilledButton.tonalIcon(
@@ -1261,7 +1419,13 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                       }
                     },
                     icon: const Icon(Icons.radar_rounded, size: 14),
-                    label: const Text('刷新扫描', style: TextStyle(fontSize: 11.5)),
+                    label: const Text(
+                      '刷新扫描',
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
                   ),
                 ],
               ),
@@ -1459,6 +1623,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                     ),
                   )
                 : ListView.separated(
+                    controller: _peersSidebarScrollController,
                     padding: const EdgeInsets.all(10),
                     itemCount: peers.length,
                     separatorBuilder: (_, __) => const SizedBox(height: 8),
@@ -1481,7 +1646,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                               color: isSel
                                   ? VideoPlatformTheme.accent
                                   : VideoPlatformTheme.borderSubtle,
-                              width: isSel ? 1.6 : 1.0,
+                              width: 1.5,
                             ),
                           ),
                           child: Column(
@@ -1646,6 +1811,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
             ),
           Expanded(
             child: SingleChildScrollView(
+              controller: _tabBarScrollController,
               scrollDirection: Axis.horizontal,
               child: Row(
                 children: List.generate(tabs.length, (idx) {
@@ -1669,9 +1835,10 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                         }
                       },
                       child: Container(
+                        height: 32,
                         padding: const EdgeInsets.symmetric(
                           horizontal: 12,
-                          vertical: 6,
+                          vertical: 5,
                         ),
                         decoration: BoxDecoration(
                           color: selected
@@ -1682,6 +1849,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                             color: selected
                                 ? VideoPlatformTheme.accent
                                 : VideoPlatformTheme.borderSubtle,
+                            width: 1.2,
                           ),
                         ),
                         child: Row(
@@ -1699,9 +1867,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                               item.label,
                               style: TextStyle(
                                 fontSize: 12,
-                                fontWeight: selected
-                                    ? FontWeight.w800
-                                    : FontWeight.w600,
+                                fontWeight: FontWeight.w700,
                                 color: selected
                                     ? Colors.black
                                     : VideoPlatformTheme.textPrimary,
@@ -1787,36 +1953,40 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
             ),
           ),
           child: SingleChildScrollView(
+            controller: _rdpTopToolbarScrollController,
             scrollDirection: Axis.horizontal,
             child: Row(
               children: [
-                FilledButton.icon(
-                  style: FilledButton.styleFrom(
-                    visualDensity: VisualDensity.compact,
-                    backgroundColor: _isStreamingDesktop
-                        ? const Color(0xFFEF4444)
-                        : VideoPlatformTheme.accent,
-                    foregroundColor:
-                        _isStreamingDesktop ? Colors.white : Colors.black,
-                  ),
-                  onPressed: () {
-                    if (_isStreamingDesktop) {
-                      _stopDesktopStream();
-                    } else {
-                      _startDesktopStream();
-                    }
-                  },
-                  icon: Icon(
-                    _isStreamingDesktop
-                        ? Icons.stop_circle_outlined
-                        : Icons.play_arrow_rounded,
-                    size: 16,
-                  ),
-                  label: Text(
-                    _isStreamingDesktop ? '停止远控' : '连接桌面',
-                    style: const TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.w800,
+                ConstrainedBox(
+                  constraints: const BoxConstraints(minWidth: 92),
+                  child: FilledButton.icon(
+                    style: FilledButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      backgroundColor: _isStreamingDesktop
+                          ? const Color(0xFFEF4444)
+                          : VideoPlatformTheme.accent,
+                      foregroundColor:
+                          _isStreamingDesktop ? Colors.white : Colors.black,
+                    ),
+                    onPressed: () {
+                      if (_isStreamingDesktop) {
+                        _stopDesktopStream();
+                      } else {
+                        _startDesktopStream();
+                      }
+                    },
+                    icon: Icon(
+                      _isStreamingDesktop
+                          ? Icons.stop_circle_outlined
+                          : Icons.play_arrow_rounded,
+                      size: 16,
+                    ),
+                    label: Text(
+                      _isStreamingDesktop ? '停止远控' : '连接桌面',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                      ),
                     ),
                   ),
                 ),
@@ -1837,6 +2007,40 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                       fontWeight: FontWeight.w700,
                     ),
                   ),
+                ),
+                const SizedBox(width: 6),
+
+                // One-tap Show OS Desktop / Minimize Remote App Window button
+                OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                  ),
+                  onPressed: () => _sendRemoteKey('show_desktop'),
+                  icon: const Icon(Icons.desktop_windows_rounded, size: 14),
+                  label: const Text(
+                    '显示系统桌面',
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                FilterChip(
+                  visualDensity: VisualDensity.compact,
+                  showCheckmark: false,
+                  selected: _autoMinimizeRemoteApp,
+                  tooltip: '连接桌面时自动最小化远端流光应用窗口，直接显示对方完整操作系统桌面与其他软件',
+                  label: const Text(
+                    '自动隐藏远端本应用',
+                    style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+                  ),
+                  onSelected: (v) {
+                    setState(() => _autoMinimizeRemoteApp = v);
+                    if (v && _isStreamingDesktop && _captureMode == 'desktop') {
+                      _sendRemoteKey('minimize_app');
+                    }
+                  },
                 ),
                 const SizedBox(width: 8),
 
@@ -2006,6 +2210,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
         children: [
           // Row 1: Windows RDP Virtual Mouse Buttons + System Desktop Shortcuts
           SingleChildScrollView(
+            controller: _rdpBottomDockScrollController,
             scrollDirection: Axis.horizontal,
             child: Row(
               children: [
@@ -2415,27 +2620,44 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
             child: Stack(
               fit: StackFit.expand,
               children: [
-                Image.memory(
-                  _latestFrameBytes!,
-                  gaplessPlayback: true,
-                  fit: BoxFit.fill,
+                ValueListenableBuilder<Uint8List?>(
+                  valueListenable: _frameBytesNotifier,
+                  builder: (ctx, frameBytes, _) {
+                    final activeBytes = frameBytes ?? _latestFrameBytes;
+                    if (activeBytes == null) {
+                      return const SizedBox.shrink();
+                    }
+                    return Image.memory(
+                      activeBytes,
+                      gaplessPlayback: true,
+                      fit: BoxFit.fill,
+                    );
+                  },
                 ),
                 // High-visibility Windows-RDP Virtual Mouse Pointer Cursor
-                Positioned(
-                  left: (_virtualCursorNx * canvasSize.width) - 4,
-                  top: (_virtualCursorNy * canvasSize.height) - 4,
-                  child: IgnorePointer(
-                    child: CustomPaint(
-                      size: const Size(28, 28),
-                      painter: _RdpVirtualCursorPainter(
-                        isDragLocked: _isDragLocked,
+                ValueListenableBuilder<Offset>(
+                  valueListenable: _cursorPosNotifier,
+                  builder: (ctx, cursorNorm, _) {
+                    return Positioned(
+                      left: (cursorNorm.dx * canvasSize.width) - 4,
+                      top: (cursorNorm.dy * canvasSize.height) - 4,
+                      child: IgnorePointer(
+                        child: CustomPaint(
+                          size: const Size(28, 28),
+                          painter: _RdpVirtualCursorPainter(
+                            isDragLocked: _isDragLocked || _isDirectDragging,
+                          ),
+                        ),
                       ),
-                    ),
-                  ),
+                    );
+                  },
                 ),
               ],
             ),
           );
+
+          final allowDirectRemoteDrag =
+              !isTrackpad && (_currentZoomScale <= 1.05 || _isDragLocked);
 
           return Center(
             child: SizedBox(
@@ -2444,143 +2666,197 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
               child: Stack(
                 fit: StackFit.expand,
                 children: [
-                  Listener(
-                    onPointerSignal: (signal) {
-                      if (signal is PointerScrollEvent) {
-                        final norm = isTrackpad
-                            ? Offset(_virtualCursorNx, _virtualCursorNy)
-                            : sceneToNormalized(signal.localPosition);
+                  MouseRegion(
+                    onHover: (event) {
+                      if (!isTrackpad) {
+                        final norm = sceneToNormalized(event.localPosition);
                         _sendRemotePointer(
-                          type: 'scroll',
+                          type: _isDragLocked ? 'drag' : 'move',
                           nx: norm.dx,
                           ny: norm.dy,
-                          deltaX: -signal.scrollDelta.dx,
-                          deltaY: -signal.scrollDelta.dy,
+                          deltaX: event.delta.dx,
+                          deltaY: event.delta.dy,
                         );
                       }
                     },
-                    child: GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onTapUp: (details) {
-                        _desktopCanvasFocusNode.requestFocus();
-                        if (isTrackpad) {
-                          // Trackpad mode: tap anywhere clicks at virtual mouse cursor!
+                    child: Listener(
+                      onPointerSignal: (signal) {
+                        if (signal is PointerScrollEvent) {
+                          final norm = isTrackpad
+                              ? Offset(_virtualCursorNx, _virtualCursorNy)
+                              : sceneToNormalized(signal.localPosition);
                           _sendRemotePointer(
-                            type: 'tap',
-                            nx: _virtualCursorNx,
-                            ny: _virtualCursorNy,
-                          );
-                        } else {
-                          final norm = sceneToNormalized(details.localPosition);
-                          final effectiveType =
-                              _pointerTool == 'drag' ? 'tap' : _pointerTool;
-                          _sendRemotePointer(
-                            type: effectiveType,
+                            type: 'scroll',
                             nx: norm.dx,
                             ny: norm.dy,
+                            deltaX: -signal.scrollDelta.dx,
+                            deltaY: -signal.scrollDelta.dy,
                           );
                         }
                       },
-                      onDoubleTapDown: (details) {
-                        if (isTrackpad) {
-                          _sendRemotePointer(
-                            type: 'double_tap',
-                            nx: _virtualCursorNx,
-                            ny: _virtualCursorNy,
-                          );
-                        } else {
-                          final norm = sceneToNormalized(details.localPosition);
-                          _sendRemotePointer(
-                            type: 'double_tap',
-                            nx: norm.dx,
-                            ny: norm.dy,
-                          );
-                        }
-                      },
-                      onLongPressStart: (details) {
-                        HapticFeedback.mediumImpact();
-                        if (isTrackpad) {
+                      child: GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTapUp: (details) {
+                          _desktopCanvasFocusNode.requestFocus();
+                          if (isTrackpad) {
+                            // Trackpad mode: tap anywhere clicks at virtual mouse cursor!
+                            _sendRemotePointer(
+                              type: 'tap',
+                              nx: _virtualCursorNx,
+                              ny: _virtualCursorNy,
+                            );
+                          } else {
+                            final norm =
+                                sceneToNormalized(details.localPosition);
+                            final effectiveType =
+                                _pointerTool == 'drag' ? 'tap' : _pointerTool;
+                            _sendRemotePointer(
+                              type: effectiveType,
+                              nx: norm.dx,
+                              ny: norm.dy,
+                            );
+                          }
+                        },
+                        onDoubleTapDown: (details) {
+                          if (isTrackpad) {
+                            _sendRemotePointer(
+                              type: 'double_tap',
+                              nx: _virtualCursorNx,
+                              ny: _virtualCursorNy,
+                            );
+                          } else {
+                            final norm =
+                                sceneToNormalized(details.localPosition);
+                            _sendRemotePointer(
+                              type: 'double_tap',
+                              nx: norm.dx,
+                              ny: norm.dy,
+                            );
+                          }
+                        },
+                        onLongPressStart: (details) {
+                          HapticFeedback.mediumImpact();
+                          if (isTrackpad) {
+                            _sendRemotePointer(
+                              type: 'right_click',
+                              nx: _virtualCursorNx,
+                              ny: _virtualCursorNy,
+                            );
+                          } else {
+                            final norm =
+                                sceneToNormalized(details.localPosition);
+                            _sendRemotePointer(
+                              type: 'right_click',
+                              nx: norm.dx,
+                              ny: norm.dy,
+                            );
+                          }
+                        },
+                        onSecondaryTapUp: (details) {
+                          final norm = isTrackpad
+                              ? Offset(_virtualCursorNx, _virtualCursorNy)
+                              : sceneToNormalized(details.localPosition);
                           _sendRemotePointer(
                             type: 'right_click',
-                            nx: _virtualCursorNx,
-                            ny: _virtualCursorNy,
-                          );
-                        } else {
-                          final norm = sceneToNormalized(details.localPosition);
-                          _sendRemotePointer(
-                            type: 'right_click',
                             nx: norm.dx,
                             ny: norm.dy,
                           );
-                        }
-                      },
-                      onSecondaryTapUp: (details) {
-                        final norm = isTrackpad
-                            ? Offset(_virtualCursorNx, _virtualCursorNy)
-                            : sceneToNormalized(details.localPosition);
-                        _sendRemotePointer(
-                          type: 'right_click',
-                          nx: norm.dx,
-                          ny: norm.dy,
-                        );
-                      },
-                      onScaleStart: isTrackpad
-                          ? (details) {
-                              _lastTrackpadPanLocal = details.localFocalPoint;
-                            }
-                          : null,
-                      onScaleUpdate: isTrackpad
-                          ? (details) {
-                              if (details.pointerCount >= 2) {
-                                // Two-finger pinch zoom in Trackpad mode!
-                                final nextScale =
-                                    (_currentZoomScale * details.scale.clamp(0.92, 1.08))
-                                        .clamp(1.0, 6.0);
-                                _setDesktopZoom(
-                                  nextScale,
-                                  focalNormalized: Offset(
-                                    _virtualCursorNx,
-                                    _virtualCursorNy,
-                                  ),
-                                  viewportSize: canvasSize,
-                                );
-                                return;
-                              }
-                              // Single-finger trackpad slide: move virtual mouse cursor smoothly!
-                              final prev = _lastTrackpadPanLocal ??
-                                  details.localFocalPoint;
-                              final delta = details.localFocalPoint - prev;
-                              _lastTrackpadPanLocal = details.localFocalPoint;
-
-                              final effScale =
-                                  max(1.0, _currentZoomScale * 0.65);
-                              final dnx = (delta.dx / canvasSize.width) *
-                                  (_trackpadSensitivity / effScale);
-                              final dny = (delta.dy / canvasSize.height) *
-                                  (_trackpadSensitivity / effScale);
-                              setState(() {
-                                _virtualCursorNx =
-                                    (_virtualCursorNx + dnx).clamp(0.0, 1.0);
-                                _virtualCursorNy =
-                                    (_virtualCursorNy + dny).clamp(0.0, 1.0);
-                              });
-                              _autoPanZoomedViewportToFollowCursor(canvasSize);
+                        },
+                        onScaleStart: (details) {
+                          _lastTrackpadPanLocal = details.localFocalPoint;
+                          if (!isTrackpad &&
+                              allowDirectRemoteDrag &&
+                              details.pointerCount == 1) {
+                            _isDirectDragging = true;
+                            final norm =
+                                sceneToNormalized(details.localFocalPoint);
+                            _sendRemotePointer(
+                              type: 'down',
+                              nx: norm.dx,
+                              ny: norm.dy,
+                            );
+                          }
+                        },
+                        onScaleUpdate: (details) {
+                          if (details.pointerCount >= 2) {
+                            // Two-finger pinch zoom in both Trackpad & Direct modes!
+                            if (_isDirectDragging) {
+                              _isDirectDragging = false;
                               _sendRemotePointer(
-                                type: _isDragLocked ? 'drag' : 'move',
+                                type: 'up',
                                 nx: _virtualCursorNx,
                                 ny: _virtualCursorNy,
-                                deltaX: delta.dx,
-                                deltaY: delta.dy,
                               );
                             }
-                          : null,
-                      child: InteractiveViewer(
-                        transformationController: _zoomController,
-                        minScale: 1.0,
-                        maxScale: 6.0,
-                        panEnabled: !isTrackpad,
-                        scaleEnabled: !isTrackpad,
-                        child: desktopCanvas,
+                            final nextScale = (_currentZoomScale *
+                                    details.scale.clamp(0.92, 1.08))
+                                .clamp(1.0, 6.0);
+                            _setDesktopZoom(
+                              nextScale,
+                              focalNormalized: Offset(
+                                _virtualCursorNx,
+                                _virtualCursorNy,
+                              ),
+                              viewportSize: canvasSize,
+                            );
+                            return;
+                          }
+                          final prev =
+                              _lastTrackpadPanLocal ?? details.localFocalPoint;
+                          final delta = details.localFocalPoint - prev;
+                          _lastTrackpadPanLocal = details.localFocalPoint;
+
+                          if (isTrackpad) {
+                            // Single-finger trackpad slide: move virtual mouse cursor smoothly!
+                            final effScale =
+                                max(1.0, _currentZoomScale * 0.65);
+                            final dnx = (delta.dx / canvasSize.width) *
+                                (_trackpadSensitivity / effScale);
+                            final dny = (delta.dy / canvasSize.height) *
+                                (_trackpadSensitivity / effScale);
+                            final nextNx =
+                                (_virtualCursorNx + dnx).clamp(0.0, 1.0);
+                            final nextNy =
+                                (_virtualCursorNy + dny).clamp(0.0, 1.0);
+                            _updateLocalVirtualCursor(nextNx, nextNy);
+                            _autoPanZoomedViewportToFollowCursor(canvasSize);
+                            _sendRemotePointer(
+                              type: _isDragLocked ? 'drag' : 'move',
+                              nx: nextNx,
+                              ny: nextNy,
+                              deltaX: delta.dx,
+                              deltaY: delta.dy,
+                            );
+                          } else if (allowDirectRemoteDrag) {
+                            final norm =
+                                sceneToNormalized(details.localFocalPoint);
+                            _sendRemotePointer(
+                              type: 'drag',
+                              nx: norm.dx,
+                              ny: norm.dy,
+                              deltaX: delta.dx,
+                              deltaY: delta.dy,
+                            );
+                          }
+                        },
+                        onScaleEnd: (details) {
+                          if (_isDirectDragging) {
+                            _isDirectDragging = false;
+                            _sendRemotePointer(
+                              type: 'up',
+                              nx: _virtualCursorNx,
+                              ny: _virtualCursorNy,
+                            );
+                          }
+                        },
+                        child: InteractiveViewer(
+                          transformationController: _zoomController,
+                          minScale: 1.0,
+                          maxScale: 6.0,
+                          panEnabled: !isTrackpad && !allowDirectRemoteDrag,
+                          scaleEnabled: !isTrackpad && !allowDirectRemoteDrag,
+                          child: desktopCanvas,
+                        ),
                       ),
                     ),
                   ),
@@ -2830,11 +3106,14 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
     final currentMini = widget.appState.miniPlayerSession;
 
     return SingleChildScrollView(
+      controller: _remoteControlScrollController,
       padding: const EdgeInsets.all(16),
-      child: Wrap(
-        spacing: 16,
-        runSpacing: 16,
-        children: [
+      child: SizedBox(
+        width: double.infinity,
+        child: Wrap(
+          spacing: 16,
+          runSpacing: 16,
+          children: [
           // 1. Virtual D-Pad Remote Controller Card
           ConstrainedBox(
             constraints: const BoxConstraints(minWidth: 300, maxWidth: 420),
@@ -3324,6 +3603,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
           ),
         ],
       ),
+      ),
     );
   }
 
@@ -3393,6 +3673,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Container(
+            width: double.infinity,
             padding: const EdgeInsets.all(14),
             decoration: BoxDecoration(
               color: _isDraggingFiles
@@ -3403,22 +3684,22 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                 color: _isDraggingFiles
                     ? VideoPlatformTheme.accent
                     : VideoPlatformTheme.borderSubtle,
-                width: _isDraggingFiles ? 2 : 1,
+                width: 1.5,
               ),
             ),
-            child: Wrap(
-              spacing: 10,
-              runSpacing: 10,
-              alignment: WrapAlignment.spaceBetween,
-              crossAxisAlignment: WrapCrossAlignment.center,
-              children: [
-                Column(
+            child: LayoutBuilder(
+              builder: (ctx, headerConstraints) {
+                final isCompactHeader = headerConstraints.maxWidth < 680;
+                final infoColumn = Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
                   children: [
                     Text(
                       peer != null
                           ? '向「${peer.deviceName}」传文件（${peer.connectionModeLabel}）'
                           : '请先选择目标客户端设备',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                         fontSize: 14,
                         fontWeight: FontWeight.w800,
@@ -3427,15 +3708,17 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                     ),
                     const SizedBox(height: 3),
                     Text(
-                      '本机接收目录：$_localSaveDirPath',
+                      '本机接收目录：${_localSaveDirPath.isEmpty ? "流光互联接收" : _localSaveDirPath}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                         fontSize: 11.5,
                         color: VideoPlatformTheme.textSecondary,
                       ),
                     ),
                   ],
-                ),
-                Wrap(
+                );
+                final actionButtons = Wrap(
                   spacing: 8,
                   runSpacing: 6,
                   children: [
@@ -3453,22 +3736,31 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                       icon: const Icon(Icons.perm_media_rounded, size: 16),
                       label: const Text('发送视频/图片'),
                     ),
-                    if (!kIsWeb &&
-                        Platform.isMacOS &&
-                        _localSaveDirPath.isNotEmpty)
-                      OutlinedButton.icon(
-                        onPressed: () {
-                          NativeUtilsChannelHub.channel.invokeMethod(
-                            'revealFileInFinder',
-                            {'path': _localSaveDirPath},
-                          );
-                        },
-                        icon: const Icon(Icons.folder_open_rounded, size: 16),
-                        label: const Text('打开接收文件夹'),
-                      ),
+                    OutlinedButton.icon(
+                      onPressed: _openReceiveFolder,
+                      icon: const Icon(Icons.folder_open_rounded, size: 16),
+                      label: const Text('打开接收文件夹'),
+                    ),
                   ],
-                ),
-              ],
+                );
+                if (isCompactHeader) {
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      infoColumn,
+                      const SizedBox(height: 10),
+                      actionButtons,
+                    ],
+                  );
+                }
+                return Row(
+                  children: [
+                    Expanded(child: infoColumn),
+                    const SizedBox(width: 12),
+                    actionButtons,
+                  ],
+                );
+              },
             ),
           ),
           const SizedBox(height: 12),
@@ -3490,7 +3782,10 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Padding(
-                          padding: const EdgeInsets.all(12),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 8,
+                          ),
                           child: Row(
                             children: [
                               Icon(
@@ -3499,11 +3794,29 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                                 color: VideoPlatformTheme.accent,
                               ),
                               const SizedBox(width: 6),
-                              Text(
-                                '文件传输队列 (${transfers.length})',
-                                style: const TextStyle(
-                                  fontSize: 13.5,
-                                  fontWeight: FontWeight.w800,
+                              Expanded(
+                                child: Text(
+                                  '文件传输队列 (${transfers.length})',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    fontSize: 13.5,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                              ),
+                              TextButton.icon(
+                                style: TextButton.styleFrom(
+                                  visualDensity: VisualDensity.compact,
+                                ),
+                                onPressed: _openReceiveFolder,
+                                icon: const Icon(
+                                  Icons.folder_open_rounded,
+                                  size: 15,
+                                ),
+                                label: const Text(
+                                  '打开接收文件夹',
+                                  style: TextStyle(fontSize: 11.5),
                                 ),
                               ),
                             ],
@@ -3523,6 +3836,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                                   ),
                                 )
                               : ListView.separated(
+                                  controller: _transfersScrollController,
                                   padding: const EdgeInsets.all(10),
                                   itemCount: transfers.length,
                                   separatorBuilder: (_, __) =>
@@ -3577,6 +3891,9 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                                                 style: TextStyle(
                                                   fontSize: 11.5,
                                                   fontWeight: FontWeight.w700,
+                                                  fontFeatures: const [
+                                                    FontFeature.tabularFigures(),
+                                                  ],
                                                   color: t.status == 'completed'
                                                       ? const Color(0xFF22C55E)
                                                       : (t.status == 'failed'
@@ -3604,6 +3921,9 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                                                       TextOverflow.ellipsis,
                                                   style: TextStyle(
                                                     fontSize: 11,
+                                                    fontFeatures: const [
+                                                      FontFeature.tabularFigures(),
+                                                    ],
                                                     color: VideoPlatformTheme
                                                         .textSecondary,
                                                   ),
@@ -3624,24 +3944,133 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                                                 ),
                                               if (t.status == 'completed' &&
                                                   t.savedPath.isNotEmpty) ...[
-                                                if (!kIsWeb &&
-                                                    Platform.isMacOS)
-                                                  TextButton(
-                                                    onPressed: () {
-                                                      NativeUtilsChannelHub
-                                                          .channel
-                                                          .invokeMethod(
-                                                        'revealFileInFinder',
-                                                        {'path': t.savedPath},
-                                                      );
-                                                    },
-                                                    child: const Text(
-                                                      '在访达中显示',
-                                                      style: TextStyle(
-                                                        fontSize: 11,
-                                                      ),
+                                                TextButton.icon(
+                                                  onPressed: () {
+                                                    NativeUtilsChannelHub
+                                                        .revealOrOpenLocalPath(
+                                                      t.savedPath,
+                                                    );
+                                                  },
+                                                  icon: const Icon(
+                                                    Icons.folder_open_rounded,
+                                                    size: 14,
+                                                  ),
+                                                  label: Text(
+                                                    (!kIsWeb &&
+                                                            Platform.isMacOS)
+                                                        ? '在访达中显示'
+                                                        : '打开所在位置',
+                                                    style: const TextStyle(
+                                                      fontSize: 11,
                                                     ),
                                                   ),
+                                                ),
+                                                Builder(
+                                                  builder: (_) {
+                                                    final k115 =
+                                                        'tx_${t.id}_${t.savedPath}';
+                                                    final isPending115 =
+                                                        _pending115Keys
+                                                            .contains(k115);
+                                                    final isDone115 =
+                                                        _completed115Keys
+                                                            .contains(k115);
+                                                    final isFailed115 =
+                                                        _failed115Keys
+                                                            .contains(k115);
+                                                    final c115 = isDone115
+                                                        ? const Color(
+                                                            0xFF22C55E,
+                                                          )
+                                                        : (isFailed115
+                                                            ? const Color(
+                                                                0xFFEF4444,
+                                                              )
+                                                            : null);
+                                                    return TextButton.icon(
+                                                      onPressed: isPending115
+                                                          ? null
+                                                          : () async {
+                                                              setState(() {
+                                                                _pending115Keys
+                                                                    .add(k115);
+                                                                _failed115Keys
+                                                                    .remove(
+                                                                      k115,
+                                                                    );
+                                                              });
+                                                              final res =
+                                                                  await trigger115CloudDownload(
+                                                                context:
+                                                                    context,
+                                                                api: widget
+                                                                    .appState
+                                                                    .api,
+                                                                downloadUrl: '',
+                                                                fileName:
+                                                                    t.fileName,
+                                                                localFilePath:
+                                                                    t.savedPath,
+                                                              );
+                                                              if (!mounted) {
+                                                                return;
+                                                              }
+                                                              setState(() {
+                                                                _pending115Keys
+                                                                    .remove(
+                                                                      k115,
+                                                                    );
+                                                                if (res.ok) {
+                                                                  _completed115Keys
+                                                                      .add(
+                                                                        k115,
+                                                                      );
+                                                                } else {
+                                                                  _failed115Keys
+                                                                      .add(
+                                                                        k115,
+                                                                      );
+                                                                }
+                                                              });
+                                                            },
+                                                      icon: isPending115
+                                                          ? const SizedBox(
+                                                              width: 12,
+                                                              height: 12,
+                                                              child:
+                                                                  CircularProgressIndicator(
+                                                                strokeWidth:
+                                                                    1.8,
+                                                              ),
+                                                            )
+                                                          : Icon(
+                                                              isDone115
+                                                                  ? Icons
+                                                                      .check_circle_rounded
+                                                                  : (isFailed115
+                                                                      ? Icons
+                                                                          .error_outline_rounded
+                                                                      : Icons
+                                                                          .cloud_upload_rounded),
+                                                              size: 14,
+                                                              color: c115,
+                                                            ),
+                                                      label: Text(
+                                                        isPending115
+                                                            ? '115上传中...'
+                                                            : (isDone115
+                                                                ? '已存115 ✓'
+                                                                : (isFailed115
+                                                                    ? '115失败·重试'
+                                                                    : '115云下载')),
+                                                        style: TextStyle(
+                                                          fontSize: 11,
+                                                          color: c115,
+                                                        ),
+                                                      ),
+                                                    );
+                                                  },
+                                                ),
                                               ],
                                             ],
                                           ),
@@ -3723,6 +4152,7 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                                       ),
                                     )
                                   : ListView.separated(
+                                      controller: _remoteFilesScrollController,
                                       padding: const EdgeInsets.all(10),
                                       itemCount: _remoteFiles.length,
                                       separatorBuilder: (_, __) =>
@@ -3829,6 +4259,105 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                                                   Icons.download_rounded,
                                                   size: 18,
                                                 ),
+                                              ),
+                                              Builder(
+                                                builder: (_) {
+                                                  final k115 =
+                                                      'remote_${peer?.deviceId}_${item.relativePath}';
+                                                  final isPending115 =
+                                                      _pending115Keys
+                                                          .contains(k115);
+                                                  final isDone115 =
+                                                      _completed115Keys
+                                                          .contains(k115);
+                                                  final isFailed115 =
+                                                      _failed115Keys
+                                                          .contains(k115);
+                                                  return IconButton(
+                                                    visualDensity:
+                                                        VisualDensity.compact,
+                                                    tooltip: isDone115
+                                                        ? '已存115 ✓'
+                                                        : (isFailed115
+                                                            ? '115云下载失败，点击重试'
+                                                            : '115云下载'),
+                                                    onPressed: isPending115
+                                                        ? null
+                                                        : () async {
+                                                            if (peer == null) {
+                                                              return;
+                                                            }
+                                                            final url = _mesh
+                                                                .buildRemoteFileStreamUrl(
+                                                              peer,
+                                                              item,
+                                                            );
+                                                            setState(() {
+                                                              _pending115Keys
+                                                                  .add(k115);
+                                                              _failed115Keys
+                                                                  .remove(k115);
+                                                            });
+                                                            final res =
+                                                                await trigger115CloudDownload(
+                                                              context: context,
+                                                              api: widget
+                                                                  .appState.api,
+                                                              downloadUrl: url,
+                                                              fileName:
+                                                                  item.name,
+                                                            );
+                                                            if (!mounted) {
+                                                              return;
+                                                            }
+                                                            setState(() {
+                                                              _pending115Keys
+                                                                  .remove(k115);
+                                                              if (res.ok) {
+                                                                _completed115Keys
+                                                                    .add(k115);
+                                                              } else {
+                                                                _failed115Keys
+                                                                    .add(k115);
+                                                              }
+                                                            });
+                                                          },
+                                                    icon: isPending115
+                                                        ? const SizedBox(
+                                                            width: 15,
+                                                            height: 15,
+                                                            child:
+                                                                CircularProgressIndicator(
+                                                              strokeWidth: 2,
+                                                              color: Color(
+                                                                0xFF38BDF8,
+                                                              ),
+                                                            ),
+                                                          )
+                                                        : Icon(
+                                                            isDone115
+                                                                ? Icons
+                                                                    .check_circle_rounded
+                                                                : (isFailed115
+                                                                    ? Icons
+                                                                        .error_outline_rounded
+                                                                    : Icons
+                                                                        .cloud_download_rounded),
+                                                            size: 18,
+                                                            color: isDone115
+                                                                ? const Color(
+                                                                    0xFF22C55E,
+                                                                  )
+                                                                : (isFailed115
+                                                                    ? const Color(
+                                                                        0xFFEF4444,
+                                                                      )
+                                                                    : const Color(
+                                                                        0xFF38BDF8,
+                                                                      )),
+                                                          ),
+                                                  );
+                                                },
                                               ),
                                             ],
                                           ),
@@ -4123,18 +4652,15 @@ class _PeerMeshScreenState extends State<PeerMeshScreen> {
                       ),
                     ),
                   ),
-                if (msg.localFilePath.isNotEmpty &&
-                    !kIsWeb &&
-                    Platform.isMacOS)
+                if (msg.localFilePath.isNotEmpty && !kIsWeb)
                   InkWell(
                     onTap: () {
-                      NativeUtilsChannelHub.channel.invokeMethod(
-                        'revealFileInFinder',
-                        {'path': msg.localFilePath},
+                      NativeUtilsChannelHub.revealOrOpenLocalPath(
+                        msg.localFilePath,
                       );
                     },
                     child: Text(
-                      '📂 在访达中显示',
+                      Platform.isMacOS ? '📂 在访达中显示' : '📂 打开所在文件夹',
                       style: TextStyle(
                         fontSize: 11,
                         fontWeight: FontWeight.w700,

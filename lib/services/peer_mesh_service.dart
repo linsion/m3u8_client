@@ -475,6 +475,16 @@ class PeerMeshService extends ChangeNotifier {
   DateTime? _lastRemoteCursorAt;
   int _pointerIdCounter = 900;
 
+  // Incoming mouse move/drag coalescing state (prevents event queue lag)
+  bool _isInjectingMouse = false;
+  Map<String, dynamic>? _pendingMouseMovePayload;
+
+  // Persistent Windows Desktop Capture & Input Worker Process
+  Process? _winDaemonProc;
+  Future<Process?>? _winDaemonStarting;
+  int _winDaemonReqSeq = 0;
+  final Map<String, Completer<String>> _winDaemonPending = {};
+
   String get deviceId => _deviceId;
   String get deviceName => _deviceName;
   String get localIp => _localIp;
@@ -513,6 +523,18 @@ class PeerMeshService extends ChangeNotifier {
       return a.deviceId.compareTo(b.deviceId);
     });
     return list;
+  }
+
+  @visibleForTesting
+  void upsertPeerForTesting(PeerDeviceNode node) {
+    _upsertPeerNode(node, forceNotify: true);
+  }
+
+  @visibleForTesting
+  void removePeerForTesting(String deviceId) {
+    _peers.remove(deviceId);
+    _peerDiscoveryOrder.remove(deviceId);
+    notifyListeners();
   }
 
   void _upsertPeerNode(PeerDeviceNode node, {bool forceNotify = false}) {
@@ -1647,13 +1669,20 @@ class PeerMeshService extends ChangeNotifier {
       if (peerId.isEmpty || peerId == _deviceId) return;
 
       final senderIp = dg.address.address;
+      final existing = _peers[peerId];
+      final keepExistingHost = existing != null &&
+          existing.isLanReachable &&
+          existing.host.isNotEmpty &&
+          existing.host != '127.0.0.1' &&
+          DateTime.now().difference(existing.lastSeenAt).inSeconds < 18;
+      final stableHost = keepExistingHost ? existing.host : senderIp;
       final node = PeerDeviceNode.fromJson(
         map,
-        fallbackHost: senderIp,
-        isManualOverride: _peers[peerId]?.isManual,
+        fallbackHost: stableHost,
+        isManualOverride: existing?.isManual,
         isLanReachableOverride: true,
       ).copyWith(
-        host: senderIp,
+        host: stableHost,
         isLanReachable: true,
         lastSeenAt: DateTime.now(),
       );
@@ -1723,14 +1752,22 @@ class PeerMeshService extends ChangeNotifier {
       final peerId = (decoded['deviceId'] ?? '').toString().trim();
       if (peerId.isEmpty || peerId == _deviceId) return null;
       final existing = _peers[peerId];
+      final keepExistingHost = !isManual &&
+          existing != null &&
+          existing.isLanReachable &&
+          existing.host.isNotEmpty &&
+          existing.host != '127.0.0.1' &&
+          DateTime.now().difference(existing.lastSeenAt).inSeconds < 18;
+      final stableHost = keepExistingHost ? existing.host : host;
+      final stablePort = keepExistingHost ? existing.port : port;
       final node = PeerDeviceNode.fromJson(
         decoded,
-        fallbackHost: host,
+        fallbackHost: stableHost,
         isManualOverride: isManual || (existing?.isManual ?? false),
         isLanReachableOverride: true,
       ).copyWith(
-        host: host,
-        port: port,
+        host: stableHost,
+        port: stablePort,
         isLanReachable: true,
         lastSeenAt: DateTime.now(),
       );
@@ -1789,7 +1826,8 @@ class PeerMeshService extends ChangeNotifier {
   Future<Map<String, bool>> checkMacDesktopPermissions({
     bool prompt = false,
   }) async {
-    if (kIsWeb || (!Platform.isMacOS && !Platform.isAndroid)) {
+    if (kIsWeb ||
+        (!Platform.isMacOS && !Platform.isWindows && !Platform.isAndroid)) {
       return const {'screenCapture': true, 'accessibility': true};
     }
     try {
@@ -1802,8 +1840,31 @@ class PeerMeshService extends ChangeNotifier {
         'accessibility': res?['accessibility'] == true,
       };
     } catch (_) {
+      if (!kIsWeb && Platform.isWindows) {
+        return const {'screenCapture': true, 'accessibility': true};
+      }
       return const {'screenCapture': false, 'accessibility': false};
     }
+  }
+
+  /// Minimizes the local app window so the remote controller immediately sees
+  /// the underlying OS desktop and other applications instead of this app's window.
+  Future<bool> minimizeLocalAppWindow() async {
+    if (kIsWeb) return false;
+    if (Platform.isMacOS || Platform.isWindows) {
+      try {
+        final ok = await NativeUtilsChannelHub.channel
+            .invokeMethod<bool>('minimizeAppWindow');
+        if (ok == true) return true;
+      } catch (_) {}
+    }
+    if (Platform.isWindows) {
+      return _injectWindowsDesktopKey(keyName: 'minimize_app');
+    }
+    if (Platform.isLinux) {
+      return _injectLinuxDesktopKey(keyName: 'show_desktop');
+    }
+    return false;
   }
 
   /// Captures a screen frame in either `'desktop'` (full OS desktop / full device screen) or `'app'` (Flutter window) mode.
@@ -1822,7 +1883,9 @@ class PeerMeshService extends ChangeNotifier {
         _allowDesktopCapture &&
         supportsNativeDesktopCapture;
 
-    if (wantDesktop && !kIsWeb && (Platform.isMacOS || Platform.isAndroid)) {
+    if (wantDesktop &&
+        !kIsWeb &&
+        (Platform.isMacOS || Platform.isWindows || Platform.isAndroid)) {
       try {
         final res = await NativeUtilsChannelHub.channel
             .invokeMapMethod<String, dynamic>(
@@ -1866,6 +1929,221 @@ class PeerMeshService extends ChangeNotifier {
     return _captureAppRepaintBoundaryFrame(maxWidth: maxWidth);
   }
 
+  static String _encodePowerShellCommand(String script) {
+    final codeUnits = script.codeUnits;
+    final utf16Le = Uint8List(codeUnits.length * 2);
+    for (int i = 0; i < codeUnits.length; i++) {
+      final u = codeUnits[i];
+      utf16Le[i * 2] = u & 0xFF;
+      utf16Le[i * 2 + 1] = (u >> 8) & 0xFF;
+    }
+    return base64Encode(utf16Le);
+  }
+
+  Future<Process?> _ensureWindowsDesktopDaemon() async {
+    if (kIsWeb || !Platform.isWindows) return null;
+    if (_winDaemonProc != null) return _winDaemonProc;
+    if (_winDaemonStarting != null) return _winDaemonStarting;
+
+    final completer = Completer<Process?>();
+    _winDaemonStarting = completer.future;
+
+    try {
+      final proc = await Process.start(
+        'powershell',
+        ['-NoProfile', '-NoLogo', '-NonInteractive', '-Command', '-'],
+      );
+      _winDaemonProc = proc;
+
+      proc.stdout
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen(
+        (line) {
+          final trimmed = line.trim();
+          if (trimmed.isEmpty) return;
+          final sep1 = trimmed.indexOf('|');
+          if (sep1 <= 0) return;
+          final prefix = trimmed.substring(0, sep1);
+          final rest = trimmed.substring(sep1 + 1);
+          final sep2 = rest.indexOf('|');
+          final reqId = sep2 >= 0 ? rest.substring(0, sep2) : rest;
+          final payload = sep2 >= 0 ? rest.substring(sep2 + 1) : '';
+          final pending = _winDaemonPending.remove(reqId);
+          if (pending != null && !pending.isCompleted) {
+            pending.complete('$prefix|$payload');
+          }
+        },
+        onDone: () {
+          _winDaemonProc = null;
+          _winDaemonStarting = null;
+          for (final c in _winDaemonPending.values) {
+            if (!c.isCompleted) c.complete('');
+          }
+          _winDaemonPending.clear();
+        },
+        onError: (_) {
+          _winDaemonProc = null;
+          _winDaemonStarting = null;
+        },
+      );
+      proc.stderr.drain<void>();
+
+      const bootstrapScript = r'''
+$ErrorActionPreference = 'SilentlyContinue'
+Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class LgWin32Remote {
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
+  [DllImport("user32.dll")] public static extern void mouse_event(int dwFlags, int dx, int dy, int cButtons, int dwExtraInfo);
+  [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, int dwFlags, int dwExtraInfo);
+  [DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+}
+"@
+[LgWin32Remote]::SetProcessDPIAware() | Out-Null
+$jpegCodec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' } | Select-Object -First 1
+$cyanPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(230, 56, 189, 248), 3)
+$shellApp = $null
+
+while (($line = [Console]::In.ReadLine()) -ne $null) {
+  if ([string]::IsNullOrWhiteSpace($line)) { continue }
+  $parts = $line.Split('|')
+  $cmd = $parts[0]
+  if ($cmd -eq 'CAP' -and $parts.Length -ge 4) {
+    $id = $parts[1]
+    $maxW = [int]$parts[2]
+    $qual = [long]$parts[3]
+    try {
+      $sw = [LgWin32Remote]::GetSystemMetrics(0)
+      $sh = [LgWin32Remote]::GetSystemMetrics(1)
+      if ($sw -le 0 -or $sh -le 0) {
+        $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+        $sw = $b.Width; $sh = $b.Height
+      }
+      $bmp = New-Object System.Drawing.Bitmap($sw, $sh)
+      $g = [System.Drawing.Graphics]::FromImage($bmp)
+      $g.CopyFromScreen(0, 0, 0, 0, (New-Object System.Drawing.Size($sw, $sh)))
+      $cur = [System.Windows.Forms.Cursor]::Position
+      $g.DrawEllipse($cyanPen, $cur.X - 8, $cur.Y - 8, 16, 16)
+      $g.Dispose()
+      $scale = [Math]::Min(1.0, [double]$maxW / [double]$sw)
+      $dw = [Math]::Max(1, [int]($sw * $scale))
+      $dh = [Math]::Max(1, [int]($sh * $scale))
+      $outBmp = if ($scale -lt 0.999) { New-Object System.Drawing.Bitmap($bmp, $dw, $dh) } else { $bmp }
+      if ($outBmp -ne $bmp) { $bmp.Dispose() }
+      $ms = New-Object System.IO.MemoryStream
+      $ep = New-Object System.Drawing.Imaging.EncoderParameters(1)
+      $ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, $qual)
+      $outBmp.Save($ms, $jpegCodec, $ep)
+      $outBmp.Dispose()
+      $ep.Dispose()
+      $b64 = [Convert]::ToBase64String($ms.ToArray())
+      $ms.Dispose()
+      [Console]::Out.WriteLine("FRAME|$id|$dw|$dh|$b64")
+      [Console]::Out.Flush()
+    } catch {
+      [Console]::Out.WriteLine("ERR|$id|cap")
+      [Console]::Out.Flush()
+    }
+  } elseif ($cmd -eq 'MOUSE' -and $parts.Length -ge 7) {
+    $id = $parts[1]
+    $mtype = $parts[2]
+    $nx = [double]$parts[3]
+    $ny = [double]$parts[4]
+    $dx = [int]$parts[5]
+    $dy = [int]$parts[6]
+    try {
+      $sw = [Math]::Max(1, [LgWin32Remote]::GetSystemMetrics(0))
+      $sh = [Math]::Max(1, [LgWin32Remote]::GetSystemMetrics(1))
+      $x = [int]([Math]::Round($nx * ($sw - 1)))
+      $y = [int]([Math]::Round($ny * ($sh - 1)))
+      [LgWin32Remote]::SetCursorPos($x, $y) | Out-Null
+      switch ($mtype) {
+        'tap' { [LgWin32Remote]::mouse_event(0x0002, 0, 0, 0, 0); [LgWin32Remote]::mouse_event(0x0004, 0, 0, 0, 0) }
+        'double_tap' {
+          [LgWin32Remote]::mouse_event(0x0002, 0, 0, 0, 0); [LgWin32Remote]::mouse_event(0x0004, 0, 0, 0, 0)
+          [LgWin32Remote]::mouse_event(0x0002, 0, 0, 0, 0); [LgWin32Remote]::mouse_event(0x0004, 0, 0, 0, 0)
+        }
+        'right_click' { [LgWin32Remote]::mouse_event(0x0008, 0, 0, 0, 0); [LgWin32Remote]::mouse_event(0x0010, 0, 0, 0, 0) }
+        'down' { [LgWin32Remote]::mouse_event(0x0002, 0, 0, 0, 0) }
+        'up' { [LgWin32Remote]::mouse_event(0x0004, 0, 0, 0, 0) }
+        'scroll' {
+          if ($dy -ne 0) { [LgWin32Remote]::mouse_event(0x0800, 0, 0, ($dy * 3), 0) }
+          if ($dx -ne 0) { [LgWin32Remote]::mouse_event(0x01000, 0, 0, ($dx * 3), 0) }
+        }
+      }
+    } catch {}
+    [Console]::Out.WriteLine("OK|$id|1")
+    [Console]::Out.Flush()
+  } elseif ($cmd -eq 'KEY' -and $parts.Length -ge 3) {
+    $id = $parts[1]
+    $k = $parts[2]
+    try {
+      if ($k -eq 'show_desktop' -or $k -eq 'win+d') {
+        if ($null -eq $shellApp) { $shellApp = New-Object -ComObject Shell.Application }
+        $shellApp.ToggleDesktop()
+      } elseif ($k -eq 'minimize_app' -or $k -eq 'hide_app') {
+        $fg = [LgWin32Remote]::GetForegroundWindow()
+        if ($fg -ne [IntPtr]::Zero) { [LgWin32Remote]::ShowWindow($fg, 6) | Out-Null }
+      } elseif ($k -eq 'mission_control' -or $k -eq 'win+tab') {
+        [LgWin32Remote]::keybd_event(0x5B, 0, 0, 0)
+        [LgWin32Remote]::keybd_event(0x09, 0, 0, 0)
+        [LgWin32Remote]::keybd_event(0x09, 0, 2, 0)
+        [LgWin32Remote]::keybd_event(0x5B, 0, 2, 0)
+      } else {
+        [System.Windows.Forms.SendKeys]::SendWait($k)
+      }
+    } catch {}
+    [Console]::Out.WriteLine("OK|$id|1")
+    [Console]::Out.Flush()
+  } elseif ($cmd -eq 'TEXT' -and $parts.Length -ge 3) {
+    $id = $parts[1]
+    $b64 = $parts[2]
+    try {
+      $txt = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
+      [System.Windows.Forms.SendKeys]::SendWait($txt)
+    } catch {}
+    [Console]::Out.WriteLine("OK|$id|1")
+    [Console]::Out.Flush()
+  }
+}
+''';
+      proc.stdin.writeln(bootstrapScript);
+      await proc.stdin.flush();
+      completer.complete(proc);
+      return proc;
+    } catch (_) {
+      _winDaemonProc = null;
+      _winDaemonStarting = null;
+      completer.complete(null);
+      return null;
+    }
+  }
+
+  Future<String?> _sendWinDaemonCommand(
+    String cmdPrefix,
+    List<String> args, {
+    Duration timeout = const Duration(milliseconds: 1800),
+  }) async {
+    final proc = await _ensureWindowsDesktopDaemon();
+    if (proc == null) return null;
+    final reqId = 'r${++_winDaemonReqSeq}';
+    final completer = Completer<String>();
+    _winDaemonPending[reqId] = completer;
+    try {
+      proc.stdin.writeln('$cmdPrefix|$reqId|${args.join('|')}');
+      return await completer.future.timeout(timeout);
+    } catch (_) {
+      _winDaemonPending.remove(reqId);
+      return null;
+    }
+  }
+
   Future<({
     Uint8List bytes,
     String mimeType,
@@ -1876,9 +2154,38 @@ class PeerMeshService extends ChangeNotifier {
     int maxWidth = 1280,
     int quality = 72,
   }) async {
+    // 1. Fast Path: Persistent In-Memory PowerShell C# Worker Daemon (~15-25ms, zero disk I/O)
     try {
-      final tmpPath =
-          '${Directory.systemTemp.path}\\lg_win_desk_$pid.jpg';
+      final resp = await _sendWinDaemonCommand(
+        'CAP',
+        [maxWidth.toString(), quality.toString()],
+        timeout: const Duration(milliseconds: 1800),
+      );
+      if (resp != null && resp.startsWith('FRAME|')) {
+        final parts = resp.substring(6).split('|');
+        if (parts.length >= 3) {
+          final w = int.tryParse(parts[0]) ?? 1280;
+          final h = int.tryParse(parts[1]) ?? 720;
+          final b64 = parts[2].trim();
+          if (b64.isNotEmpty) {
+            final bytes = base64Decode(b64);
+            if (bytes.isNotEmpty) {
+              return (
+                bytes: bytes,
+                mimeType: 'image/jpeg',
+                actualMode: 'desktop',
+                width: w,
+                height: h,
+              );
+            }
+          }
+        }
+      }
+    } catch (_) {}
+
+    // 2. Fallback: One-shot PowerShell with -EncodedCommand and in-memory MemoryStream
+    // (Eliminates temp file lock collisions and command-line quote escaping issues)
+    try {
       final script = '''
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing
 \$b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
@@ -1890,38 +2197,49 @@ Add-Type -AssemblyName System.Windows.Forms,System.Drawing
 \$g.DrawEllipse(\$pen, \$cur.X - 7, \$cur.Y - 7, 14, 14)
 \$g.Dispose()
 \$scale = [Math]::Min(1.0, $maxWidth.0 / \$b.Width)
-\$dw = [int](\$b.Width * \$scale)
-\$dh = [int](\$b.Height * \$scale)
+\$dw = [Math]::Max(1, [int](\$b.Width * \$scale))
+\$dh = [Math]::Max(1, [int](\$b.Height * \$scale))
 \$out = New-Object System.Drawing.Bitmap(\$bmp, \$dw, \$dh)
 \$bmp.Dispose()
-\$codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { \$_.MimeType -eq 'image/jpeg' }
+\$ms = New-Object System.IO.MemoryStream
+\$codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { \$_.MimeType -eq 'image/jpeg' } | Select-Object -First 1
 \$ep = New-Object System.Drawing.Imaging.EncoderParameters(1)
 \$ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, [long]$quality)
-\$out.Save('$tmpPath', \$codec, \$ep)
+\$out.Save(\$ms, \$codec, \$ep)
 \$out.Dispose()
-Write-Output "\$dw,\$dh"
+\$b64 = [Convert]::ToBase64String(\$ms.ToArray())
+\$ms.Dispose()
+[Console]::Out.WriteLine("\$dw,\$dh,\$b64")
 ''';
       final res = await Process.run(
         'powershell',
-        ['-NoProfile', '-NonInteractive', '-Command', script],
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-EncodedCommand',
+          _encodePowerShellCommand(script),
+        ],
       ).timeout(const Duration(seconds: 3));
-      final f = File(tmpPath);
-      if (res.exitCode == 0 && await f.exists()) {
-        final bytes = await f.readAsBytes();
-        try {
-          await f.delete();
-        } catch (_) {}
-        if (bytes.isNotEmpty) {
-          final parts = res.stdout.toString().trim().split(',');
-          final w = parts.isNotEmpty ? (int.tryParse(parts[0]) ?? 1280) : 1280;
-          final h = parts.length > 1 ? (int.tryParse(parts[1]) ?? 720) : 720;
-          return (
-            bytes: bytes,
-            mimeType: 'image/jpeg',
-            actualMode: 'desktop',
-            width: w,
-            height: h,
-          );
+      if (res.exitCode == 0) {
+        final outStr = res.stdout.toString().trim();
+        final c1 = outStr.indexOf(',');
+        final c2 = c1 > 0 ? outStr.indexOf(',', c1 + 1) : -1;
+        if (c1 > 0 && c2 > c1) {
+          final w = int.tryParse(outStr.substring(0, c1)) ?? 1280;
+          final h = int.tryParse(outStr.substring(c1 + 1, c2)) ?? 720;
+          final b64 = outStr.substring(c2 + 1).trim();
+          if (b64.isNotEmpty) {
+            final bytes = base64Decode(b64);
+            if (bytes.isNotEmpty) {
+              return (
+                bytes: bytes,
+                mimeType: 'image/jpeg',
+                actualMode: 'desktop',
+                width: w,
+                height: h,
+              );
+            }
+          }
         }
       }
     } catch (_) {}
@@ -2182,19 +2500,51 @@ Write-Output "\$dw,\$dh"
     final action = (payload['action'] ?? '').toString().trim();
     switch (action) {
       case 'mouse':
+        final mType = (payload['type'] ?? 'tap').toString();
+        if (mType == 'move' || mType == 'drag') {
+          if (_isInjectingMouse) {
+            _pendingMouseMovePayload = payload;
+            return {'ok': true};
+          }
+          _isInjectingMouse = true;
+          try {
+            await _injectLocalPointerOrDesktopMouse(payload);
+            while (_pendingMouseMovePayload != null) {
+              final nextPayload = _pendingMouseMovePayload!;
+              _pendingMouseMovePayload = null;
+              await _injectLocalPointerOrDesktopMouse(nextPayload);
+            }
+          } finally {
+            _isInjectingMouse = false;
+          }
+          return {'ok': true};
+        }
+        _pendingMouseMovePayload = null;
         await _injectLocalPointerOrDesktopMouse(payload);
+        return {'ok': true};
+
+      case 'minimize_app':
+      case 'hide_app':
+        await minimizeLocalAppWindow();
         return {'ok': true};
 
       case 'key':
         final keyName = (payload['key'] ?? '').toString().trim().toLowerCase();
-        final targetMode = (payload['targetMode'] ?? 'app').toString();
+        if (keyName == 'minimize_app' || keyName == 'hide_app') {
+          await minimizeLocalAppWindow();
+          return {'ok': true};
+        }
+        if (keyName == 'show_desktop' || keyName == 'win+d') {
+          unawaited(minimizeLocalAppWindow());
+        }
+        final targetMode = (payload['targetMode'] ?? 'desktop').toString();
         await _injectLocalKeyAction(keyName, targetMode: targetMode);
         return {'ok': true};
 
       case 'text':
         final text = (payload['text'] ?? '').toString();
         final submit = payload['submit'] == true;
-        final targetMode = (payload['targetMode'] ?? 'app').toString();
+        final targetMode = (payload['targetMode'] ?? 'desktop').toString();
         await _injectLocalTextInput(
           text,
           submit: submit,
@@ -2239,11 +2589,10 @@ Write-Output "\$dw,\$dh"
         double.tryParse((payload['deltaX'] ?? 0).toString()) ?? 0.0;
     final deltaY =
         double.tryParse((payload['deltaY'] ?? 0).toString()) ?? 0.0;
-    final targetMode = (payload['targetMode'] ?? 'app').toString();
+    final targetMode = (payload['targetMode'] ?? 'desktop').toString();
 
     _lastRemoteCursorNormalized = Offset(nx, ny);
     _lastRemoteCursorAt = DateTime.now();
-    notifyListeners();
 
     final useOsDesktopControl =
         (targetMode == 'desktop' || targetMode == 'auto') &&
@@ -2252,7 +2601,7 @@ Write-Output "\$dw,\$dh"
 
     if (useOsDesktopControl &&
         !kIsWeb &&
-        (Platform.isMacOS || Platform.isAndroid)) {
+        (Platform.isMacOS || Platform.isWindows || Platform.isAndroid)) {
       try {
         final ok = await NativeUtilsChannelHub.channel.invokeMethod<bool>(
           'injectDesktopMouseEvent',
@@ -2273,6 +2622,7 @@ Write-Output "\$dw,\$dh"
         type: type,
         nx: nx,
         ny: ny,
+        deltaX: deltaX.round(),
         deltaY: deltaY.round(),
       )) {
         return;
@@ -2406,8 +2756,28 @@ Write-Output "\$dw,\$dh"
     required String type,
     required double nx,
     required double ny,
+    int deltaX = 0,
     required int deltaY,
   }) async {
+    // 1. Fast Path: Persistent In-Memory PowerShell C# Worker Daemon (<1ms latency)
+    try {
+      final resp = await _sendWinDaemonCommand(
+        'MOUSE',
+        [
+          type,
+          nx.toStringAsFixed(4),
+          ny.toStringAsFixed(4),
+          deltaX.toString(),
+          deltaY.toString(),
+        ],
+        timeout: const Duration(milliseconds: 800),
+      );
+      if (resp != null && resp.startsWith('OK|')) {
+        return true;
+      }
+    } catch (_) {}
+
+    // 2. Fallback: One-shot PowerShell with -EncodedCommand
     try {
       final script = '''
 Add-Type -AssemblyName System.Windows.Forms
@@ -2418,16 +2788,21 @@ Add-Type -MemberDefinition '[DllImport("user32.dll")] public static extern void 
 [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(\$x, \$y)
 switch ('$type') {
   'tap' { [Win32.WinMouse]::mouse_event(0x0002, 0, 0, 0, 0); [Win32.WinMouse]::mouse_event(0x0004, 0, 0, 0, 0) }
-  'double_tap' { [Win32.WinMouse]::mouse_event(0x0002, 0, 0, 0, 0); [Win32.WinMouse]::mouse_event(0x0004, 0, 0, 0, 0); Start-Sleep -Milliseconds 40; [Win32.WinMouse]::mouse_event(0x0002, 0, 0, 0, 0); [Win32.WinMouse]::mouse_event(0x0004, 0, 0, 0, 0) }
+  'double_tap' { [Win32.WinMouse]::mouse_event(0x0002, 0, 0, 0, 0); [Win32.WinMouse]::mouse_event(0x0004, 0, 0, 0, 0); [Win32.WinMouse]::mouse_event(0x0002, 0, 0, 0, 0); [Win32.WinMouse]::mouse_event(0x0004, 0, 0, 0, 0) }
   'right_click' { [Win32.WinMouse]::mouse_event(0x0008, 0, 0, 0, 0); [Win32.WinMouse]::mouse_event(0x0010, 0, 0, 0, 0) }
   'down' { [Win32.WinMouse]::mouse_event(0x0002, 0, 0, 0, 0) }
   'up' { [Win32.WinMouse]::mouse_event(0x0004, 0, 0, 0, 0) }
-  'scroll' { [Win32.WinMouse]::mouse_event(0x0800, 0, 0, ${deltaY * 4}, 0) }
+  'scroll' { [Win32.WinMouse]::mouse_event(0x0800, 0, 0, ${deltaY * 3}, 0) }
 }
 ''';
       final res = await Process.run(
         'powershell',
-        ['-NoProfile', '-NonInteractive', '-Command', script],
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-EncodedCommand',
+          _encodePowerShellCommand(script),
+        ],
       ).timeout(const Duration(seconds: 2));
       return res.exitCode == 0;
     } catch (_) {
@@ -2471,7 +2846,7 @@ switch ('$type') {
 
   Future<void> _injectLocalKeyAction(
     String keyName, {
-    String targetMode = 'app',
+    String targetMode = 'desktop',
   }) async {
     final useOsDesktopControl =
         (targetMode == 'desktop' || targetMode == 'auto') &&
@@ -2480,7 +2855,7 @@ switch ('$type') {
 
     if (useOsDesktopControl &&
         !kIsWeb &&
-        (Platform.isMacOS || Platform.isAndroid)) {
+        (Platform.isMacOS || Platform.isWindows || Platform.isAndroid)) {
       try {
         final handled = await NativeUtilsChannelHub.channel.invokeMethod<bool>(
           'injectDesktopKeyEvent',
@@ -2566,10 +2941,43 @@ switch ('$type') {
     String keyName = '',
     String text = '',
   }) async {
+    if (text.isNotEmpty) {
+      try {
+        final b64 = base64Encode(utf8.encode(text));
+        final resp = await _sendWinDaemonCommand(
+          'TEXT',
+          [b64],
+          timeout: const Duration(milliseconds: 1000),
+        );
+        if (resp != null && resp.startsWith('OK|')) {
+          return true;
+        }
+      } catch (_) {}
+    }
+
+    final lowerKey = keyName.toLowerCase().trim();
+    if (lowerKey == 'show_desktop' ||
+        lowerKey == 'win+d' ||
+        lowerKey == 'minimize_app' ||
+        lowerKey == 'hide_app' ||
+        lowerKey == 'mission_control' ||
+        lowerKey == 'win+tab') {
+      try {
+        final resp = await _sendWinDaemonCommand(
+          'KEY',
+          [lowerKey],
+          timeout: const Duration(milliseconds: 1000),
+        );
+        if (resp != null && resp.startsWith('OK|')) {
+          return true;
+        }
+      } catch (_) {}
+    }
+
     try {
       String sendKeyStr = text;
       if (sendKeyStr.isEmpty) {
-        sendKeyStr = switch (keyName.toLowerCase()) {
+        sendKeyStr = switch (lowerKey) {
           'enter' || 'ok' => '{ENTER}',
           'back' || 'escape' || 'esc' => '{ESC}',
           'tab' => '{TAB}',
@@ -2594,12 +3002,24 @@ switch ('$type') {
           _ => keyName,
         };
       }
-      if (keyName == 'show_desktop' || keyName == 'win+d') {
+      if (text.isEmpty && sendKeyStr.isNotEmpty) {
+        final resp = await _sendWinDaemonCommand(
+          'KEY',
+          [sendKeyStr],
+          timeout: const Duration(milliseconds: 1000),
+        );
+        if (resp != null && resp.startsWith('OK|')) {
+          return true;
+        }
+      }
+      if (lowerKey == 'show_desktop' || lowerKey == 'win+d') {
         final res = await Process.run('powershell', [
           '-NoProfile',
           '-NonInteractive',
-          '-Command',
-          '(New-Object -ComObject Shell.Application).ToggleDesktop()',
+          '-EncodedCommand',
+          _encodePowerShellCommand(
+            '(New-Object -ComObject Shell.Application).ToggleDesktop()',
+          ),
         ]).timeout(const Duration(seconds: 2));
         return res.exitCode == 0;
       }
@@ -2607,8 +3027,10 @@ switch ('$type') {
       final res = await Process.run('powershell', [
         '-NoProfile',
         '-NonInteractive',
-        '-Command',
-        "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('$escaped')",
+        '-EncodedCommand',
+        _encodePowerShellCommand(
+          "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('$escaped')",
+        ),
       ]).timeout(const Duration(seconds: 2));
       return res.exitCode == 0;
     } catch (_) {
@@ -2664,7 +3086,7 @@ switch ('$type') {
 
     if (useOsDesktopControl &&
         !kIsWeb &&
-        (Platform.isMacOS || Platform.isAndroid)) {
+        (Platform.isMacOS || Platform.isWindows || Platform.isAndroid)) {
       try {
         final ok = await NativeUtilsChannelHub.channel.invokeMethod<bool>(
           'injectDesktopKeyEvent',
@@ -3415,40 +3837,65 @@ switch ('$type') {
   }
 
   void _handlePeerWebSocket(WebSocket ws) {
-    Timer? streamTimer;
-    bool streamingFrame = false;
-    String streamMode = 'auto';
+    Timer? nextFrameTimer;
+    bool isStreaming = false;
+    bool capturingFrame = false;
+    bool pendingImmediateFrame = false;
+    String streamMode = 'desktop';
     int streamMaxWidth = 1280;
     int streamQuality = 70;
-    int streamFps = 5;
+    int streamFps = 15;
 
-    void startLoop() {
-      streamTimer?.cancel();
-      final intervalMs = (1000 ~/ streamFps.clamp(1, 15)).clamp(65, 1000);
-      streamTimer = Timer.periodic(Duration(milliseconds: intervalMs), (_) async {
-        if (streamingFrame || ws.readyState != WebSocket.open) return;
-        streamingFrame = true;
-        try {
-          final frame = await captureLocalScreenFrame(
-            mode: streamMode,
-            maxWidth: streamMaxWidth,
-            quality: streamQuality,
-          );
-          if (frame != null && ws.readyState == WebSocket.open) {
-            ws.add(jsonEncode({
-              'event': 'screen_frame',
-              'mode': frame.actualMode,
-              'mimeType': frame.mimeType,
-              'width': frame.width,
-              'height': frame.height,
-              'data': base64Encode(frame.bytes),
-            }));
-          }
-        } catch (_) {
-        } finally {
-          streamingFrame = false;
+    Future<void> captureAndSendOnce({bool scheduleNext = true}) async {
+      if (!isStreaming || ws.readyState != WebSocket.open) return;
+      if (capturingFrame) {
+        pendingImmediateFrame = true;
+        return;
+      }
+      capturingFrame = true;
+      final sw = Stopwatch()..start();
+      try {
+        final frame = await captureLocalScreenFrame(
+          mode: streamMode,
+          maxWidth: streamMaxWidth,
+          quality: streamQuality,
+        );
+        if (frame != null && isStreaming && ws.readyState == WebSocket.open) {
+          ws.add(jsonEncode({
+            'event': 'screen_frame',
+            'mode': frame.actualMode,
+            'mimeType': frame.mimeType,
+            'width': frame.width,
+            'height': frame.height,
+            'data': base64Encode(frame.bytes),
+          }));
         }
-      });
+      } catch (_) {
+      } finally {
+        sw.stop();
+        capturingFrame = false;
+      }
+      if (!isStreaming || ws.readyState != WebSocket.open) return;
+      if (pendingImmediateFrame) {
+        pendingImmediateFrame = false;
+        nextFrameTimer?.cancel();
+        nextFrameTimer = Timer(
+          const Duration(milliseconds: 12),
+          () => unawaited(captureAndSendOnce()),
+        );
+        return;
+      }
+      if (scheduleNext) {
+        final targetIntervalMs =
+            (1000 ~/ streamFps.clamp(1, 24)).clamp(40, 1000);
+        final waitMs =
+            max(10, targetIntervalMs - sw.elapsedMilliseconds);
+        nextFrameTimer?.cancel();
+        nextFrameTimer = Timer(
+          Duration(milliseconds: waitMs),
+          () => unawaited(captureAndSendOnce()),
+        );
+      }
     }
 
     ws.listen(
@@ -3459,29 +3906,43 @@ switch ('$type') {
           if (map is! Map<String, dynamic>) return;
           final cmd = (map['cmd'] ?? map['action'] ?? '').toString();
           if (cmd == 'start_stream') {
-            streamMode = (map['mode'] ?? 'auto').toString();
+            streamMode = (map['mode'] ?? 'desktop').toString();
             streamMaxWidth =
                 int.tryParse((map['maxWidth'] ?? 1280).toString()) ?? 1280;
             streamQuality =
                 int.tryParse((map['quality'] ?? 70).toString()) ?? 70;
-            streamFps = int.tryParse((map['fps'] ?? 5).toString()) ?? 5;
-            startLoop();
+            streamFps = int.tryParse((map['fps'] ?? 15).toString()) ?? 15;
+            if (map['minimizeApp'] == true &&
+                (streamMode == 'desktop' || streamMode == 'auto')) {
+              unawaited(minimizeLocalAppWindow());
+            }
+            isStreaming = true;
+            nextFrameTimer?.cancel();
+            unawaited(captureAndSendOnce());
           } else if (cmd == 'stop_stream') {
-            streamTimer?.cancel();
-            streamTimer = null;
+            isStreaming = false;
+            nextFrameTimer?.cancel();
+            nextFrameTimer = null;
           } else {
             final res = await _executeIncomingControlCommand(map);
             if (ws.readyState == WebSocket.open) {
               ws.add(jsonEncode({'event': 'control_ack', ...res}));
             }
+            // Push an immediate frame after discrete interactions so visual feedback is instantaneous
+            final mType = (map['type'] ?? '').toString();
+            if (isStreaming && mType != 'move') {
+              unawaited(captureAndSendOnce(scheduleNext: false));
+            }
           }
         } catch (_) {}
       },
       onDone: () {
-        streamTimer?.cancel();
+        isStreaming = false;
+        nextFrameTimer?.cancel();
       },
       onError: (_) {
-        streamTimer?.cancel();
+        isStreaming = false;
+        nextFrameTimer?.cancel();
       },
     );
   }
@@ -3682,7 +4143,7 @@ switch ('$type') {
     return 'application/octet-stream';
   }
 
-  /// Detects all local IPv4 addresses, prioritizing LAN (`en*`, `wlan*`, `eth*`)
+  /// Detects all local IPv4 addresses, prioritizing LAN (`en*`, `wlan*`, `eth*`, `以太网`, `本地连接`)
   /// and also including Tailscale (`100.x.x.x`), ZeroTier (`zt*`), and VPN interfaces.
   static Future<List<String>> _detectAllLocalIps() async {
     try {
@@ -3692,23 +4153,44 @@ switch ('$type') {
       );
       final primary = <String>[];
       final secondary = <String>[];
+      final virtualAdapters = <String>[];
       for (final iface in interfaces) {
         final name = iface.name.toLowerCase();
+        final isVirtual = name.contains('vethernet') ||
+            name.contains('wsl') ||
+            name.contains('hyper-v') ||
+            name.contains('vmware') ||
+            name.contains('vmnet') ||
+            name.contains('virtualbox') ||
+            name.contains('vbox') ||
+            name.contains('docker') ||
+            name.contains('npcap') ||
+            name.contains('loopback');
+        final isPhysicalLan = !isVirtual &&
+            (name.startsWith('en') ||
+                name.startsWith('wlan') ||
+                name.startsWith('eth') ||
+                name.startsWith('wi-fi') ||
+                name.contains('以太网') ||
+                name.contains('本地连接') ||
+                name.contains('无线网络'));
         for (final addr in iface.addresses) {
           final ip = addr.address;
           if (!ip.startsWith('169.254.') && ip != '127.0.0.1') {
-            if (name.startsWith('en') ||
-                name.startsWith('wlan') ||
-                name.startsWith('eth') ||
-                name.startsWith('wi-fi')) {
+            if (isPhysicalLan) {
               if (!primary.contains(ip)) primary.add(ip);
+            } else if (isVirtual) {
+              if (!virtualAdapters.contains(ip)) virtualAdapters.add(ip);
             } else {
               if (!secondary.contains(ip)) secondary.add(ip);
             }
           }
         }
       }
-      return [...primary, ...secondary];
+      primary.sort();
+      secondary.sort();
+      virtualAdapters.sort();
+      return [...primary, ...secondary, ...virtualAdapters];
     } catch (_) {
       return const [];
     }

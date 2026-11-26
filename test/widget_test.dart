@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:m3u8_client/main.dart';
@@ -15,6 +16,7 @@ import 'package:m3u8_client/services/peer_mesh_service.dart';
 import 'package:m3u8_client/services/proxy_routing_service.dart';
 import 'package:m3u8_client/services/smb_client_service.dart';
 import 'package:m3u8_client/services/telegram_notification_service.dart';
+import 'package:m3u8_client/services/tv_platform_service.dart';
 import 'package:m3u8_client/state/app_state.dart';
 import 'package:m3u8_client/ui/screens/downloads_screen.dart';
 import 'package:m3u8_client/ui/screens/library_history_screen.dart';
@@ -123,6 +125,39 @@ class _FakeTelegramApiClient extends ApiClient {
     );
   }
 
+  int lastFetchOffsetId = 0;
+  bool lastFetchMarkRead = false;
+  void Function(int percent, String statusText)? activeUploadProgressCallback;
+  String lastResolvedLinkUrl = '';
+  bool throwOnResolveLink = false;
+  String lastSentText = '';
+  String lastSentPeer = '';
+  int downloadTelegramBytesCount = 0;
+  final Map<int, TelegramFilePreview> filePreviewsByMsgId = {};
+  final Map<int, Uint8List> rawFileBytesByMsgId = {};
+
+  @override
+  Future<TelegramFilePreview> fetchTelegramFilePreview({
+    required String accountId,
+    required String peer,
+    required int messageId,
+    String? entry,
+  }) async {
+    final p = filePreviewsByMsgId[messageId];
+    if (p != null) return p;
+    throw const ApiException('服务端未内置该格式预览，由客户端解析');
+  }
+
+  @override
+  Future<Uint8List> downloadTelegramBytes(String url) async {
+    downloadTelegramBytesCount++;
+    final uri = Uri.tryParse(url);
+    final msgId = int.tryParse(uri?.queryParameters['message_id'] ?? '') ?? 0;
+    final customBytes = rawFileBytesByMsgId[msgId];
+    if (customBytes != null) return customBytes;
+    return Uint8List.fromList([0x25, 0x50, 0x44, 0x46]);
+  }
+
   @override
   Future<({List<TelegramMessage> messages, int nextOffset})>
       fetchTelegramMessages({
@@ -130,13 +165,105 @@ class _FakeTelegramApiClient extends ApiClient {
     required String peer,
     int offsetId = 0,
     int limit = 50,
+    bool markRead = false,
   }) async {
-    return (
-      messages: List<TelegramMessage>.from(
-        serverMessagesByPeer[peer] ?? const <TelegramMessage>[],
-      ),
-      nextOffset: 0,
+    lastFetchOffsetId = offsetId;
+    lastFetchMarkRead = markRead;
+    final all = List<TelegramMessage>.from(
+      serverMessagesByPeer[peer] ?? const <TelegramMessage>[],
     );
+    if (offsetId > 0) {
+      final filtered = all.where((m) => m.id < offsetId).toList();
+      final tail = filtered.length > limit
+          ? filtered.sublist(filtered.length - limit)
+          : filtered;
+      return (
+        messages: tail,
+        nextOffset: tail.isNotEmpty && tail.first.id > 1 ? tail.first.id : 0,
+      );
+    }
+    final tail =
+        all.length > limit ? all.sublist(all.length - limit) : all;
+    return (
+      messages: tail,
+      nextOffset: all.length > limit ? tail.first.id : 0,
+    );
+  }
+
+  @override
+  Future<List<TelegramMessage>> sendTelegramFiles({
+    required String accountId,
+    required String peer,
+    required List<TelegramOutgoingFile> files,
+    String text = '',
+    int replyTo = 0,
+    bool asFile = false,
+    void Function(int percent, String statusText)? onProgress,
+  }) async {
+    activeUploadProgressCallback = onProgress;
+    onProgress?.call(28, '正在上传 ${files.first.name} (2.8 MB / 10.0 MB · 5.6 MB/s)...');
+    await sendCompleter.future;
+    onProgress?.call(100, '发送完成');
+    sendCompleted = true;
+    return [
+      TelegramMessage(
+        id: 305,
+        date: 1700000090,
+        sender: '我',
+        text: text,
+        outgoing: true,
+        replyToId: replyTo,
+        attachment: TelegramAttachment(
+          kind: 'file',
+          name: files.first.name,
+          fileName: files.first.name,
+          size: files.first.size,
+          mimeType: files.first.mimeType,
+        ),
+      ),
+    ];
+  }
+
+  @override
+  Future<
+      ({
+        TelegramChat chat,
+        List<TelegramMessage> messages,
+        int nextOffset,
+        int messageId,
+      })> resolveTelegramLink({
+    required String accountId,
+    required String url,
+  }) async {
+    lastResolvedLinkUrl = url;
+    if (throwOnResolveLink) {
+      throw Exception('当前账号尚未加入该私有频道');
+    }
+    final chat = serverChats.first;
+    final msgs = serverMessagesByPeer[chat.peer] ?? const <TelegramMessage>[];
+    return (
+      chat: chat,
+      messages: msgs,
+      nextOffset: 0,
+      messageId: msgs.isNotEmpty ? msgs.first.id : 0,
+    );
+  }
+
+  int nextSentMessageId = 102;
+  final List<int> deletedMessageIds = [];
+
+  @override
+  Future<void> deleteTelegramMessages({
+    required String accountId,
+    required String peer,
+    required List<int> messageIds,
+    bool revoke = true,
+  }) async {
+    deletedMessageIds.addAll(messageIds);
+    final list = serverMessagesByPeer[peer];
+    if (list != null) {
+      list.removeWhere((m) => messageIds.contains(m.id));
+    }
   }
 
   @override
@@ -146,15 +273,21 @@ class _FakeTelegramApiClient extends ApiClient {
     required String text,
     int replyTo = 0,
   }) async {
+    lastSentPeer = peer;
+    lastSentText = text;
     await sendCompleter.future;
     sendCompleted = true;
-    return TelegramMessage(
-      id: 102,
-      date: 1700000050,
+    final id = nextSentMessageId++;
+    final msg = TelegramMessage(
+      id: id,
+      date: 1700000050 + id,
       sender: '我',
       text: text,
       outgoing: true,
+      replyToId: replyTo,
     );
+    serverMessagesByPeer.putIfAbsent(peer, () => []).add(msg);
+    return msg;
   }
 
   @override
@@ -186,6 +319,24 @@ class _FakeTelegramApiClient extends ApiClient {
 
   @override
   Future<List<DownloadTask>> fetchDownloadTasks() async => const [];
+
+  int created115TasksCount = 0;
+
+  @override
+  Future<String?> createDownloadTask({
+    required String url,
+    required String name,
+    Map<String, String>? headers,
+    String? telegramAccountId,
+    Map<String, dynamic>? videoContext,
+    bool forceDuplicate = false,
+  }) async {
+    created115TasksCount++;
+    return 'task_115_$created115TasksCount';
+  }
+
+  @override
+  Future<void> uploadTaskTo115(String id) async {}
 
   @override
   Future<ServerSettings> fetchServerSettings() async => const ServerSettings({});
@@ -3190,6 +3341,1402 @@ proxies:
       await tester.tap(find.text('发送消息 & 聊天'));
       await tester.pump();
       expect(find.text('发送'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'TelegramScreen resolves quote replies (including off-screen messages & self sender), jumps to quoted message on tap, keeps pinned chats stable, preserves notifications when unfocused, and handles Telegram links in-app',
+    (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1440, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      SharedPreferences.setMockInitialValues({});
+      final fakeApi = _FakeTelegramApiClient();
+      final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+
+      // Configure 2 pinned chats at the top and 1 unpinned active group below them
+      fakeApi.serverChats = [
+        TelegramChat(
+          peer: 'channel:7001',
+          title: '置顶群组A',
+          kind: '超级群',
+          preview: '置顶内容1',
+          date: nowSec - 300,
+          unread: 0,
+          pinned: true,
+          topMessageId: 100,
+        ),
+        TelegramChat(
+          peer: 'user:7002',
+          title: '置顶好友B',
+          kind: '私聊',
+          preview: '置顶内容2',
+          date: nowSec - 400,
+          unread: 0,
+          pinned: true,
+          topMessageId: 200,
+        ),
+        TelegramChat(
+          peer: 'channel:7003',
+          title: '普通讨论群C',
+          kind: '超级群',
+          preview: '最新讨论',
+          date: nowSec - 10,
+          unread: 0,
+          pinned: false,
+          topMessageId: 360,
+        ),
+      ];
+
+      // Create 55 messages in channel:7003 so message #301 is outside the initial 50-message window (311..360)
+      final groupMessages = <TelegramMessage>[
+        TelegramMessage(
+          id: 301,
+          date: nowSec - 600,
+          sender: '收藏夹',
+          text: '这是很早之前发送的一条原消息内容_301',
+          outgoing: true,
+        ),
+        for (int id = 302; id <= 359; id++)
+          TelegramMessage(
+            id: id,
+            date: nowSec - (365 - id),
+            sender: '群友_$id',
+            text: '普通历史消息 #$id',
+            outgoing: false,
+          ),
+        // Message #360 replies to #301 (which is older than the initial 50 messages!)
+        TelegramMessage(
+          id: 360,
+          date: nowSec - 2,
+          sender: '小王',
+          text: '我引用回复一下301号消息',
+          outgoing: false,
+          replyToId: 301,
+          links: const ['https://t.me/c/7003/301'],
+        ),
+      ];
+      fakeApi.serverMessagesByPeer['channel:7003'] = groupMessages;
+
+      final appState = AppState(customApi: fakeApi);
+      await appState.telegramNotifications.setSystemNotificationsEnabled(false);
+      appState.updateTelegramReadingContext(
+        isTelegramViewActive: true,
+        isAppForeground: true,
+      );
+      addTearDown(appState.dispose);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: VideoPlatformTheme.buildTheme(),
+          home: Scaffold(
+            body: TelegramScreen(appState: appState),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+      await tester.pump(const Duration(milliseconds: 50));
+
+      // Refresh so our fakeApi chats replace any static session cache
+      await tester.tap(find.byIcon(Icons.refresh_rounded).first);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      // 1. Verify pinned chats are rendered above unpinned chat
+      final pinAPos = tester.getTopLeft(find.text('置顶群组A').first);
+      final pinBPos = tester.getTopLeft(find.text('置顶好友B').first);
+      final unpinnedCPos = tester.getTopLeft(find.text('普通讨论群C').first);
+      expect(pinAPos.dy, lessThan(pinBPos.dy));
+      expect(pinBPos.dy, lessThan(unpinnedCPos.dy));
+
+      // 2. Inject a real-time SSE message for unpinned chat 'channel:7003'
+      // and verify it NEVER jumps above '置顶群组A' or '置顶好友B'!
+      appState.telegramNotifications.injectSseEventForTesting(
+        'update',
+        jsonEncode({
+          'type': 'new_message',
+          'account_id': 'default',
+          'peer': 'channel:7003',
+          'chat_title': '普通讨论群C',
+          'new_message': true,
+          'notification_muted': false,
+          'message_id': 361,
+          'message': {
+            'id': 361,
+            'date': nowSec + 5,
+            'sender': '小李',
+            'text': '新来的普通群消息',
+            'outgoing': false,
+          },
+        }),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 30));
+
+      final pinAPosAfter = tester.getTopLeft(find.text('置顶群组A').first);
+      final pinBPosAfter = tester.getTopLeft(find.text('置顶好友B').first);
+      final unpinnedCPosAfter = tester.getTopLeft(find.text('普通讨论群C').first);
+      expect(pinAPosAfter.dy, lessThan(pinBPosAfter.dy));
+      expect(pinBPosAfter.dy, lessThan(unpinnedCPosAfter.dy));
+
+      // 3. Open '普通讨论群C' and verify message #360 automatically fetches off-screen replied-to message #301,
+      // displays its original content ('这是很早之前发送的一条原消息内容_301'), and resolves outgoing '收藏夹' sender to '回复 测试账号'!
+      await tester.tap(find.text('普通讨论群C').first);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 60));
+      await tester.pump(const Duration(milliseconds: 60));
+
+      expect(find.text('我引用回复一下301号消息'), findsOneWidget);
+      expect(
+        find.textContaining('这是很早之前发送的一条原消息内容_301'),
+        findsWidgets,
+      );
+      expect(find.text('回复 测试账号'), findsOneWidget);
+      expect(find.text('回复 收藏夹'), findsNothing);
+
+      // 4. Tap the reply quote banner -> jumps to and loads/highlights message #301 in the conversation
+      final quoteBannerFinder = find.byKey(
+        const ValueKey('tg_reply_quote_channel:7003_360_301'),
+      );
+      expect(quoteBannerFinder, findsOneWidget);
+      await tester.tap(quoteBannerFinder);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 350));
+      await tester.pump(const Duration(milliseconds: 250));
+
+      expect(
+        find.text('这是很早之前发送的一条原消息内容_301'),
+        findsWidgets,
+      );
+
+      // 5. Simulate window losing focus (`isAppForeground: false`) while 'channel:7003' is open:
+      // Incoming SSE message MUST create a notification and MUST NOT be auto-dismissed by _onRealtimeNotificationEvent!
+      appState.updateTelegramReadingContext(isAppForeground: false);
+      appState.telegramNotifications.injectSseEventForTesting(
+        'update',
+        jsonEncode({
+          'type': 'new_message',
+          'account_id': 'default',
+          'peer': 'channel:7003',
+          'chat_title': '普通讨论群C',
+          'new_message': true,
+          'notification_muted': false,
+          'message_id': 362,
+          'message': {
+            'id': 362,
+            'date': nowSec + 15,
+            'sender': '小张',
+            'text': '后台窗口收到的重要通知消息',
+            'outgoing': false,
+            'silent': false,
+          },
+        }),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(
+        appState.telegramNotifications.totalUnreadNotificationCount,
+        greaterThanOrEqualTo(1),
+      );
+      expect(
+        appState.telegramNotifications.pendingNotifications.any(
+          (n) =>
+              n.peer == 'channel:7003' &&
+              n.preview.contains('后台窗口收到的重要通知消息'),
+        ),
+        isTrue,
+      );
+
+      // 6. Verify a single silent message does NOT permanently mute the group for subsequent normal messages
+      appState.telegramNotifications.injectSseEventForTesting(
+        'update',
+        jsonEncode({
+          'type': 'new_message',
+          'account_id': 'default',
+          'peer': 'channel:7003',
+          'chat_title': '普通讨论群C',
+          'new_message': true,
+          'notification_muted': false,
+          'message_id': 363,
+          'message': {
+            'id': 363,
+            'date': nowSec + 20,
+            'sender': 'Bot',
+            'text': '单条静默消息',
+            'outgoing': false,
+            'silent': true,
+          },
+        }),
+      );
+      expect(
+        appState.telegramNotifications
+            .isServerPeerMuted('default', 'channel:7003'),
+        isFalse,
+      );
+
+      // Clean up pending highlight timer before ending test
+      await tester.pump(const Duration(milliseconds: 2700));
+    },
+  );
+
+  testWidgets(
+    'TelegramScreen renders inline clickable text_links and labeled corresponding link chips for message contents and auto-triggers bot /start parameters',
+    (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1440, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      SharedPreferences.setMockInitialValues({});
+      final fakeApi = _FakeTelegramApiClient();
+      final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+
+      fakeApi.serverChats = [
+        TelegramChat(
+          peer: 'user:8512861139',
+          title: 'fjxgjjbot',
+          kind: '机器人',
+          preview: '/start',
+          date: nowSec - 20,
+          unread: 0,
+          readOnly: false,
+          topMessageId: 801,
+        ),
+        TelegramChat(
+          peer: 'channel:2246105365',
+          title: '漫画与短剧资源频道',
+          kind: '频道',
+          preview: '【Zking】剑星同人Ⅲ',
+          date: nowSec - 5,
+          unread: 0,
+          broadcast: true,
+          readOnly: true,
+          topMessageId: 17926,
+        ),
+      ];
+
+      final msg1 = TelegramMessage.fromJson({
+        'id': 17925,
+        'date': nowSec - 10,
+        'sender': '漫画与短剧资源频道',
+        'text':
+            '【Zking】剑星同人Ⅲ\n标签: #3d #Zking #剑星同人\n\n[点我进入在线观看]\n\nPDF原档下载 (点击跳转)\n\n原档压缩包下载 (点击跳转)',
+        'outgoing': false,
+        'text_links': [
+          {
+            'offset': 35,
+            'length': 10,
+            'url': 'https://telegra.ph/Zking剑星同人--目录-11-25',
+          },
+          {
+            'offset': 47,
+            'length': 14,
+            'url':
+                'https://t.me/fjxgjjbot?start=6ead51bd-2962-4f13-8a80-b12a483eafc3',
+          },
+          {
+            'offset': 63,
+            'length': 14,
+            'url':
+                'https://t.me/fjxgjjbot?start=f8dff6db-3ad1-4398-b490-a001695c0db2',
+          },
+        ],
+        'links': [
+          'https://telegra.ph/Zking剑星同人--目录-11-25',
+          'https://t.me/fjxgjjbot?start=6ead51bd-2962-4f13-8a80-b12a483eafc3',
+          'https://t.me/fjxgjjbot?start=f8dff6db-3ad1-4398-b490-a001695c0db2',
+        ],
+      });
+
+      final msg2 = TelegramMessage.fromJson({
+        'id': 17926,
+        'date': nowSec - 5,
+        'sender': '漫画与短剧资源频道',
+        'text': '母上攻略 第二季5\n\n目录 导航首页\n\n传送门 第二季4\n\n简介：黄豆版\n\n#母上攻略 #AI短剧',
+        'outgoing': false,
+        'text_links': [
+          {
+            'offset': 11,
+            'length': 2,
+            'url': 'https://t.me/jinqinzhiyuan/30',
+          },
+          {
+            'offset': 20,
+            'length': 3,
+            'url': 'https://t.me/muzizhiyuan/487',
+          },
+        ],
+      });
+
+      expect(msg1.textLinks.length, 3);
+      expect(msg2.textLinks.length, 2);
+
+      fakeApi.serverMessagesByPeer['channel:2246105365'] = [msg1, msg2];
+      fakeApi.serverMessagesByPeer['user:8512861139'] = [
+        TelegramMessage(
+          id: 801,
+          date: nowSec - 20,
+          sender: 'fjxgjjbot',
+          text: '欢迎使用资源分发机器人',
+          outgoing: false,
+        ),
+      ];
+
+      final appState = AppState(customApi: fakeApi);
+      await appState.telegramNotifications.setSystemNotificationsEnabled(false);
+      appState.updateTelegramReadingContext(
+        isTelegramViewActive: true,
+        isAppForeground: true,
+      );
+      addTearDown(appState.dispose);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: VideoPlatformTheme.buildTheme(),
+          home: Scaffold(
+            body: TelegramScreen(appState: appState),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      await tester.tap(find.byIcon(Icons.refresh_rounded).first);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      // Open '漫画与短剧资源频道'
+      await tester.tap(find.text('漫画与短剧资源频道').first);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 60));
+
+      // 1. Verify labeled link chips show the corresponding content text + target hint
+      expect(
+        find.textContaining('点我进入在线观看 · telegra.ph'),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining('PDF原档下载 (点击跳转) · @fjxgjjbot'),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining('原档压缩包下载 (点击跳转) · @fjxgjjbot'),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining('目录 导航首页 · @jinqinzhiyuan/30'),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining('传送门 第二季4 · @muzizhiyuan/487'),
+        findsOneWidget,
+      );
+
+      // 2. Tap 'PDF原档下载 (点击跳转) · @fjxgjjbot' chip -> resolves bot link and automatically sends '/start 6ead51bd-2962-4f13-8a80-b12a483eafc3'
+      final pdfBotChip =
+          find.byKey(const ValueKey('tg_msg_link_chip_17925_1'));
+      expect(pdfBotChip, findsOneWidget);
+      await tester.tap(pdfBotChip);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 80));
+
+      expect(
+        fakeApi.lastResolvedLinkUrl,
+        'https://t.me/fjxgjjbot?start=6ead51bd-2962-4f13-8a80-b12a483eafc3',
+      );
+      expect(fakeApi.lastSentPeer, 'user:8512861139');
+      expect(
+        fakeApi.lastSentText,
+        '/start 6ead51bd-2962-4f13-8a80-b12a483eafc3',
+      );
+      await tester.pump(const Duration(seconds: 8));
+    },
+  );
+
+  testWidgets(
+    'TelegramScreen local file download does not show bottom SnackBar, updates icon to check_circle_rounded, and clicking again opens location instead of re-downloading',
+    (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1440, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      SharedPreferences.setMockInitialValues({});
+      final fakeApi = _FakeTelegramApiClient();
+      final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      fakeApi.serverChats = [
+        TelegramChat(
+          peer: 'user:1888',
+          title: '下载测试会话',
+          kind: '私聊',
+          preview: '附带测试文件',
+          date: nowSec,
+          unread: 0,
+          readOnly: false,
+          topMessageId: 109,
+        ),
+      ];
+      fakeApi.serverMessagesByPeer['user:1888'] = [
+        TelegramMessage(
+          id: 109,
+          date: nowSec,
+          sender: '下载测试会话',
+          text: '附带测试文件',
+          outgoing: false,
+          attachment: const TelegramAttachment(
+            kind: 'file',
+            fileName: 'report_2026.pdf',
+            size: 2048,
+            mimeType: 'application/pdf',
+            url: 'https://example.test/api/telegram/file?id=109',
+          ),
+        ),
+      ];
+      final appState = AppState(customApi: fakeApi);
+      await appState.telegramNotifications.setSystemNotificationsEnabled(false);
+      appState.updateTelegramReadingContext(
+        isTelegramViewActive: true,
+        isAppForeground: true,
+      );
+      addTearDown(appState.dispose);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: VideoPlatformTheme.buildTheme(),
+          home: Scaffold(
+            body: TelegramScreen(appState: appState),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      await tester.tap(find.byIcon(Icons.refresh_rounded).first);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      await tester.tap(find.text('下载测试会话').first);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      // Verify the file card 'report_2026.pdf' is visible with its download button
+      expect(find.text('report_2026.pdf'), findsOneWidget);
+      final dlBtn = find.byTooltip('下载保存到本机电脑');
+      expect(dlBtn, findsOneWidget);
+      expect(fakeApi.downloadTelegramBytesCount, 0);
+
+      // Tap the local download button
+      await tester.tap(dlBtn);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      // 1. Download executed once
+      expect(fakeApi.downloadTelegramBytesCount, 1);
+
+      // 2. No bottom SnackBar toast is popped up
+      expect(find.byType(SnackBar), findsNothing);
+
+      // 3. The download icon has switched to the green success check icon (Icons.check_circle_rounded)
+      expect(
+        find.byKey(const ValueKey('file_l_true_false')),
+        findsOneWidget,
+      );
+      final iconWidget = tester.widget<Icon>(
+        find.byKey(const ValueKey('file_l_true_false')),
+      );
+      expect(iconWidget.icon, Icons.check_circle_rounded);
+
+      // 4. Tapping the success icon button again opens the file location and does NOT re-download
+      final openBtn = find.ancestor(
+        of: find.byKey(const ValueKey('file_l_true_false')),
+        matching: find.byType(IconButton),
+      );
+      expect(openBtn, findsOneWidget);
+      await tester.tap(openBtn);
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 3));
+      expect(fakeApi.downloadTelegramBytesCount, 1);
+    },
+  );
+
+  testWidgets(
+    'TelegramScreen file preview supports common formats including CSV table view, JSON formatting, PDF, Office/Archive, and local byte fallback',
+    (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1440, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      SharedPreferences.setMockInitialValues({});
+      final fakeApi = _FakeTelegramApiClient();
+      final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      fakeApi.serverChats = [
+        TelegramChat(
+          peer: 'user:1999',
+          title: '多格式文件预览会话',
+          kind: '私聊',
+          preview: '常见文件格式预览测试',
+          date: nowSec,
+          unread: 0,
+          readOnly: false,
+          topMessageId: 2203,
+        ),
+      ];
+      fakeApi.serverMessagesByPeer['user:1999'] = [
+        TelegramMessage(
+          id: 2201,
+          date: nowSec - 20,
+          sender: '多格式文件预览会话',
+          text: '财务报表 CSV',
+          outgoing: false,
+          attachment: const TelegramAttachment(
+            kind: 'file',
+            fileName: 'finance_2026.csv',
+            size: 1024,
+            mimeType: 'text/csv',
+            url: 'https://example.test/api/telegram/file?id=2201',
+          ),
+        ),
+        TelegramMessage(
+          id: 2202,
+          date: nowSec - 10,
+          sender: '多格式文件预览会话',
+          text: '服务端未解析的 Dart 源码文件',
+          outgoing: false,
+          attachment: const TelegramAttachment(
+            kind: 'file',
+            fileName: 'player_engine.dart',
+            size: 512,
+            mimeType: 'application/octet-stream',
+            url: 'https://example.test/api/telegram/file?id=2202',
+          ),
+        ),
+        TelegramMessage(
+          id: 2203,
+          date: nowSec,
+          sender: '多格式文件预览会话',
+          text: 'Excel 表格与 PDF 文档',
+          outgoing: false,
+          attachment: const TelegramAttachment(
+            kind: 'file',
+            fileName: 'manual_guide.pdf',
+            size: 4096,
+            mimeType: 'application/pdf',
+            url: 'https://example.test/api/telegram/file?id=2203',
+          ),
+        ),
+      ];
+
+      fakeApi.filePreviewsByMsgId[2201] = const TelegramFilePreview(
+        name: 'finance_2026.csv',
+        size: 1024,
+        encoding: 'UTF-8',
+        kind: 'text',
+        text: '季度,营收,增长率\n2026-Q1,1280万,+18.5%\n2026-Q2,1560万,+21.8%',
+      );
+      fakeApi.rawFileBytesByMsgId[2202] = Uint8List.fromList(
+        utf8.encode('void initPlayerEngine() {\n  print("Hello Telegram Preview");\n}'),
+      );
+      fakeApi.rawFileBytesByMsgId[2203] = Uint8List.fromList(
+        latin1.encode(
+          '%PDF-1.4\n1 0 obj << /Type /Page >> endobj\nstream\n(Telegram PDF Inline Preview Text) Tj\nendstream\n',
+        ),
+      );
+
+      final appState = AppState(customApi: fakeApi);
+      await appState.telegramNotifications.setSystemNotificationsEnabled(false);
+      appState.updateTelegramReadingContext(
+        isTelegramViewActive: true,
+        isAppForeground: true,
+      );
+      addTearDown(appState.dispose);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: VideoPlatformTheme.buildTheme(),
+          home: Scaffold(
+            body: TelegramScreen(appState: appState),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      await tester.tap(find.byIcon(Icons.refresh_rounded).first);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      await tester.tap(find.text('多格式文件预览会话').first);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      // All 3 files show '点击预览' and preview icon button
+      expect(find.text('finance_2026.csv'), findsOneWidget);
+      expect(find.text('player_engine.dart'), findsOneWidget);
+      expect(find.text('manual_guide.pdf'), findsOneWidget);
+      expect(find.byTooltip('在线预览文件内容'), findsNWidgets(3));
+
+      // 1. Tap 'finance_2026.csv' to open interactive DataTable CSV preview
+      await tester.tap(find.text('finance_2026.csv'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(find.byType(DataTable), findsOneWidget);
+      expect(find.text('2026-Q1'), findsOneWidget);
+      expect(find.text('1560万'), findsOneWidget);
+      // Close dialog
+      await tester.tap(find.byIcon(Icons.close_rounded).last);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      // 2. Tap 'player_engine.dart' -> server throws, client fallback downloads bytes and decodes UTF-8 code
+      await tester.tap(find.text('player_engine.dart'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(find.text('DART'), findsOneWidget);
+      expect(
+        find.textContaining('Hello Telegram Preview'),
+        findsOneWidget,
+      );
+      await tester.tap(find.byIcon(Icons.close_rounded).last);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      // 3. Tap 'manual_guide.pdf' -> client fallback extracts PDF text stream and page summary
+      await tester.tap(find.text('manual_guide.pdf'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(find.text('PDF'), findsOneWidget);
+      expect(
+        find.textContaining('Telegram PDF Inline Preview Text'),
+        findsOneWidget,
+      );
+      await tester.tap(find.byIcon(Icons.close_rounded).last);
+      await tester.pump();
+    },
+  );
+
+  testWidgets(
+    'PeerMeshScreen File Transfer always displays 打开接收文件夹 and invokes native pickFiles on 选择文件发送',
+    (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(1280, 820));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      SharedPreferences.setMockInitialValues({});
+
+      const nativeChannel = MethodChannel('com.linsion.m3u8_client/native_utils');
+      int pickFilesCalls = 0;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(nativeChannel, (MethodCall call) async {
+        if (call.method == 'pickFiles') {
+          pickFilesCalls++;
+          return <Map<String, dynamic>>[];
+        }
+        if (call.method == 'revealFileInFinder') {
+          return true;
+        }
+        return null;
+      });
+      addTearDown(() {
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(nativeChannel, null);
+      });
+
+      final appState = AppState();
+      addTearDown(appState.dispose);
+
+      // Inject a synthetic LAN peer so the File Transfer tab renders active controls
+      PeerMeshService.instance.upsertPeerForTesting(
+        PeerDeviceNode(
+          deviceId: 'peer_win_test',
+          deviceName: 'Windows-Workstation',
+          platform: 'windows',
+          host: '192.168.1.88',
+          port: 9529,
+          lastSeenAt: DateTime.now(),
+          isLanReachable: true,
+        ),
+      );
+      addTearDown(() {
+        PeerMeshService.instance.removePeerForTesting('peer_win_test');
+      });
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: VideoPlatformTheme.buildTheme(),
+          home: Scaffold(
+            body: PeerMeshScreen(appState: appState),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      // Switch to 传输文件 & 远端库 tab
+      await tester.tap(find.text('传输文件 & 远端库'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      // Verify 打开接收文件夹 button is always present (both top bar and transfer queue header)
+      expect(find.text('打开接收文件夹'), findsWidgets);
+      expect(find.text('选择文件发送'), findsOneWidget);
+
+      // Tap 选择文件发送 -> should invoke native system file picker ('pickFiles')
+      await tester.tap(find.text('选择文件发送'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+      expect(pickFilesCalls, 1);
+    },
+  );
+
+  testWidgets(
+    'DownloadsScreen and TelegramScreen display 115云下载 across download entry points',
+    (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(1280, 820));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      SharedPreferences.setMockInitialValues({});
+
+      final fakeApi = _FakeTelegramApiClient();
+      fakeApi.serverChats = [
+        const TelegramChat(
+          peer: 'user:1998',
+          title: '115云下载会话',
+          kind: '私聊',
+          preview: '分享一个文档附件',
+          date: 1700001600,
+          unread: 0,
+          readOnly: false,
+          topMessageId: 2301,
+        ),
+      ];
+      fakeApi.serverMessagesByPeer['user:1998'] = [
+        const TelegramMessage(
+          id: 2301,
+          date: 1700001600,
+          sender: '115云下载会话',
+          outgoing: false,
+          text: '分享一个文档附件与直链 https://example.com/video_demo.mp4',
+          links: ['https://example.com/video_demo.mp4'],
+          attachment: TelegramAttachment(
+            kind: 'file',
+            name: 'archive_bundle.zip',
+            fileName: 'archive_bundle.zip',
+            size: 4096,
+            mimeType: 'application/zip',
+            url: 'https://example.com/archive_bundle.zip',
+          ),
+        ),
+      ];
+
+      final appState = AppState(customApi: fakeApi);
+      await appState.telegramNotifications.setSystemNotificationsEnabled(false);
+      addTearDown(appState.dispose);
+
+      // 1. Verify DownloadsScreen create task dialog & batch import dialog include 115云下载 / 批量115云下载
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: VideoPlatformTheme.buildTheme(),
+          home: Scaffold(
+            body: DownloadsScreen(appState: appState),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      await tester.tap(find.text('新建 / 嗅探'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 250));
+      expect(find.text('115云下载'), findsOneWidget);
+      await tester.tap(find.text('取消'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 250));
+
+      await tester.tap(find.text('批量导入'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 250));
+      expect(find.text('批量115云下载'), findsOneWidget);
+      await tester.tap(find.text('取消'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 250));
+
+      // 2. Verify TelegramScreen file card displays 115云下载 button
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: VideoPlatformTheme.buildTheme(),
+          home: Scaffold(
+            body: TelegramScreen(appState: appState),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      await tester.tap(find.byIcon(Icons.refresh_rounded).first);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      await tester.tap(find.text('115云下载会话').first);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(find.text('archive_bundle.zip'), findsOneWidget);
+      expect(find.byTooltip('115云下载'), findsWidgets);
+
+      // 3. Verify message link chip has 115云下载 button and clicking it transitions to 已存115 ✓
+      final link115Btn = find.byKey(const ValueKey('tg_msg_link_115_2301_0'));
+      expect(link115Btn, findsOneWidget);
+      expect(
+        find.descendant(of: link115Btn, matching: find.text('115云下载')),
+        findsOneWidget,
+      );
+
+      await tester.tap(link115Btn);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+
+      expect(
+        find.descendant(of: link115Btn, matching: find.text('已存115 ✓')),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(
+          of: link115Btn,
+          matching: find.byIcon(Icons.check_circle_rounded),
+        ),
+        findsOneWidget,
+      );
+    },
+  );
+
+  testWidgets(
+    'PeerMeshScreen Remote Desktop defaults to full system desktop capture with 显示系统桌面 and 自动隐藏远端本应用',
+    (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(1280, 820));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      SharedPreferences.setMockInitialValues({});
+
+      const nativeChannel = MethodChannel('com.linsion.m3u8_client/native_utils');
+      int captureCalls = 0;
+      int minimizeCalls = 0;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(nativeChannel, (MethodCall call) async {
+        if (call.method == 'captureDesktopScreenJpeg') {
+          captureCalls++;
+          return <String, dynamic>{
+            'bytes': Uint8List.fromList(<int>[0xFF, 0xD8, 0xFF, 0xD9]),
+            'width': 1920,
+            'height': 1080,
+          };
+        }
+        if (call.method == 'minimizeAppWindow') {
+          minimizeCalls++;
+          return true;
+        }
+        if (call.method == 'checkDesktopPermissions') {
+          return <String, dynamic>{
+            'screenCapture': true,
+            'accessibility': true,
+          };
+        }
+        return null;
+      });
+      addTearDown(() {
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(nativeChannel, null);
+      });
+
+      final frame = await PeerMeshService.instance.captureLocalScreenFrame(
+        mode: 'desktop',
+      );
+      expect(captureCalls, 1);
+      expect(frame, isNotNull);
+      expect(frame!.actualMode, 'desktop');
+      expect(frame.width, 1920);
+      expect(frame.height, 1080);
+
+      final minOk = await PeerMeshService.instance.minimizeLocalAppWindow();
+      expect(minOk, isTrue);
+      expect(minimizeCalls, 1);
+
+      final appState = AppState();
+      addTearDown(appState.dispose);
+
+      PeerMeshService.instance.upsertPeerForTesting(
+        PeerDeviceNode(
+          deviceId: 'peer_rdp_test',
+          deviceName: 'Remote-Desktop-PC',
+          platform: 'windows',
+          host: '192.168.1.99',
+          port: 18190,
+          lastSeenAt: DateTime.now(),
+          isLanReachable: true,
+        ),
+      );
+      addTearDown(() {
+        PeerMeshService.instance.removePeerForTesting('peer_rdp_test');
+      });
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: VideoPlatformTheme.buildTheme(),
+          home: Scaffold(
+            body: PeerMeshScreen(appState: appState),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(find.text('显示系统桌面'), findsOneWidget);
+      expect(find.text('自动隐藏远端本应用'), findsOneWidget);
+      expect(find.text('🖥️ 控制整个系统桌面/设备'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'TelegramScreen supports voice message recording & sending, speech-to-text input, and in-app voice call console',
+    (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(1280, 820));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      SharedPreferences.setMockInitialValues({});
+
+      const nativeChannel = MethodChannel('com.linsion.m3u8_client/native_utils');
+      int startRecordCalls = 0;
+      int stopRecordCalls = 0;
+      int sttCalls = 0;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(nativeChannel, (MethodCall call) async {
+        if (call.method == 'startVoiceRecording') {
+          startRecordCalls++;
+          return <String, dynamic>{
+            'ok': true,
+            'path': '/tmp/voice_test.m4a',
+            'mimeType': 'audio/mp4',
+          };
+        }
+        if (call.method == 'stopVoiceRecording') {
+          stopRecordCalls++;
+          final wavBytes =
+              NativeUtilsChannelHub.buildValidPcmWavBytes(durationSeconds: 3);
+          return <String, dynamic>{
+            'ok': true,
+            'path': '/tmp/voice_test.wav',
+            'name': 'voice_2026-11-26_09-30-00.wav',
+            'mimeType': 'audio/wav',
+            'duration': 3,
+            'size': wavBytes.length,
+            'bytes': wavBytes,
+          };
+        }
+        if (call.method == 'cancelVoiceRecording') {
+          return true;
+        }
+        if (call.method == 'recognizeVoiceToText') {
+          sttCalls++;
+          return <String, dynamic>{
+            'ok': true,
+            'text': '你好，这是语音转文字测试内容',
+          };
+        }
+        return null;
+      });
+      addTearDown(() {
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(nativeChannel, null);
+      });
+
+      final fakeApi = _FakeTelegramApiClient();
+      fakeApi.serverChats = [
+        const TelegramChat(
+          peer: 'user:3001',
+          title: '语音通话与语音发送好友',
+          kind: '私聊',
+          preview: '在线可通话',
+          date: 1700002000,
+          unread: 0,
+          readOnly: false,
+          topMessageId: 3101,
+        ),
+      ];
+      fakeApi.serverMessagesByPeer['user:3001'] = [
+        const TelegramMessage(
+          id: 3101,
+          date: 1700002000,
+          sender: '语音通话与语音发送好友',
+          outgoing: false,
+          text: '我们可以语音聊天或直接打语音电话',
+        ),
+      ];
+
+      final appState = AppState(customApi: fakeApi);
+      await appState.telegramNotifications.setSystemNotificationsEnabled(false);
+      addTearDown(appState.dispose);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: VideoPlatformTheme.buildTheme(),
+          home: Scaffold(
+            body: TelegramScreen(appState: appState),
+          ),
+        ),
+      );
+      for (int i = 0; i < 5; i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+
+      await tester.tap(find.byIcon(Icons.refresh_rounded).first);
+      for (int i = 0; i < 4; i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+
+      await tester.tap(find.text('语音通话与语音发送好友').first);
+      for (int i = 0; i < 4; i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+
+      // 1. Test Voice-to-Text (`语音转文字`)
+      final voiceBtn = find.byKey(const ValueKey('tg_voice_record_btn'));
+      expect(voiceBtn, findsOneWidget);
+      await tester.tap(voiceBtn);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 120));
+
+      expect(startRecordCalls, 1);
+      expect(
+        find.byKey(const ValueKey('tg_voice_recording_bar')),
+        findsOneWidget,
+      );
+
+      await tester.tap(find.byKey(const ValueKey('tg_voice_to_text_btn')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+
+      expect(sttCalls, 1);
+      expect(find.text('你好，这是语音转文字测试内容'), findsWidgets);
+
+      // 2. Test Voice Message Recording & Direct Sending (`发送语音`)
+      await tester.tap(voiceBtn);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 120));
+      expect(startRecordCalls, 2);
+
+      await tester.tap(find.byKey(const ValueKey('tg_send_voice_btn')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 150));
+
+      expect(stopRecordCalls, 2);
+
+      // 3. Test In-App Telegram Voice Call Console (`发起 Telegram 语音通话`)
+      final callBtn = find.byKey(const ValueKey('tg_voice_call_btn'));
+      expect(callBtn, findsOneWidget);
+      await tester.tap(callBtn);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+
+      expect(
+        find.byKey(const ValueKey('tg_voice_call_dialog')),
+        findsOneWidget,
+      );
+      expect(find.text('Telegram 实时语音通话'), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('tg_call_push_chunk_btn')),
+        findsOneWidget,
+      );
+
+      // Hang up the call
+      await tester.tap(find.byKey(const ValueKey('tg_call_hangup_btn')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 250));
+      expect(find.byKey(const ValueKey('tg_voice_call_dialog')), findsNothing);
+    },
+  );
+
+  testWidgets(
+    'TelegramScreen supports editing already-sent outgoing messages in place (only 1 message, not 2) and @mention autocomplete in compose box',
+    (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(1280, 820));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      final fakeApi = _FakeTelegramApiClient();
+      fakeApi.nextSentMessageId = 5200;
+      fakeApi.serverChats = const [
+        TelegramChat(
+          peer: 'chat:5001',
+          title: '技术讨论群',
+          kind: '群组',
+          preview: '大家下午好',
+          date: 1700003000,
+          unread: 0,
+          readOnly: false,
+          topMessageId: 5102,
+        ),
+      ];
+      fakeApi.serverMessagesByPeer['chat:5001'] = [
+        const TelegramMessage(
+          id: 5101,
+          date: 1700002900,
+          sender: '张工程师',
+          outgoing: false,
+          text: '请问新版客户端什么时候发布？',
+        ),
+        const TelegramMessage(
+          id: 5102,
+          date: 1700003000,
+          sender: '我',
+          outgoing: true,
+          text: '预计今天下午三点发布初版',
+        ),
+      ];
+
+      final appState = AppState(customApi: fakeApi);
+      await appState.telegramNotifications.setSystemNotificationsEnabled(false);
+      addTearDown(appState.dispose);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: VideoPlatformTheme.buildTheme(),
+          home: Scaffold(
+            body: TelegramScreen(appState: appState),
+          ),
+        ),
+      );
+      for (int i = 0; i < 5; i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+
+      await tester.tap(find.byIcon(Icons.refresh_rounded).first);
+      for (int i = 0; i < 4; i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+
+      await tester.tap(find.text('技术讨论群').first);
+      for (int i = 0; i < 4; i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+
+      expect(find.text('预计今天下午三点发布初版'), findsWidgets);
+
+      // 1. Click "编辑" on the already-sent outgoing message (id: 5102)
+      final editBtn = find.byKey(const ValueKey('tg_msg_edit_btn_5102'));
+      expect(editBtn, findsOneWidget);
+      await tester.tap(editBtn);
+      await tester.pump();
+
+      // Verify editing banner appears and compose box is pre-filled with original message text
+      expect(
+        find.byKey(const ValueKey('tg_editing_message_banner')),
+        findsOneWidget,
+      );
+      final composeField = find.byKey(const ValueKey('tg_compose_text_field'));
+      expect(composeField, findsOneWidget);
+      expect(
+        tester.widget<TextField>(composeField).controller?.text,
+        '预计今天下午三点发布初版',
+      );
+
+      // Modify the text and click the Send / Save Edit button
+      await tester.enterText(composeField, '预计今天下午五点正式发布新版');
+      await tester.pump();
+      await tester.tap(find.byKey(const ValueKey('tg_send_message_btn')));
+      for (int i = 0; i < 5; i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+
+      // Verify the editing banner closed, old message 5102 was revoked, and ONLY 1 updated message is shown (old text is gone!)
+      expect(
+        find.byKey(const ValueKey('tg_editing_message_banner')),
+        findsNothing,
+      );
+      expect(fakeApi.deletedMessageIds, contains(5102));
+      expect(find.text('预计今天下午三点发布初版'), findsNothing);
+      expect(find.text('预计今天下午五点正式发布新版'), findsWidgets);
+      expect(find.text('已编辑'), findsOneWidget);
+
+      // 2. Test @mention autocomplete in the compose input box
+      await tester.tap(find.byKey(const ValueKey('tg_compose_mention_btn')));
+      await tester.pump();
+
+      expect(
+        find.byKey(const ValueKey('tg_mention_autocomplete_bar')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('tg_mention_item_张工程师')),
+        findsOneWidget,
+      );
+
+      // Select "@张工程师" from the mention popup
+      await tester.tap(find.byKey(const ValueKey('tg_mention_item_张工程师')));
+      await tester.pump();
+
+      expect(
+        find.byKey(const ValueKey('tg_mention_autocomplete_bar')),
+        findsNothing,
+      );
+      expect(
+        tester.widget<TextField>(composeField).controller?.text,
+        '@张工程师 ',
+      );
+
+      // Also test typing "@张" directly in the input box triggers @mention autocomplete
+      await tester.enterText(composeField, '你好 @张');
+      await tester.pump();
+      expect(
+        find.byKey(const ValueKey('tg_mention_autocomplete_bar')),
+        findsOneWidget,
+      );
+      await tester.tap(find.byKey(const ValueKey('tg_mention_item_张工程师')));
+      await tester.pump();
+      expect(
+        tester.widget<TextField>(composeField).controller?.text,
+        '你好 @张工程师 ',
+      );
+    },
+  );
+
+  testWidgets(
+    'TelegramScreen renders AnimatedSticker.tgs Lottie vector stickers, interactive preview dialog, and compose TGS sticker picker',
+    (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(1280, 820));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      final fakeApi = _FakeTelegramApiClient();
+      final presetTgsBytes = TelegramBuiltinTgsStickers.presets.first.tgsBytes;
+      final parsedComp =
+          TelegramTgsLottieComposition.tryParseBytes(presetTgsBytes);
+      expect(parsedComp, isNotNull);
+      expect(parsedComp!.hasDrawableShapes, isTrue);
+
+      fakeApi.rawFileBytesByMsgId[6101] = presetTgsBytes;
+      fakeApi.serverChats = const [
+        TelegramChat(
+          peer: 'user:6001',
+          title: '表情包测试好友',
+          kind: '私聊',
+          preview: '[动态贴纸]',
+          date: 1700004000,
+          unread: 0,
+          readOnly: false,
+          topMessageId: 6101,
+        ),
+      ];
+      fakeApi.serverMessagesByPeer['user:6001'] = [
+        TelegramMessage(
+          id: 6101,
+          date: 1700004000,
+          sender: '表情包测试好友',
+          outgoing: false,
+          text: '',
+          attachment: TelegramAttachment(
+            kind: 'file',
+            name: 'AnimatedSticker.tgs',
+            fileName: 'AnimatedSticker.tgs',
+            mimeType: 'application/x-tgsticker',
+            size: presetTgsBytes.length,
+            url: 'https://example.test/api/telegram/file?message_id=6101',
+          ),
+        ),
+      ];
+
+      final appState = AppState(customApi: fakeApi);
+      await appState.telegramNotifications.setSystemNotificationsEnabled(false);
+      addTearDown(appState.dispose);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: VideoPlatformTheme.buildTheme(),
+          home: Scaffold(
+            body: TelegramScreen(appState: appState),
+          ),
+        ),
+      );
+      for (int i = 0; i < 5; i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+
+      await tester.tap(find.byIcon(Icons.refresh_rounded).first);
+      for (int i = 0; i < 4; i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+
+      await tester.tap(find.text('表情包测试好友').first);
+      for (int i = 0; i < 5; i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+
+      // 1. Verify AnimatedSticker.tgs renders as an animated sticker card in the chat bubble
+      expect(
+        find.byKey(const ValueKey('tg_sticker_card_6101')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('tg_animated_sticker_view_6101')),
+        findsOneWidget,
+      );
+      expect(find.text('动态贴纸 · AnimatedSticker.tgs'), findsOneWidget);
+
+      // 2. Tap zoom button to open the interactive AnimatedSticker.tgs preview dialog
+      await tester.tap(find.byKey(const ValueKey('tg_sticker_zoom_btn_6101')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 150));
+
+      expect(
+        find.byKey(const ValueKey('tg_sticker_preview_dialog')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('tg_sticker_dialog_play_pause_btn')),
+        findsOneWidget,
+      );
+
+      // Close preview dialog
+      await tester.tap(find.byIcon(Icons.close_rounded).last);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 250));
+      expect(
+        find.byKey(const ValueKey('tg_sticker_preview_dialog')),
+        findsNothing,
+      );
+
+      // 3. Open the Emoji & Sticker Panel and switch to the "✨ 贴纸" (AnimatedSticker.tgs) tab
+      await tester.tap(
+        find.byIcon(Icons.sentiment_satisfied_alt_rounded).first,
+      );
+      await tester.pump();
+      await tester.tap(
+        find.byKey(const ValueKey('tg_emoji_tab_tgs_stickers')),
+      );
+      await tester.pump();
+
+      expect(
+        find.byKey(const ValueKey('tg_animated_stickers_grid')),
+        findsOneWidget,
+      );
+      final thumbsUpPreset = find.byKey(
+        const ValueKey('tg_builtin_tgs_sticker_thumbs_up'),
+      );
+      expect(thumbsUpPreset, findsOneWidget);
+
+      // Tap the preset animated TGS sticker to send it
+      await tester.tap(thumbsUpPreset);
+      for (int i = 0; i < 4; i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+      expect(fakeApi.sendCompleted, isTrue);
     },
   );
 }

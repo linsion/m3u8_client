@@ -3288,6 +3288,7 @@ class ApiClient {
     required String peer,
     int offsetId = 0,
     int limit = 50,
+    bool markRead = false,
   }) async {
     final data = await _getJson(
       '/api/telegram/messages',
@@ -3296,7 +3297,7 @@ class ApiClient {
         'peer': peer,
         'offset_id': offsetId.toString(),
         'limit': limit.toString(),
-        'mark_read': '1',
+        'mark_read': markRead ? '1' : '0',
       },
       timeout: const Duration(seconds: 40),
     );
@@ -3370,6 +3371,7 @@ class ApiClient {
         'peer': peer,
         'text': text,
         'reply_to': replyTo,
+        'reply_to_id': replyTo,
         'random_id': randomId,
       },
       timeout: const Duration(seconds: 35),
@@ -3378,12 +3380,89 @@ class ApiClient {
       final msgJson = data['message'];
       if (msgJson is Map<String, dynamic>) {
         final parsed = TelegramMessage.fromJson(msgJson);
-        return msgJson.containsKey('outgoing')
-            ? parsed
-            : parsed.copyWith(outgoing: true);
+        return parsed.copyWith(
+          outgoing: msgJson.containsKey('outgoing') ? parsed.outgoing : true,
+          replyToId: parsed.replyToId > 0 ? parsed.replyToId : replyTo,
+        );
       }
     }
     return null;
+  }
+
+  /// Edit an already-sent outgoing Telegram message in place (`不是发2条`).
+  ///
+  /// 1. First attempts native MTProto edit endpoints (`/api/telegram/edit` or `/api/telegram/edit-message`).
+  /// 2. If the backend server does not implement the native edit route, atomically revokes/deletes
+  ///    the original message on Telegram (`deleteTelegramMessages(..., revoke: true)`) and sends
+  ///    the updated message (`sendTelegramTextMessage(..., replyTo: replyTo)`), ensuring only 1 message
+  ///    exists on Telegram and in the conversation (never 2 messages).
+  Future<({TelegramMessage? message, bool replacedByResend})>
+      editTelegramMessage({
+    required String accountId,
+    required String peer,
+    required int messageId,
+    required String text,
+    int replyTo = 0,
+  }) async {
+    for (final endpoint in const [
+      '/api/telegram/edit',
+      '/api/telegram/edit-message',
+    ]) {
+      try {
+        final data = await _postJson(
+          endpoint,
+          query: {'account_id': accountId},
+          body: {
+            'peer': peer,
+            'message_id': messageId,
+            'id': messageId,
+            'text': text,
+          },
+          timeout: const Duration(seconds: 15),
+        );
+        if (data is Map<String, dynamic>) {
+          final msgJson = data['message'];
+          if (msgJson is Map<String, dynamic>) {
+            final parsed = TelegramMessage.fromJson(msgJson);
+            return (
+              message: parsed.copyWith(
+                id: parsed.id > 0 ? parsed.id : messageId,
+                outgoing:
+                    msgJson.containsKey('outgoing') ? parsed.outgoing : true,
+                replyToId: parsed.replyToId > 0 ? parsed.replyToId : replyTo,
+              ),
+              replacedByResend: false,
+            );
+          }
+          if (data['ok'] == true || data['edited'] == true) {
+            return (message: null, replacedByResend: false);
+          }
+        }
+      } on ApiException catch (e) {
+        final upper = e.message.toUpperCase();
+        if (upper.contains('MESSAGE_NOT_MODIFIED')) {
+          return (message: null, replacedByResend: false);
+        }
+      } catch (_) {}
+    }
+
+    if (messageId > 0) {
+      try {
+        await deleteTelegramMessages(
+          accountId: accountId,
+          peer: peer,
+          messageIds: [messageId],
+          revoke: true,
+        );
+      } catch (_) {}
+    }
+    final resent = await sendTelegramTextMessage(
+      accountId: accountId,
+      peer: peer,
+      text: text,
+      replyTo: replyTo,
+    );
+    return (message: resent, replacedByResend: true);
   }
 
   /// Press a callback or text choice button on a Telegram message (`/api/telegram/button`).
@@ -3434,6 +3513,18 @@ class ApiClient {
     }
   }
 
+  static String _formatUploadByteSize(int bytes) {
+    if (bytes <= 0) return '0 B';
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) {
+      return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    }
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+  }
+
   /// Upload and send 1..10 files/screenshots/photos/videos to a Telegram chat
   /// using `/api/telegram/send-files` (`multipart/form-data` + SSE progress stream).
   Future<List<TelegramMessage>> sendTelegramFiles({
@@ -3449,21 +3540,82 @@ class ApiClient {
     final uri = _buildUri('/api/telegram/send-files', {
       'account_id': accountId,
     });
-    final request = http.MultipartRequest('POST', uri);
+    final totalDeclaredBytes = files.fold<int>(
+      0,
+      (sum, f) => sum + (f.size > 0 ? f.size : f.bytes.length),
+    );
+    final uploadStartMs = DateTime.now().millisecondsSinceEpoch;
+    int lastReportedClientPercent = -1;
+    int lastReportMs = 0;
+
+    if (onProgress != null) {
+      onProgress(
+        1,
+        '正在准备上传 (${_formatUploadByteSize(totalDeclaredBytes)})…',
+      );
+    }
+
+    final request = _TelegramProgressMultipartRequest(
+      'POST',
+      uri,
+      onUploadBytes: onProgress == null
+          ? null
+          : (bytesSent, totalBytes) {
+              final effTotal =
+                  totalBytes > 0 ? totalBytes : (totalDeclaredBytes > 0 ? totalDeclaredBytes : 1);
+              final ratio = (bytesSent / effTotal).clamp(0.0, 1.0);
+              // Map Phase 1 (Client -> Server upload) to 1%..55%
+              final clientPct = (1 + (ratio * 54).round()).clamp(1, 55);
+              final nowMs = DateTime.now().millisecondsSinceEpoch;
+              if (clientPct == lastReportedClientPercent &&
+                  bytesSent < effTotal &&
+                  nowMs - lastReportMs < 180) {
+                return;
+              }
+              lastReportedClientPercent = clientPct;
+              lastReportMs = nowMs;
+              final elapsedSec =
+                  ((nowMs - uploadStartMs) / 1000.0).clamp(0.05, 86400.0);
+              final bytesPerSec = (bytesSent / elapsedSec).round();
+              final speedText = bytesPerSec > 0
+                  ? ' · ${_formatUploadByteSize(bytesPerSec)}/s'
+                  : '';
+              if (bytesSent >= effTotal) {
+                onProgress(
+                  55,
+                  '已上传至服务器 (${_formatUploadByteSize(effTotal)})，正在发送至 Telegram…',
+                );
+              } else {
+                onProgress(
+                  clientPct,
+                  '上传中 $clientPct% (${_formatUploadByteSize(bytesSent)} / ${_formatUploadByteSize(effTotal)}$speedText)',
+                );
+              }
+            },
+    );
     authHeaders.forEach((k, v) {
       if (k.toLowerCase() != 'content-type') {
         request.headers[k] = v;
       }
     });
 
+    final hasVoiceNote = files.any((f) => f.isVoiceNote);
     final metadata = files
-        .map((_) => <String, dynamic>{'random_id': _generateRandomId16Hex()})
+        .map(
+          (f) => <String, dynamic>{
+            'random_id': _generateRandomId16Hex(),
+            if (f.isVoiceNote) 'voice': true,
+            if (f.durationSeconds > 0) 'duration': f.durationSeconds,
+          },
+        )
         .toList();
     request.fields['request'] = jsonEncode({
       'peer': peer,
       'text': text,
       'reply_to': replyTo,
-      'as_file': asFile,
+      'reply_to_id': replyTo,
+      'as_file': hasVoiceNote ? false : asFile,
+      if (hasVoiceNote) 'voice': true,
       'files': metadata,
     });
 
@@ -3534,27 +3686,40 @@ class ApiClient {
               int.tryParse((progress['count'] ?? files.length).toString()) ??
                   files.length;
           final fileName = (progress['file'] ?? '').toString();
-          final percent = (uploaded * 100 ~/ (total > 0 ? total : 1)).clamp(
+          final rawServerPct = (uploaded * 100 ~/ (total > 0 ? total : 1)).clamp(
             0,
             100,
           );
-          final statusText = percent >= 100
+          // Map Phase 2 (Server -> Telegram DC) smoothly across 55%..99%
+          final combinedPct =
+              (55 + (rawServerPct * 44 ~/ 100)).clamp(55, 99);
+          final sizeInfo = total > 1
+              ? ' (${_formatUploadByteSize(uploaded)} / ${_formatUploadByteSize(total)})'
+              : '';
+          final statusText = rawServerPct >= 100
               ? '上传完成，正在确认发送…'
-              : '上传到 Telegram：$percent% · $index/$count · $fileName';
-          onProgress(percent, statusText);
+              : '正在发送至 Telegram：$combinedPct%$sizeInfo · $index/$count${fileName.isNotEmpty ? " · $fileName" : ""}';
+          onProgress(combinedPct, statusText);
         }
         if (phase == 'done' || event['sent'] == true) {
+          onProgress?.call(100, '发送完成');
           receivedConfirmation = event['sent'] == true;
           final rawMsgs = event['messages'];
           if (rawMsgs is List) {
+            int idx = 0;
             for (final item in rawMsgs) {
               if (item is Map<String, dynamic>) {
                 final parsed = TelegramMessage.fromJson(item);
                 confirmedMessages.add(
-                  item.containsKey('outgoing')
-                      ? parsed
-                      : parsed.copyWith(outgoing: true),
+                  parsed.copyWith(
+                    outgoing:
+                        item.containsKey('outgoing') ? parsed.outgoing : true,
+                    replyToId: parsed.replyToId > 0
+                        ? parsed.replyToId
+                        : (idx == 0 ? replyTo : 0),
+                  ),
                 );
+                idx++;
               }
             }
           }
@@ -3562,9 +3727,12 @@ class ApiClient {
           if (singleMsg is Map<String, dynamic>) {
             final parsed = TelegramMessage.fromJson(singleMsg);
             confirmedMessages.add(
-              singleMsg.containsKey('outgoing')
-                  ? parsed
-                  : parsed.copyWith(outgoing: true),
+              parsed.copyWith(
+                outgoing:
+                    singleMsg.containsKey('outgoing') ? parsed.outgoing : true,
+                replyToId:
+                    parsed.replyToId > 0 ? parsed.replyToId : replyTo,
+              ),
             );
           }
         }
@@ -3606,6 +3774,29 @@ class ApiClient {
         timeout: const Duration(seconds: 6),
       );
     } catch (_) {}
+  }
+
+  /// Initiate or manage a Telegram Voice Call (`/api/telegram/call`) if supported by the backend server.
+  Future<Map<String, dynamic>?> requestTelegramVoiceCall({
+    required String accountId,
+    required String peer,
+    required String action, // 'start', 'hangup', 'status'
+  }) async {
+    try {
+      final data = await _postJson(
+        '/api/telegram/call',
+        query: {'account_id': accountId},
+        body: {
+          'peer': peer,
+          'action': action,
+        },
+        timeout: const Duration(seconds: 8),
+      );
+      if (data is Map<String, dynamic>) {
+        return data;
+      }
+    } catch (_) {}
+    return null;
   }
 
   /// Fetch inline file preview (`/api/telegram/file-preview`) for text/code/archive/doc files.
@@ -3809,5 +4000,35 @@ class ApiClient {
     return _buildUri('/api/telegram/stream', {
       'account_id': accountId,
     });
+  }
+}
+
+class _TelegramProgressMultipartRequest extends http.MultipartRequest {
+  final void Function(int bytesSent, int totalBytes)? onUploadBytes;
+
+  _TelegramProgressMultipartRequest(
+    super.method,
+    super.url, {
+    this.onUploadBytes,
+  });
+
+  @override
+  http.ByteStream finalize() {
+    final byteStream = super.finalize();
+    final callback = onUploadBytes;
+    if (callback == null) return byteStream;
+    final total = contentLength;
+    int sent = 0;
+    return http.ByteStream(
+      byteStream.transform(
+        StreamTransformer<List<int>, List<int>>.fromHandlers(
+          handleData: (chunk, sink) {
+            sent += chunk.length;
+            callback(sent, total);
+            sink.add(chunk);
+          },
+        ),
+      ),
+    );
   }
 }

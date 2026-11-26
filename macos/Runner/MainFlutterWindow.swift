@@ -1,11 +1,14 @@
 import ApplicationServices
+import AVFoundation
 import AVKit
 import Cocoa
 import CoreGraphics
 import CoreImage
 import FlutterMacOS
 import GameController
+import ImageIO
 import MediaPlayer
+import Speech
 import UserNotifications
 
 /// Transparent AppKit drag-destination overlay view placed over FlutterView.
@@ -52,6 +55,15 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
   private var remoteCommandsConfigured = false
   private var cachedNowPlayingArtwork: MPMediaItemArtwork?
   private var cachedNowPlayingTrackTitle: String = ""
+  private var didAutoPromptScreenCapture = false
+  private var activeVoiceRecorder: AVAudioRecorder?
+  private var activeVoiceRecordURL: URL?
+  private var activeVoiceRecordStartedAt: Date?
+  private lazy var remoteEventSource: CGEventSource? = {
+    let src = CGEventSource(stateID: .combinedSessionState)
+    src?.localEventsSuppressionInterval = 0.0
+    return src
+  }()
 
   override func awakeFromNib() {
     Self.migrateSandboxedContainerPreferencesIfNeeded()
@@ -122,6 +134,28 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
       case "injectDesktopKeyEvent":
         let args = (call.arguments as? [String: Any]) ?? [:]
         self?.injectMacDesktopKeyEvent(args: args, result: result)
+      case "minimizeAppWindow":
+        DispatchQueue.main.async {
+          self?.miniaturize(nil)
+          result(true)
+        }
+      case "startVoiceRecording":
+        self?.startMacVoiceRecording(result: result)
+      case "stopVoiceRecording":
+        self?.stopMacVoiceRecording(result: result)
+      case "cancelVoiceRecording":
+        self?.cancelMacVoiceRecording(result: result)
+      case "recognizeVoiceToText":
+        let args = (call.arguments as? [String: Any]) ?? [:]
+        self?.recognizeMacVoiceToText(args: args, result: result)
+      case "reportIncomingSystemCall":
+        let args = (call.arguments as? [String: Any]) ?? [:]
+        self?.reportMacIncomingSystemCall(args: args, result: result)
+      case "startOutgoingSystemCall":
+        result(["ok": true, "callKit": false])
+      case "endSystemCall":
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["tg_incoming_call"])
+        result(true)
       case "revealFileInFinder":
         let args = call.arguments as? [String: Any]
         let path = (args?["path"] as? String) ?? ""
@@ -613,6 +647,182 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
     }
   }
 
+  private func startMacVoiceRecording(result: @escaping FlutterResult) {
+    AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+      DispatchQueue.main.async {
+        guard let self = self else {
+          result(["ok": false, "error": "窗口已关闭"])
+          return
+        }
+        if !granted {
+          result(["ok": false, "error": "未授予麦克风录音权限，请在系统设置 -> 隐私与安全性 -> 麦克风中开启"])
+          return
+        }
+        if let existing = self.activeVoiceRecorder, existing.isRecording {
+          existing.stop()
+        }
+        let ts = Int(Date().timeIntervalSince1970 * 1000)
+        let fileURL = URL(fileURLWithPath: NSTemporaryDirectory())
+          .appendingPathComponent("voice_\(ts).m4a")
+        let settings: [String: Any] = [
+          AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+          AVSampleRateKey: 44100.0,
+          AVNumberOfChannelsKey: 1,
+          AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
+          AVEncoderBitRateKey: 64000
+        ]
+        do {
+          let recorder = try AVAudioRecorder(url: fileURL, settings: settings)
+          recorder.isMeteringEnabled = true
+          if recorder.prepareToRecord() && recorder.record() {
+            self.activeVoiceRecorder = recorder
+            self.activeVoiceRecordURL = fileURL
+            self.activeVoiceRecordStartedAt = Date()
+            result([
+              "ok": true,
+              "path": fileURL.path,
+              "mimeType": "audio/mp4"
+            ])
+          } else {
+            result(["ok": false, "error": "无法启动麦克风录音设备"])
+          }
+        } catch {
+          result(["ok": false, "error": error.localizedDescription])
+        }
+      }
+    }
+  }
+
+  private func stopMacVoiceRecording(result: @escaping FlutterResult) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else {
+        result(nil)
+        return
+      }
+      let startedAt = self.activeVoiceRecordStartedAt ?? Date()
+      if let recorder = self.activeVoiceRecorder {
+        recorder.stop()
+      }
+      self.activeVoiceRecorder = nil
+      self.activeVoiceRecordStartedAt = nil
+      guard let fileURL = self.activeVoiceRecordURL else {
+        result(nil)
+        return
+      }
+      self.activeVoiceRecordURL = nil
+      let elapsedSec = max(1, Int(round(Date().timeIntervalSince(startedAt))))
+      if let data = try? Data(contentsOf: fileURL), !data.isEmpty {
+        result([
+          "ok": true,
+          "path": fileURL.path,
+          "name": fileURL.lastPathComponent,
+          "mimeType": "audio/mp4",
+          "duration": elapsedSec,
+          "size": data.count,
+          "bytes": FlutterStandardTypedData(bytes: data)
+        ])
+      } else {
+        result(nil)
+      }
+    }
+  }
+
+  private func cancelMacVoiceRecording(result: @escaping FlutterResult) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else {
+        result(false)
+        return
+      }
+      self.activeVoiceRecorder?.stop()
+      self.activeVoiceRecorder = nil
+      self.activeVoiceRecordStartedAt = nil
+      if let url = self.activeVoiceRecordURL {
+        try? FileManager.default.removeItem(at: url)
+      }
+      self.activeVoiceRecordURL = nil
+      result(true)
+    }
+  }
+
+  private func recognizeMacVoiceToText(args: [String: Any], result: @escaping FlutterResult) {
+    let path = (args["path"] as? String) ?? ""
+    guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else {
+      DispatchQueue.main.async {
+        NSApp.sendAction(Selector(("startDictation:")), to: nil, from: nil)
+        result(["ok": true, "text": "", "dictationTriggered": true])
+      }
+      return
+    }
+    let fileURL = URL(fileURLWithPath: path)
+    SFSpeechRecognizer.requestAuthorization { authStatus in
+      guard authStatus == .authorized else {
+        DispatchQueue.main.async {
+          result(["ok": false, "error": "未开启系统语音识别权限"])
+        }
+        return
+      }
+      let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))
+        ?? SFSpeechRecognizer(locale: Locale.current)
+      guard let validRecognizer = recognizer, validRecognizer.isAvailable else {
+        DispatchQueue.main.async {
+          result(["ok": false, "error": "当前系统语音识别服务暂不可用"])
+        }
+        return
+      }
+      let request = SFSpeechURLRecognitionRequest(url: fileURL)
+      request.shouldReportPartialResults = false
+      var didFinish = false
+      validRecognizer.recognitionTask(with: request) { res, err in
+        if didFinish { return }
+        if let res = res, res.isFinal {
+          didFinish = true
+          let text = res.bestTranscription.formattedString
+          DispatchQueue.main.async {
+            result(["ok": true, "text": text])
+          }
+        } else if let err = err {
+          didFinish = true
+          DispatchQueue.main.async {
+            result(["ok": false, "error": err.localizedDescription])
+          }
+        }
+      }
+    }
+  }
+
+  private func reportMacIncomingSystemCall(args: [String: Any], result: @escaping FlutterResult) {
+    let callerName = (args["callerName"] as? String) ?? "Telegram 来电"
+    let peer = (args["peer"] as? String) ?? ""
+    let accountId = (args["accountId"] as? String) ?? "default"
+
+    DispatchQueue.main.async { [weak self] in
+      NSApp.requestUserAttention(.criticalRequest)
+      NSSound(named: NSSound.Name("Glass"))?.play()
+      let content = UNMutableNotificationContent()
+      content.title = "📞 \(callerName) 正在呼叫您"
+      content.subtitle = "Telegram 实时语音通话来电"
+      content.body = "点击通知立即进入应用接听语音通话"
+      content.sound = .default
+      content.userInfo = [
+        "key": "tg_call:\(accountId):\(peer)",
+        "accountId": accountId,
+        "peer": peer,
+        "messageId": 0,
+        "isIncomingCall": true
+      ]
+      let req = UNNotificationRequest(
+        identifier: "tg_incoming_call",
+        content: content,
+        trigger: nil
+      )
+      UNUserNotificationCenter.current().add(req, withCompletionHandler: nil)
+      if self?.isMiniaturized == true {
+        self?.deminiaturize(nil)
+      }
+      result(["ok": true, "callKit": false])
+    }
+  }
+
   private func checkMacDesktopPermissions(prompt: Bool, result: @escaping FlutterResult) {
     var hasScreenCapture = CGPreflightScreenCaptureAccess()
     if prompt && !hasScreenCapture {
@@ -655,6 +865,12 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
     let normX = max(0.0, min(1.0, (mouseLoc.x - screenFrame.origin.x) / max(1.0, screenFrame.width)))
     // macOS NSEvent.mouseLocation has origin at bottom-left; normalize to top-left (0,0)
     let normY = max(0.0, min(1.0, 1.0 - ((mouseLoc.y - screenFrame.origin.y) / max(1.0, screenFrame.height))))
+
+    var hasAccess = CGPreflightScreenCaptureAccess()
+    if !hasAccess && !didAutoPromptScreenCapture {
+      didAutoPromptScreenCapture = true
+      hasAccess = CGRequestScreenCaptureAccess()
+    }
 
     DispatchQueue.global(qos: .userInteractive).async {
       let mainDisplayId = CGMainDisplayID()
@@ -707,7 +923,7 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
         }
         return
       }
-      ctx.interpolationQuality = .medium
+      ctx.interpolationQuality = .low
       ctx.draw(validCgImage, in: CGRect(x: 0, y: 0, width: CGFloat(dstW), height: CGFloat(dstH)))
 
       // Draw a high-visibility remote cursor indicator at current mouse position
@@ -728,12 +944,25 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
         }
         return
       }
-      let bmp = NSBitmapImageRep(cgImage: scaledCg)
       let compFactor = max(0.25, min(0.95, Double(quality) / 100.0))
-      guard let jpegData = bmp.representation(
-        using: .jpeg,
-        properties: [.compressionFactor: NSNumber(value: compFactor)]
-      ) else {
+      var jpegData: Data?
+      let mutableData = CFDataCreateMutable(nil, 0)
+      if let mData = mutableData,
+         let dest = CGImageDestinationCreateWithData(mData, "public.jpeg" as CFString, 1, nil) {
+        let opts = [kCGImageDestinationLossyCompressionQuality: compFactor] as CFDictionary
+        CGImageDestinationAddImage(dest, scaledCg, opts)
+        if CGImageDestinationFinalize(dest) {
+          jpegData = mData as Data
+        }
+      }
+      if jpegData == nil {
+        let bmp = NSBitmapImageRep(cgImage: scaledCg)
+        jpegData = bmp.representation(
+          using: .jpeg,
+          properties: [.compressionFactor: NSNumber(value: compFactor)]
+        )
+      }
+      guard let finalJpeg = jpegData else {
         DispatchQueue.main.async {
           result(nil)
         }
@@ -741,11 +970,12 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
       }
       DispatchQueue.main.async {
         result([
-          "bytes": FlutterStandardTypedData(bytes: jpegData),
+          "bytes": FlutterStandardTypedData(bytes: finalJpeg),
           "width": dstW,
           "height": dstH,
           "cursorX": normX,
-          "cursorY": normY
+          "cursorY": normY,
+          "screenCaptureGranted": hasAccess
         ])
       }
     }
@@ -764,40 +994,43 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
       x: bounds.origin.x + CGFloat(nx) * bounds.width,
       y: bounds.origin.y + CGFloat(ny) * bounds.height
     )
+    let src = remoteEventSource
+    src?.localEventsSuppressionInterval = 0.0
+    CGAssociateMouseAndMouseCursorPosition(1)
 
     switch type {
     case "move":
       CGWarpMouseCursorPosition(pt)
-      if let ev = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: pt, mouseButton: .left) {
+      if let ev = CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: pt, mouseButton: .left) {
         ev.post(tap: .cghidEventTap)
       }
     case "down":
       CGWarpMouseCursorPosition(pt)
-      if let ev = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: pt, mouseButton: .left) {
+      if let ev = CGEvent(mouseEventSource: src, mouseType: .leftMouseDown, mouseCursorPosition: pt, mouseButton: .left) {
         ev.post(tap: .cghidEventTap)
       }
     case "drag":
       CGWarpMouseCursorPosition(pt)
-      if let ev = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDragged, mouseCursorPosition: pt, mouseButton: .left) {
+      if let ev = CGEvent(mouseEventSource: src, mouseType: .leftMouseDragged, mouseCursorPosition: pt, mouseButton: .left) {
         ev.post(tap: .cghidEventTap)
       }
     case "up":
       CGWarpMouseCursorPosition(pt)
-      if let ev = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) {
+      if let ev = CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) {
         ev.post(tap: .cghidEventTap)
       }
     case "tap":
       CGWarpMouseCursorPosition(pt)
-      if let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: pt, mouseButton: .left),
-         let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) {
+      if let down = CGEvent(mouseEventSource: src, mouseType: .leftMouseDown, mouseCursorPosition: pt, mouseButton: .left),
+         let up = CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) {
         down.post(tap: .cghidEventTap)
         up.post(tap: .cghidEventTap)
       }
     case "double_tap":
       CGWarpMouseCursorPosition(pt)
       for clickNum: Int64 in 1...2 {
-        if let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: pt, mouseButton: .left),
-           let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) {
+        if let down = CGEvent(mouseEventSource: src, mouseType: .leftMouseDown, mouseCursorPosition: pt, mouseButton: .left),
+           let up = CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) {
           down.setIntegerValueField(.mouseEventClickState, value: clickNum)
           up.setIntegerValueField(.mouseEventClickState, value: clickNum)
           down.post(tap: .cghidEventTap)
@@ -806,15 +1039,15 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
       }
     case "right_click":
       CGWarpMouseCursorPosition(pt)
-      if let down = CGEvent(mouseEventSource: nil, mouseType: .rightMouseDown, mouseCursorPosition: pt, mouseButton: .right),
-         let up = CGEvent(mouseEventSource: nil, mouseType: .rightMouseUp, mouseCursorPosition: pt, mouseButton: .right) {
+      if let down = CGEvent(mouseEventSource: src, mouseType: .rightMouseDown, mouseCursorPosition: pt, mouseButton: .right),
+         let up = CGEvent(mouseEventSource: src, mouseType: .rightMouseUp, mouseCursorPosition: pt, mouseButton: .right) {
         down.post(tap: .cghidEventTap)
         up.post(tap: .cghidEventTap)
       }
     case "scroll":
       CGWarpMouseCursorPosition(pt)
       if let scrollEv = CGEvent(
-        scrollWheelEvent2Source: nil,
+        scrollWheelEvent2Source: src,
         units: .pixel,
         wheelCount: 2,
         wheel1: deltaY,
@@ -833,11 +1066,12 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
     let rawKey = ((args["key"] as? String) ?? "").lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
     let text = (args["text"] as? String) ?? ""
     let explicitMods = (args["modifiers"] as? [String])?.map { $0.lowercased() } ?? []
+    let src = remoteEventSource
 
     if !text.isEmpty {
       let utf16Chars = Array(text.utf16)
-      if let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-         let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) {
+      if let down = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true),
+         let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) {
         down.keyboardSetUnicodeString(stringLength: utf16Chars.count, unicodeString: utf16Chars)
         up.keyboardSetUnicodeString(stringLength: utf16Chars.count, unicodeString: utf16Chars)
         down.post(tap: .cghidEventTap)
@@ -847,10 +1081,21 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSDraggingDestination, UNUs
       return
     }
 
+    if rawKey == "minimize_app" || rawKey == "hide_app" {
+      DispatchQueue.main.async { [weak self] in
+        self?.miniaturize(nil)
+      }
+      result(true)
+      return
+    }
+
     // Parse compound shortcuts like "cmd+c", "ctrl+v", "alt+tab", "win+d", "show_desktop"
     var flags: CGEventFlags = []
     var baseKey = rawKey
     if rawKey == "show_desktop" || rawKey == "win+d" {
+      DispatchQueue.main.async { [weak self] in
+        self?.miniaturize(nil)
+      }
       baseKey = "f11"
       flags.insert(.maskSecondaryFn)
     } else if rawKey == "mission_control" || rawKey == "win+tab" {

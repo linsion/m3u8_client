@@ -117,6 +117,18 @@ class TelegramNotificationService extends ChangeNotifier {
     return sum;
   }
 
+  int unreadNotificationCountForAccount(String accountId) {
+    final clean = accountId.trim();
+    if (clean.isEmpty) return 0;
+    int sum = 0;
+    for (final item in _pendingByKey.values) {
+      if (item.accountId == clean) {
+        sum += item.count;
+      }
+    }
+    return sum;
+  }
+
   String _peerKey(String accountId, String peer) => '$accountId|$peer';
   String _pendingKey(String accountId, String peer) => '$accountId\n$peer';
 
@@ -280,12 +292,17 @@ class TelegramNotificationService extends ChangeNotifier {
   }
 
   void start() {
-    if (_running) return;
+    if (_running) {
+      if (_sseLineSub == null || _accountsById.length <= 1) {
+        unawaited(refreshAccountsAndConnect());
+      }
+      return;
+    }
     _running = true;
     _bornMs = DateTime.now().millisecondsSinceEpoch;
     _watchdogTimer?.cancel();
     _watchdogTimer = Timer.periodic(
-      const Duration(seconds: 10),
+      const Duration(seconds: 6),
       (_) => _checkConnectionsWatchdog(),
     );
     _updateStatusLabel();
@@ -307,6 +324,60 @@ class TelegramNotificationService extends ChangeNotifier {
     if (sortedIdsKey != _connectedIdsKey || _sseLineSub == null) {
       _connectSseStream(sortedIdsKey);
     }
+  }
+
+  /// Immediately registers all discovered [accounts] and ensures the multi-account
+  /// SSE notification stream is subscribed to all of them without waiting for a 30s poll.
+  void registerAccounts(
+    List<TelegramAccount> accounts, {
+    String? activeId,
+  }) {
+    for (final acc in accounts) {
+      final clean = acc.id.trim();
+      if (clean.isNotEmpty) {
+        _accountsById[clean] = acc;
+      }
+    }
+    if (activeId != null && activeId.trim().isNotEmpty) {
+      final cleanActive = activeId.trim();
+      _accountsById.putIfAbsent(
+        cleanActive,
+        () => TelegramAccount(id: cleanActive, name: 'Telegram'),
+      );
+    }
+    if (!_running || _accountsById.isEmpty) return;
+    final validIds = _accountsById.keys.toList()..sort();
+    final sortedIdsKey = validIds.join(',');
+    if (sortedIdsKey != _connectedIdsKey || _sseLineSub == null) {
+      _connectSseStream(sortedIdsKey);
+    }
+  }
+
+  /// Allows fast live-polling in [TelegramScreen] to deliver an incoming message
+  /// notification immediately if the SSE stream has not delivered it yet.
+  /// Deduplicated by `accountId + peer + message.id` via [_seenMessageTimestamps].
+  void notifyFromPolledMessage({
+    required String accountId,
+    required String peer,
+    required String chatTitle,
+    required TelegramMessage message,
+    bool notificationMuted = false,
+  }) {
+    if (_disposed || message.outgoing || message.id <= 0) return;
+    final cleanAcc = accountId.trim().isNotEmpty ? accountId.trim() : 'default';
+    final account = _accountsById[cleanAcc] ??
+        TelegramAccount(id: cleanAcc, name: 'Telegram');
+    _receiveUpdateEvent(
+      account,
+      TelegramNotificationEvent(
+        accountId: cleanAcc,
+        peer: peer,
+        chatTitle: chatTitle,
+        newMessage: true,
+        notificationMuted: notificationMuted,
+        message: message,
+      ),
+    );
   }
 
   void stop() {
@@ -399,7 +470,7 @@ class TelegramNotificationService extends ChangeNotifier {
     if (_connectedIdsKey.isNotEmpty &&
         _reconnectTimer == null &&
         (_sseLineSub == null ||
-            (_lastStreamEventMs > 0 && nowMs - _lastStreamEventMs > 28000))) {
+            (_lastStreamEventMs > 0 && nowMs - _lastStreamEventMs > 20000))) {
       _connectSseStream(_connectedIdsKey, previousDelayMs: _reconnectDelayMs);
     }
   }
@@ -445,8 +516,8 @@ class TelegramNotificationService extends ChangeNotifier {
       _closeActiveSseStream();
       _reconnectTimer?.cancel();
       final nextDelay = _reconnectDelayMs <= 0
-          ? 1200
-          : (_reconnectDelayMs * 2).clamp(1200, 12000);
+          ? 600
+          : (_reconnectDelayMs * 2).clamp(600, 8000);
       _reconnectDelayMs = nextDelay;
       _reconnectTimer = Timer(Duration(milliseconds: nextDelay), () {
         _reconnectTimer = null;
@@ -617,7 +688,7 @@ class TelegramNotificationService extends ChangeNotifier {
 
     // Ignore Telegram's historical catch-up batch on initial subscription
     final nowMs = DateTime.now().millisecondsSinceEpoch;
-    if (message.date > 0 && message.date * 1000 < _bornMs - 30000) {
+    if (message.date > 0 && message.date * 1000 < _bornMs - 120000) {
       return;
     }
 
@@ -642,9 +713,6 @@ class TelegramNotificationService extends ChangeNotifier {
       return;
     }
     if (message.silent) {
-      if (event.peer.startsWith('channel:') || event.peer.startsWith('chat:')) {
-        recordServerChatMuteState(account.id, event.peer, true);
-      }
       return;
     }
     if (isPeerMuted(account.id, event.peer)) {

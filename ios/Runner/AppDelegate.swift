@@ -1,5 +1,8 @@
 import AVFoundation
 import AVKit
+#if canImport(CallKit) && !os(tvOS)
+import CallKit
+#endif
 import CoreImage
 import Flutter
 import GameController
@@ -14,10 +17,18 @@ import UserNotifications
   private let mediaSessionChannelName = "com.linsion.m3u8_client/media_session"
   private var notificationsChannel: FlutterMethodChannel?
   private var mediaSessionChannel: FlutterMethodChannel?
+  private var utilsChannel: FlutterMethodChannel?
   private var pendingQrResult: FlutterResult?
   private var remoteCommandsConfigured = false
   private var cachedNowPlayingArtwork: MPMediaItemArtwork?
   private var cachedNowPlayingTrackTitle: String = ""
+  private var activeCallUUID: UUID?
+  private var activeCallPeer: String = ""
+  private var activeCallAccountId: String = "default"
+#if canImport(CallKit) && !os(tvOS)
+  private var callKitProvider: CXProvider?
+  private lazy var callKitController = CXCallController()
+#endif
 
   override func application(
     _ application: UIApplication,
@@ -100,6 +111,26 @@ import UserNotifications
         self?.handleMediaSessionMethodCall(call: call, result: result)
       }
       configureLockScreenRemoteCommands()
+
+      let utilsChannel = FlutterMethodChannel(
+        name: "com.linsion.m3u8_client/native_utils",
+        binaryMessenger: controller.binaryMessenger
+      )
+      self.utilsChannel = utilsChannel
+      configureIosCallKitIfAvailable()
+      utilsChannel.setMethodCallHandler { [weak self] call, result in
+        let args = (call.arguments as? [String: Any]) ?? [:]
+        switch call.method {
+        case "reportIncomingSystemCall":
+          self?.reportIosIncomingCallKit(args: args, result: result)
+        case "startOutgoingSystemCall":
+          self?.startIosOutgoingCallKit(args: args, result: result)
+        case "endSystemCall":
+          self?.endIosCallKit(result: result)
+        default:
+          result(FlutterMethodNotImplemented)
+        }
+      }
     }
 
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
@@ -123,6 +154,79 @@ import UserNotifications
         routePicker.removeFromSuperview()
       }
     }
+  }
+
+  private func configureIosCallKitIfAvailable() {
+#if canImport(CallKit) && !os(tvOS)
+    guard callKitProvider == nil else { return }
+    let config = CXProviderConfiguration(localizedName: "流光 Telegram 语音")
+    config.supportsVideo = false
+    config.maximumCallsPerCallGroup = 1
+    config.supportedHandleTypes = [.generic]
+    let provider = CXProvider(configuration: config)
+    provider.setDelegate(self, queue: nil)
+    self.callKitProvider = provider
+#endif
+  }
+
+  private func reportIosIncomingCallKit(args: [String: Any], result: @escaping FlutterResult) {
+    let callerName = (args["callerName"] as? String) ?? "Telegram 来电"
+    let peer = (args["peer"] as? String) ?? ""
+    let accountId = (args["accountId"] as? String) ?? "default"
+    self.activeCallPeer = peer
+    self.activeCallAccountId = accountId
+    let uuid = UUID()
+    self.activeCallUUID = uuid
+#if canImport(CallKit) && !os(tvOS)
+    configureIosCallKitIfAvailable()
+    let update = CXCallUpdate()
+    update.remoteHandle = CXHandle(type: .generic, value: peer.isEmpty ? callerName : peer)
+    update.localizedCallerName = callerName
+    update.hasVideo = false
+    callKitProvider?.reportNewIncomingCall(with: uuid, update: update) { error in
+      DispatchQueue.main.async {
+        result(["ok": error == nil, "callId": uuid.uuidString, "callKit": true])
+      }
+    }
+#else
+    result(["ok": true, "callId": uuid.uuidString, "callKit": false])
+#endif
+  }
+
+  private func startIosOutgoingCallKit(args: [String: Any], result: @escaping FlutterResult) {
+    let calleeName = (args["callerName"] as? String) ?? "Telegram 语音通话"
+    let peer = (args["peer"] as? String) ?? ""
+    let accountId = (args["accountId"] as? String) ?? "default"
+    self.activeCallPeer = peer
+    self.activeCallAccountId = accountId
+    let uuid = UUID()
+    self.activeCallUUID = uuid
+#if canImport(CallKit) && !os(tvOS)
+    configureIosCallKitIfAvailable()
+    let handle = CXHandle(type: .generic, value: peer.isEmpty ? calleeName : peer)
+    let startAction = CXStartCallAction(call: uuid, handle: handle)
+    startAction.contactIdentifier = calleeName
+    let transaction = CXTransaction(action: startAction)
+    callKitController.request(transaction) { error in
+      DispatchQueue.main.async {
+        result(["ok": error == nil, "callId": uuid.uuidString, "callKit": true])
+      }
+    }
+#else
+    result(["ok": true, "callId": uuid.uuidString, "callKit": false])
+#endif
+  }
+
+  private func endIosCallKit(result: @escaping FlutterResult) {
+#if canImport(CallKit) && !os(tvOS)
+    if let uuid = activeCallUUID {
+      let endAction = CXEndCallAction(call: uuid)
+      let transaction = CXTransaction(action: endAction)
+      callKitController.request(transaction) { _ in }
+    }
+#endif
+    activeCallUUID = nil
+    result(true)
   }
 
   private static func generateQrPngData(content: String, size: CGFloat) -> Data? {
@@ -657,6 +761,39 @@ class IosQrCameraScannerViewController: UIViewController, AVCaptureMetadataOutpu
     session.stopRunning()
     dismiss(animated: true) { [weak self] in
       self?.onCodeScanned(text)
+    }
+  }
+}
+#endif
+
+#if canImport(CallKit) && !os(tvOS)
+extension AppDelegate: CXProviderDelegate {
+  func providerDidReset(_ provider: CXProvider) {
+    activeCallUUID = nil
+  }
+
+  func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
+    action.fulfill()
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      self.utilsChannel?.invokeMethod("onSystemCallAction", arguments: [
+        "action": "accepted",
+        "peer": self.activeCallPeer,
+        "accountId": self.activeCallAccountId
+      ])
+    }
+  }
+
+  func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
+    action.fulfill()
+    activeCallUUID = nil
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      self.utilsChannel?.invokeMethod("onSystemCallAction", arguments: [
+        "action": "ended",
+        "peer": self.activeCallPeer,
+        "accountId": self.activeCallAccountId
+      ])
     }
   }
 }

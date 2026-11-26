@@ -248,12 +248,18 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     final isForeground = state == AppLifecycleState.resumed;
     if (isForeground) {
       unawaited(WakelockPlus.enable().catchError((_) {}));
+      widget.appState.updateTelegramReadingContext(isAppForeground: true);
       unawaited(
         widget.appState.handleAppLifecycleStateChanged(true),
       );
       if (widget.appState.isAuthenticated) {
         _sniffClipboardOnResume();
       }
+    } else if (state == AppLifecycleState.inactive) {
+      // On macOS / Windows / iOS / Android, when the window loses focus or is behind
+      // another app, mark reading context as non-foreground so incoming Telegram
+      // messages trigger system/in-app notifications immediately.
+      widget.appState.updateTelegramReadingContext(isAppForeground: false);
     } else if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden ||
         state == AppLifecycleState.detached) {

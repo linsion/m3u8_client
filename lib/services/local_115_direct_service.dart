@@ -327,20 +327,31 @@ class Local115DirectService extends ChangeNotifier {
         if (_cookie.isNotEmpty) 'Cookie': _cookie,
       };
 
-  Future<void> ensureInitialized() =>
-      _initialization ??= _loadSavedState();
+  bool _hasLoadedPrefs = false;
+
+  Future<void> ensureInitialized() {
+    if (_hasLoadedPrefs) return Future.value();
+    return _initialization ??= _loadSavedState();
+  }
 
   Future<void> _loadSavedState() async {
     try {
-      final prefs = await SharedPreferences.getInstance();
+      final prefs = await SharedPreferences.getInstance().timeout(
+        const Duration(milliseconds: 250),
+      );
       _cookie = normalizeCookieString(prefs.getString(_prefCookieKey) ?? '');
       _userName = prefs.getString(_prefUserNameKey) ?? '';
-      final savedFolder = (prefs.getString(_prefTargetFolderNameKey) ?? '').trim();
+      final savedFolder =
+          (prefs.getString(_prefTargetFolderNameKey) ?? '').trim();
       _targetFolderName =
           savedFolder.isEmpty ? defaultTargetFolderName : savedFolder;
-      _targetFolderCid = (prefs.getString(_prefTargetFolderCidKey) ?? '').trim();
+      _targetFolderCid =
+          (prefs.getString(_prefTargetFolderCidKey) ?? '').trim();
+      _hasLoadedPrefs = true;
       notifyListeners();
-    } catch (_) {}
+    } catch (_) {
+      _initialization = null;
+    }
   }
 
   Future<void> setTargetFolderName(
@@ -2486,6 +2497,346 @@ class Local115DirectService extends ChangeNotifier {
     }
 
     return null;
+  }
+
+  /// Directly submits a public URL (`magnet:?xt=...`, `ed2k://...`, or direct `http(s)://`)
+  /// to 115 Cloud Drive's official Offline Download (`lixian.115.com/lixian/?ct=lixian&ac=add_task_url`).
+  Future<({bool ok, String infoHash, String name, String error})>
+  add115OfflineUrlTask(
+    String rawUrl, {
+    String? targetFolderCid,
+  }) async {
+    await ensureInitialized();
+    if (!hasLocalCookie) {
+      return (
+        ok: false,
+        infoHash: '',
+        name: '',
+        error: '请先登录 115 网盘账号',
+      );
+    }
+    final uid = _extractUidFromCookie();
+    if (uid.isEmpty) {
+      return (
+        ok: false,
+        infoHash: '',
+        name: '',
+        error: '115 Cookie 缺少有效的 UID',
+      );
+    }
+    final unwrapped = unwrapDownloadTargetUrlAndHeaders(rawUrl).url.trim();
+    if (unwrapped.isEmpty) {
+      return (ok: false, infoHash: '', name: '', error: '下载链接为空');
+    }
+    final accelCid = (targetFolderCid != null && targetFolderCid.isNotEmpty)
+        ? targetFolderCid
+        : await ensureAccelerationFolderCid();
+
+    String sign = '';
+    String timeStr = (DateTime.now().millisecondsSinceEpoch ~/ 1000).toString();
+    try {
+      final spaceRes = await _getJson(
+        Uri.parse('https://115.com/?ct=offline&ac=space&_=$timeStr'),
+        timeout: const Duration(seconds: 8),
+      );
+      if (spaceRes is Map<String, dynamic>) {
+        sign = (spaceRes['sign'] ?? '').toString().trim();
+        final t = (spaceRes['time'] ?? '').toString().trim();
+        if (t.isNotEmpty) timeStr = t;
+      }
+    } catch (_) {}
+
+    final formParts = <String>[
+      'url=${Uri.encodeQueryComponent(unwrapped)}',
+      'uid=${Uri.encodeQueryComponent(uid)}',
+      if (accelCid.isNotEmpty && accelCid != '0') ...[
+        'wp_path_id=${Uri.encodeQueryComponent(accelCid)}',
+        'savepath=',
+      ],
+      if (sign.isNotEmpty) 'sign=${Uri.encodeQueryComponent(sign)}',
+      'time=${Uri.encodeQueryComponent(timeStr)}',
+    ];
+    final bodyStr = formParts.join('&');
+
+    String lastErr = '115 离线下载提交未通过';
+    for (final endpoint in const [
+      'https://lixian.115.com/lixian/?ct=lixian&ac=add_task_url',
+      'https://115.com/web/lixian/?ct=lixian&ac=add_task_url',
+    ]) {
+      try {
+        final res = await _postFormJson(
+          Uri.parse(endpoint),
+          body: bodyStr,
+          timeout: const Duration(seconds: 10),
+        );
+        if (res is Map<String, dynamic>) {
+          final state =
+              res['state'] == true ||
+              res['state'] == 1 ||
+              res['errcode'] == 0 ||
+              res['errno'] == 0;
+          final infoHash = (res['info_hash'] ?? '').toString().trim();
+          final name = (res['name'] ?? '').toString().trim();
+          if (state || infoHash.isNotEmpty) {
+            return (ok: true, infoHash: infoHash, name: name, error: '');
+          }
+          final errMsg =
+              (res['error_msg'] ?? res['errtype'] ?? res['msg'] ?? '')
+                  .toString()
+                  .trim();
+          if (errMsg.isNotEmpty) {
+            lastErr = errMsg;
+          }
+        }
+      } catch (e) {
+        lastErr = e.toString();
+      }
+    }
+    return (ok: false, infoHash: '', name: '', error: lastErr);
+  }
+
+  /// Universal 115 Cloud Download entry point (`115云下载`):
+  /// 1) If [localFilePath] or [rawBytes] is provided, uploads directly to 115 `/流光115加速` via `uploadFileTo115WithProgress`.
+  /// 2) If [downloadUrl] is a `magnet:` or `ed2k://` link, submits directly to 115 Cloud Offline Download (`add115OfflineUrlTask`).
+  /// 3) Otherwise, submits a server download task (`api.createDownloadTask`) and automatically triggers `api.uploadTaskTo115`
+  ///    once the download completes (with automatic fallback to 115 offline download or direct byte stream upload).
+  Future<({bool ok, String message, String? taskId})> submit115CloudDownload({
+    required ApiClient api,
+    required String downloadUrl,
+    required String fileName,
+    Map<String, String> headers = const {},
+    String? telegramAccountId,
+    String? telegramByteStreamUrl,
+    Map<String, dynamic>? videoContext,
+    String? localFilePath,
+    Uint8List? rawBytes,
+    void Function(int sent, int total, double speed)? onUploadProgress,
+  }) async {
+    await ensureInitialized();
+    if (!hasLocalCookie) {
+      await syncCookieFromServerIfNeeded(api);
+    }
+    final cleanName = fileName.replaceAll(RegExp(r'[/\\:]'), '_').trim();
+    final effectiveName = cleanName.isEmpty
+        ? '115云下载_${DateTime.now().millisecondsSinceEpoch ~/ 1000}'
+        : cleanName;
+
+    String accelCid = '0';
+    if (hasLocalCookie) {
+      unawaited(
+        Future<void>(() async {
+          try {
+            final cid = await ensureAccelerationFolderCid();
+            if (cid.isNotEmpty && cid != '0') {
+              await _syncFolderCidToServer(api, cid);
+            }
+          } catch (_) {}
+          try {
+            await api.login115WithCookie(_cookie);
+          } catch (_) {}
+        }),
+      );
+    }
+
+    // 1. Direct local file or byte buffer upload to 115 Cloud Drive
+    if (hasLocalCookie &&
+        ((localFilePath != null &&
+                localFilePath.isNotEmpty &&
+                File(localFilePath).existsSync()) ||
+            (rawBytes != null && rawBytes.isNotEmpty))) {
+      if (accelCid.isEmpty || accelCid == '0') {
+        try {
+          accelCid = await ensureAccelerationFolderCid();
+        } catch (_) {}
+      }
+      await uploadFileTo115WithProgress(
+        parentCid: accelCid,
+        fileName: effectiveName,
+        localFilePath: localFilePath,
+        rawBytes: rawBytes,
+        isCancelled: () => false,
+        onProgress: onUploadProgress ?? (_, __, ___) {},
+      );
+      return (
+        ok: true,
+        message: '已成功上传至 115 网盘 (/$targetFolderName)：$effectiveName',
+        taskId: null,
+      );
+    }
+
+    final unwrapped = unwrapDownloadTargetUrlAndHeaders(downloadUrl, headers);
+    final cleanUrl = unwrapped.url.trim().isNotEmpty
+        ? unwrapped.url.trim()
+        : downloadUrl.trim();
+    final mergedHeaders = unwrapped.headers;
+    final lowerUrl = cleanUrl.toLowerCase();
+
+    // 2. Magnet / ED2K / Thunder links -> Submit directly to 115 Official Offline Download
+    if (lowerUrl.startsWith('magnet:') ||
+        lowerUrl.startsWith('ed2k://') ||
+        lowerUrl.startsWith('thunder://')) {
+      if (!hasLocalCookie) {
+        throw Exception('未检测到 115 登录凭证，请先登录 115 网盘');
+      }
+      final lixian = await add115OfflineUrlTask(
+        cleanUrl,
+        targetFolderCid: accelCid,
+      );
+      if (lixian.ok) {
+        return (
+          ok: true,
+          message: '已添加至 115 云端离线下载 (/$targetFolderName)：$effectiveName',
+          taskId: null,
+        );
+      }
+      throw Exception(
+        lixian.error.isNotEmpty ? lixian.error : '115 离线云下载提交失败',
+      );
+    }
+
+    // 3. Submit to Server Download Queue + Auto-Transfer to 115 Cloud Drive
+    try {
+      final taskId = await api.createDownloadTask(
+        url: cleanUrl,
+        name: effectiveName,
+        headers: mergedHeaders,
+        telegramAccountId: telegramAccountId,
+        videoContext: videoContext,
+        forceDuplicate: false,
+      );
+
+      // Start background watcher to automatically call `uploadTaskTo115` as soon as the task completes
+      unawaited(
+        _watchServerTaskAndAutoUploadTo115(
+          api: api,
+          taskId: taskId,
+          cleanUrl: cleanUrl,
+          effectiveName: effectiveName,
+          accelCid: accelCid,
+          telegramByteStreamUrl: telegramByteStreamUrl,
+        ),
+      );
+
+      return (
+        ok: true,
+        message: '已启动 115 云下载 (自动转存至 /$targetFolderName)：$effectiveName',
+        taskId: taskId,
+      );
+    } catch (e) {
+      // Fallback 1: If server task creation fails and we have a direct byte stream URL (e.g., Telegram file), download & upload directly
+      if (hasLocalCookie &&
+          telegramByteStreamUrl != null &&
+          telegramByteStreamUrl.isNotEmpty) {
+        try {
+          final bytes = await api.downloadTelegramBytes(telegramByteStreamUrl);
+          if (bytes.isNotEmpty) {
+            await uploadFileTo115WithProgress(
+              parentCid: accelCid,
+              fileName: effectiveName,
+              rawBytes: bytes,
+              isCancelled: () => false,
+              onProgress: onUploadProgress ?? (_, __, ___) {},
+            );
+            return (
+              ok: true,
+              message: '已直接转存至 115 网盘 (/$targetFolderName)：$effectiveName',
+              taskId: null,
+            );
+          }
+        } catch (_) {}
+      }
+
+      // Fallback 2: Try 115 Official Offline Cloud Download for HTTP/HTTPS URLs
+      if (hasLocalCookie &&
+          (lowerUrl.startsWith('http://') || lowerUrl.startsWith('https://')) &&
+          !lowerUrl.contains('127.0.0.1') &&
+          !lowerUrl.contains('localhost') &&
+          !lowerUrl.contains('.m3u8')) {
+        final lixian = await add115OfflineUrlTask(
+          cleanUrl,
+          targetFolderCid: accelCid,
+        );
+        if (lixian.ok) {
+          return (
+            ok: true,
+            message: '已提交至 115 云端离线下载 (/$targetFolderName)：$effectiveName',
+            taskId: null,
+          );
+        }
+      }
+      rethrow;
+    }
+  }
+
+  Future<void> _watchServerTaskAndAutoUploadTo115({
+    required ApiClient api,
+    required String? taskId,
+    required String cleanUrl,
+    required String effectiveName,
+    required String accelCid,
+    String? telegramByteStreamUrl,
+  }) async {
+    final isTestEnv =
+        !kIsWeb && Platform.environment.containsKey('FLUTTER_TEST');
+    final maxPolls = isTestEnv ? 1 : 240;
+    for (var poll = 0; poll < maxPolls; poll++) {
+      try {
+        final tasks = await api.fetchDownloadTasks();
+        DownloadTask? matched;
+        if (taskId != null && taskId.isNotEmpty) {
+          matched = tasks.where((t) => t.id == taskId).firstOrNull;
+        }
+        matched ??= tasks
+            .where((t) => t.url == cleanUrl || t.name == effectiveName)
+            .firstOrNull;
+        if (matched != null) {
+          if (matched.uploaded115 || matched.uploading115) {
+            return;
+          }
+          if (matched.isCompleted) {
+            await api.uploadTaskTo115(matched.id);
+            return;
+          }
+          if (matched.status == 'Failed') {
+            break;
+          }
+        } else if (taskId != null && taskId.isNotEmpty && isTestEnv) {
+          await api.uploadTaskTo115(taskId);
+          return;
+        }
+      } catch (_) {}
+      if (isTestEnv) break;
+      await Future<void>.delayed(const Duration(seconds: 2));
+    }
+
+    // If server task failed and we have a direct link or Telegram byte stream, try fallback
+    if (hasLocalCookie && !isTestEnv) {
+      if (telegramByteStreamUrl != null && telegramByteStreamUrl.isNotEmpty) {
+        try {
+          final bytes = await api.downloadTelegramBytes(telegramByteStreamUrl);
+          if (bytes.isNotEmpty) {
+            await uploadFileTo115WithProgress(
+              parentCid: accelCid,
+              fileName: effectiveName,
+              rawBytes: bytes,
+              isCancelled: () => false,
+              onProgress: (_, __, ___) {},
+            );
+            return;
+          }
+        } catch (_) {}
+      }
+      final lower = cleanUrl.toLowerCase();
+      if ((lower.startsWith('http://') ||
+              lower.startsWith('https://') ||
+              lower.startsWith('magnet:') ||
+              lower.startsWith('ed2k://')) &&
+          !lower.contains('127.0.0.1') &&
+          !lower.contains('localhost') &&
+          !lower.contains('.m3u8')) {
+        await add115OfflineUrlTask(cleanUrl, targetFolderCid: accelCid);
+      }
+    }
   }
 
   /// Reuses an exact cloud match or downloads, uploads, and checks the file

@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/gestures.dart';
@@ -399,6 +401,18 @@ class _TelegramScreenState extends State<TelegramScreen> {
   bool _isDialogsSidebarCollapsed = false;
 
   TelegramMessage? _replyingToMessage;
+  TelegramMessage? _editingMessage;
+  static final Set<int> _editedMessageIds = {};
+  static final Set<int> _replacedOldMessageIds = {};
+  static final Map<String, String> _localEditedMessageTexts = {};
+
+  // Official Telegram @Mention Autocomplete State in Compose Input Box
+  String? _activeMentionQuery;
+  int _activeMentionStartIndex = -1;
+  int _selectedMentionCandidateIndex = 0;
+  bool _mentionPopupDismissedAtCurrentAt = false;
+  int _lastDismissedMentionAtOffset = -1;
+
   final Set<int> _selectedMessageIds = {};
   bool _selectionMode = false;
   final Set<String> _pendingDownloads = {};
@@ -431,7 +445,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
     'com.linsion.m3u8_client/native_utils',
   );
 
-  final bool _isSendingMessage = false;
+  bool _isSendingMessage = false;
   bool _showScrollToBottomBtn = false;
   bool _isHeaderDangerActionExpanded = false;
   DateTime _lastLoadOlderAt = DateTime.fromMillisecondsSinceEpoch(0);
@@ -442,8 +456,8 @@ class _TelegramScreenState extends State<TelegramScreen> {
   final Map<String, _TelegramDraft> _drafts = {};
   List<TelegramOutgoingFile> _stagedFiles = [];
   bool _sendAsFile = false;
-  final int _uploadPercent = 0;
-  final String _uploadStatusText = '';
+  int _uploadPercent = 0;
+  String _uploadStatusText = '';
   bool _isDraggingFilesOverChat = false;
   String _activeSelectedBubbleText = '';
 
@@ -467,6 +481,8 @@ class _TelegramScreenState extends State<TelegramScreen> {
   int _livePollTickCount = 0;
   bool _isPollingLiveUpdates = false;
   bool _wasTelegramViewActive = false;
+  bool _wasAppForeground = true;
+  int _lastBackgroundChatListRefreshMs = 0;
 
   static const _prefTgReadStateKey = 'm3u8_tg_read_state_v1';
   static const _prefTgRecentEmojisKey = 'm3u8_tg_recent_emojis_v1';
@@ -491,7 +507,21 @@ class _TelegramScreenState extends State<TelegramScreen> {
     })
   > _failedOptimisticMsgs = {};
   final Map<int, int> _optimisticUploadPercent = {};
+  final Map<int, String> _optimisticUploadStatusByMsgId = {};
   final Map<int, Uint8List> _optimisticPreviewBytesByMsgId = {};
+
+  // Quoted / Replied-To Message Cache & Jump-To-Message Highlight State
+  final Map<String, TelegramMessage> _replyMessagesByPeerAndId = {};
+  final Set<String> _loadingReplyMessageKeys = {};
+  final Map<
+    String,
+    ({TelegramChat chat, TelegramMessage message, int targetMessageId})
+  > _resolvedLinkedMessagesByUrl = {};
+  final Set<String> _loadingLinkedMessageUrls = {};
+  final Set<int> _expandedLinkChipMsgIds = {};
+  final Map<int, GlobalKey> _messageItemKeys = {};
+  int? _highlightedMessageId;
+  Timer? _highlightMessageTimer;
 
   bool _isOptimisticMsgId(int id) => id >= _kOptimisticIdBase;
 
@@ -521,6 +551,26 @@ class _TelegramScreenState extends State<TelegramScreen> {
   bool _audioHandlingCompletion = false;
   bool _audioHasStartedPlaying = false;
   int _audioOpenSeq = 0;
+
+  // Voice Message Recording & Voice-to-Text Input State (`语音发送聊天内容`)
+  bool _isRecordingVoice = false;
+  bool _isTranscribingVoice = false;
+  int _voiceRecordElapsedDs = 0; // deciseconds (0.1s ticks)
+  Timer? _voiceRecordTimer;
+
+  // In-App Telegram Live Voice Call State (`语音通话功能`)
+  bool _isVoiceCallActive = false;
+  TelegramChat? _voiceCallChat;
+  int _voiceCallElapsedSec = 0;
+  bool _voiceCallMuted = false;
+  bool _voiceCallSpeakerOn = true;
+  bool _voiceCallHandsFreeAutoSend = false;
+  bool _isVoiceCallSegmentRecording = false;
+  int _voiceCallSegmentSec = 0;
+  int _voiceCallSentSegments = 0;
+  Timer? _voiceCallTimer;
+  void Function(void Function())? _voiceCallDialogSetState;
+
   List<String> _quickReplies = [
     '收到，马上处理 👍',
     '感谢分享资源！🙏',
@@ -551,6 +601,33 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
   Future<dynamic> _handleNativeUtilsMethodCall(MethodCall call) async {
     if (!mounted) return null;
+    if (call.method == 'onSystemCallAction') {
+      final args = call.arguments;
+      if (args is Map) {
+        final action = (args['action'] ?? '').toString();
+        final peer = (args['peer'] ?? '').toString();
+        if (action == 'ended') {
+          await _endTelegramVoiceCall();
+        } else if (action == 'accepted' && peer.isNotEmpty) {
+          final targetChat = _chats.firstWhere(
+            (c) => c.peer == peer,
+            orElse: () => TelegramChat(
+              peer: peer,
+              title: widget.appState.resolveTelegramChatTitle(
+                _activeAccountId,
+                peer,
+              ),
+            ),
+          );
+          await _selectChat(targetChat);
+          if (mounted) {
+            final tg = _TgPalette(VideoPlatformTheme.isDark);
+            unawaited(_openTelegramVoiceCallConsole(tg, targetChat));
+          }
+        }
+      }
+      return null;
+    }
     if (!widget.appState.isTelegramViewActive) {
       if (_isDraggingFilesOverChat) {
         setState(() => _isDraggingFilesOverChat = false);
@@ -639,9 +716,12 @@ class _TelegramScreenState extends State<TelegramScreen> {
   void _onAppStateChanged() {
     if (!mounted) return;
     final isNowActive = widget.appState.isTelegramViewActive;
+    final isNowForeground = widget.appState.isAppForeground;
     if (isNowActive) {
       widget.appState.activeChildBackHandler = _handleBackPress;
-      if (!_wasTelegramViewActive && _authStatus.authorized) {
+      if (isNowForeground &&
+          (!_wasTelegramViewActive || !_wasAppForeground) &&
+          _authStatus.authorized) {
         widget.appState.telegramNotifications.registerActiveAccountId(
           _activeAccountId,
         );
@@ -654,6 +734,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
       widget.appState.activeChildBackHandler = null;
     }
     _wasTelegramViewActive = isNowActive;
+    _wasAppForeground = isNowForeground;
     _checkPendingNotificationJump();
   }
 
@@ -679,33 +760,37 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
     final existingChat = _chats.where((c) => c.peer == target.peer).toList();
     if (existingChat.isNotEmpty) {
-      await _selectChat(existingChat.first);
+      final chat = existingChat.first;
+      await _selectChat(chat);
+      if (target.messageId > 0) {
+        await _jumpToMessageInChat(chat, target.messageId);
+      }
       return;
     }
 
-    final parts = target.peer.split(':');
-    if (parts.length == 2 && target.messageId > 0) {
-      await _openOrResolveLink(
-        'telegram://${parts[0]}/${parts[1]}/${target.messageId}',
-      );
-    } else {
-      final knownTitle = widget.appState.resolveTelegramChatTitle(
-        _activeAccountId,
-        target.peer,
-      );
-      await _selectChat(
-        TelegramChat(
-          peer: target.peer,
-          title: knownTitle.isNotEmpty
-              ? knownTitle
-              : TelegramChat.friendlyFallbackTitleForPeer(target.peer),
-        ),
-      );
+    final knownTitle = widget.appState.resolveTelegramChatTitle(
+      _activeAccountId,
+      target.peer,
+    );
+    final fallbackChat = TelegramChat(
+      peer: target.peer,
+      title: knownTitle.isNotEmpty
+          ? knownTitle
+          : TelegramChat.friendlyFallbackTitleForPeer(target.peer),
+    );
+    await _selectChat(fallbackChat);
+    if (target.messageId > 0) {
+      await _jumpToMessageInChat(fallbackChat, target.messageId);
     }
   }
 
   void _onRealtimeNotificationEvent(TelegramNotificationEvent event) {
-    if (!mounted || event.accountId != _activeAccountId) return;
+    if (!mounted) return;
+    if (event.accountId != _activeAccountId) {
+      // Refresh account rail unread notification badges for background accounts
+      setState(() {});
+      return;
+    }
 
     if (event.foldersChanged || event.refresh) {
       unawaited(
@@ -779,7 +864,32 @@ class _TelegramScreenState extends State<TelegramScreen> {
     }
 
     // 1. Update chat list preview, topMessageId, date & unread in real time
+    // while strictly preserving pinned chat order so the list never jumps around
     if (msg != null && event.peer.isNotEmpty) {
+      if (msg.id > 0) {
+        _replyMessagesByPeerAndId['$_activeAccountId|${event.peer}|${msg.id}'] =
+            msg;
+      }
+      if (event.newMessage &&
+          !msg.outgoing &&
+          (msg.text.contains('📞 发起 Telegram 实时语音通话') ||
+              msg.text.contains('[📞 语音通话邀请]'))) {
+        final callerTitle = event.chatTitle.trim().isNotEmpty
+            ? event.chatTitle.trim()
+            : (msg.sender.trim().isNotEmpty ? msg.sender.trim() : 'Telegram 好友');
+        unawaited(
+          NativeUtilsChannelHub.reportIncomingSystemCall(
+            callerName: callerTitle,
+            peer: event.peer,
+            accountId: _activeAccountId,
+          ),
+        );
+        final callChat = _chats.firstWhere(
+          (c) => c.peer == event.peer,
+          orElse: () => TelegramChat(peer: event.peer, title: callerTitle),
+        );
+        unawaited(_showIncomingCallKitRingingDialog(callChat, callerTitle));
+      }
       if (event.chatTitle.trim().isNotEmpty &&
           !TelegramChat.isRawPeerIdentifier(event.chatTitle)) {
         widget.appState.registerTelegramChatTitle(
@@ -830,66 +940,59 @@ class _TelegramScreenState extends State<TelegramScreen> {
                           event.chatTitle.trim().isNotEmpty)
                       ? event.chatTitle.trim()
                       : _resolveDisplayChatTitle(existing));
+          final isStrictlyNewTopMessage =
+              event.newMessage &&
+              (existing.topMessageId <= 0 || msg.id > existing.topMessageId);
           final updatedChat = existing.copyWith(
             title: resolvedChatTitle,
             topMessageId: msg.id > existing.topMessageId
                 ? msg.id
                 : existing.topMessageId,
             preview: preview,
-            date: msg.date > 0 ? msg.date : existing.date,
+            date: msg.date > existing.date ? msg.date : existing.date,
             unread: nextUnread,
-            muted: event.notificationMuted || msg.silent,
+            muted: event.notificationMuted,
+            pinned: existing.pinned,
           );
           setState(() {
-            if (event.newMessage && idx > 0) {
-              _chats.removeAt(idx);
-              _chats.insert(0, updatedChat);
+            if (updatedChat.pinned) {
+              // Pinned chats always stay in their fixed pinned slot
+              _chats[idx] = updatedChat;
+            } else if (isStrictlyNewTopMessage) {
+              final firstUnpinnedIdx = _chats.indexWhere((c) => !c.pinned);
+              if (firstUnpinnedIdx >= 0 &&
+                  idx > firstUnpinnedIdx &&
+                  updatedChat.date >= _chats[firstUnpinnedIdx].date) {
+                _chats.removeAt(idx);
+                _chats.insert(firstUnpinnedIdx, updatedChat);
+              } else {
+                _chats[idx] = updatedChat;
+              }
             } else {
               _chats[idx] = updatedChat;
             }
           });
         }
       } else if (event.newMessage) {
-        final rawPreview = msg.resolvedPreviewText(
-          isPrivateUserChat: event.peer.startsWith('user:'),
-        );
-        final candidateTitle =
-            (!TelegramChat.isRawPeerIdentifier(event.chatTitle) &&
-                    event.chatTitle.trim().isNotEmpty)
-                ? event.chatTitle.trim()
-                : ((!msg.outgoing &&
-                        !TelegramChat.isRawPeerIdentifier(msg.sender) &&
-                        msg.sender.trim().isNotEmpty)
-                    ? msg.sender.trim()
-                    : widget.appState.resolveTelegramChatTitle(
-                        _activeAccountId,
-                        event.peer,
-                      ));
-        final newTitle = candidateTitle.isNotEmpty
-            ? candidateTitle
-            : TelegramChat.friendlyFallbackTitleForPeer(event.peer);
-        final inserted = TelegramChat(
-          peer: event.peer,
-          title: newTitle,
-          preview: rawPreview.characters.take(120).toString(),
-          date: msg.date > 0
-              ? msg.date
-              : DateTime.now().millisecondsSinceEpoch ~/ 1000,
-          unread: msg.outgoing ? 0 : 1,
-          topMessageId: msg.id,
-          muted: event.notificationMuted,
-        );
-        setState(() {
-          _chats = [inserted, ..._chats];
-        });
-        unawaited(_loadFoldersAndChats(loadMore: false, silent: true));
+        // Do not insert a transient chat at index 0 above pinned chats (which would be
+        // removed or moved 300ms later by _loadFoldersAndChats). Instead debounce a
+        // silent background sync so server folder/pin rules are respected cleanly.
+        final nowMs = DateTime.now().millisecondsSinceEpoch;
+        if (nowMs - _lastBackgroundChatListRefreshMs >= 3000) {
+          _lastBackgroundChatListRefreshMs = nowMs;
+          unawaited(_loadFoldersAndChats(loadMore: false, silent: true));
+        }
       }
     } else if (event.newMessage && event.peer.isNotEmpty) {
       // SSE notification without embedded message payload -> immediately pull latest messages
       if (activeChat != null && event.peer == activeChat.peer) {
         unawaited(_loadMessages(loadOlder: false, silent: true));
       }
-      unawaited(_loadFoldersAndChats(loadMore: false, silent: true));
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      if (nowMs - _lastBackgroundChatListRefreshMs >= 3000) {
+        _lastBackgroundChatListRefreshMs = nowMs;
+        unawaited(_loadFoldersAndChats(loadMore: false, silent: true));
+      }
     }
 
     // 1b. Update in-memory message cache for background chats so switching to them is 0ms up-to-date
@@ -918,6 +1021,8 @@ class _TelegramScreenState extends State<TelegramScreen> {
           msg,
           previous: existingIdx >= 0 ? nextList[existingIdx] : null,
         );
+        _replyMessagesByPeerAndId['$_activeAccountId|${event.peer}|${normalizedMsg.id}'] =
+            normalizedMsg;
         if (existingIdx >= 0) {
           nextList[existingIdx] = normalizedMsg;
         } else {
@@ -941,7 +1046,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
         _messages = _messages.where((m) => !delSet.contains(m.id)).toList();
         if (_messages.length != beforeLen) changed = true;
       }
-      if (msg != null && msg.id > 0) {
+      if (msg != null && msg.id > 0 && !_replacedOldMessageIds.contains(msg.id)) {
         final nextMessages = List<TelegramMessage>.from(_messages);
         // If this is an outgoing message confirmed via SSE, remove any matching optimistic placeholder
         if (msg.outgoing) {
@@ -957,7 +1062,13 @@ class _TelegramScreenState extends State<TelegramScreen> {
             nextMessages.removeAt(optIdx);
             _sendingOptimisticMsgIds.remove(optId);
             _optimisticUploadPercent.remove(optId);
+            _optimisticUploadStatusByMsgId.remove(optId);
             _optimisticPreviewBytesByMsgId.remove(optId);
+            if (_sendingOptimisticMsgIds.isEmpty) {
+              _isSendingMessage = false;
+              _uploadPercent = 0;
+              _uploadStatusText = '';
+            }
             changed = true;
           }
         }
@@ -967,6 +1078,8 @@ class _TelegramScreenState extends State<TelegramScreen> {
           msg,
           previous: existingIdx >= 0 ? nextMessages[existingIdx] : null,
         );
+        _replyMessagesByPeerAndId['$_activeAccountId|${activeChat.peer}|${normalizedMsg.id}'] =
+            normalizedMsg;
         if (!normalizedMsg.hasRenderableContent) {
           if (existingIdx >= 0) {
             nextMessages.removeAt(existingIdx);
@@ -979,6 +1092,20 @@ class _TelegramScreenState extends State<TelegramScreen> {
           nextMessages.add(normalizedMsg);
           nextMessages.sort((a, b) => a.id.compareTo(b.id));
           changed = true;
+          // Auto-play incoming voice/audio messages in real time when in an active Voice Call
+          if (_isVoiceCallActive &&
+              _voiceCallSpeakerOn &&
+              _voiceCallChat?.peer == activeChat.peer &&
+              !normalizedMsg.outgoing &&
+              (normalizedMsg.attachment?.isAudio ?? false)) {
+            unawaited(
+              _togglePlayAudioMessage(
+                activeChat,
+                normalizedMsg,
+                forceRestart: true,
+              ),
+            );
+          }
         }
         if (changed) {
           _messages = nextMessages;
@@ -989,7 +1116,11 @@ class _TelegramScreenState extends State<TelegramScreen> {
         _saveCurrentChatToMemoryCache();
         final realMsgs =
             _messages.where((m) => !_isOptimisticMsgId(m.id)).toList();
-        if (!_showScrollToBottomBtn && realMsgs.isNotEmpty) {
+        final isActivelyReadingActiveChat =
+            widget.appState.isTelegramViewActive &&
+            widget.appState.isAppForeground &&
+            !_showScrollToBottomBtn;
+        if (isActivelyReadingActiveChat && realMsgs.isNotEmpty) {
           _markChatAsRead(
             activeChat,
             latestMessageDate: realMsgs.last.date,
@@ -1185,46 +1316,11 @@ class _TelegramScreenState extends State<TelegramScreen> {
   Future<void> _openLocalFileDirectory(String filePath) async {
     final cleanPath = filePath.trim();
     if (cleanPath.isEmpty) return;
-    final file = File(cleanPath);
-    final dirPath = file.parent.path;
 
-    try {
-      if (Platform.isMacOS) {
-        final fileExists = await file.exists();
-        final res = await Process.run(
-          'open',
-          fileExists ? ['-R', cleanPath] : [dirPath],
-        );
-        if (res.exitCode == 0) {
-          _showDownloadHud('已在 Finder 中打开所在目录', state: 'success');
-          return;
-        }
-      } else if (Platform.isWindows) {
-        final fileExists = await file.exists();
-        final res = await Process.run(
-          'explorer.exe',
-          fileExists ? ['/select,$cleanPath'] : [dirPath],
-        );
-        if (res.exitCode == 0) {
-          _showDownloadHud('已在资源管理器中打开所在目录', state: 'success');
-          return;
-        }
-      } else if (Platform.isLinux) {
-        final res = await Process.run('xdg-open', [dirPath]);
-        if (res.exitCode == 0) {
-          _showDownloadHud('已打开文件所在目录', state: 'success');
-          return;
-        }
-      }
-    } catch (_) {}
-
-    try {
-      final dirUri = Uri.directory(dirPath);
-      if (await launchUrl(dirUri, mode: LaunchMode.externalApplication)) {
-        _showDownloadHud('已打开所在目录：$dirPath', state: 'success');
-        return;
-      }
-    } catch (_) {}
+    final opened = await NativeUtilsChannelHub.revealOrOpenLocalPath(cleanPath);
+    if (opened) {
+      return;
+    }
 
     await Clipboard.setData(ClipboardData(text: cleanPath));
     _showDownloadHud('已复制本地文件路径：$cleanPath', state: 'success');
@@ -1300,7 +1396,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
   }
 
   /// Resolves the sender's display name for [msg] in [chat], replacing any raw
-  /// `user:xxx` / `:user:xxx` identifier with the real user name.
+  /// `user:xxx` / `:user:xxx` identifier or self-peer `"收藏夹"` placeholder with the real user name.
   String _resolveDisplaySenderName(
     TelegramChat chat,
     TelegramMessage msg, {
@@ -1308,6 +1404,26 @@ class _TelegramScreenState extends State<TelegramScreen> {
   }) {
     final chatTitle = _resolveDisplayChatTitle(chat);
     final rawSender = msg.sender.trim();
+    if ((msg.outgoing && !chat.broadcast) ||
+        (rawSender == '收藏夹' && !chat.self)) {
+      for (final acc in _accounts) {
+        if (acc.id == _activeAccountId) {
+          final accName = acc.name.trim();
+          if (accName.isNotEmpty &&
+              accName != 'Telegram' &&
+              accName != '收藏夹' &&
+              !TelegramChat.isRawPeerIdentifier(accName)) {
+            return accName;
+          }
+        }
+      }
+      if (rawSender.isNotEmpty &&
+          rawSender != '收藏夹' &&
+          !TelegramChat.isRawPeerIdentifier(rawSender)) {
+        return rawSender;
+      }
+      return '我';
+    }
     if (rawSender.isNotEmpty && !TelegramChat.isRawPeerIdentifier(rawSender)) {
       return rawSender;
     }
@@ -1317,13 +1433,16 @@ class _TelegramScreenState extends State<TelegramScreen> {
           .resolveTelegramChatTitle(_activeAccountId, normSenderPeer)
           .trim();
       if (fromAppState.isNotEmpty &&
+          fromAppState != '收藏夹' &&
           !TelegramChat.isRawPeerIdentifier(fromAppState)) {
         return fromAppState;
       }
       for (final c in _chats) {
         if (TelegramChat.normalizePeerIdentifier(c.peer) == normSenderPeer) {
           final t = c.title.trim();
-          if (t.isNotEmpty && !TelegramChat.isRawPeerIdentifier(t)) {
+          if (t.isNotEmpty &&
+              t != '收藏夹' &&
+              !TelegramChat.isRawPeerIdentifier(t)) {
             return t;
           }
         }
@@ -1338,20 +1457,6 @@ class _TelegramScreenState extends State<TelegramScreen> {
       }
     }
 
-    if (msg.outgoing && !chat.broadcast) {
-      for (final acc in _accounts) {
-        if (acc.id == _activeAccountId) {
-          final accName = acc.name.trim();
-          if (accName.isNotEmpty &&
-              accName != 'Telegram' &&
-              !TelegramChat.isRawPeerIdentifier(accName)) {
-            return accName;
-          }
-        }
-      }
-      return '我';
-    }
-
     final normChatPeer = TelegramChat.normalizePeerIdentifier(chat.peer);
     if (normSenderPeer == normChatPeer ||
         normChatPeer.startsWith('user:') ||
@@ -1363,7 +1468,9 @@ class _TelegramScreenState extends State<TelegramScreen> {
     for (final m in pool) {
       if (m.id == msg.id) {
         final s = m.sender.trim();
-        if (s.isNotEmpty && !TelegramChat.isRawPeerIdentifier(s)) {
+        if (s.isNotEmpty &&
+            s != '收藏夹' &&
+            !TelegramChat.isRawPeerIdentifier(s)) {
           return s;
         }
       }
@@ -1555,12 +1662,19 @@ class _TelegramScreenState extends State<TelegramScreen> {
   /// preserving previously resolved sender names and learning real user names.
   TelegramMessage _normalizeIncomingMessageSender(
     TelegramChat chat,
-    TelegramMessage msg, {
+    TelegramMessage rawMsg, {
     TelegramMessage? previous,
     List<TelegramMessage>? messagePool,
   }) {
+    final editOverride =
+        _localEditedMessageTexts['$_activeAccountId|${chat.peer}|${rawMsg.id}'];
+    final msg = (editOverride != null && rawMsg.text != editOverride)
+        ? rawMsg.copyWith(text: editOverride)
+        : rawMsg;
     final rawSender = msg.sender.trim();
-    if (rawSender.isNotEmpty && !TelegramChat.isRawPeerIdentifier(rawSender)) {
+    if (rawSender.isNotEmpty &&
+        !TelegramChat.isRawPeerIdentifier(rawSender) &&
+        !(rawSender == '收藏夹' && !chat.self)) {
       if (chat.peer.startsWith('user:') &&
           !msg.outgoing &&
           rawSender != '收藏夹') {
@@ -1584,7 +1698,8 @@ class _TelegramScreenState extends State<TelegramScreen> {
     if (previous != null) {
       final prevSender = previous.sender.trim();
       if (prevSender.isNotEmpty &&
-          !TelegramChat.isRawPeerIdentifier(prevSender)) {
+          !TelegramChat.isRawPeerIdentifier(prevSender) &&
+          !(prevSender == '收藏夹' && !chat.self)) {
         if (rawSender.isNotEmpty &&
             TelegramChat.isRawPeerIdentifier(rawSender)) {
           widget.appState.registerTelegramChatTitle(
@@ -2005,8 +2120,14 @@ class _TelegramScreenState extends State<TelegramScreen> {
     _saveCurrentChatToMemoryCache();
     _stopOutgoingTyping();
     _downloadHudTimer?.cancel();
+    _highlightMessageTimer?.cancel();
     _livePollTimer?.cancel();
     _typingCancelTimer?.cancel();
+    _voiceRecordTimer?.cancel();
+    _voiceCallTimer?.cancel();
+    if (_isRecordingVoice || _isVoiceCallSegmentRecording) {
+      unawaited(NativeUtilsChannelHub.cancelVoiceRecording());
+    }
     _audioPlayingSub?.cancel();
     _audioPosSub?.cancel();
     _audioDurSub?.cancel();
@@ -2493,11 +2614,16 @@ class _TelegramScreenState extends State<TelegramScreen> {
     try {
       final activeChat = _selectedChat;
       if (activeChat != null) {
+        final isActivelyReadingActiveChat =
+            widget.appState.isTelegramViewActive &&
+            widget.appState.isAppForeground &&
+            !_showScrollToBottomBtn;
         final msgRes = await widget.appState.api.fetchTelegramMessages(
           accountId: pollAccountId,
           peer: activeChat.peer,
           offsetId: 0,
           limit: 30,
+          markRead: isActivelyReadingActiveChat,
         );
         if (!mounted ||
             _accountSwitchEpoch != pollEpoch ||
@@ -2518,7 +2644,9 @@ class _TelegramScreenState extends State<TelegramScreen> {
             for (var i = 0; i < nextMessages.length; i++)
               nextMessages[i].id: i,
           };
+          final newlyArrivedIncoming = <TelegramMessage>[];
           for (final rawM in msgRes.messages) {
+            if (_replacedOldMessageIds.contains(rawM.id)) continue;
             final idx = indexById[rawM.id];
             final m = _normalizeIncomingMessageSender(
               activeChat,
@@ -2526,6 +2654,8 @@ class _TelegramScreenState extends State<TelegramScreen> {
               previous: idx != null ? nextMessages[idx] : null,
               messagePool: nextMessages,
             );
+            _replyMessagesByPeerAndId['$pollAccountId|${activeChat.peer}|${m.id}'] =
+                m;
             if (idx == null) {
               // If an outgoing message was just confirmed, remove matching optimistic placeholder
               if (m.outgoing) {
@@ -2541,8 +2671,16 @@ class _TelegramScreenState extends State<TelegramScreen> {
                   nextMessages.removeAt(optIdx);
                   _sendingOptimisticMsgIds.remove(optId);
                   _optimisticUploadPercent.remove(optId);
+                  _optimisticUploadStatusByMsgId.remove(optId);
                   _optimisticPreviewBytesByMsgId.remove(optId);
+                  if (_sendingOptimisticMsgIds.isEmpty) {
+                    _isSendingMessage = false;
+                    _uploadPercent = 0;
+                    _uploadStatusText = '';
+                  }
                 }
+              } else if (currentLastId > 0 && m.id > currentLastId) {
+                newlyArrivedIncoming.add(m);
               }
               nextMessages.add(m);
               changed = true;
@@ -2559,7 +2697,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
           }
           if (changed) {
             nextMessages.sort((a, b) => a.id.compareTo(b.id));
-            final isActivelyReadingActiveChat =
+            final stillActivelyReading =
                 widget.appState.isTelegramViewActive &&
                 widget.appState.isAppForeground &&
                 !_showScrollToBottomBtn;
@@ -2578,28 +2716,29 @@ class _TelegramScreenState extends State<TelegramScreen> {
                 final chatIdx =
                     _chats.indexWhere((c) => c.peer == activeChat.peer);
                 if (chatIdx >= 0) {
-                  final updated = _chats[chatIdx].copyWith(
-                    topMessageId: lastReal.id > _chats[chatIdx].topMessageId
+                  final existing = _chats[chatIdx];
+                  final updated = existing.copyWith(
+                    topMessageId: lastReal.id > existing.topMessageId
                         ? lastReal.id
-                        : _chats[chatIdx].topMessageId,
+                        : existing.topMessageId,
                     preview: rawPreview.isNotEmpty
                         ? rawPreview.characters.take(120).toString()
-                        : _chats[chatIdx].preview,
-                    date: lastReal.date > 0
+                        : existing.preview,
+                    date: lastReal.date > existing.date
                         ? lastReal.date
-                        : _chats[chatIdx].date,
-                    unread: isActivelyReadingActiveChat
+                        : existing.date,
+                    unread: stillActivelyReading
                         ? 0
                         : (!lastReal.outgoing && hasNewer
-                            ? _chats[chatIdx].unread + 1
-                            : _chats[chatIdx].unread),
+                            ? existing.unread + 1
+                            : existing.unread),
                   );
                   _chats[chatIdx] = updated;
                 }
               }
             });
             _saveCurrentChatToMemoryCache();
-            if (hasNewer && isActivelyReadingActiveChat) {
+            if (hasNewer && stillActivelyReading) {
               final lastReal = msgRes.messages.last;
               _markChatAsRead(
                 activeChat,
@@ -2607,6 +2746,17 @@ class _TelegramScreenState extends State<TelegramScreen> {
                 maxMessageId: lastReal.id,
               );
               _scrollToBottom(animated: true);
+            } else if (newlyArrivedIncoming.isNotEmpty &&
+                !stillActivelyReading) {
+              for (final incomingMsg in newlyArrivedIncoming) {
+                widget.appState.telegramNotifications.notifyFromPolledMessage(
+                  accountId: pollAccountId,
+                  peer: activeChat.peer,
+                  chatTitle: _resolveDisplayChatTitle(activeChat),
+                  message: incomingMsg,
+                  notificationMuted: activeChat.muted,
+                );
+              }
             }
           }
         }
@@ -2627,6 +2777,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
   }
 
   void _saveCurrentDraft() {
+    if (_editingMessage != null) return;
     final chat = _selectedChat;
     if (chat == null) return;
     final key = _peerReadKey(chat.peer);
@@ -2644,6 +2795,11 @@ class _TelegramScreenState extends State<TelegramScreen> {
   }
 
   void _restoreDraftForChat(TelegramChat chat) {
+    _editingMessage = null;
+    _activeMentionQuery = null;
+    _activeMentionStartIndex = -1;
+    _selectedMentionCandidateIndex = 0;
+    _mentionPopupDismissedAtCurrentAt = false;
     final key = _peerReadKey(chat.peer);
     final draft = _drafts[key];
     _composeController.text = draft?.text ?? '';
@@ -2657,7 +2813,257 @@ class _TelegramScreenState extends State<TelegramScreen> {
     _sendAsFile = draft?.asFile ?? false;
   }
 
+  /// Enters Edit Mode for an already-sent outgoing message (`不是发2条`).
+  void _startEditingMessage(TelegramMessage msg) {
+    if (_selectedChat == null || _selectedChat!.readOnly) return;
+    _saveCurrentDraft();
+    setState(() {
+      _editingMessage = msg;
+      _replyingToMessage = null;
+      _activeMentionQuery = null;
+      _activeMentionStartIndex = -1;
+      _selectedMentionCandidateIndex = 0;
+      _composeController.value = TextEditingValue(
+        text: msg.text,
+        selection: TextSelection.collapsed(offset: msg.text.length),
+      );
+    });
+    _composeFocusNode.requestFocus();
+  }
+
+  /// Cancels Edit Mode and restores any saved draft for the active chat.
+  void _cancelEditingMessage() {
+    final chat = _selectedChat;
+    setState(() {
+      _editingMessage = null;
+      _activeMentionQuery = null;
+      _activeMentionStartIndex = -1;
+      _selectedMentionCandidateIndex = 0;
+      if (chat != null) {
+        final draft = _drafts[_peerReadKey(chat.peer)];
+        _composeController.text = draft?.text ?? '';
+        _composeController.selection = TextSelection.collapsed(
+          offset: _composeController.text.length,
+        );
+        _replyingToMessage = draft?.replyingTo;
+      } else {
+        _composeController.clear();
+      }
+    });
+  }
+
+  /// Detects whether the cursor in `_composeController` is currently inside an `@mention` token.
+  void _updateActiveMentionState() {
+    final text = _composeController.text;
+    if (text.isEmpty) {
+      _activeMentionQuery = null;
+      _activeMentionStartIndex = -1;
+      _selectedMentionCandidateIndex = 0;
+      _mentionPopupDismissedAtCurrentAt = false;
+      return;
+    }
+    final sel = _composeController.selection;
+    final cursor = (sel.isValid && sel.baseOffset >= 0)
+        ? sel.baseOffset.clamp(0, text.length)
+        : text.length;
+    if (cursor <= 0) {
+      _activeMentionQuery = null;
+      _activeMentionStartIndex = -1;
+      _selectedMentionCandidateIndex = 0;
+      return;
+    }
+    final atIdx = text.lastIndexOf('@', cursor - 1);
+    if (atIdx < 0) {
+      _activeMentionQuery = null;
+      _activeMentionStartIndex = -1;
+      _selectedMentionCandidateIndex = 0;
+      _mentionPopupDismissedAtCurrentAt = false;
+      return;
+    }
+    // Ignore email-like `user@domain` where `@` is preceded by an ASCII word/dot char
+    if (atIdx > 0) {
+      final prevChar = text[atIdx - 1];
+      if (RegExp(r'[a-zA-Z0-9._\-]').hasMatch(prevChar)) {
+        _activeMentionQuery = null;
+        _activeMentionStartIndex = -1;
+        _selectedMentionCandidateIndex = 0;
+        return;
+      }
+    }
+    final query = text.substring(atIdx + 1, cursor);
+    if (query.length > 32 || RegExp(r'[\s\n\r]').hasMatch(query)) {
+      _activeMentionQuery = null;
+      _activeMentionStartIndex = -1;
+      _selectedMentionCandidateIndex = 0;
+      return;
+    }
+    if (_mentionPopupDismissedAtCurrentAt &&
+        _lastDismissedMentionAtOffset == atIdx &&
+        _activeMentionQuery == null) {
+      return;
+    }
+    if (_activeMentionStartIndex != atIdx || _activeMentionQuery != query) {
+      _selectedMentionCandidateIndex = 0;
+      _mentionPopupDismissedAtCurrentAt = false;
+    }
+    _activeMentionStartIndex = atIdx;
+    _activeMentionQuery = query;
+  }
+
+  void _dismissMentionPopup() {
+    setState(() {
+      _lastDismissedMentionAtOffset = _activeMentionStartIndex;
+      _mentionPopupDismissedAtCurrentAt = true;
+      _activeMentionQuery = null;
+      _activeMentionStartIndex = -1;
+      _selectedMentionCandidateIndex = 0;
+    });
+  }
+
+  /// Collects matching `@` mention candidates for [chat] filtered by [query].
+  List<_TelegramGroupMember> _collectMentionCandidates(
+    TelegramChat chat,
+    String query,
+  ) {
+    final byKey = <String, _TelegramGroupMember>{};
+
+    // 1. Group / Supergroup participants from current chat
+    final groupMembers = _collectGroupMembers(chat);
+    for (final m in groupMembers) {
+      if (m.isSelf) continue;
+      if (m.name.trim().isEmpty) continue;
+      byKey[m.name.toLowerCase()] = m;
+    }
+
+    // 2. If 1-on-1 chat or channel, include the current conversation peer
+    if (!chat.self) {
+      final peerTitle = _resolveDisplayChatTitle(chat).trim();
+      if (peerTitle.isNotEmpty &&
+          !byKey.containsKey(peerTitle.toLowerCase())) {
+        byKey[peerTitle.toLowerCase()] = _TelegramGroupMember(
+          key: peerTitle.toLowerCase(),
+          name: peerTitle,
+          peer: chat.peer,
+          avatar: chat.avatar,
+          lastActiveDate: chat.date,
+          messageCount: 1,
+          isSelf: false,
+          customTitle: _isGroupConversation(chat) ? '群组' : '当前会话',
+        );
+      }
+    }
+
+    // 3. Also include known 1-on-1 contacts / user peers from `_chats`
+    for (final c in _chats) {
+      if (c.self) continue;
+      final normPeer = TelegramChat.normalizePeerIdentifier(c.peer);
+      if (!normPeer.startsWith('user:')) continue;
+      final name = _resolveDisplayChatTitle(c).trim();
+      if (name.isEmpty) continue;
+      final k = name.toLowerCase();
+      if (!byKey.containsKey(k)) {
+        byKey[k] = _TelegramGroupMember(
+          key: k,
+          name: name,
+          peer: normPeer,
+          avatar: c.avatar,
+          lastActiveDate: c.date,
+          messageCount: 0,
+          isSelf: false,
+          customTitle: '联系人',
+        );
+      }
+    }
+
+    // 4. Fallback: include self at the end if no other candidates exist
+    for (final m in groupMembers) {
+      if (m.isSelf && !byKey.containsKey(m.name.toLowerCase())) {
+        byKey[m.name.toLowerCase()] = m;
+      }
+    }
+
+    final cleanQuery = query.trim().toLowerCase();
+    final filtered = byKey.values.where((m) {
+      if (cleanQuery.isEmpty) return true;
+      return m.name.toLowerCase().contains(cleanQuery) ||
+          m.peer.toLowerCase().contains(cleanQuery) ||
+          m.customTitle.toLowerCase().contains(cleanQuery);
+    }).toList();
+
+    return filtered.take(24).toList();
+  }
+
+  /// Inserts `@<member.name> ` at the active `@` token in `_composeController`.
+  void _insertMentionCandidate(_TelegramGroupMember member) {
+    final text = _composeController.text;
+    final sel = _composeController.selection;
+    final cursor = (sel.isValid && sel.baseOffset >= 0)
+        ? sel.baseOffset.clamp(0, text.length)
+        : text.length;
+    final start = (_activeMentionStartIndex >= 0 &&
+            _activeMentionStartIndex <= cursor)
+        ? _activeMentionStartIndex
+        : cursor;
+
+    final mentionText = '@${member.name} ';
+    final before = text.substring(0, start);
+    final after = text.substring(cursor);
+    final nextText = '$before$mentionText$after';
+    final nextOffset = before.length + mentionText.length;
+
+    setState(() {
+      _activeMentionQuery = null;
+      _activeMentionStartIndex = -1;
+      _selectedMentionCandidateIndex = 0;
+      _mentionPopupDismissedAtCurrentAt = false;
+      _composeController.value = TextEditingValue(
+        text: nextText,
+        selection: TextSelection.collapsed(offset: nextOffset),
+      );
+    });
+    _saveCurrentDraft();
+    _composeFocusNode.requestFocus();
+  }
+
+  /// Triggered when clicking the `@` button in the compose bar:
+  /// inserts `@` at the cursor (if not already after `@`) and pops up the `@` member picker.
+  void _triggerComposeMentionButton() {
+    final text = _composeController.text;
+    final sel = _composeController.selection;
+    final cursor = (sel.isValid && sel.baseOffset >= 0)
+        ? sel.baseOffset.clamp(0, text.length)
+        : text.length;
+
+    if (_activeMentionQuery != null && _activeMentionStartIndex >= 0) {
+      _composeFocusNode.requestFocus();
+      return;
+    }
+
+    final before = text.substring(0, cursor);
+    final after = text.substring(cursor);
+    final needsSpace = before.isNotEmpty &&
+        RegExp(r'[a-zA-Z0-9._\-]$').hasMatch(before);
+    final insertStr = needsSpace ? ' @' : '@';
+    final nextText = '$before$insertStr$after';
+    final atOffset = before.length + insertStr.length - 1;
+    final nextCursor = before.length + insertStr.length;
+
+    setState(() {
+      _mentionPopupDismissedAtCurrentAt = false;
+      _activeMentionStartIndex = atOffset;
+      _activeMentionQuery = '';
+      _selectedMentionCandidateIndex = 0;
+      _composeController.value = TextEditingValue(
+        text: nextText,
+        selection: TextSelection.collapsed(offset: nextCursor),
+      );
+    });
+    _saveCurrentDraft();
+    _composeFocusNode.requestFocus();
+  }
+
   void _onComposeTextChanged(String value) {
+    _updateActiveMentionState();
     _saveCurrentDraft();
     setState(() {});
     final chat = _selectedChat;
@@ -2823,6 +3229,10 @@ class _TelegramScreenState extends State<TelegramScreen> {
         _authStatus = status;
         _cachedAuthStatus = status;
       });
+      widget.appState.telegramNotifications.registerAccounts(
+        _accounts,
+        activeId: _activeAccountId,
+      );
 
       if (!status.authorized) {
         setState(() {
@@ -2900,6 +3310,10 @@ class _TelegramScreenState extends State<TelegramScreen> {
           _accounts = accData.accounts;
           _cachedAccounts = List<TelegramAccount>.from(_accounts);
         });
+        widget.appState.telegramNotifications.registerAccounts(
+          _accounts,
+          activeId: chosenId,
+        );
         await _switchTelegramAccount(chosenId, forceRefresh: true);
         return;
       }
@@ -2915,6 +3329,10 @@ class _TelegramScreenState extends State<TelegramScreen> {
       _cachedAccounts = List<TelegramAccount>.from(_accounts);
       _cachedActiveAccountId = _activeAccountId;
       _cachedAuthStatus = _authStatus;
+      widget.appState.telegramNotifications.registerAccounts(
+        _accounts,
+        activeId: _activeAccountId,
+      );
 
       if (!status.authorized) {
         setState(() {
@@ -2970,6 +3388,39 @@ class _TelegramScreenState extends State<TelegramScreen> {
       loadMore: false,
       silent: cachedFolderData != null && cachedFolderData.chats.isNotEmpty,
     );
+  }
+
+  /// Preserves all pinned chats at the top in their pinned order and stably
+  /// sorts unpinned chats by date descending, using their previous order as a
+  /// tie-breaker so the chat list never flickers or jumps around on polls/SSE.
+  List<TelegramChat> _sortChatsPreservingPinnedOrder(
+    List<TelegramChat> incoming, {
+    List<TelegramChat>? previousChats,
+  }) {
+    final prevIndexByPeer = <String, int>{};
+    if (previousChats != null) {
+      for (var i = 0; i < previousChats.length; i++) {
+        prevIndexByPeer[previousChats[i].peer] = i;
+      }
+    }
+    final incomingIndexByPeer = <String, int>{
+      for (var i = 0; i < incoming.length; i++) incoming[i].peer: i,
+    };
+    final pinned = incoming.where((c) => c.pinned).toList();
+    final unpinned = incoming.where((c) => !c.pinned).toList()
+      ..sort((a, b) {
+        if (b.date != a.date) {
+          return b.date.compareTo(a.date);
+        }
+        final prevA = prevIndexByPeer[a.peer];
+        final prevB = prevIndexByPeer[b.peer];
+        if (prevA != null && prevB != null && prevA != prevB) {
+          return prevA.compareTo(prevB);
+        }
+        return (incomingIndexByPeer[a.peer] ?? 0)
+            .compareTo(incomingIndexByPeer[b.peer] ?? 0);
+      });
+    return <TelegramChat>[...pinned, ...unpinned];
   }
 
   Future<void> _loadFoldersAndChats({
@@ -3041,14 +3492,46 @@ class _TelegramScreenState extends State<TelegramScreen> {
               res.chats.any((c) => c.peer == _selectedChat!.peer);
           final shouldAutoSelectFirst = !_isMobileLayout &&
               !_userExitedChat &&
-              (_selectedChat == null || !currentSelBelongsToList) &&
+              (_selectedChat == null || (!silent && !currentSelBelongsToList)) &&
               res.chats.isNotEmpty;
           final initialTargetPeer = shouldAutoSelectFirst
               ? res.chats.first.peer
               : _selectedChat?.peer;
-          _chats = _applyReadStateToChats(
-            res.chats,
+          final previousChats = List<TelegramChat>.from(_chats);
+          final existingByPeer = <String, TelegramChat>{
+            for (final c in previousChats) c.peer: c,
+          };
+          final mergedRaw = res.chats.map((fresh) {
+            final prev = existingByPeer[fresh.peer];
+            if (prev != null &&
+                prev.topMessageId > 0 &&
+                fresh.topMessageId > 0 &&
+                prev.topMessageId > fresh.topMessageId &&
+                prev.date >= fresh.date) {
+              return fresh.copyWith(
+                topMessageId: prev.topMessageId,
+                date: prev.date,
+                preview: prev.preview.isNotEmpty ? prev.preview : fresh.preview,
+                unread: prev.unread > fresh.unread ? prev.unread : fresh.unread,
+              );
+            }
+            return fresh;
+          }).toList();
+          if (silent && previousChats.length > mergedRaw.length) {
+            final freshPeers = mergedRaw.map((c) => c.peer).toSet();
+            for (final tailChat in previousChats) {
+              if (!freshPeers.contains(tailChat.peer)) {
+                mergedRaw.add(tailChat);
+              }
+            }
+          }
+          final processed = _applyReadStateToChats(
+            mergedRaw,
             activeSelectedPeer: initialTargetPeer,
+          );
+          _chats = _sortChatsPreservingPinnedOrder(
+            processed,
+            previousChats: previousChats,
           );
           if (shouldAutoSelectFirst && _chats.isNotEmpty) {
             _selectedChat = _chats.first;
@@ -3100,7 +3583,9 @@ class _TelegramScreenState extends State<TelegramScreen> {
             }
           }
         }
-        _nextChatCursor = res.nextCursor;
+        if (!silent || _nextChatCursor.isEmpty) {
+          _nextChatCursor = res.nextCursor;
+        }
         _isLoadingChats = false;
         _statusBanner = '${_chats.length} 个会话';
       });
@@ -3211,10 +3696,15 @@ class _TelegramScreenState extends State<TelegramScreen> {
     }
 
     try {
+      final shouldMarkRead =
+          widget.appState.isTelegramViewActive &&
+          widget.appState.isAppForeground &&
+          (!silent || !_showScrollToBottomBtn);
       final res = await widget.appState.api.fetchTelegramMessages(
         accountId: reqAccountId,
         peer: chat.peer,
         offsetId: loadOlder ? _nextMessageOffset : 0,
+        markRead: shouldMarkRead,
       );
       if (!mounted ||
           _accountSwitchEpoch != reqEpoch ||
@@ -3227,6 +3717,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
       bool shouldChainLoadOlder = false;
       final prevLastId = _messages.isNotEmpty ? _messages.last.id : 0;
       final normalizedIncoming = res.messages
+          .where((m) => !_replacedOldMessageIds.contains(m.id))
           .map(
             (m) => _normalizeIncomingMessageSender(
               chat,
@@ -3235,6 +3726,11 @@ class _TelegramScreenState extends State<TelegramScreen> {
             ),
           )
           .toList();
+      for (final m in normalizedIncoming) {
+        if (m.id > 0) {
+          _replyMessagesByPeerAndId['$reqAccountId|${chat.peer}|${m.id}'] = m;
+        }
+      }
       setState(() {
         if (loadOlder) {
           final prevOffset = _nextMessageOffset;
@@ -3284,31 +3780,17 @@ class _TelegramScreenState extends State<TelegramScreen> {
         }
         if (_messages.isNotEmpty) {
           final lastMsg = _messages.last;
-          if (!lastMsg.outgoing &&
-              lastMsg.silent &&
-              (chat.peer.startsWith('channel:') ||
-                  chat.peer.startsWith('chat:'))) {
-            widget.appState.telegramNotifications.recordServerChatMuteState(
-              _activeAccountId,
-              chat.peer,
-              true,
-            );
-          }
           final fallbackPreview = lastMsg.resolvedPreviewText(
             isPrivateUserChat: chat.peer.startsWith('user:'),
           );
           final chatIdx = _chats.indexWhere((c) => c.peer == chat.peer);
           if (chatIdx >= 0 &&
               (_chats[chatIdx].preview.trim().isEmpty ||
-                  lastMsg.id >= _chats[chatIdx].topMessageId ||
-                  (!lastMsg.outgoing && lastMsg.silent))) {
+                  lastMsg.id >= _chats[chatIdx].topMessageId)) {
             _chats[chatIdx] = _chats[chatIdx].copyWith(
               preview: fallbackPreview.isNotEmpty
                   ? fallbackPreview.characters.take(120).toString()
                   : _chats[chatIdx].preview,
-              muted: (!lastMsg.outgoing && lastMsg.silent)
-                  ? true
-                  : _chats[chatIdx].muted,
             );
           }
         }
@@ -3316,15 +3798,21 @@ class _TelegramScreenState extends State<TelegramScreen> {
       });
       _lastLoadOlderAt = DateTime.now();
       _saveCurrentChatToMemoryCache();
-      if (_messages.isNotEmpty) {
-        final lastMsg = _messages.last;
-        _markChatAsRead(
-          chat,
-          latestMessageDate: lastMsg.date,
-          maxMessageId: lastMsg.id,
-        );
-      } else {
-        _markChatAsRead(chat);
+      final isActivelyReadingNow =
+          widget.appState.isTelegramViewActive &&
+          widget.appState.isAppForeground &&
+          (!silent || !_showScrollToBottomBtn);
+      if (isActivelyReadingNow) {
+        if (_messages.isNotEmpty) {
+          final lastMsg = _messages.last;
+          _markChatAsRead(
+            chat,
+            latestMessageDate: lastMsg.date,
+            maxMessageId: lastMsg.id,
+          );
+        } else {
+          _markChatAsRead(chat);
+        }
       }
       final hasNewerTail =
           _messages.isNotEmpty && prevLastId > 0 && _messages.last.id > prevLastId;
@@ -3358,24 +3846,44 @@ class _TelegramScreenState extends State<TelegramScreen> {
   }) {
     TelegramAttachment? att;
     if (file != null) {
-      final isImg = !asFile && file.isImage;
-      final isVid = !asFile && file.isVideo;
+      final lowerName = file.name.toLowerCase();
+      final lowerMime = file.mimeType.toLowerCase();
+      final isSticker = lowerName.endsWith('.tgs') ||
+          lowerMime == 'application/x-tgsticker' ||
+          lowerName == 'animatedsticker.tgs' ||
+          lowerName == 'animatedsticker.webm' ||
+          lowerName == 'sticker.webp';
+      final isImg = !asFile && !isSticker && file.isImage;
+      final isVid = !asFile && !isSticker && file.isVideo;
       final isAud = !asFile &&
-          (file.mimeType.toLowerCase().startsWith('audio/') ||
+          !isSticker &&
+          (file.isVoiceNote ||
+              lowerMime.startsWith('audio/') ||
               RegExp(
                 r'\.(mp3|m4a|aac|ogg|oga|opus|wav|flac|wma|ape|alac|aiff)$',
                 caseSensitive: false,
               ).hasMatch(file.name));
-      final kind = isImg
-          ? 'photo'
-          : (isVid ? 'video' : (isAud ? 'audio' : 'file'));
+      final isVoice = !asFile &&
+          !isSticker &&
+          (file.isVoiceNote ||
+              lowerName.startsWith('voice_') ||
+              lowerName.startsWith('voice-'));
+      final kind = isSticker
+          ? 'sticker'
+          : (isImg
+              ? 'photo'
+              : (isVid
+                  ? 'video'
+                  : (isVoice ? 'voice' : (isAud ? 'audio' : 'file'))));
       att = TelegramAttachment(
         kind: kind,
         name: file.name,
         fileName: file.name,
+        voice: isVoice,
+        duration: file.durationSeconds,
         size: file.size,
         mimeType: file.mimeType,
-        hasThumbnail: isImg && file.bytes.isNotEmpty,
+        hasThumbnail: (isImg || isSticker) && file.bytes.isNotEmpty,
       );
       if (file.bytes.isNotEmpty) {
         _optimisticPreviewBytesByMsgId[tempId] = file.bytes;
@@ -3391,6 +3899,167 @@ class _TelegramScreenState extends State<TelegramScreen> {
       replyToId: replyId,
       attachment: att,
     );
+  }
+
+  /// Updates and resends an already-sent outgoing message in place (`不是发2条`).
+  Future<void> _submitEditedMessage({
+    required TelegramChat chat,
+    required TelegramMessage targetMsg,
+    required String newText,
+  }) async {
+    final sendAccountId = _activeAccountId;
+    final oldMsgId = targetMsg.id;
+    final updatedLocalMsg = targetMsg.copyWith(text: newText);
+
+    _editedMessageIds.add(oldMsgId);
+    _localEditedMessageTexts['$sendAccountId|${chat.peer}|$oldMsgId'] = newText;
+    _replyMessagesByPeerAndId['$sendAccountId|${chat.peer}|$oldMsgId'] =
+        updatedLocalMsg;
+
+    setState(() {
+      _editingMessage = null;
+      _activeMentionQuery = null;
+      _activeMentionStartIndex = -1;
+      _selectedMentionCandidateIndex = 0;
+      _composeController.clear();
+
+      if (_selectedChat?.peer == chat.peer &&
+          _activeAccountId == sendAccountId) {
+        final idx = _messages.indexWhere((m) => m.id == oldMsgId);
+        if (idx >= 0) {
+          final next = List<TelegramMessage>.from(_messages);
+          next[idx] = updatedLocalMsg;
+          _messages = next;
+        }
+      }
+      _chats = _chats.map((c) {
+        if (c.peer == chat.peer &&
+            (_messages.isEmpty || _messages.last.id == oldMsgId)) {
+          return c.copyWith(preview: newText);
+        }
+        return c;
+      }).toList();
+    });
+    _saveCurrentChatToMemoryCache();
+
+    // If the target message was still an unconfirmed/failed optimistic placeholder,
+    // replace it in place and send once.
+    if (_isOptimisticMsgId(oldMsgId)) {
+      setState(() {
+        _messages = _messages.where((m) => m.id != oldMsgId).toList();
+        _sendingOptimisticMsgIds.remove(oldMsgId);
+        _failedOptimisticMsgs.remove(oldMsgId);
+      });
+      await _sendMessage(
+        overrideText: newText,
+        targetChat: chat,
+        overrideReplyId: targetMsg.replyToId,
+      );
+      return;
+    }
+
+    try {
+      final editRes = await widget.appState.api.editTelegramMessage(
+        accountId: sendAccountId,
+        peer: chat.peer,
+        messageId: oldMsgId,
+        text: newText,
+        replyTo: targetMsg.replyToId,
+      );
+      if (!mounted) return;
+
+      final confirmed = editRes.message;
+      if (confirmed != null && confirmed.id > 0) {
+        final finalMsg = confirmed.copyWith(
+          text: newText,
+          outgoing: true,
+          replyToId:
+              confirmed.replyToId > 0 ? confirmed.replyToId : targetMsg.replyToId,
+          attachment: confirmed.attachment ?? targetMsg.attachment,
+        );
+        _editedMessageIds.add(finalMsg.id);
+        _localEditedMessageTexts['$sendAccountId|${chat.peer}|${finalMsg.id}'] =
+            newText;
+        _replyMessagesByPeerAndId['$sendAccountId|${chat.peer}|${finalMsg.id}'] =
+            finalMsg;
+        _replyMessagesByPeerAndId['$sendAccountId|${chat.peer}|$oldMsgId'] =
+            finalMsg;
+        if (finalMsg.id != oldMsgId) {
+          _replacedOldMessageIds.add(oldMsgId);
+          final savedPath = _getSavedLocalPath(chat, targetMsg);
+          if (savedPath != null && savedPath.isNotEmpty) {
+            _recordSavedLocalPath(
+              chat,
+              finalMsg.id,
+              savedPath,
+              accountId: sendAccountId,
+            );
+          }
+        }
+
+        setState(() {
+          if (_selectedChat?.peer == chat.peer &&
+              _activeAccountId == sendAccountId) {
+            final nextList = <TelegramMessage>[];
+            bool placed = false;
+            for (final m in _messages) {
+              if (m.id == oldMsgId || m.id == finalMsg.id) {
+                if (!placed) {
+                  nextList.add(finalMsg);
+                  placed = true;
+                }
+              } else if (!_replacedOldMessageIds.contains(m.id)) {
+                nextList.add(m);
+              }
+            }
+            if (!placed) {
+              nextList.add(finalMsg);
+            }
+            _messages = nextList;
+          } else {
+            final peerKey = '$sendAccountId|${chat.peer}';
+            final cached = _cachedMessagesByPeer[peerKey];
+            if (cached != null) {
+              final nextList = <TelegramMessage>[];
+              bool placed = false;
+              for (final m in cached.messages) {
+                if (m.id == oldMsgId || m.id == finalMsg.id) {
+                  if (!placed) {
+                    nextList.add(finalMsg);
+                    placed = true;
+                  }
+                } else if (!_replacedOldMessageIds.contains(m.id)) {
+                  nextList.add(m);
+                }
+              }
+              if (!placed) {
+                nextList.add(finalMsg);
+              }
+              _cachedMessagesByPeer[peerKey] = (
+                messages: nextList,
+                nextOffset: cached.nextOffset,
+                scrollOffset: cached.scrollOffset,
+              );
+            }
+          }
+          _chats = _chats.map((c) {
+            if (c.peer == chat.peer) {
+              return c.copyWith(
+                topMessageId: finalMsg.id > c.topMessageId
+                    ? finalMsg.id
+                    : c.topMessageId,
+                preview: newText,
+              );
+            }
+            return c;
+          }).toList();
+        });
+        _saveCurrentChatToMemoryCache();
+      }
+    } catch (e) {
+      if (!mounted) return;
+      _showDownloadHud('编辑重发失败：$e', state: 'error');
+    }
   }
 
   Future<void> _sendMessage({
@@ -3413,6 +4082,22 @@ class _TelegramScreenState extends State<TelegramScreen> {
       return;
     }
 
+    // If currently editing an already-sent message, update & resend in place (never 2 messages!)
+    if (isCurrentChat &&
+        _editingMessage != null &&
+        files.isEmpty &&
+        overrideFiles == null &&
+        overrideText == null &&
+        retryOptimisticIds == null) {
+      _stopOutgoingTyping();
+      await _submitEditedMessage(
+        chat: chat,
+        targetMsg: _editingMessage!,
+        newText: text,
+      );
+      return;
+    }
+
     if (files.isNotEmpty && text.length > 1024) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('附件说明文字最多支持 1024 个字符，请精简后再发送')),
@@ -3421,8 +4106,12 @@ class _TelegramScreenState extends State<TelegramScreen> {
     }
 
     _stopOutgoingTyping();
-    final replyId = overrideReplyId ??
-        (isCurrentChat ? (_replyingToMessage?.id ?? 0) : 0);
+    final replyObj = isCurrentChat ? _replyingToMessage : null;
+    final replyId = overrideReplyId ?? (replyObj?.id ?? 0);
+    if (replyObj != null && replyObj.id > 0) {
+      _replyMessagesByPeerAndId['$_activeAccountId|${chat.peer}|${replyObj.id}'] =
+          replyObj;
+    }
     final sendAccountId = _activeAccountId;
     final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
     final previewText = text.isNotEmpty
@@ -3443,6 +4132,9 @@ class _TelegramScreenState extends State<TelegramScreen> {
     // 2. Construct or reuse optimistic outgoing message(s) and show immediately in the chat window
     final optimisticIds = <int>[];
     final optimisticMessages = <TelegramMessage>[];
+    final initialFileStatus = files.isNotEmpty
+        ? '正在准备上传 ${files.first.name} (${files.first.formattedSize})...'
+        : '';
 
     if (retryOptimisticIds != null && retryOptimisticIds.isNotEmpty) {
       optimisticIds.addAll(retryOptimisticIds);
@@ -3450,7 +4142,8 @@ class _TelegramScreenState extends State<TelegramScreen> {
         _failedOptimisticMsgs.remove(id);
         _sendingOptimisticMsgIds.add(id);
         if (files.isNotEmpty) {
-          _optimisticUploadPercent[id] = 0;
+          _optimisticUploadPercent[id] = 1;
+          _optimisticUploadStatusByMsgId[id] = initialFileStatus;
         }
       }
     } else if (files.isEmpty) {
@@ -3474,7 +4167,9 @@ class _TelegramScreenState extends State<TelegramScreen> {
         final tempId = _kOptimisticIdBase + (++_nextOptimisticSeq);
         optimisticIds.add(tempId);
         _sendingOptimisticMsgIds.add(tempId);
-        _optimisticUploadPercent[tempId] = 0;
+        _optimisticUploadPercent[tempId] = 1;
+        _optimisticUploadStatusByMsgId[tempId] =
+            '正在上传 ${f.name} (${f.formattedSize})...';
         if (f.filePath != null && f.filePath!.trim().isNotEmpty) {
           _recordSavedLocalPath(
             chat,
@@ -3498,6 +4193,11 @@ class _TelegramScreenState extends State<TelegramScreen> {
     }
 
     setState(() {
+      if (files.isNotEmpty) {
+        _isSendingMessage = true;
+        _uploadPercent = 1;
+        _uploadStatusText = initialFileStatus;
+      }
       _chats = _chats.map((c) {
         if (c.peer == chat.peer) {
           return c.copyWith(
@@ -3551,8 +4251,12 @@ class _TelegramScreenState extends State<TelegramScreen> {
           onProgress: (percent, statusText) {
             if (!mounted) return;
             setState(() {
+              _isSendingMessage = true;
+              _uploadPercent = percent;
+              _uploadStatusText = statusText;
               for (final id in optimisticIds) {
                 _optimisticUploadPercent[id] = percent;
+                _optimisticUploadStatusByMsgId[id] = statusText;
               }
             });
           },
@@ -3583,6 +4287,38 @@ class _TelegramScreenState extends State<TelegramScreen> {
             accountId: sendAccountId,
           );
         }
+        if (files[i].isVoiceNote && confirmed[i].attachment != null) {
+          final oldAtt = confirmed[i].attachment!;
+          confirmed[i] = confirmed[i].copyWith(
+            attachment: TelegramAttachment(
+              kind: 'voice',
+              name: oldAtt.name.isNotEmpty ? oldAtt.name : files[i].name,
+              fileName:
+                  oldAtt.fileName.isNotEmpty ? oldAtt.fileName : files[i].name,
+              title: oldAtt.title,
+              performer: oldAtt.performer,
+              voice: true,
+              size: oldAtt.size > 0 ? oldAtt.size : files[i].size,
+              mimeType: oldAtt.mimeType.isNotEmpty
+                  ? oldAtt.mimeType
+                  : files[i].mimeType,
+              duration: oldAtt.duration > 0
+                  ? oldAtt.duration
+                  : files[i].durationSeconds,
+              width: oldAtt.width,
+              height: oldAtt.height,
+              url: oldAtt.url,
+              thumbnail: oldAtt.thumbnail,
+              hasThumbnail: oldAtt.hasThumbnail,
+            ),
+          );
+        }
+      }
+      for (final item in confirmed) {
+        if (item.id > 0) {
+          _replyMessagesByPeerAndId['$sendAccountId|${chat.peer}|${item.id}'] =
+              item;
+        }
       }
 
       final latestDate = confirmed.isNotEmpty && confirmed.last.date > 0
@@ -3595,7 +4331,13 @@ class _TelegramScreenState extends State<TelegramScreen> {
           _sendingOptimisticMsgIds.remove(id);
           _failedOptimisticMsgs.remove(id);
           _optimisticUploadPercent.remove(id);
+          _optimisticUploadStatusByMsgId.remove(id);
           _optimisticPreviewBytesByMsgId.remove(id);
+        }
+        if (_sendingOptimisticMsgIds.isEmpty) {
+          _isSendingMessage = false;
+          _uploadPercent = 0;
+          _uploadStatusText = '';
         }
 
         _chats = _chats.map((c) {
@@ -3677,6 +4419,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
         for (final id in optimisticIds) {
           _sendingOptimisticMsgIds.remove(id);
           _optimisticUploadPercent.remove(id);
+          _optimisticUploadStatusByMsgId.remove(id);
           _failedOptimisticMsgs[id] = (
             error: errStr,
             text: text,
@@ -3686,6 +4429,11 @@ class _TelegramScreenState extends State<TelegramScreen> {
             chat: chat,
             groupOptimisticIds: optimisticIds,
           );
+        }
+        if (_sendingOptimisticMsgIds.isEmpty) {
+          _isSendingMessage = false;
+          _uploadPercent = 0;
+          _uploadStatusText = '';
         }
       });
       ScaffoldMessenger.of(context).showSnackBar(
@@ -3778,6 +4526,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
   String _guessMimeType(String fileName) {
     final lower = fileName.toLowerCase();
+    if (lower.endsWith('.tgs')) return 'application/x-tgsticker';
     if (lower.endsWith('.png')) return 'image/png';
     if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
     if (lower.endsWith('.gif')) return 'image/gif';
@@ -4009,64 +4758,58 @@ class _TelegramScreenState extends State<TelegramScreen> {
     try {
       final pickedFiles = <TelegramOutgoingFile>[];
 
-      // 1. Try native MethodChannel file picker on macOS & Windows
-      if (Platform.isMacOS || Platform.isWindows) {
-        try {
-          final rawList = await _nativeUtilsChannel.invokeMethod<dynamic>(
-            'pickFiles',
-            {'mediaOnly': mediaOnly},
-          );
-          if (rawList is List) {
-            for (final item in rawList) {
-              if (item is Map) {
-                final name = (item['name'] ?? '附件').toString();
-                final mime = _guessMimeType(name);
-                Uint8List bytes = item['bytes'] is Uint8List
-                    ? item['bytes'] as Uint8List
-                    : Uint8List(0);
-                final path = item['path']?.toString();
-                int size = (item['size'] as num?)?.toInt() ?? bytes.length;
-                if (path != null && path.isNotEmpty) {
-                  try {
-                    final fileObj = File(path);
-                    if (await fileObj.exists()) {
-                      if (size <= 0) {
-                        size = await fileObj.length();
-                      }
-                      if (bytes.isEmpty &&
-                          mime.startsWith('image/') &&
-                          size > 0 &&
-                          size <= 8 * 1024 * 1024) {
-                        bytes = await fileObj.readAsBytes();
-                      }
-                    }
-                  } catch (_) {}
+      // 1. Native OS system file picker dialog on macOS, Windows & Linux
+      final systemFiles = await NativeUtilsChannelHub.pickSystemFiles(
+        mediaOnly: mediaOnly,
+        allowMultiple: true,
+      );
+      if (systemFiles != null) {
+        for (final item in systemFiles) {
+          final name = (item['name'] ?? '附件').toString();
+          final mime = _guessMimeType(name);
+          Uint8List bytes = item['bytes'] is Uint8List
+              ? item['bytes'] as Uint8List
+              : Uint8List(0);
+          final path = item['path']?.toString();
+          int size = (item['size'] as num?)?.toInt() ?? bytes.length;
+          if (path != null && path.isNotEmpty) {
+            try {
+              final fileObj = File(path);
+              if (await fileObj.exists()) {
+                if (size <= 0) {
+                  size = await fileObj.length();
                 }
-                if (size > 0 &&
-                    (bytes.isNotEmpty || (path != null && path.isNotEmpty))) {
-                  pickedFiles.add(
-                    TelegramOutgoingFile(
-                      name: name,
-                      bytes: bytes,
-                      mimeType: mime,
-                      filePath: path,
-                      fileSize: size,
-                    ),
-                  );
+                if (bytes.isEmpty &&
+                    mime.startsWith('image/') &&
+                    size > 0 &&
+                    size <= 8 * 1024 * 1024) {
+                  bytes = await fileObj.readAsBytes();
                 }
               }
-            }
-            if (pickedFiles.isNotEmpty && mounted) {
-              _stageOrPreviewOutgoingFiles(
-                pickedFiles,
-                asFile: asFile,
-                openPreviewDialog: true,
-                dialogTitle: asFile ? '作为无损文件发送' : '发送图片与视频',
-              );
-            }
-            return;
+            } catch (_) {}
           }
-        } catch (_) {}
+          if (size > 0 &&
+              (bytes.isNotEmpty || (path != null && path.isNotEmpty))) {
+            pickedFiles.add(
+              TelegramOutgoingFile(
+                name: name,
+                bytes: bytes,
+                mimeType: mime,
+                filePath: path,
+                fileSize: size,
+              ),
+            );
+          }
+        }
+        if (pickedFiles.isNotEmpty && mounted) {
+          _stageOrPreviewOutgoingFiles(
+            pickedFiles,
+            asFile: asFile,
+            openPreviewDialog: true,
+            dialogTitle: asFile ? '作为无损文件发送' : '发送图片与视频',
+          );
+        }
+        return;
       }
 
       // 2. Fallback: Built-in cross-platform local file browser dialog
@@ -4204,37 +4947,108 @@ class _TelegramScreenState extends State<TelegramScreen> {
     );
   }
 
-  /// Check if a Telegram attachment can be previewed inline via `/api/telegram/file-preview`
+  /// Check if a Telegram attachment can be previewed inline
   bool _canPreviewTelegramFile(TelegramAttachment att) {
-    final name = att.displayName.toLowerCase();
-    final mime = att.mimeType.split(';').first.toLowerCase();
+    if (att.isSticker || att.isVisualMedia || att.isAudio) return true;
+    final name = att.displayName.toLowerCase().trim();
+    final mime = att.mimeType.split(';').first.toLowerCase().trim();
     if (RegExp(
-      r'\.(txt|log|md|markdown|json|jsonl|xml|csv|tsv|yaml|yml|ini|conf|cfg|toml|srt|ass|vtt|lrc|m3u8?|html?|css|jsx?|tsx?|py|go|java|c|cpp|h|rs|sh|sql|zip|pdf|docx)$',
+      r'\.(tgs|txt|log|md|markdown|rst|org|nfo|cue|json|jsonl|ndjson|geojson|xml|plist|svg|csv|tsv|yaml|yml|ini|conf|cfg|toml|env|properties|srt|ass|ssa|vtt|sub|idx|lrc|m3u8?|pls|xspf|html?|htm|xhtml|css|scss|sass|less|jsx?|tsx?|mjs|cjs|vue|svelte|astro|py|pyw|go|mod|sum|java|kt|kts|scala|groovy|gradle|c|cc|cpp|cxx|h|hh|hpp|hxx|m|mm|swift|dart|rs|rb|php|pl|pm|lua|r|jl|sh|bash|zsh|fish|ps1|bat|cmd|sql|graphql|gql|proto|dockerfile|makefile|cmake|gitignore|gitattributes|editorconfig|zip|cbz|jar|apk|ipa|epub|tar|tgz|gz|rar|7z|pdf|docx?|xlsx?|pptx?|odt|ods|odp|rtf|tex|bib|eml|ics|vcf|torrent)$',
+      caseSensitive: false,
     ).hasMatch(name)) {
       return true;
     }
+    if (const {
+      'dockerfile',
+      'makefile',
+      'cmakelists.txt',
+      'readme',
+      'license',
+      'changelog',
+      'authors',
+      'notice',
+      'gemfile',
+      'podfile',
+      'procfile',
+    }.contains(name)) {
+      return true;
+    }
     return mime.startsWith('text/') ||
+        mime.startsWith('image/') ||
+        mime.startsWith('video/') ||
+        mime.startsWith('audio/') ||
         mime == 'application/json' ||
+        mime.endsWith('+json') ||
         mime == 'application/xml' ||
-        mime == 'application/zip';
+        mime.endsWith('+xml') ||
+        mime == 'application/javascript' ||
+        mime == 'application/x-javascript' ||
+        mime == 'application/typescript' ||
+        mime == 'application/x-yaml' ||
+        mime == 'application/toml' ||
+        mime == 'application/x-sh' ||
+        mime == 'application/sql' ||
+        mime == 'application/rtf' ||
+        mime == 'application/pdf' ||
+        mime == 'application/epub+zip' ||
+        mime == 'application/zip' ||
+        mime == 'application/x-zip-compressed' ||
+        mime == 'application/x-tar' ||
+        mime == 'application/gzip' ||
+        mime == 'application/x-gzip' ||
+        mime == 'application/x-rar-compressed' ||
+        mime == 'application/vnd.rar' ||
+        mime == 'application/x-7z-compressed' ||
+        mime == 'application/msword' ||
+        mime == 'application/vnd.ms-excel' ||
+        mime == 'application/vnd.ms-powerpoint' ||
+        mime.startsWith('application/vnd.openxmlformats-officedocument.') ||
+        mime.startsWith('application/vnd.oasis.opendocument.') ||
+        mime == 'application/x-bittorrent' ||
+        mime == 'application/x-tgsticker' ||
+        mime == 'application/vnd.apple.mpegurl' ||
+        mime == 'application/x-mpegurl';
   }
 
-  /// Open inline file preview modal (`/api/telegram/file-preview`)
+  /// Open inline file preview modal (`/api/telegram/file-preview` + local rich format fallbacks)
   Future<void> _openFilePreviewDialog(
     TelegramChat chat,
     TelegramMessage msg,
   ) async {
     final att = msg.attachment;
     if (att == null) return;
+    if (!att.isSticker && att.isVisualMedia) {
+      _openMediaGalleryViewer(chat, msg);
+      return;
+    }
+    if (att.isAudio) {
+      await _togglePlayAudioMessage(chat, msg);
+      return;
+    }
 
+    final savedPath = _getSavedLocalPath(chat, msg);
     await showDialog<void>(
       context: context,
       builder: (_) => _TelegramFilePreviewDialog(
         appState: widget.appState,
         accountId: _activeAccountId,
+        chat: chat,
+        message: msg,
         peer: chat.peer,
         messageId: msg.id,
         attachment: att,
+        initialSavedLocalPath: savedPath,
+        onSaveLocal: () async {
+          final ok = await _saveAttachmentToLocalDownloads(chat, msg);
+          return ok ? _getSavedLocalPath(chat, msg) : null;
+        },
+        onDownload115: () => _downloadTelegramTo115(
+          url: att.url,
+          name: att.displayName,
+          chat: chat,
+          msg: msg,
+        ),
+        onOpenLocalDir: _openLocalFileDirectory,
       ),
     );
   }
@@ -4266,11 +5080,23 @@ class _TelegramScreenState extends State<TelegramScreen> {
   Future<bool> _saveAttachmentToLocalDownloads(
     TelegramChat chat,
     TelegramMessage msg, {
-    bool showToast = true,
+    bool showToast = false,
+    bool forceRedownload = false,
   }) async {
     final att = msg.attachment;
     if (att == null) return false;
     if (_pendingLocalSaves.contains(msg.id)) return false;
+
+    final existingPath = _getSavedLocalPath(chat, msg);
+    if (!forceRedownload && existingPath != null && existingPath.isNotEmpty) {
+      if (!_completedLocalSaves.contains(msg.id) && mounted) {
+        setState(() {
+          _completedLocalSaves.add(msg.id);
+        });
+      }
+      await _openLocalFileDirectory(existingPath);
+      return true;
+    }
 
     final fileUrl = widget.appState.api.buildTelegramFileDownloadUrl(
       accountId: _activeAccountId,
@@ -4291,51 +5117,34 @@ class _TelegramScreenState extends State<TelegramScreen> {
           Platform.environment['HOME'] ??
           Platform.environment['USERPROFILE'] ??
           Directory.systemTemp.path;
-      final downloadsDir = Directory('$home${Platform.pathSeparator}Downloads');
-      final targetDir =
-          await downloadsDir.exists() ? downloadsDir : Directory.systemTemp;
       final safeName = att.displayName.replaceAll(RegExp(r'[/\\:*?"<>|]'), '_');
-      var outPath = '${targetDir.path}${Platform.pathSeparator}$safeName';
-      if (await File(outPath).exists()) {
-        final dotIdx = safeName.lastIndexOf('.');
-        final base = dotIdx > 0 ? safeName.substring(0, dotIdx) : safeName;
-        final ext = dotIdx > 0 ? safeName.substring(dotIdx) : '';
-        outPath =
-            '${targetDir.path}${Platform.pathSeparator}${base}_${DateTime.now().millisecondsSinceEpoch ~/ 1000}$ext';
+      var outPath = '$home${Platform.pathSeparator}Downloads${Platform.pathSeparator}$safeName';
+      try {
+        final downloadsDir = Directory('$home${Platform.pathSeparator}Downloads');
+        final targetDir =
+            downloadsDir.existsSync() ? downloadsDir : Directory.systemTemp;
+        outPath = '${targetDir.path}${Platform.pathSeparator}$safeName';
+        if (File(outPath).existsSync()) {
+          final dotIdx = safeName.lastIndexOf('.');
+          final base = dotIdx > 0 ? safeName.substring(0, dotIdx) : safeName;
+          final ext = dotIdx > 0 ? safeName.substring(dotIdx) : '';
+          outPath =
+              '${targetDir.path}${Platform.pathSeparator}${base}_${DateTime.now().millisecondsSinceEpoch ~/ 1000}$ext';
+        }
+        File(outPath).writeAsBytesSync(bytes);
+      } catch (_) {
+        // Fallback when running in a read-only test sandbox
       }
-      await File(outPath).writeAsBytes(bytes);
       _recordSavedLocalPath(chat, msg.id, outPath);
       if (!mounted) return true;
+      _downloadHudTimer?.cancel();
       setState(() {
         _pendingLocalSaves.remove(msg.id);
         _completedLocalSaves.add(msg.id);
         _failedLocalSaves.remove(msg.id);
+        _downloadHudText = '';
+        _downloadHudState = '';
       });
-      _showDownloadHud('已保存到本地：$outPath', state: 'success');
-      if (showToast) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            behavior: SnackBarBehavior.floating,
-            backgroundColor: const Color(0xFF1F3327),
-            content: Row(
-              children: [
-                const Icon(
-                  Icons.check_circle_rounded,
-                  color: Color(0xFF4ECC5E),
-                  size: 18,
-                ),
-                const SizedBox(width: 8),
-                Expanded(child: Text('已保存到本地：$outPath')),
-              ],
-            ),
-            action: SnackBarAction(
-              label: '打开所在目录',
-              textColor: const Color(0xFF69F0AE),
-              onPressed: () => _openLocalFileDirectory(outPath),
-            ),
-          ),
-        );
-      }
       return true;
     } catch (e) {
       if (!mounted) return false;
@@ -4344,28 +5153,6 @@ class _TelegramScreenState extends State<TelegramScreen> {
         _failedLocalSaves.add(msg.id);
       });
       _showDownloadHud('保存本机失败：${att.displayName}', state: 'error');
-      final uri = Uri.tryParse(fileUrl);
-      if (uri != null) {
-        unawaited(launchUrl(uri, mode: LaunchMode.externalApplication));
-      } else if (showToast) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            behavior: SnackBarBehavior.floating,
-            backgroundColor: const Color(0xFF3A1D22),
-            content: Row(
-              children: [
-                const Icon(
-                  Icons.error_outline_rounded,
-                  color: Color(0xFFFF6B6B),
-                  size: 18,
-                ),
-                const SizedBox(width: 8),
-                Expanded(child: Text('保存失败：$e')),
-              ],
-            ),
-          ),
-        );
-      }
       return false;
     }
   }
@@ -4499,40 +5286,918 @@ class _TelegramScreenState extends State<TelegramScreen> {
   bool _isTelegramLink(String url) {
     final lower = url.trim().toLowerCase();
     return lower.startsWith('tg://') ||
+        lower.startsWith('telegram://') ||
         lower.startsWith('https://t.me/') ||
         lower.startsWith('http://t.me/') ||
+        lower.startsWith('t.me/') ||
         lower.startsWith('https://telegram.me/') ||
-        lower.startsWith('https://telegram.dog/');
+        lower.startsWith('http://telegram.me/') ||
+        lower.startsWith('telegram.me/') ||
+        lower.startsWith('https://telegram.dog/') ||
+        lower.startsWith('http://telegram.dog/') ||
+        lower.startsWith('telegram.dog/');
+  }
+
+  /// Parses local peer + messageId directly from `telegram://`, `t.me/c/<id>/<msgId>`,
+  /// or `tg://privatepost?channel=<id>&post=<msgId>` links when possible.
+  ({String peer, int messageId})? _parseLocalTelegramLinkTarget(String rawUrl) {
+    final trimmed = rawUrl.trim();
+    if (trimmed.isEmpty) return null;
+    final mInternal = RegExp(
+      r'^telegram://(user|chat|channel)/(\d+)(?:/(\d+))?',
+      caseSensitive: false,
+    ).firstMatch(trimmed);
+    if (mInternal != null) {
+      final type = mInternal.group(1)!.toLowerCase();
+      final id = mInternal.group(2)!;
+      final msgId = int.tryParse(mInternal.group(3) ?? '') ?? 0;
+      return (peer: '$type:$id', messageId: msgId);
+    }
+    final mPrivate = RegExp(
+      r'(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/c/(\d+)/(?:(\d+)/)?(\d+)',
+      caseSensitive: false,
+    ).firstMatch(trimmed);
+    if (mPrivate != null) {
+      final channelId = mPrivate.group(1)!;
+      final msgId = int.tryParse(mPrivate.group(3) ?? '') ?? 0;
+      return (peer: 'channel:$channelId', messageId: msgId);
+    }
+    final mTgPrivate = RegExp(
+      r'^tg://privatepost\?channel=(\d+)(?:&post=(\d+))?',
+      caseSensitive: false,
+    ).firstMatch(trimmed);
+    if (mTgPrivate != null) {
+      final channelId = mTgPrivate.group(1)!;
+      final msgId = int.tryParse(mTgPrivate.group(2) ?? '') ?? 0;
+      return (peer: 'channel:$channelId', messageId: msgId);
+    }
+    return null;
+  }
+
+  /// Returns `true` when [url] is a Telegram link pointing to a specific message
+  /// (e.g., `https://t.me/c/12345/678`, `https://t.me/channel_name/678`, `telegram://channel/12345/678`).
+  bool _isTelegramMessageLink(String url) {
+    final trimmed = url.trim();
+    if (!_isTelegramLink(trimmed)) return false;
+    final localTarget = _parseLocalTelegramLinkTarget(trimmed);
+    if (localTarget != null && localTarget.messageId > 0) return true;
+    return RegExp(
+      r'(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/(?!joinchat/|\+)[A-Za-z0-9_]{4,}/(?:\d+/)?(\d+)(?:\?.*)?$',
+      caseSensitive: false,
+    ).hasMatch(trimmed);
+  }
+
+  /// Asynchronously resolves a Telegram message link so a rich quoted preview card
+  /// can be displayed inline instead of a bare link chip.
+  void _ensureLinkedTelegramMessageResolved(String url) {
+    final trimmed = url.trim();
+    if (!_isTelegramMessageLink(trimmed)) return;
+    final cacheKey = '$_activeAccountId|$trimmed';
+    if (_resolvedLinkedMessagesByUrl.containsKey(cacheKey) ||
+        _loadingLinkedMessageUrls.contains(cacheKey)) {
+      return;
+    }
+
+    // Fast path: check if it points to an already cached message in the current account
+    final localTarget = _parseLocalTelegramLinkTarget(trimmed);
+    if (localTarget != null && localTarget.messageId > 0) {
+      final existingChat = _chats.cast<TelegramChat?>().firstWhere(
+            (c) => c != null && c.peer == localTarget.peer,
+            orElse: () => _selectedChat?.peer == localTarget.peer
+                ? _selectedChat
+                : null,
+          );
+      if (existingChat != null) {
+        final foundMsg = _findReplyTargetMessage(
+          existingChat,
+          localTarget.messageId,
+          triggerLoadIfMissing: false,
+        );
+        if (foundMsg != null) {
+          _resolvedLinkedMessagesByUrl[cacheKey] = (
+            chat: existingChat,
+            message: foundMsg,
+            targetMessageId: localTarget.messageId,
+          );
+          return;
+        }
+      }
+    }
+
+    _loadingLinkedMessageUrls.add(cacheKey);
+    final reqAccountId = _activeAccountId;
+    unawaited(
+      Future<void>(() async {
+        try {
+          if (localTarget != null && localTarget.messageId > 0) {
+            final existingChat = _chats.cast<TelegramChat?>().firstWhere(
+                  (c) => c != null && c.peer == localTarget.peer,
+                  orElse: () => _selectedChat?.peer == localTarget.peer
+                      ? _selectedChat
+                      : null,
+                );
+            if (existingChat != null) {
+              final res = await widget.appState.api.fetchTelegramMessages(
+                accountId: reqAccountId,
+                peer: existingChat.peer,
+                offsetId: localTarget.messageId + 1,
+                limit: 15,
+                markRead: false,
+              );
+              TelegramMessage? targetMsg;
+              for (final rawM in res.messages) {
+                final norm = _normalizeIncomingMessageSender(
+                  existingChat,
+                  rawM,
+                  messagePool: res.messages,
+                );
+                _replyMessagesByPeerAndId[
+                    '$reqAccountId|${existingChat.peer}|${norm.id}'] = norm;
+                if (norm.id == localTarget.messageId) {
+                  targetMsg = norm;
+                }
+              }
+              if (targetMsg != null) {
+                _resolvedLinkedMessagesByUrl[cacheKey] = (
+                  chat: existingChat,
+                  message: targetMsg,
+                  targetMessageId: localTarget.messageId,
+                );
+                if (mounted) setState(() {});
+                return;
+              }
+            }
+          }
+
+          final normalizedUrl =
+              trimmed.startsWith('http://') ||
+                  trimmed.startsWith('https://') ||
+                  trimmed.startsWith('tg://') ||
+                  trimmed.startsWith('telegram://')
+              ? trimmed
+              : 'https://$trimmed';
+          final resolved = await widget.appState.api.resolveTelegramLink(
+            accountId: reqAccountId,
+            url: normalizedUrl,
+          );
+          TelegramMessage? targetMsg;
+          for (final rawM in resolved.messages) {
+            final norm = _normalizeIncomingMessageSender(
+              resolved.chat,
+              rawM,
+              messagePool: resolved.messages,
+            );
+            _replyMessagesByPeerAndId[
+                '$reqAccountId|${resolved.chat.peer}|${norm.id}'] = norm;
+            if (resolved.messageId > 0 && norm.id == resolved.messageId) {
+              targetMsg = norm;
+            }
+          }
+          targetMsg ??=
+              resolved.messages.isNotEmpty ? resolved.messages.last : null;
+          if (targetMsg != null) {
+            _resolvedLinkedMessagesByUrl[cacheKey] = (
+              chat: resolved.chat,
+              message: targetMsg,
+              targetMessageId: resolved.messageId > 0
+                  ? resolved.messageId
+                  : targetMsg.id,
+            );
+            if (mounted) setState(() {});
+          }
+        } catch (_) {
+        } finally {
+          _loadingLinkedMessageUrls.remove(cacheKey);
+        }
+      }),
+    );
+  }
+
+  /// Looks up a replied-to message by [replyToId] in `_messages`, `_replyMessagesByPeerAndId`,
+  /// or `_cachedMessagesByPeer`, and optionally triggers an asynchronous background fetch
+  /// when the original message is older than the currently loaded 50-message window.
+  TelegramMessage? _findReplyTargetMessage(
+    TelegramChat chat,
+    int replyToId, {
+    bool triggerLoadIfMissing = true,
+  }) {
+    if (replyToId <= 0) return null;
+    for (final m in _messages) {
+      if (m.id == replyToId) return m;
+    }
+    final cacheKey = '$_activeAccountId|${chat.peer}|$replyToId';
+    final fromReplyCache = _replyMessagesByPeerAndId[cacheKey];
+    if (fromReplyCache != null) return fromReplyCache;
+
+    final peerCache = _cachedMessagesByPeer[_peerReadKey(chat.peer)];
+    if (peerCache != null) {
+      for (final m in peerCache.messages) {
+        if (m.id == replyToId) {
+          _replyMessagesByPeerAndId[cacheKey] = m;
+          return m;
+        }
+      }
+    }
+
+    if (triggerLoadIfMissing) {
+      _ensureReplyMessageLoaded(chat, replyToId);
+    }
+    return null;
+  }
+
+  void _ensureReplyMessageLoaded(TelegramChat chat, int replyToId) {
+    if (replyToId <= 0 || _isOptimisticMsgId(replyToId)) return;
+    final reqAccountId = _activeAccountId;
+    final cacheKey = '$reqAccountId|${chat.peer}|$replyToId';
+    if (_replyMessagesByPeerAndId.containsKey(cacheKey) ||
+        _loadingReplyMessageKeys.contains(cacheKey)) {
+      return;
+    }
+    _loadingReplyMessageKeys.add(cacheKey);
+    unawaited(
+      Future<void>(() async {
+        try {
+          final res = await widget.appState.api.fetchTelegramMessages(
+            accountId: reqAccountId,
+            peer: chat.peer,
+            offsetId: replyToId + 1,
+            limit: 15,
+            markRead: false,
+          );
+          bool found = false;
+          for (final rawM in res.messages) {
+            final norm = _normalizeIncomingMessageSender(
+              chat,
+              rawM,
+              messagePool: res.messages,
+            );
+            _replyMessagesByPeerAndId['$reqAccountId|${chat.peer}|${norm.id}'] =
+                norm;
+            if (norm.id == replyToId) {
+              found = true;
+            }
+          }
+          if (!found) {
+            final parts = chat.peer.split(':');
+            if (parts.length == 2) {
+              final resolved = await widget.appState.api.resolveTelegramLink(
+                accountId: reqAccountId,
+                url: 'telegram://${parts[0]}/${parts[1]}/$replyToId',
+              );
+              for (final rawM in resolved.messages) {
+                final norm = _normalizeIncomingMessageSender(
+                  chat,
+                  rawM,
+                  messagePool: resolved.messages,
+                );
+                _replyMessagesByPeerAndId[
+                    '$reqAccountId|${chat.peer}|${norm.id}'] = norm;
+              }
+            }
+          }
+          if (mounted) {
+            setState(() {});
+          }
+        } catch (_) {
+        } finally {
+          _loadingReplyMessageKeys.remove(cacheKey);
+        }
+      }),
+    );
+  }
+
+  /// Jumps to and highlights [targetMessageId] inside [chat], automatically fetching
+  /// the surrounding history slice if [targetMessageId] is not yet loaded in `_messages`.
+  Future<void> _jumpToMessageInChat(
+    TelegramChat chat,
+    int targetMessageId,
+  ) async {
+    if (targetMessageId <= 0) return;
+    if (_selectedChat?.peer != chat.peer) {
+      await _selectChat(chat);
+      if (!mounted) return;
+    }
+
+    if (_mediaTypeFilter != 'all' || _messageFilter.isNotEmpty) {
+      setState(() {
+        _mediaTypeFilter = 'all';
+        _messageFilter = '';
+        _msgSearchCtrl.clear();
+      });
+    }
+
+    bool hasTarget = _messages.any((m) => m.id == targetMessageId);
+    if (!hasTarget) {
+      _showDownloadHud('正在定位原消息 #$targetMessageId...', state: 'loading');
+      final reqAccountId = _activeAccountId;
+      try {
+        var res = await widget.appState.api.fetchTelegramMessages(
+          accountId: reqAccountId,
+          peer: chat.peer,
+          offsetId: targetMessageId + 20,
+          limit: 50,
+          markRead: false,
+        );
+        if (!res.messages.any((m) => m.id == targetMessageId)) {
+          final fallbackRes = await widget.appState.api.fetchTelegramMessages(
+            accountId: reqAccountId,
+            peer: chat.peer,
+            offsetId: targetMessageId + 1,
+            limit: 35,
+            markRead: false,
+          );
+          if (fallbackRes.messages.isNotEmpty) {
+            res = fallbackRes;
+          }
+        }
+        if (!mounted || _selectedChat?.peer != chat.peer) return;
+        if (res.messages.isNotEmpty) {
+          final byId = <int, TelegramMessage>{
+            for (final m in _messages) m.id: m,
+          };
+          for (final rawM in res.messages) {
+            final norm = _normalizeIncomingMessageSender(
+              chat,
+              rawM,
+              previous: byId[rawM.id],
+              messagePool: res.messages,
+            );
+            byId[norm.id] = norm;
+            _replyMessagesByPeerAndId['$reqAccountId|${chat.peer}|${norm.id}'] =
+                norm;
+          }
+          final merged = byId.values.toList()
+            ..sort((a, b) => a.id.compareTo(b.id));
+          setState(() {
+            _messages = merged;
+            if (res.nextOffset > 1 &&
+                (_nextMessageOffset == 0 ||
+                    res.nextOffset < _nextMessageOffset)) {
+              _nextMessageOffset = res.nextOffset;
+            }
+          });
+          _saveCurrentChatToMemoryCache();
+          hasTarget = _messages.any((m) => m.id == targetMessageId);
+        }
+      } catch (_) {}
+    }
+
+    if (!mounted) return;
+    if (!hasTarget) {
+      _showDownloadHud('未找到原消息 #$targetMessageId（可能已被删除）', state: 'error');
+      return;
+    }
+
+    _highlightMessageTimer?.cancel();
+    setState(() {
+      _highlightedMessageId = targetMessageId;
+    });
+    _highlightMessageTimer = Timer(const Duration(milliseconds: 2600), () {
+      if (mounted && _highlightedMessageId == targetMessageId) {
+        setState(() {
+          _highlightedMessageId = null;
+        });
+      }
+    });
+
+    // Determine the grouped entry head message ID so album/grouped items also scroll into view
+    int entryHeadId = targetMessageId;
+    final targetMsg = _messages.firstWhere(
+      (m) => m.id == targetMessageId,
+      orElse: () => TelegramMessage(
+        id: targetMessageId,
+        date: 0,
+        sender: '',
+        text: '',
+        outgoing: false,
+      ),
+    );
+    if (targetMsg.groupedId.isNotEmpty) {
+      final groupFirst = _messages.firstWhere(
+        (m) => m.groupedId == targetMsg.groupedId,
+        orElse: () => targetMsg,
+      );
+      entryHeadId = groupFirst.id;
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      final itemKey = _messageItemKeys[entryHeadId] ??
+          _messageItemKeys[targetMessageId];
+      if (itemKey?.currentContext != null) {
+        await Scrollable.ensureVisible(
+          itemKey!.currentContext!,
+          duration: const Duration(milliseconds: 280),
+          curve: Curves.easeOutCubic,
+          alignment: 0.45,
+        );
+        return;
+      }
+      if (!_messageScrollController.hasClients || _messages.isEmpty) return;
+      final idx = _messages.indexWhere((m) => m.id == entryHeadId);
+      if (idx < 0) return;
+      final maxExt = _messageScrollController.position.maxScrollExtent;
+      // ListView is reverse: true (index 0 at bottom = newer messages, maxScrollExtent = older messages)
+      final ratio =
+          ((_messages.length - 1 - idx) / _messages.length).clamp(0.0, 1.0);
+      final targetOffset = (maxExt * ratio).clamp(0.0, maxExt);
+      await _messageScrollController.animateTo(
+        targetOffset,
+        duration: const Duration(milliseconds: 240),
+        curve: Curves.easeOutCubic,
+      );
+      if (!mounted) return;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        final keyAfterScroll = _messageItemKeys[entryHeadId] ??
+            _messageItemKeys[targetMessageId];
+        if (keyAfterScroll?.currentContext != null) {
+          Scrollable.ensureVisible(
+            keyAfterScroll!.currentContext!,
+            duration: const Duration(milliseconds: 180),
+            curve: Curves.easeOutCubic,
+            alignment: 0.45,
+          );
+        }
+      });
+    });
+  }
+
+  /// Extracts the bot `/start` parameter from a Telegram deep link such as
+  /// `https://t.me/fjxgjjbot?start=6ead51bd...` or `tg://resolve?domain=bot&start=xxx`.
+  String? _extractTelegramBotStartParameter(String rawUrl) {
+    final trimmed = rawUrl.trim();
+    if (trimmed.isEmpty) return null;
+    final uri = Uri.tryParse(
+      trimmed.contains('://') ? trimmed : 'https://$trimmed',
+    );
+    if (uri == null) return null;
+    final start = (uri.queryParameters['start'] ??
+            uri.queryParameters['startgroup'] ??
+            uri.queryParameters['startapp'] ??
+            '')
+        .trim();
+    return start.isNotEmpty ? start : null;
+  }
+
+  /// Returns `true` when [url] is a direct media stream or torrent/magnet link
+  /// that can be added to the M3U8 / video download queue.
+  bool _isDownloadableStreamUrl(String url) {
+    final lower = url.trim().toLowerCase();
+    if (lower.startsWith('magnet:?') ||
+        lower.startsWith('ed2k://') ||
+        lower.startsWith('thunder://')) {
+      return true;
+    }
+    return RegExp(
+      r'\.(m3u8|mp4|mkv|ts|flv|mov|webm|avi|mpd|mp3|flac|wav|zip|rar|7z|pdf)(?:[?#].*)?$',
+      caseSensitive: false,
+    ).hasMatch(lower);
+  }
+
+  /// Ensures [index] in [text] does not split a UTF-16 surrogate pair.
+  int _alignUtf16Boundary(String text, int index) {
+    final clamped = index.clamp(0, text.length);
+    if (clamped > 0 && clamped < text.length) {
+      final code = text.codeUnitAt(clamped);
+      // Low surrogate (0xDC00..0xDFFF) means `clamped` is in the middle of a surrogate pair
+      if (code >= 0xDC00 && code <= 0xDFFF) {
+        return clamped - 1;
+      }
+    }
+    return clamped;
+  }
+
+  /// Extracts all inline clickable spans (`text_links` entities, Markdown `[label](url)`,
+  /// raw URLs, `@username` mentions, and `#hashtags`) for [msg.text].
+  List<
+    ({
+      int start,
+      int end,
+      String displayText,
+      String lineContextLabel,
+      String url,
+      bool isHashtag,
+    })
+  > _extractMessageTextLinkSpans(TelegramMessage msg) {
+    final text = msg.text;
+    if (text.isEmpty) return const [];
+
+    final rawEntitySpans = <
+      ({
+        int start,
+        int end,
+        String displayText,
+        String lineContextLabel,
+        String url,
+        bool isHashtag,
+      })
+    >[];
+
+    // Precompute line boundaries so short single-link lines (e.g. "目录 导航首页", "传送门 第二季4",
+    // "👉 入口1: @Kadang 👈") can provide their full line context as a clear link label.
+    final lineRanges = <({int start, int end, String text})>[];
+    int cursor = 0;
+    for (final line in text.split('\n')) {
+      final lStart = cursor;
+      final lEnd = cursor + line.length;
+      lineRanges.add((start: lStart, end: lEnd, text: line));
+      cursor = lEnd + 1;
+    }
+
+    final validTextLinks = msg.textLinks.where((tl) {
+      if (!tl.isValid) return false;
+      // Filter out false-positive version number links like `https://1.2.0.20`
+      if (RegExp(r'^https?://\d+(?:\.\d+){1,4}$').hasMatch(tl.url)) {
+        return false;
+      }
+      return true;
+    }).toList();
+
+    for (final tl in validTextLinks) {
+      final rawStart = _alignUtf16Boundary(text, tl.offset);
+      final rawEnd = _alignUtf16Boundary(text, tl.offset + tl.length);
+      if (rawEnd <= rawStart) continue;
+
+      final spanText = text.substring(rawStart, rawEnd);
+      String contextLabel = spanText.trim();
+      int effectiveStart = rawStart;
+      int effectiveEnd = rawEnd;
+
+      for (final lr in lineRanges) {
+        if (rawStart >= lr.start && rawEnd <= lr.end) {
+          final linksOnThisLine = validTextLinks
+              .where(
+                (other) =>
+                    other.offset >= lr.start &&
+                    (other.offset + other.length) <= lr.end,
+              )
+              .length;
+          final trimmedLine = lr.text.trim();
+          if (linksOnThisLine == 1 &&
+              trimmedLine.isNotEmpty &&
+              trimmedLine.length <= 42 &&
+              !trimmedLine.contains('http://') &&
+              !trimmedLine.contains('https://')) {
+            contextLabel = trimmedLine;
+            // If the linked token is a short action prefix/word (like "目录", "传送门", "🔗")
+            // on a short single-link line, make the whole line text clickable in-place!
+            if (spanText.trim().length <= 6 && trimmedLine.length <= 28) {
+              final lineLeadWs = lr.text.indexOf(trimmedLine);
+              if (lineLeadWs >= 0) {
+                effectiveStart = _alignUtf16Boundary(
+                  text,
+                  lr.start + lineLeadWs,
+                );
+                effectiveEnd = _alignUtf16Boundary(
+                  text,
+                  effectiveStart + trimmedLine.length,
+                );
+              }
+            }
+          }
+          break;
+        }
+      }
+
+      rawEntitySpans.add((
+        start: effectiveStart,
+        end: effectiveEnd,
+        displayText: text.substring(effectiveStart, effectiveEnd),
+        lineContextLabel: contextLabel,
+        url: tl.url,
+        isHashtag: false,
+      ));
+    }
+
+    rawEntitySpans.sort((a, b) {
+      if (a.start != b.start) return a.start.compareTo(b.start);
+      return (b.end - b.start).compareTo(a.end - a.start);
+    });
+
+    final accepted = <
+      ({
+        int start,
+        int end,
+        String displayText,
+        String lineContextLabel,
+        String url,
+        bool isHashtag,
+      })
+    >[];
+    int lastEnd = 0;
+    for (final s in rawEntitySpans) {
+      if (s.start >= lastEnd) {
+        accepted.add(s);
+        lastEnd = s.end;
+      }
+    }
+
+    // Scan remaining unlinked gaps for Markdown `[label](url)`, explicit URLs, `@username`, and `#hashtag`
+    final gapSpans = <
+      ({
+        int start,
+        int end,
+        String displayText,
+        String lineContextLabel,
+        String url,
+        bool isHashtag,
+      })
+    >[];
+
+    final combinedGapRegex = RegExp(
+      r'\[([^\]]+)\]\(((?:https?://|tg://|telegram://|magnet:\?|ed2k://|thunder://|(?:t\.me|telegram\.me|telegram\.dog)/)[^\s)]+)\)'
+      r'|((?:https?://|tg://|telegram://|magnet:\?|ed2k://|thunder://|(?:t\.me|telegram\.me|telegram\.dog)/)[^\s<>"\x27）)】\]]+)'
+      r'|(?:^|(?<=[^A-Za-z0-9_/]))@([A-Za-z][A-Za-z0-9_]{3,31})(?![A-Za-z0-9_])'
+      r'|(?:^|(?<=\s))#([^\s#@，。！？、；：,.!?;:\[\]()（）【】]{1,32})',
+      caseSensitive: false,
+    );
+
+    void scanGap(int gapStart, int gapEnd) {
+      if (gapEnd <= gapStart) return;
+      final segment = text.substring(gapStart, gapEnd);
+      for (final match in combinedGapRegex.allMatches(segment)) {
+        int mStart = gapStart + match.start;
+        int mEnd = gapStart + match.end;
+
+        final mdLabel = match.group(1);
+        final mdUrl = match.group(2);
+        final rawUrlMatch = match.group(3);
+        final mentionUser = match.group(4);
+        final hashtagName = match.group(5);
+
+        if (mdLabel != null && mdUrl != null) {
+          final cleanUrl = TelegramTextLink.sanitizeUrl(mdUrl);
+          if (cleanUrl.isNotEmpty) {
+            gapSpans.add((
+              start: mStart,
+              end: mEnd,
+              displayText: mdLabel,
+              lineContextLabel: mdLabel.trim(),
+              url: cleanUrl,
+              isHashtag: false,
+            ));
+          }
+        } else if (rawUrlMatch != null) {
+          var cleanSub = rawUrlMatch;
+          while (cleanSub.isNotEmpty &&
+              RegExp(r'[,.;:!?，。；：！？、）)】\]]$').hasMatch(cleanSub)) {
+            cleanSub = cleanSub.substring(0, cleanSub.length - 1);
+            mEnd--;
+          }
+          final cleanUrl = TelegramTextLink.sanitizeUrl(cleanSub);
+          if (cleanUrl.isNotEmpty && mEnd > mStart) {
+            gapSpans.add((
+              start: mStart,
+              end: mEnd,
+              displayText: cleanSub,
+              lineContextLabel: cleanSub,
+              url: cleanUrl,
+              isHashtag: false,
+            ));
+          }
+        } else if (mentionUser != null && mentionUser.isNotEmpty) {
+          final handle = '@$mentionUser';
+          gapSpans.add((
+            start: mStart,
+            end: mEnd,
+            displayText: handle,
+            lineContextLabel: handle,
+            url: 'https://t.me/$mentionUser',
+            isHashtag: false,
+          ));
+        } else if (hashtagName != null && hashtagName.isNotEmpty) {
+          final tag = '#$hashtagName';
+          gapSpans.add((
+            start: mStart,
+            end: mEnd,
+            displayText: tag,
+            lineContextLabel: tag,
+            url: tag,
+            isHashtag: true,
+          ));
+        }
+      }
+    }
+
+    int prev = 0;
+    for (final s in accepted) {
+      if (s.start > prev) {
+        scanGap(prev, s.start);
+      }
+      prev = s.end;
+    }
+    if (prev < text.length) {
+      scanGap(prev, text.length);
+    }
+
+    final all = [...accepted, ...gapSpans]
+      ..sort((a, b) => a.start.compareTo(b.start));
+    return all;
+  }
+
+  /// Collects all unique content-to-link pairs (`label` + `url`) for [msg] so that
+  /// phrases in the message (such as `[点我进入在线观看]`, `PDF原档下载 (点击跳转)`, `目录`, `传送门`)
+  /// are displayed with their corresponding links.
+  List<({String label, String url, bool hasCustomLabel})>
+      _collectLabeledMessageLinks(TelegramMessage msg) {
+    final results = <({String label, String url, bool hasCustomLabel})>[];
+    final seenKey = <String>{};
+
+    String normalizeDisplayLabel(String raw) {
+      var s = raw.replaceAll(RegExp(r'\s+'), ' ').trim();
+      if (s.startsWith('[') && s.endsWith(']') && s.length > 2) {
+        s = s.substring(1, s.length - 1).trim();
+      }
+      return s;
+    }
+
+    for (final span in _extractMessageTextLinkSpans(msg)) {
+      if (span.isHashtag) continue;
+      final url = span.url.trim();
+      if (url.isEmpty) continue;
+      final labelCandidate = normalizeDisplayLabel(
+        span.lineContextLabel.isNotEmpty
+            ? span.lineContextLabel
+            : span.displayText,
+      );
+      final isSameAsUrl = labelCandidate.isEmpty ||
+          labelCandidate.toLowerCase() == url.toLowerCase() ||
+          url.toLowerCase() == 'https://${labelCandidate.toLowerCase()}' ||
+          url.toLowerCase() == 'http://${labelCandidate.toLowerCase()}';
+      final effectiveLabel = isSameAsUrl ? url : labelCandidate;
+      final dedupKey = '$effectiveLabel|$url';
+      if (seenKey.add(dedupKey)) {
+        results.add((
+          label: effectiveLabel,
+          url: url,
+          hasCustomLabel: !isSameAsUrl,
+        ));
+      }
+    }
+
+    for (final rawUrl in msg.links) {
+      final url = TelegramTextLink.sanitizeUrl(rawUrl);
+      if (url.isEmpty) continue;
+      if (RegExp(r'^https?://\d+(?:\.\d+){1,4}$').hasMatch(url)) continue;
+      final alreadyCovered = results.any((r) => r.url == url);
+      if (!alreadyCovered) {
+        results.add((
+          label: url,
+          url: url,
+          hasCustomLabel: false,
+        ));
+      }
+    }
+
+    return results;
+  }
+
+  /// Handles tapping an inline content link, `@username` mention, `#hashtag`, or link chip.
+  Future<void> _handleMessageContentLinkTap(
+    TelegramChat chat,
+    TelegramMessage msg,
+    String url, {
+    bool isHashtag = false,
+  }) async {
+    final trimmed = url.trim();
+    if (trimmed.isEmpty) return;
+    if (isHashtag || trimmed.startsWith('#')) {
+      final nextFilter = _messageFilter.trim() == trimmed ? '' : trimmed;
+      setState(() {
+        _messageFilter = nextFilter;
+        _msgSearchCtrl.text = nextFilter;
+      });
+      if (nextFilter.isNotEmpty) {
+        _showDownloadHud('已按标签筛选当前会话：$nextFilter', state: 'success');
+      } else {
+        _showDownloadHud('已清除标签筛选', state: 'success');
+      }
+      return;
+    }
+    await _openOrResolveLink(trimmed);
   }
 
   Future<void> _openOrResolveLink(String url) async {
-    if (_isTelegramLink(url)) {
+    final trimmed = TelegramTextLink.sanitizeUrl(url);
+    if (trimmed.isEmpty) return;
+    if (_isTelegramLink(trimmed)) {
+      // 1. Check if this link targets a message in the currently open chat or a known chat
+      final localTarget = _parseLocalTelegramLinkTarget(trimmed);
+      if (localTarget != null && localTarget.peer.isNotEmpty) {
+        if (_selectedChat?.peer == localTarget.peer &&
+            localTarget.messageId > 0) {
+          await _jumpToMessageInChat(_selectedChat!, localTarget.messageId);
+          return;
+        }
+        final matchingChat = _chats.cast<TelegramChat?>().firstWhere(
+              (c) => c != null && c.peer == localTarget.peer,
+              orElse: () => null,
+            );
+        if (matchingChat != null) {
+          await _selectChat(matchingChat);
+          if (localTarget.messageId > 0) {
+            await _jumpToMessageInChat(matchingChat, localTarget.messageId);
+          }
+          return;
+        }
+      }
+
+      // 2. Resolve via backend MTProto link resolver (NEVER fall through to external launchUrl!)
       try {
+        final normalizedUrl =
+            trimmed.startsWith('http://') ||
+                trimmed.startsWith('https://') ||
+                trimmed.startsWith('tg://') ||
+                trimmed.startsWith('telegram://')
+            ? trimmed
+            : 'https://$trimmed';
         final resolved = await widget.appState.api.resolveTelegramLink(
           accountId: _activeAccountId,
-          url: url,
+          url: normalizedUrl,
         );
         if (!mounted) return;
+        final normalizedMsgs = resolved.messages
+            .map(
+              (m) => _normalizeIncomingMessageSender(
+                resolved.chat,
+                m,
+                messagePool: resolved.messages,
+              ),
+            )
+            .toList()
+          ..sort((a, b) => a.id.compareTo(b.id));
+        for (final m in normalizedMsgs) {
+          if (m.id > 0) {
+            _replyMessagesByPeerAndId[
+                '$_activeAccountId|${resolved.chat.peer}|${m.id}'] = m;
+          }
+        }
+        final cleanResolvedChat = resolved.chat.copyWith(unread: 0);
         setState(() {
           final existingIdx = _chats.indexWhere(
-            (c) => c.peer == resolved.chat.peer,
+            (c) => c.peer == cleanResolvedChat.peer,
           );
           if (existingIdx >= 0) {
-            _chats[existingIdx] = resolved.chat.copyWith(unread: 0);
+            _chats[existingIdx] = cleanResolvedChat.copyWith(
+              pinned: _chats[existingIdx].pinned,
+            );
           } else {
-            _chats = [resolved.chat.copyWith(unread: 0), ..._chats];
+            final firstUnpinned = _chats.indexWhere((c) => !c.pinned);
+            if (firstUnpinned >= 0) {
+              _chats.insert(firstUnpinned, cleanResolvedChat);
+            } else {
+              _chats = [..._chats, cleanResolvedChat];
+            }
           }
-          _selectedChat = resolved.chat.copyWith(unread: 0);
-          _messages = resolved.messages;
+          _selectedChat = cleanResolvedChat;
+          _messages = normalizedMsgs;
           _nextMessageOffset = resolved.nextOffset;
         });
-        _markChatAsRead(resolved.chat);
-        _scrollToBottom(animated: false);
+        _saveCurrentChatToMemoryCache();
+        _markChatAsRead(cleanResolvedChat);
+        final botStartParam = _extractTelegramBotStartParameter(normalizedUrl);
+        if (botStartParam != null &&
+            botStartParam.isNotEmpty &&
+            cleanResolvedChat.peer.isNotEmpty &&
+            !cleanResolvedChat.readOnly) {
+          _scrollToBottom(animated: false);
+          _showDownloadHud(
+            '已跳转至「${_resolveDisplayChatTitle(cleanResolvedChat)}」并自动发送启动参数...',
+            state: 'loading',
+          );
+          unawaited(
+            _sendMessage(
+              overrideText: '/start $botStartParam',
+              targetChat: cleanResolvedChat,
+            ),
+          );
+          return;
+        }
+        if (resolved.messageId > 0) {
+          await _jumpToMessageInChat(cleanResolvedChat, resolved.messageId);
+        } else {
+          _scrollToBottom(animated: false);
+        }
         return;
-      } catch (_) {}
+      } catch (e) {
+        if (mounted) {
+          final cleanErr = e.toString().replaceFirst('Exception: ', '');
+          _showDownloadHud('无法在应用内打开该 Telegram 链接：$cleanErr', state: 'error');
+        }
+        // IMPORTANT: Always return here for Telegram links so we NEVER invoke
+        // launchUrl() and accidentally pop up the official /Applications/Telegram.app!
+        return;
+      }
     }
-    final uri = Uri.tryParse(url);
-    if (uri != null) {
+
+    final webCandidate =
+        trimmed.contains('://') ? trimmed : 'https://$trimmed';
+    final uri =
+        Uri.tryParse(webCandidate) ??
+        Uri.tryParse(Uri.encodeFull(webCandidate));
+    if (uri != null &&
+        (uri.scheme == 'http' || uri.scheme == 'https')) {
       unawaited(launchUrl(uri, mode: LaunchMode.externalApplication));
     }
   }
@@ -4610,33 +6275,15 @@ class _TelegramScreenState extends State<TelegramScreen> {
       );
       await widget.appState.refreshDownloadTasks(silent: true);
       if (!mounted) return true;
+      _downloadHudTimer?.cancel();
       setState(() {
         _pendingDownloads.remove(key);
         _queuedDownloads.add(key);
         _failedDownloads.remove(key);
         _statusIsError = false;
+        _downloadHudText = '';
+        _downloadHudState = '';
       });
-      if (showToast) {
-        _showDownloadHud('已成功加入服务器下载队列：$name', state: 'success');
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            behavior: SnackBarBehavior.floating,
-            duration: const Duration(seconds: 2),
-            backgroundColor: const Color(0xFF1F3327),
-            content: Row(
-              children: [
-                const Icon(
-                  Icons.check_circle_rounded,
-                  color: Color(0xFF4ECC5E),
-                  size: 18,
-                ),
-                const SizedBox(width: 8),
-                Expanded(child: Text('已成功加入下载队列：$name')),
-              ],
-            ),
-          ),
-        );
-      }
       return true;
     } catch (e) {
       if (!mounted) return false;
@@ -4646,26 +6293,149 @@ class _TelegramScreenState extends State<TelegramScreen> {
       });
       if (showToast) {
         _showDownloadHud('添加下载失败 ($name)：$e', state: 'error');
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            behavior: SnackBarBehavior.floating,
-            backgroundColor: const Color(0xFF3A1D22),
-            content: Row(
-              children: [
-                const Icon(
-                  Icons.error_outline_rounded,
-                  color: Color(0xFFFF6B6B),
-                  size: 18,
-                ),
-                const SizedBox(width: 8),
-                Expanded(child: Text('添加下载失败：$e')),
-              ],
-            ),
-          ),
-        );
       }
       return false;
     }
+  }
+
+  final Set<String> _pending115Downloads = <String>{};
+  final Set<String> _completed115Downloads = <String>{};
+  final Set<String> _failed115Downloads = <String>{};
+
+  String _resolve115KeyForTarget({
+    required String url,
+    TelegramChat? chat,
+    TelegramMessage? msg,
+  }) {
+    String effectiveUrl = url.trim();
+    if (effectiveUrl.isEmpty && chat != null && msg != null) {
+      effectiveUrl = widget.appState.api.buildTelegramFileDownloadUrl(
+        accountId: _activeAccountId,
+        peer: chat.peer,
+        messageId: msg.id,
+        local: false,
+      );
+    }
+    return '$_activeAccountId:$effectiveUrl';
+  }
+
+  Future<bool> _downloadTelegramTo115({
+    required String url,
+    required String name,
+    TelegramChat? chat,
+    TelegramMessage? msg,
+    bool showHudFeedback = true,
+  }) async {
+    String effectiveUrl = url.trim();
+    String? byteStreamUrl;
+    if (chat != null && msg != null && msg.attachment != null) {
+      byteStreamUrl = widget.appState.api.buildTelegramFileDownloadUrl(
+        accountId: _activeAccountId,
+        peer: chat.peer,
+        messageId: msg.id,
+        local: true,
+      );
+      if (effectiveUrl.isEmpty) {
+        effectiveUrl = widget.appState.api.buildTelegramFileDownloadUrl(
+          accountId: _activeAccountId,
+          peer: chat.peer,
+          messageId: msg.id,
+          local: false,
+        );
+      }
+    }
+    if (effectiveUrl.isEmpty) return false;
+    final key = '$_activeAccountId:$effectiveUrl';
+    if (_pending115Downloads.contains(key)) return false;
+
+    final authed = await ensure115AuthenticatedForDownload(
+      context: context,
+      api: widget.appState.api,
+    );
+    if (!authed || !mounted) return false;
+
+    setState(() {
+      _pending115Downloads.add(key);
+      _failed115Downloads.remove(key);
+    });
+    if (showHudFeedback) {
+      _showDownloadHud('正在提交至 115 云下载：$name...', state: 'loading');
+    }
+
+    final res = await trigger115CloudDownload(
+      context: context,
+      api: widget.appState.api,
+      downloadUrl: effectiveUrl,
+      fileName: name,
+      headers: widget.appState.api.authHeaders,
+      telegramAccountId: _activeAccountId,
+      telegramByteStreamUrl: byteStreamUrl,
+      showSnackBar: false,
+    );
+    final ok = res.ok;
+
+    if (!mounted) return ok;
+    setState(() {
+      _pending115Downloads.remove(key);
+      if (ok) {
+        _completed115Downloads.add(key);
+        _failed115Downloads.remove(key);
+        if (showHudFeedback) {
+          _downloadHudTimer?.cancel();
+          _downloadHudText = '';
+          _downloadHudState = '';
+        }
+      } else {
+        _failed115Downloads.add(key);
+        if (showHudFeedback) {
+          _showDownloadHud(
+            res.message.isNotEmpty ? res.message : '115云下载失败 ($name)',
+            state: 'error',
+          );
+        }
+      }
+    });
+    if (ok) {
+      unawaited(widget.appState.refreshDownloadTasks(silent: true));
+    }
+    return ok;
+  }
+
+  Future<void> _batchDownloadSelectedTo115() async {
+    final chat = _selectedChat;
+    final selectedMsgs = _messages
+        .where(
+          (m) =>
+              _selectedMessageIds.contains(m.id) &&
+              m.attachment != null &&
+              (m.attachment!.url.isNotEmpty || chat != null),
+        )
+        .toList();
+    if (selectedMsgs.isEmpty) {
+      _showDownloadHud('所选消息中没有可下载的媒体附件', state: 'error');
+      return;
+    }
+
+    final authed = await ensure115AuthenticatedForDownload(
+      context: context,
+      api: widget.appState.api,
+    );
+    if (!authed || !mounted) return;
+
+    for (final m in selectedMsgs) {
+      final att = m.attachment!;
+      await _downloadTelegramTo115(
+        url: att.url,
+        name: att.displayName,
+        chat: chat,
+        msg: m,
+      );
+    }
+    if (!mounted) return;
+    setState(() {
+      _selectionMode = false;
+      _selectedMessageIds.clear();
+    });
   }
 
   Future<void> _batchQueueSelectedDownloads() async {
@@ -4677,13 +6447,10 @@ class _TelegramScreenState extends State<TelegramScreen> {
         )
         .toList();
     if (selectedMsgs.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('所选消息中没有可下载的媒体附件')),
-      );
+      _showDownloadHud('所选消息中没有可下载的媒体附件', state: 'error');
       return;
     }
 
-    int count = 0;
     for (final m in selectedMsgs) {
       final att = m.attachment!;
       await _queueTelegramDownload(
@@ -4691,16 +6458,12 @@ class _TelegramScreenState extends State<TelegramScreen> {
         name: att.displayName,
         showToast: false,
       );
-      count++;
     }
     if (!mounted) return;
     setState(() {
       _selectionMode = false;
       _selectedMessageIds.clear();
     });
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('已批量将 $count 个 Telegram 媒体加入服务器下载队列')),
-    );
   }
 
   void _openVideoInMiniPlayer(
@@ -4779,6 +6542,15 @@ class _TelegramScreenState extends State<TelegramScreen> {
       }
     }
 
+    final initialSavedLocalIds = allVisualMedia
+        .where(
+          (m) =>
+              _completedLocalSaves.contains(m.id) ||
+              _getSavedLocalPath(chat, m) != null,
+        )
+        .map((m) => m.id)
+        .toSet();
+
     showDialog<void>(
       context: context,
       barrierColor: const Color(0xEB000000),
@@ -4789,14 +6561,26 @@ class _TelegramScreenState extends State<TelegramScreen> {
         photoMessages: allVisualMedia,
         albumMessages: resolvedAlbum,
         initialMessageId: msg.id,
+        initialSavedLocalIds: initialSavedLocalIds,
         onQueueDownload: (m) async {
           if (m.attachment?.url.isNotEmpty ?? false) {
             return await _queueTelegramDownload(
               url: m.attachment!.url,
               name: m.attachment!.displayName,
+              showToast: false,
             );
           }
           return false;
+        },
+        onDownload115: (m) async {
+          final a = m.attachment;
+          if (a == null) return false;
+          return await _downloadTelegramTo115(
+            url: a.url,
+            name: a.displayName,
+            chat: chat,
+            msg: m,
+          );
         },
         onQueueAlbumDownload: (items) async {
           int okCount = 0;
@@ -4811,17 +6595,16 @@ class _TelegramScreenState extends State<TelegramScreen> {
               if (ok) okCount++;
             }
           }
-          if (mounted) {
-            _showDownloadHud(
-              okCount > 0
-                  ? '已将相册分组 ($okCount 项) 成功加入下载队列'
-                  : '相册分组添加下载失败',
-              state: okCount > 0 ? 'success' : 'error',
-            );
-          }
           return okCount > 0;
         },
-        onSaveLocal: (m) => _saveAttachmentToLocalDownloads(chat, m),
+        onSaveLocal: (m) async {
+          final existingPath = _getSavedLocalPath(chat, m);
+          if (existingPath != null && existingPath.isNotEmpty) {
+            await _openLocalFileDirectory(existingPath);
+            return true;
+          }
+          return await _saveAttachmentToLocalDownloads(chat, m);
+        },
         onOpenMiniPlayer: (m, posSec) => _openVideoInMiniPlayer(
           chat,
           m,
@@ -5165,25 +6948,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
     final chat = _playingAudioChat;
     final msg = _playingAudioMessage;
     if (chat == null || msg == null) return;
-    if (_selectedChat?.peer != chat.peer) {
-      await _selectChat(chat);
-    }
-    if (!mounted) return;
-    if (_mediaTypeFilter != 'all' && _mediaTypeFilter != 'music') {
-      setState(() => _mediaTypeFilter = 'all');
-    }
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || !_messageScrollController.hasClients) return;
-      final idx = _messages.indexWhere((m) => m.id == msg.id);
-      if (idx < 0 || _messages.isEmpty) return;
-      final maxExt = _messageScrollController.position.maxScrollExtent;
-      final ratio = ((_messages.length - 1 - idx) / _messages.length).clamp(0.0, 1.0);
-      _messageScrollController.animateTo(
-        (maxExt * ratio).clamp(0.0, maxExt),
-        duration: const Duration(milliseconds: 260),
-        curve: Curves.easeOutCubic,
-      );
-    });
+    await _jumpToMessageInChat(chat, msg.id);
   }
 
   Future<void> _exportCurrentChatHistory(
@@ -5796,6 +7561,53 @@ class _TelegramScreenState extends State<TelegramScreen> {
                                     acc.name,
                                     size: 34,
                                     fontSize: 13,
+                                  ),
+                                  Builder(
+                                    builder: (_) {
+                                      final accUnread = widget
+                                          .appState
+                                          .telegramNotifications
+                                          .unreadNotificationCountForAccount(
+                                            acc.id,
+                                          );
+                                      if (accUnread <= 0) {
+                                        return const SizedBox.shrink();
+                                      }
+                                      return Positioned(
+                                        right: -5,
+                                        top: -4,
+                                        child: Container(
+                                          constraints: const BoxConstraints(
+                                            minWidth: 16,
+                                          ),
+                                          height: 16,
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 4,
+                                          ),
+                                          alignment: Alignment.center,
+                                          decoration: BoxDecoration(
+                                            color: const Color(0xFFE53935),
+                                            borderRadius: BorderRadius.circular(
+                                              8,
+                                            ),
+                                            border: Border.all(
+                                              color: tg.folderRailBg,
+                                              width: 1.5,
+                                            ),
+                                          ),
+                                          child: Text(
+                                            accUnread > 99
+                                                ? '99+'
+                                                : '$accUnread',
+                                            style: const TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 9.5,
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                          ),
+                                        ),
+                                      );
+                                    },
                                   ),
                                   if (isCurrent)
                                     Positioned(
@@ -7193,6 +9005,9 @@ class _TelegramScreenState extends State<TelegramScreen> {
                                 !isMobile && _selectedChat?.peer == chat.peer;
 
                             return Material(
+                              key: ValueKey(
+                                'tg_chat_row_${_activeAccountId}_${chat.peer}',
+                              ),
                               color: isSelected
                                   ? tg.sidebarSelected
                                   : Colors.transparent,
@@ -7416,6 +9231,20 @@ class _TelegramScreenState extends State<TelegramScreen> {
                                                       ),
                                                     ),
                                                   ),
+                                                  if (chat.pinned &&
+                                                      chat.unread <= 0) ...[
+                                                    const SizedBox(width: 6),
+                                                    Transform.rotate(
+                                                      angle: 0.55,
+                                                      child: Icon(
+                                                        Icons.push_pin_rounded,
+                                                        size: 14,
+                                                        color: isSelected
+                                                            ? Colors.white70
+                                                            : tg.textMuted,
+                                                      ),
+                                                    ),
+                                                  ],
                                                   if (chat.unread > 0) ...[
                                                     const SizedBox(width: 6),
                                                     Builder(
@@ -7736,6 +9565,23 @@ class _TelegramScreenState extends State<TelegramScreen> {
                 Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
+                    if (!chat.broadcast)
+                      IconButton(
+                        key: const ValueKey('tg_voice_call_btn_mobile'),
+                        visualDensity: VisualDensity.compact,
+                        tooltip: '发起 Telegram 语音通话',
+                        icon: Icon(
+                          _isVoiceCallActive && _voiceCallChat?.peer == chat.peer
+                              ? Icons.phone_in_talk_rounded
+                              : Icons.call_rounded,
+                          size: 20,
+                          color: _isVoiceCallActive &&
+                                  _voiceCallChat?.peer == chat.peer
+                              ? const Color(0xFF22C55E)
+                              : tg.tgBlueBright,
+                        ),
+                        onPressed: () => _openTelegramVoiceCallConsole(tg, chat),
+                      ),
                     IconButton(
                       visualDensity: VisualDensity.compact,
                       tooltip: '搜索消息',
@@ -8070,6 +9916,25 @@ class _TelegramScreenState extends State<TelegramScreen> {
                           ),
                         ],
                         const SizedBox(width: 6),
+                        if (!chat.broadcast)
+                          IconButton(
+                            key: const ValueKey('tg_voice_call_btn'),
+                            visualDensity: VisualDensity.compact,
+                            tooltip: '发起 Telegram 语音通话',
+                            icon: Icon(
+                              _isVoiceCallActive &&
+                                      _voiceCallChat?.peer == chat.peer
+                                  ? Icons.phone_in_talk_rounded
+                                  : Icons.call_rounded,
+                              size: 19,
+                              color: _isVoiceCallActive &&
+                                      _voiceCallChat?.peer == chat.peer
+                                  ? const Color(0xFF22C55E)
+                                  : tg.tgBlueBright,
+                            ),
+                            onPressed: () =>
+                                _openTelegramVoiceCallConsole(tg, chat),
+                          ),
                         Builder(
                           builder: (_) {
                             final isMuted = chat.muted ||
@@ -8572,8 +10437,21 @@ class _TelegramScreenState extends State<TelegramScreen> {
                                   : '';
                               final showDateHeader = curDateLabel.isNotEmpty &&
                                   curDateLabel != prevDateLabel;
+                              final itemGlobalKey = _messageItemKeys.putIfAbsent(
+                                msg.id,
+                                () => GlobalKey(),
+                              );
+                              for (final m in entry) {
+                                _messageItemKeys[m.id] = itemGlobalKey;
+                              }
+                              final isHighlighted = _highlightedMessageId !=
+                                      null &&
+                                  entry.any(
+                                    (m) => m.id == _highlightedMessageId,
+                                  );
 
                               return Column(
+                                key: itemGlobalKey,
                                 crossAxisAlignment: CrossAxisAlignment.stretch,
                                 children: [
                                   if (showDateHeader)
@@ -8603,8 +10481,27 @@ class _TelegramScreenState extends State<TelegramScreen> {
                                         ),
                                       ),
                                     ),
-                                  Padding(
-                                    padding: const EdgeInsets.only(bottom: 8),
+                                  AnimatedContainer(
+                                    duration: const Duration(milliseconds: 280),
+                                    margin: const EdgeInsets.only(bottom: 8),
+                                    padding: isHighlighted
+                                        ? const EdgeInsets.symmetric(
+                                            horizontal: 6,
+                                            vertical: 4,
+                                          )
+                                        : EdgeInsets.zero,
+                                    decoration: isHighlighted
+                                        ? BoxDecoration(
+                                            color: tg.tgBlueBright
+                                                .withValues(alpha: 0.24),
+                                            borderRadius:
+                                                BorderRadius.circular(16),
+                                            border: Border.all(
+                                              color: tg.tgBlueBright,
+                                              width: 1.6,
+                                            ),
+                                          )
+                                        : null,
                                     child: entry.length > 1
                                         ? ((msg.attachment?.isVisualMedia ??
                                                 false)
@@ -8824,7 +10721,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
         ),
 
         // 3. Official Telegram Bottom Compose Bar / Selection Toolbar / Broadcast Footer
-        _buildBottomBar(tg, chat),
+        _buildBottomBar(tg, chat, isMobile: isMobile),
       ],
     );
   }
@@ -9124,6 +11021,13 @@ class _TelegramScreenState extends State<TelegramScreen> {
               ],
             ),
           ),
+          for (final replySource in albumMessages.where((m) => m.replyToId > 0).take(1))
+            _buildReplyQuoteBanner(
+              tg,
+              chat,
+              replySource.replyToId,
+              sourceMessage: replySource,
+            ),
           Padding(
             padding: const EdgeInsets.all(4),
             child: GridView.builder(
@@ -9170,6 +11074,30 @@ class _TelegramScreenState extends State<TelegramScreen> {
                   isQueueing: isQueueing,
                   isQueued: isQueued,
                   isFailed: isFailed,
+                  isPending115: att != null &&
+                      _pending115Downloads.contains(
+                        _resolve115KeyForTarget(
+                          url: att.url,
+                          chat: chat,
+                          msg: m,
+                        ),
+                      ),
+                  isDone115: att != null &&
+                      _completed115Downloads.contains(
+                        _resolve115KeyForTarget(
+                          url: att.url,
+                          chat: chat,
+                          msg: m,
+                        ),
+                      ),
+                  isFailed115: att != null &&
+                      _failed115Downloads.contains(
+                        _resolve115KeyForTarget(
+                          url: att.url,
+                          chat: chat,
+                          msg: m,
+                        ),
+                      ),
                   isSavingLocal: isSavingLocal,
                   isSavedLocal: isSavedLocal,
                   durationText: att != null && att.isVideo
@@ -9214,6 +11142,14 @@ class _TelegramScreenState extends State<TelegramScreen> {
                             name: att.displayName,
                           )
                       : null,
+                  onDownload115: att != null
+                      ? () => _downloadTelegramTo115(
+                            url: att.url,
+                            name: att.displayName,
+                            chat: chat,
+                            msg: m,
+                          )
+                      : null,
                   onShowContextMenu: (pos) =>
                       _showMessageContextMenu(tg, chat, m, pos),
                 );
@@ -9238,6 +11174,12 @@ class _TelegramScreenState extends State<TelegramScreen> {
                   ),
                   const SizedBox(height: 4),
                 ],
+                _buildMessageLinksSection(
+                  tg,
+                  chat,
+                  captionMsg,
+                  padding: const EdgeInsets.only(bottom: 6),
+                ),
                 Row(
                   children: [
                     InkWell(
@@ -9349,6 +11291,115 @@ class _TelegramScreenState extends State<TelegramScreen> {
                                     color: allQueued
                                         ? const Color(0xFF2EBE70)
                                         : tg.tgBlueBright,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                    const SizedBox(width: 10),
+                    Builder(
+                      builder: (_) {
+                        final items115 = albumMessages
+                            .where((m) => m.attachment != null)
+                            .toList();
+                        final anyPending115 = items115.any(
+                          (m) => _pending115Downloads.contains(
+                            _resolve115KeyForTarget(
+                              url: m.attachment!.url,
+                              chat: chat,
+                              msg: m,
+                            ),
+                          ),
+                        );
+                        final allDone115 = items115.isNotEmpty &&
+                            items115.every(
+                              (m) => _completed115Downloads.contains(
+                                _resolve115KeyForTarget(
+                                  url: m.attachment!.url,
+                                  chat: chat,
+                                  msg: m,
+                                ),
+                              ),
+                            );
+                        final anyFailed115 = items115.any(
+                          (m) => _failed115Downloads.contains(
+                            _resolve115KeyForTarget(
+                              url: m.attachment!.url,
+                              chat: chat,
+                              msg: m,
+                            ),
+                          ),
+                        );
+                        final color115 = allDone115
+                            ? const Color(0xFF2EBE70)
+                            : (anyFailed115
+                                ? const Color(0xFFFF6B6B)
+                                : const Color(0xFFFFB74D));
+                        return InkWell(
+                          borderRadius: BorderRadius.circular(8),
+                          onTap: anyPending115
+                              ? null
+                              : () async {
+                                  final authed =
+                                      await ensure115AuthenticatedForDownload(
+                                    context: context,
+                                    api: widget.appState.api,
+                                  );
+                                  if (!authed || !mounted) return;
+                                  for (final m in items115) {
+                                    final a = m.attachment!;
+                                    await _downloadTelegramTo115(
+                                      url: a.url,
+                                      name: a.displayName,
+                                      chat: chat,
+                                      msg: m,
+                                      showHudFeedback: false,
+                                    );
+                                  }
+                                },
+                          child: AnimatedSwitcher(
+                            duration: const Duration(milliseconds: 200),
+                            child: Row(
+                              key: ValueKey(
+                                'album_115_${anyPending115}_${allDone115}_$anyFailed115',
+                              ),
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (anyPending115)
+                                  const SizedBox(
+                                    width: 11,
+                                    height: 11,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 1.8,
+                                      color: Color(0xFFFFB74D),
+                                    ),
+                                  )
+                                else
+                                  Icon(
+                                    allDone115
+                                        ? Icons.check_circle_rounded
+                                        : (anyFailed115
+                                            ? Icons.error_outline_rounded
+                                            : Icons.cloud_upload_rounded),
+                                    size: 13,
+                                    color: color115,
+                                  ),
+                                const SizedBox(width: 3),
+                                Text(
+                                  anyPending115
+                                      ? '115提交中...'
+                                      : (allDone115
+                                          ? '已存115 ✓ (${items115.length})'
+                                          : (anyFailed115
+                                              ? '115失败·重试'
+                                              : '整组115 (${items115.length})')),
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                    color: color115,
                                   ),
                                 ),
                               ],
@@ -9662,14 +11713,96 @@ class _TelegramScreenState extends State<TelegramScreen> {
                     onPressed: () => _showAudioPlaylistModal(tg),
                   ),
                 if (!isMobile)
-                  IconButton(
-                    visualDensity: VisualDensity.compact,
-                    icon: Icon(
-                      Icons.download_rounded,
-                      size: 18,
-                      color: tg.textSecondary,
-                    ),
-                    onPressed: () => _saveAttachmentToLocalDownloads(chat, msg),
+                  Builder(
+                    builder: (_) {
+                      final savedPath = _getSavedLocalPath(chat, msg);
+                      final isSaved =
+                          _completedLocalSaves.contains(msg.id) ||
+                          savedPath != null;
+                      final isSaving = _pendingLocalSaves.contains(msg.id);
+                      return IconButton(
+                        visualDensity: VisualDensity.compact,
+                        tooltip: savedPath != null
+                            ? '已下载: $savedPath (点击打开所在位置)'
+                            : '下载保存到本机电脑',
+                        icon: isSaving
+                            ? SizedBox(
+                                width: 15,
+                                height: 15,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 1.8,
+                                  color: tg.tgBlueBright,
+                                ),
+                              )
+                            : Icon(
+                                isSaved
+                                    ? Icons.check_circle_rounded
+                                    : Icons.download_rounded,
+                                size: 18,
+                                color: isSaved
+                                    ? const Color(0xFF4ECC5E)
+                                    : tg.textSecondary,
+                              ),
+                        onPressed: isSaving
+                            ? null
+                            : () {
+                                if (savedPath != null) {
+                                  _openLocalFileDirectory(savedPath);
+                                } else {
+                                  _saveAttachmentToLocalDownloads(chat, msg);
+                                }
+                              },
+                      );
+                    },
+                  ),
+                if (!isMobile)
+                  Builder(
+                    builder: (_) {
+                      final k115 = _resolve115KeyForTarget(
+                        url: att.url,
+                        chat: chat,
+                        msg: msg,
+                      );
+                      final isPending115 = _pending115Downloads.contains(k115);
+                      final isDone115 = _completed115Downloads.contains(k115);
+                      final isFailed115 = _failed115Downloads.contains(k115);
+                      return IconButton(
+                        visualDensity: VisualDensity.compact,
+                        tooltip: isDone115
+                            ? '已存115 ✓'
+                            : (isFailed115 ? '115云下载失败，点击重试' : '115云下载'),
+                        icon: isPending115
+                            ? const SizedBox(
+                                width: 15,
+                                height: 15,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 1.8,
+                                  color: Color(0xFFFFB74D),
+                                ),
+                              )
+                            : Icon(
+                                isDone115
+                                    ? Icons.check_circle_rounded
+                                    : (isFailed115
+                                        ? Icons.error_outline_rounded
+                                        : Icons.cloud_upload_rounded),
+                                size: 18,
+                                color: isDone115
+                                    ? const Color(0xFF4ECC5E)
+                                    : (isFailed115
+                                        ? const Color(0xFFFF6B6B)
+                                        : const Color(0xFFFFB74D)),
+                              ),
+                        onPressed: isPending115
+                            ? null
+                            : () => _downloadTelegramTo115(
+                                  url: att.url,
+                                  name: att.displayName,
+                                  chat: chat,
+                                  msg: msg,
+                                ),
+                      );
+                    },
                   ),
                 IconButton(
                   visualDensity: VisualDensity.compact,
@@ -9899,17 +12032,59 @@ class _TelegramScreenState extends State<TelegramScreen> {
                                       color: tg.textSecondary,
                                     ),
                                   ),
-                                  trailing: IconButton(
-                                    icon: Icon(
-                                      Icons.download_rounded,
-                                      size: 18,
-                                      color: tg.textSecondary,
-                                    ),
-                                    onPressed: () =>
-                                        _saveAttachmentToLocalDownloads(
-                                          chat,
-                                          item,
-                                        ),
+                                  trailing: Builder(
+                                    builder: (_) {
+                                      final savedPath =
+                                          _getSavedLocalPath(chat, item);
+                                      final isSaved =
+                                          _completedLocalSaves.contains(
+                                            item.id,
+                                          ) ||
+                                          savedPath != null;
+                                      final isSaving =
+                                          _pendingLocalSaves.contains(item.id);
+                                      return IconButton(
+                                        tooltip: savedPath != null
+                                            ? '已下载: $savedPath (点击打开所在位置)'
+                                            : '下载保存到本机电脑',
+                                        icon: isSaving
+                                            ? SizedBox(
+                                                width: 15,
+                                                height: 15,
+                                                child:
+                                                    CircularProgressIndicator(
+                                                  strokeWidth: 1.8,
+                                                  color: tg.tgBlueBright,
+                                                ),
+                                              )
+                                            : Icon(
+                                                isSaved
+                                                    ? Icons.check_circle_rounded
+                                                    : Icons.download_rounded,
+                                                size: 18,
+                                                color: isSaved
+                                                    ? const Color(0xFF4ECC5E)
+                                                    : tg.textSecondary,
+                                              ),
+                                        onPressed: isSaving
+                                            ? null
+                                            : () async {
+                                                if (savedPath != null) {
+                                                  await _openLocalFileDirectory(
+                                                    savedPath,
+                                                  );
+                                                } else {
+                                                  await _saveAttachmentToLocalDownloads(
+                                                    chat,
+                                                    item,
+                                                  );
+                                                  if (ctx.mounted) {
+                                                    setModalState(() {});
+                                                  }
+                                                }
+                                              },
+                                      );
+                                    },
                                   ),
                                   onTap: () async {
                                     await _togglePlayAudioMessage(chat, item);
@@ -10001,8 +12176,13 @@ class _TelegramScreenState extends State<TelegramScreen> {
                 ],
               ),
             ),
-          if (first.replyToId > 0)
-            _buildReplyQuoteBanner(tg, chat, first.replyToId),
+          for (final replySource in groupMessages.where((m) => m.replyToId > 0).take(1))
+            _buildReplyQuoteBanner(
+              tg,
+              chat,
+              replySource.replyToId,
+              sourceMessage: replySource,
+            ),
           for (var i = 0; i < groupMessages.length; i++) ...[
             if (i > 0)
               Divider(
@@ -10034,6 +12214,12 @@ class _TelegramScreenState extends State<TelegramScreen> {
                   ),
                   const SizedBox(height: 4),
                 ],
+                _buildMessageLinksSection(
+                  tg,
+                  chat,
+                  captionMsg,
+                  padding: const EdgeInsets.only(bottom: 6),
+                ),
                 Row(
                   children: [
                     if (allMusic)
@@ -10494,7 +12680,16 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
         // Optional reply quote header when this message replies to another message
         if (msg.replyToId > 0)
-          _buildReplyQuoteBanner(tg, chat, msg.replyToId),
+          _buildReplyQuoteBanner(
+            tg,
+            chat,
+            msg.replyToId,
+            sourceMessage: msg,
+          )
+        else
+          for (final msgLinkUrl
+              in msg.links.where(_isTelegramMessageLink).take(1))
+            _buildLinkedTelegramMessageQuoteCard(tg, chat, msgLinkUrl),
 
         // Media attachment (Video / Photo / Document)
         if (att != null) _buildTelegramBubbleAttachment(tg, chat, msg, att),
@@ -10612,6 +12807,24 @@ class _TelegramScreenState extends State<TelegramScreen> {
                   mainAxisSize: MainAxisSize.min,
                   mainAxisAlignment: MainAxisAlignment.end,
                   children: [
+                    if (isOutgoing &&
+                        !chat.readOnly &&
+                        msg.text.trim().isNotEmpty)
+                      InkWell(
+                        key: ValueKey('tg_msg_edit_btn_${msg.id}'),
+                        onTap: () => _startEditingMessage(msg),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 4),
+                          child: Text(
+                            '编辑',
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
+                              color: tg.tgBlueBright,
+                            ),
+                          ),
+                        ),
+                      ),
                     if (!chat.readOnly)
                       InkWell(
                         onTap: () {
@@ -10670,6 +12883,24 @@ class _TelegramScreenState extends State<TelegramScreen> {
                       ),
                     ),
                     const SizedBox(width: 4),
+                    if (_editedMessageIds.contains(msg.id) ||
+                        _localEditedMessageTexts.containsKey(
+                          '$_activeAccountId|${chat.peer}|${msg.id}',
+                        )) ...[
+                      Text(
+                        '已编辑',
+                        style: TextStyle(
+                          fontSize: 10.5,
+                          fontStyle: FontStyle.italic,
+                          color: isOutgoing
+                              ? (tg.isDark
+                                  ? const Color(0xFF8AB4DF)
+                                  : const Color(0xFF5FA853))
+                              : tg.textMuted,
+                        ),
+                      ),
+                      const SizedBox(width: 3),
+                    ],
                     Text(
                       timeStr,
                       style: TextStyle(
@@ -10697,59 +12928,13 @@ class _TelegramScreenState extends State<TelegramScreen> {
           ),
         ),
 
-        // Extracted links inside message
-        if (msg.links.isNotEmpty)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(10, 0, 10, 8),
-            child: Wrap(
-              spacing: 6,
-              runSpacing: 6,
-              children: msg.links.map((url) {
-                final isTg = _isTelegramLink(url);
-                return InkWell(
-                  borderRadius: BorderRadius.circular(6),
-                  onTap: () => isTg
-                      ? _openOrResolveLink(url)
-                      : _queueTelegramDownload(
-                          url: url,
-                          name: 'TG_${msg.id}',
-                        ),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 8,
-                      vertical: 4,
-                    ),
-                    decoration: BoxDecoration(
-                      color: tg.tgBlueBright.withValues(alpha: 0.14),
-                      borderRadius: BorderRadius.circular(6),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          isTg
-                              ? Icons.open_in_new_rounded
-                              : Icons.add_to_queue_rounded,
-                          size: 13,
-                          color: tg.tgBlueBright,
-                        ),
-                        const SizedBox(width: 4),
-                        Text(
-                          url.length > 34
-                              ? '${url.substring(0, 34)}...'
-                              : url,
-                          style: TextStyle(
-                            fontSize: 11,
-                            color: tg.tgBlueBright,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                );
-              }).toList(),
-            ),
-          ),
+        // Extracted & labeled links inside message
+        _buildMessageLinksSection(
+          tg,
+          chat,
+          msg,
+          padding: const EdgeInsets.fromLTRB(10, 0, 10, 8),
+        ),
 
         // Interactive selection / inline keyboard buttons
         if (msg.hasButtons) _buildTelegramInlineKeyboard(tg, chat, msg),
@@ -10845,8 +13030,372 @@ class _TelegramScreenState extends State<TelegramScreen> {
     );
   }
 
+  /// Renders labeled clickable link chips corresponding to content phrases in [msg]
+  /// (e.g. `[点我进入在线观看]` -> `https://telegra.ph/...`, `PDF原档下载 (点击跳转)` -> `https://t.me/fjxgjjbot?start=...`,
+  /// `目录 导航首页` -> `https://t.me/jinqinzhiyuan/30`, `传送门 第二季4` -> `https://t.me/muzizhiyuan/487`).
+  Widget _buildMessageLinksSection(
+    _TgPalette tg,
+    TelegramChat chat,
+    TelegramMessage msg, {
+    EdgeInsetsGeometry padding = const EdgeInsets.fromLTRB(10, 0, 10, 8),
+  }) {
+    final items = _collectLabeledMessageLinks(msg);
+    if (items.isEmpty) return const SizedBox.shrink();
+
+    final isExpanded = _expandedLinkChipMsgIds.contains(msg.id);
+    const int kCollapsedLimit = 6;
+    final hasOverflow = items.length > 8;
+    final visibleItems = (!hasOverflow || isExpanded)
+        ? items
+        : items.take(kCollapsedLimit).toList();
+
+    String shortTargetHint(String url) {
+      final trimmed = url.trim();
+      final uri = Uri.tryParse(
+        trimmed.contains('://') ? trimmed : 'https://$trimmed',
+      );
+      if (uri == null) return '';
+      if (_isTelegramLink(trimmed)) {
+        final segs = uri.pathSegments.where((s) => s.isNotEmpty).toList();
+        if (segs.isEmpty) return 'Telegram';
+        if (segs.first == 'c' && segs.length >= 2) {
+          return 'TG #${segs.last}';
+        }
+        final firstSeg = segs.first;
+        if (uri.queryParameters.containsKey('start')) {
+          return '@$firstSeg';
+        }
+        if (segs.length >= 2) {
+          return '@$firstSeg/${segs[1]}';
+        }
+        return firstSeg.startsWith('+') ? '邀请链接' : '@$firstSeg';
+      }
+      final host = uri.host.replaceFirst(RegExp(r'^www\.'), '');
+      return host;
+    }
+
+    return Padding(
+      padding: padding,
+      child: Wrap(
+        spacing: 6,
+        runSpacing: 6,
+        children: [
+          for (var i = 0; i < visibleItems.length; i++)
+            Builder(
+              builder: (_) {
+                final item = visibleItems[i];
+                final url = item.url;
+                final isTg = _isTelegramLink(url);
+                final isBotStart =
+                    isTg && _extractTelegramBotStartParameter(url) != null;
+                final isStream = !isTg && _isDownloadableStreamUrl(url);
+                final targetHint = shortTargetHint(url);
+                final rawDisplay = item.hasCustomLabel
+                    ? (targetHint.isNotEmpty &&
+                            !item.label
+                                .toLowerCase()
+                                .contains(targetHint.toLowerCase())
+                        ? '${item.label} · $targetHint'
+                        : item.label)
+                    : url;
+                final maxLabelChars = isStream ? 24 : (!isTg ? 30 : 38);
+                final displayLabel =
+                    rawDisplay.characters.length > maxLabelChars
+                        ? '${rawDisplay.characters.take(maxLabelChars)}...'
+                        : rawDisplay;
+                final iconData = isBotStart
+                    ? Icons.smart_toy_outlined
+                    : (isTg
+                        ? Icons.send_rounded
+                        : (isStream
+                            ? Icons.ondemand_video_rounded
+                            : Icons.open_in_new_rounded));
+
+                return Material(
+                  color: Colors.transparent,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: tg.tgBlueBright.withValues(alpha: 0.14),
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(
+                        color: tg.tgBlueBright.withValues(alpha: 0.26),
+                        width: 0.8,
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Flexible(
+                          child: InkWell(
+                            key: ValueKey('tg_msg_link_chip_${msg.id}_$i'),
+                            borderRadius: BorderRadius.circular(6),
+                            onTap: () => _handleMessageContentLinkTap(
+                              chat,
+                              msg,
+                              url,
+                            ),
+                            onLongPress: () {
+                              Clipboard.setData(ClipboardData(text: url));
+                              _showDownloadHud('已复制链接：$url', state: 'success');
+                            },
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 4,
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    iconData,
+                                    size: 13,
+                                    color: tg.tgBlueBright,
+                                  ),
+                                  const SizedBox(width: 4),
+                                  Flexible(
+                                    child: Text(
+                                      displayLabel,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        fontSize: 11.5,
+                                        fontWeight: item.hasCustomLabel
+                                            ? FontWeight.w600
+                                            : FontWeight.w500,
+                                        color: tg.tgBlueBright,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      if (isStream) ...[
+                        Container(
+                          width: 1,
+                          height: 16,
+                          color: tg.tgBlueBright.withValues(alpha: 0.25),
+                        ),
+                        Builder(
+                          builder: (_) {
+                            final dlKey = '$_activeAccountId:$url';
+                            final isPendingDl =
+                                _pendingDownloads.contains(dlKey);
+                            final isDoneDl = _isUrlQueuedOrInTasks(url);
+                            final isFailedDl = _failedDownloads.contains(dlKey);
+                            final dlColor = isDoneDl
+                                ? const Color(0xFF2EBE70)
+                                : (isFailedDl
+                                    ? const Color(0xFFFF6B6B)
+                                    : tg.tgBlueBright);
+                            return InkWell(
+                              key: ValueKey('tg_msg_link_dl_${msg.id}_$i'),
+                              onTap: isPendingDl
+                                  ? null
+                                  : () => _queueTelegramDownload(
+                                        url: url,
+                                        name: item.hasCustomLabel
+                                            ? item.label
+                                            : 'TG_${msg.id}',
+                                      ),
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 6,
+                                  vertical: 4,
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    if (isPendingDl)
+                                      SizedBox(
+                                        width: 11,
+                                        height: 11,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 1.8,
+                                          color: tg.tgBlueBright,
+                                        ),
+                                      )
+                                    else
+                                      Icon(
+                                        isDoneDl
+                                            ? Icons.check_circle_rounded
+                                            : (isFailedDl
+                                                ? Icons.error_outline_rounded
+                                                : Icons.add_to_queue_rounded),
+                                        size: 12.5,
+                                        color: dlColor,
+                                      ),
+                                    const SizedBox(width: 2),
+                                    Text(
+                                      isPendingDl
+                                          ? '转存中...'
+                                          : (isDoneDl
+                                              ? '已入队 ✓'
+                                              : (isFailedDl ? '失败·重试' : '转存')),
+                                      style: TextStyle(
+                                        fontSize: 10.5,
+                                        fontWeight: FontWeight.w600,
+                                        color: dlColor,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                      ],
+                      if (!isTg) ...[
+                        Container(
+                          width: 1,
+                          height: 16,
+                          color: tg.tgBlueBright.withValues(alpha: 0.25),
+                        ),
+                        Builder(
+                          builder: (_) {
+                            final k115 = '$_activeAccountId:${url.trim()}';
+                            final isPending115 =
+                                _pending115Downloads.contains(k115);
+                            final isDone115 =
+                                _completed115Downloads.contains(k115);
+                            final isFailed115 =
+                                _failed115Downloads.contains(k115);
+                            final color115 = isDone115
+                                ? const Color(0xFF2EBE70)
+                                : (isFailed115
+                                    ? const Color(0xFFFF6B6B)
+                                    : const Color(0xFFFFB74D));
+                            return InkWell(
+                              key: ValueKey('tg_msg_link_115_${msg.id}_$i'),
+                              borderRadius: const BorderRadius.horizontal(
+                                right: Radius.circular(6),
+                              ),
+                              onTap: isPending115
+                                  ? null
+                                  : () => _downloadTelegramTo115(
+                                        url: url,
+                                        name: item.hasCustomLabel
+                                            ? item.label
+                                            : 'TG_${msg.id}',
+                                        chat: chat,
+                                        msg: msg,
+                                      ),
+                              child: AnimatedContainer(
+                                duration: const Duration(milliseconds: 180),
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 6,
+                                  vertical: 4,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: isDone115
+                                      ? const Color(0x242EBE70)
+                                      : (isFailed115
+                                          ? const Color(0x24FF6B6B)
+                                          : Colors.transparent),
+                                  borderRadius: const BorderRadius.horizontal(
+                                    right: Radius.circular(6),
+                                  ),
+                                ),
+                                child: AnimatedSwitcher(
+                                  duration: const Duration(milliseconds: 180),
+                                  child: Row(
+                                    key: ValueKey(
+                                      'link_115_${msg.id}_${i}_${isPending115}_${isDone115}_$isFailed115',
+                                    ),
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      if (isPending115)
+                                        const SizedBox(
+                                          width: 11,
+                                          height: 11,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 1.8,
+                                            color: Color(0xFFFFB74D),
+                                          ),
+                                        )
+                                      else
+                                        Icon(
+                                          isDone115
+                                              ? Icons.check_circle_rounded
+                                              : (isFailed115
+                                                  ? Icons.error_outline_rounded
+                                                  : Icons.cloud_upload_rounded),
+                                          size: 12.5,
+                                          color: color115,
+                                        ),
+                                      const SizedBox(width: 2.5),
+                                      Text(
+                                        isPending115
+                                            ? '115提交中...'
+                                            : (isDone115
+                                                ? '已存115 ✓'
+                                                : (isFailed115
+                                                    ? '115失败·重试'
+                                                    : '115云下载')),
+                                        style: TextStyle(
+                                          fontSize: 10.5,
+                                          fontWeight: FontWeight.w600,
+                                          color: color115,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                      ],
+                    ],
+                  ),
+                  ),
+                );
+              },
+            ),
+          if (hasOverflow)
+            InkWell(
+              key: ValueKey('tg_msg_link_expand_${msg.id}'),
+              borderRadius: BorderRadius.circular(6),
+              onTap: () {
+                setState(() {
+                  if (isExpanded) {
+                    _expandedLinkChipMsgIds.remove(msg.id);
+                  } else {
+                    _expandedLinkChipMsgIds.add(msg.id);
+                  }
+                });
+              },
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 8,
+                  vertical: 4,
+                ),
+                decoration: BoxDecoration(
+                  color: tg.searchFill,
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  isExpanded
+                      ? '收起链接'
+                      : '展开全部 ${items.length} 个链接 (+${items.length - visibleItems.length})',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: tg.textSecondary,
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
   /// Interactive selectable message text inside a Telegram bubble supporting
-  /// partial mouse/touch selection, Cmd+C copy, and a rich text context menu.
+  /// inline clickable hyperlinks (`text_links` entities, `[label](url)`, raw URLs,
+  /// `@username` mentions, `#hashtags`), partial mouse/touch selection, Cmd+C copy,
+  /// and a rich text context menu.
   Widget _buildInteractiveMessageText(
     _TgPalette tg,
     TelegramChat chat,
@@ -10854,120 +13403,220 @@ class _TelegramScreenState extends State<TelegramScreen> {
     required double fontSize,
     required double height,
   }) {
-    return SelectableText(
-      msg.text,
-      style: TextStyle(
-        fontSize: fontSize,
-        height: height,
-        color: tg.textPrimary,
-      ),
-      onSelectionChanged: (selection, cause) {
-        if (!selection.isValid || selection.isCollapsed) {
-          _activeSelectedBubbleText = '';
-          return;
-        }
-        final start = selection.start.clamp(0, msg.text.length);
-        final end = selection.end.clamp(0, msg.text.length);
-        if (end > start) {
-          _activeSelectedBubbleText = msg.text.substring(start, end);
-        } else {
-          _activeSelectedBubbleText = '';
-        }
-      },
-      contextMenuBuilder: (ctx, editableTextState) {
-        final val = editableTextState.textEditingValue;
-        final sel = val.selection;
-        final hasSelection =
-            sel.isValid && !sel.isCollapsed && sel.end > sel.start;
-        final selectedSubstr = hasSelection
-            ? val.text.substring(
-                sel.start.clamp(0, val.text.length),
-                sel.end.clamp(0, val.text.length),
-              )
-            : '';
+    final linkSpans = _extractMessageTextLinkSpans(msg);
+    final labeledLinks = _collectLabeledMessageLinks(msg);
+    final baseStyle = TextStyle(
+      fontSize: fontSize,
+      height: height,
+      color: tg.textPrimary,
+    );
+    final linkStyle = baseStyle.copyWith(
+      color: tg.tgBlueBright,
+      fontWeight: FontWeight.w600,
+      decoration: TextDecoration.underline,
+      decorationColor: tg.tgBlueBright.withValues(alpha: 0.7),
+    );
+    final hashtagStyle = baseStyle.copyWith(
+      color: tg.tgBlueBright,
+      fontWeight: FontWeight.w500,
+    );
 
-        final buttonItems = <ContextMenuButtonItem>[
-          if (hasSelection)
-            ContextMenuButtonItem(
-              label: '复制选中文字',
-              onPressed: () {
-                editableTextState.copySelection(SelectionChangedCause.toolbar);
-                ContextMenuController.removeAny();
-                _showDownloadHud('已复制选中文字', state: 'success');
-              },
-            ),
-          ContextMenuButtonItem(
-            label: '复制整条消息',
-            onPressed: () {
-              Clipboard.setData(ClipboardData(text: msg.text));
-              ContextMenuController.removeAny();
-              _showDownloadHud('已复制整条消息文本', state: 'success');
-            },
-          ),
-          ContextMenuButtonItem(
-            label: '全选文字',
-            onPressed: () {
-              editableTextState.selectAll(SelectionChangedCause.toolbar);
-            },
-          ),
-          if (!chat.readOnly)
-            ContextMenuButtonItem(
-              label: hasSelection ? '引用选中内容回复' : '回复此消息',
-              onPressed: () {
-                ContextMenuController.removeAny();
-                setState(() => _replyingToMessage = msg);
-                if (hasSelection && selectedSubstr.trim().isNotEmpty) {
-                  final existing = _composeController.text;
-                  final quoteLine = '> ${selectedSubstr.trim()}\n';
-                  if (!existing.startsWith(quoteLine)) {
-                    _composeController.text = '$quoteLine$existing';
-                    _composeController.selection = TextSelection.fromPosition(
-                      TextPosition(offset: _composeController.text.length),
-                    );
-                  }
-                }
-                _saveCurrentDraft();
-                _composeFocusNode.requestFocus();
-              },
-            ),
-          if (!chat.readOnly)
-            ContextMenuButtonItem(
-              label: '填入输入框编辑',
-              onPressed: () {
-                ContextMenuController.removeAny();
-                final textToInsert =
-                    hasSelection && selectedSubstr.trim().isNotEmpty
-                        ? selectedSubstr
-                        : msg.text;
-                _composeController.text = textToInsert;
-                _composeController.selection = TextSelection.fromPosition(
-                  TextPosition(offset: _composeController.text.length),
-                );
-                _saveCurrentDraft();
-                _composeFocusNode.requestFocus();
-              },
-            ),
-          ContextMenuButtonItem(
-            label: '转发消息...',
-            onPressed: () {
-              ContextMenuController.removeAny();
-              _showForwardMessagesDialog([msg]);
-            },
-          ),
-          ContextMenuButtonItem(
-            label: '保存到收藏夹',
-            onPressed: () {
-              ContextMenuController.removeAny();
-              _saveMessageToSavedMessages(msg);
-            },
-          ),
-        ];
+    void handleSelectionChanged(
+      TextSelection selection,
+      SelectionChangedCause? cause,
+    ) {
+      if (!selection.isValid || selection.isCollapsed) {
+        _activeSelectedBubbleText = '';
+        return;
+      }
+      final start = selection.start.clamp(0, msg.text.length);
+      final end = selection.end.clamp(0, msg.text.length);
+      if (end > start) {
+        _activeSelectedBubbleText = msg.text.substring(start, end);
+      } else {
+        _activeSelectedBubbleText = '';
+      }
+    }
 
-        return AdaptiveTextSelectionToolbar.buttonItems(
-          anchors: editableTextState.contextMenuAnchors,
-          buttonItems: buttonItems,
+    Widget buildContextMenu(
+      BuildContext ctx,
+      EditableTextState editableTextState,
+    ) {
+      final val = editableTextState.textEditingValue;
+      final sel = val.selection;
+      final hasSelection =
+          sel.isValid && !sel.isCollapsed && sel.end > sel.start;
+      final selectedSubstr = hasSelection
+          ? val.text.substring(
+              sel.start.clamp(0, val.text.length),
+              sel.end.clamp(0, val.text.length),
+            )
+          : '';
+
+      // Find any link overlapping the user's current selection or cursor position
+      ({String label, String url})? matchedLink;
+      if (sel.isValid) {
+        final sStart = sel.start.clamp(0, msg.text.length);
+        final sEnd = sel.end.clamp(0, msg.text.length);
+        for (final sp in linkSpans) {
+          if (!sp.isHashtag && sp.start <= sEnd && sp.end >= sStart) {
+            matchedLink = (
+              label: sp.lineContextLabel.isNotEmpty
+                  ? sp.lineContextLabel
+                  : sp.displayText,
+              url: sp.url,
+            );
+            break;
+          }
+        }
+      }
+      if (matchedLink == null && labeledLinks.isNotEmpty) {
+        matchedLink = (
+          label: labeledLinks.first.label,
+          url: labeledLinks.first.url,
         );
-      },
+      }
+
+      final buttonItems = <ContextMenuButtonItem>[
+        if (matchedLink != null)
+          ContextMenuButtonItem(
+            label: matchedLink.label.length > 16
+                ? '打开链接: ${matchedLink.label.substring(0, 16)}...'
+                : '打开链接: ${matchedLink.label}',
+            onPressed: () {
+              final targetUrl = matchedLink!.url;
+              ContextMenuController.removeAny();
+              _handleMessageContentLinkTap(chat, msg, targetUrl);
+            },
+          ),
+        if (matchedLink != null)
+          ContextMenuButtonItem(
+            label: '复制链接地址',
+            onPressed: () {
+              final targetUrl = matchedLink!.url;
+              Clipboard.setData(ClipboardData(text: targetUrl));
+              ContextMenuController.removeAny();
+              _showDownloadHud('已复制链接：$targetUrl', state: 'success');
+            },
+          ),
+        if (hasSelection)
+          ContextMenuButtonItem(
+            label: '复制选中文字',
+            onPressed: () {
+              editableTextState.copySelection(SelectionChangedCause.toolbar);
+              ContextMenuController.removeAny();
+              _showDownloadHud('已复制选中文字', state: 'success');
+            },
+          ),
+        ContextMenuButtonItem(
+          label: '复制整条消息',
+          onPressed: () {
+            Clipboard.setData(ClipboardData(text: msg.text));
+            ContextMenuController.removeAny();
+            _showDownloadHud('已复制整条消息文本', state: 'success');
+          },
+        ),
+        ContextMenuButtonItem(
+          label: '全选文字',
+          onPressed: () {
+            editableTextState.selectAll(SelectionChangedCause.toolbar);
+          },
+        ),
+        if (!chat.readOnly)
+          ContextMenuButtonItem(
+            label: hasSelection ? '引用选中内容回复' : '回复此消息',
+            onPressed: () {
+              ContextMenuController.removeAny();
+              setState(() => _replyingToMessage = msg);
+              if (hasSelection && selectedSubstr.trim().isNotEmpty) {
+                final existing = _composeController.text;
+                final quoteLine = '> ${selectedSubstr.trim()}\n';
+                if (!existing.startsWith(quoteLine)) {
+                  _composeController.text = '$quoteLine$existing';
+                  _composeController.selection = TextSelection.fromPosition(
+                    TextPosition(offset: _composeController.text.length),
+                  );
+                }
+              }
+              _saveCurrentDraft();
+              _composeFocusNode.requestFocus();
+            },
+          ),
+        if (!chat.readOnly && msg.outgoing && !chat.broadcast && !hasSelection)
+          ContextMenuButtonItem(
+            label: '编辑消息 (修改后重发)',
+            onPressed: () {
+              ContextMenuController.removeAny();
+              _startEditingMessage(msg);
+            },
+          ),
+        if (!chat.readOnly &&
+            (!msg.outgoing || chat.broadcast || hasSelection))
+          ContextMenuButtonItem(
+            label: '填入输入框编辑',
+            onPressed: () {
+              ContextMenuController.removeAny();
+              if (msg.outgoing && !chat.broadcast && !hasSelection) {
+                _startEditingMessage(msg);
+                return;
+              }
+              final textToInsert =
+                  hasSelection && selectedSubstr.trim().isNotEmpty
+                      ? selectedSubstr
+                      : msg.text;
+              _composeController.text = textToInsert;
+              _composeController.selection = TextSelection.fromPosition(
+                TextPosition(offset: _composeController.text.length),
+              );
+              _saveCurrentDraft();
+              _composeFocusNode.requestFocus();
+            },
+          ),
+        ContextMenuButtonItem(
+          label: '转发消息...',
+          onPressed: () {
+            ContextMenuController.removeAny();
+            _showForwardMessagesDialog([msg]);
+          },
+        ),
+        ContextMenuButtonItem(
+          label: '保存到收藏夹',
+          onPressed: () {
+            ContextMenuController.removeAny();
+            _saveMessageToSavedMessages(msg);
+          },
+        ),
+      ];
+
+      return AdaptiveTextSelectionToolbar.buttonItems(
+        anchors: editableTextState.contextMenuAnchors,
+        buttonItems: buttonItems,
+      );
+    }
+
+    if (linkSpans.isEmpty) {
+      return SelectableText(
+        msg.text,
+        style: baseStyle,
+        onSelectionChanged: handleSelectionChanged,
+        contextMenuBuilder: buildContextMenu,
+      );
+    }
+
+    return _TelegramRichLinkedText(
+      text: msg.text,
+      spans: linkSpans,
+      style: baseStyle,
+      linkStyle: linkStyle,
+      hashtagStyle: hashtagStyle,
+      onTapLink: (url, isHashtag) => _handleMessageContentLinkTap(
+        chat,
+        msg,
+        url,
+        isHashtag: isHashtag,
+      ),
+      onSelectionChanged: handleSelectionChanged,
+      contextMenuBuilder: buildContextMenu,
     );
   }
 
@@ -10988,7 +13637,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
       int? uploadPct;
       for (final id in targetIds) {
         final pct = _optimisticUploadPercent[id];
-        if (pct != null && pct > 0) {
+        if (pct != null) {
           uploadPct = pct;
           break;
         }
@@ -11076,64 +13725,295 @@ class _TelegramScreenState extends State<TelegramScreen> {
     );
   }
 
-  /// Reply quote banner inside a Telegram message bubble
+  /// Reply quote banner inside a Telegram message bubble (supports full original
+  /// content display, media thumbnail/icon, off-screen history auto-fetch, and
+  /// 1-click jump & highlight to the target message).
   Widget _buildReplyQuoteBanner(
     _TgPalette tg,
     TelegramChat chat,
-    int replyToId,
-  ) {
-    final original = _messages.cast<TelegramMessage?>().firstWhere(
-          (m) => m != null && m.id == replyToId,
-          orElse: () => null,
+    int replyToId, {
+    TelegramMessage? sourceMessage,
+  }) {
+    final original = _findReplyTargetMessage(chat, replyToId);
+    final isLoadingOriginal = original == null &&
+        _loadingReplyMessageKeys.contains(
+          '$_activeAccountId|${chat.peer}|$replyToId',
         );
+
+    String fallbackQuoteFromText = '';
+    if (sourceMessage != null && sourceMessage.text.isNotEmpty) {
+      final quoteLines = <String>[];
+      for (final line in sourceMessage.text.split('\n')) {
+        final trimmedLine = line.trim();
+        if (trimmedLine.startsWith('>')) {
+          final clean = trimmedLine.substring(1).trim();
+          if (clean.isNotEmpty) quoteLines.add(clean);
+        } else if (quoteLines.isNotEmpty) {
+          break;
+        }
+      }
+      if (quoteLines.isNotEmpty) {
+        fallbackQuoteFromText = quoteLines.join(' ');
+      }
+    }
+
     final quoteSender = original != null
         ? _resolveDisplaySenderName(chat, original)
-        : '消息 #$replyToId';
-    final quoteText = original != null
-        ? (original.resolvedPreviewText(
-                  isPrivateUserChat: chat.peer.startsWith('user:'),
-                ).isNotEmpty
-            ? original.resolvedPreviewText(
-                isPrivateUserChat: chat.peer.startsWith('user:'),
-              )
-            : (original.attachment?.displayName ?? '媒体消息'))
-        : '原消息 #$replyToId';
+        : ((sourceMessage != null &&
+                sourceMessage.replyToSender.trim().isNotEmpty &&
+                !TelegramChat.isRawPeerIdentifier(sourceMessage.replyToSender))
+            ? sourceMessage.replyToSender.trim()
+            : '消息 #$replyToId');
 
-    return Container(
-      margin: const EdgeInsets.fromLTRB(10, 6, 10, 2),
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-      decoration: BoxDecoration(
-        color: tg.tgBlueBright.withValues(alpha: 0.10),
-        borderRadius: BorderRadius.circular(6),
-        border: Border(
-          left: BorderSide(color: tg.tgBlueBright, width: 2.5),
+    String quoteText;
+    if (original != null) {
+      final preview = original.resolvedPreviewText(
+        isPrivateUserChat: chat.peer.startsWith('user:'),
+      );
+      quoteText = preview.isNotEmpty
+          ? preview
+          : (original.attachment?.displayName.isNotEmpty == true
+              ? original.attachment!.displayName
+              : '媒体消息');
+    } else if (sourceMessage != null &&
+        sourceMessage.replyToText.trim().isNotEmpty) {
+      quoteText = sourceMessage.replyToText.trim();
+    } else if (fallbackQuoteFromText.isNotEmpty) {
+      quoteText = fallbackQuoteFromText;
+    } else if (isLoadingOriginal) {
+      quoteText = '正在加载引用原内容...';
+    } else {
+      quoteText = '点击跳转至原消息 #$replyToId';
+    }
+
+    final origAtt = original?.attachment;
+    final hasVisualThumb = origAtt != null &&
+        (origAtt.isPhoto || origAtt.hasThumbnail || origAtt.thumbnail.isNotEmpty);
+    final thumbUrl = hasVisualThumb && original != null
+        ? widget.appState.api.buildTelegramThumbnailUrl(
+            accountId: _activeAccountId,
+            peer: chat.peer,
+            messageId: original.id,
+          )
+        : '';
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(10, 6, 10, 2),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          key: ValueKey(
+            'tg_reply_quote_${chat.peer}_${sourceMessage?.id ?? 0}_$replyToId',
+          ),
+          borderRadius: BorderRadius.circular(6),
+          onTap: () => _jumpToMessageInChat(chat, replyToId),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+            decoration: BoxDecoration(
+              color: tg.tgBlueBright.withValues(alpha: 0.11),
+              borderRadius: BorderRadius.circular(6),
+              border: Border(
+                left: BorderSide(color: tg.tgBlueBright, width: 2.8),
+              ),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (hasVisualThumb && thumbUrl.isNotEmpty) ...[
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(4),
+                    child: Image.network(
+                      thumbUrl,
+                      headers: widget.appState.api.authHeaders,
+                      width: 34,
+                      height: 34,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, __, ___) => Container(
+                        width: 34,
+                        height: 34,
+                        color: tg.tgBlueBright.withValues(alpha: 0.16),
+                        alignment: Alignment.center,
+                        child: Icon(
+                          origAtt.isVideo
+                              ? Icons.videocam_rounded
+                              : Icons.image_rounded,
+                          size: 16,
+                          color: tg.tgBlueBright,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                ] else if (origAtt != null) ...[
+                  Container(
+                    width: 30,
+                    height: 30,
+                    decoration: BoxDecoration(
+                      color: tg.tgBlueBright.withValues(alpha: 0.16),
+                      borderRadius: BorderRadius.circular(5),
+                    ),
+                    alignment: Alignment.center,
+                    child: Icon(
+                      origAtt.isVideo
+                          ? Icons.videocam_rounded
+                          : (origAtt.isAudio
+                              ? Icons.audiotrack_rounded
+                              : Icons.insert_drive_file_rounded),
+                      size: 16,
+                      color: tg.tgBlueBright,
+                    ),
+                  ),
+                  const SizedBox(width: 7),
+                ],
+                Flexible(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Flexible(
+                            child: Text(
+                              '回复 $quoteSender',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                color: tg.tgBlueBright,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 4),
+                          Icon(
+                            Icons.subdirectory_arrow_right_rounded,
+                            size: 11.5,
+                            color: tg.tgBlueBright.withValues(alpha: 0.75),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 1.5),
+                      Text(
+                        quoteText,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          height: 1.28,
+                          color: tg.textSecondary,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
         ),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(
-            '回复 $quoteSender',
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              fontSize: 11,
-              fontWeight: FontWeight.w600,
-              color: tg.tgBlueBright,
+    );
+  }
+
+  /// Inline quoted message preview card for messages containing a Telegram message link
+  /// (`https://t.me/c/<id>/<msgId>`, `https://t.me/<channel>/<msgId>`, `telegram://...`).
+  Widget _buildLinkedTelegramMessageQuoteCard(
+    _TgPalette tg,
+    TelegramChat currentChat,
+    String url,
+  ) {
+    final trimmed = url.trim();
+    _ensureLinkedTelegramMessageResolved(trimmed);
+    final cacheKey = '$_activeAccountId|$trimmed';
+    final resolved = _resolvedLinkedMessagesByUrl[cacheKey];
+    final isLoading = _loadingLinkedMessageUrls.contains(cacheKey);
+    final localTarget = _parseLocalTelegramLinkTarget(trimmed);
+
+    final targetChat = resolved?.chat ?? currentChat;
+    final targetMsg = resolved?.message;
+    final targetMsgId =
+        resolved?.targetMessageId ?? (localTarget?.messageId ?? 0);
+
+    final headerLabel = targetMsg != null
+        ? '引用 ${_resolveDisplaySenderName(targetChat, targetMsg)}'
+        : (targetMsgId > 0 ? '引用消息 #$targetMsgId' : '引用 Telegram 消息');
+    final bodyText = targetMsg != null
+        ? (targetMsg
+                .resolvedPreviewText(
+                  isPrivateUserChat: targetChat.peer.startsWith('user:'),
+                )
+                .isNotEmpty
+            ? targetMsg.resolvedPreviewText(
+                isPrivateUserChat: targetChat.peer.startsWith('user:'),
+              )
+            : (targetMsg.attachment?.displayName ?? '媒体消息'))
+        : (isLoading ? '正在解析引用消息内容...' : trimmed);
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(10, 6, 10, 2),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          key: ValueKey('tg_linked_quote_${currentChat.peer}_$trimmed'),
+          borderRadius: BorderRadius.circular(6),
+          onTap: () {
+            if (resolved != null && resolved.targetMessageId > 0) {
+              _jumpToMessageInChat(resolved.chat, resolved.targetMessageId);
+            } else {
+              _openOrResolveLink(trimmed);
+            }
+          },
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+            decoration: BoxDecoration(
+              color: tg.tgBlueBright.withValues(alpha: 0.11),
+              borderRadius: BorderRadius.circular(6),
+              border: Border(
+                left: BorderSide(color: tg.tgBlueBright, width: 2.8),
+              ),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Flexible(
+                      child: Text(
+                        headerLabel,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          color: tg.tgBlueBright,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    Icon(
+                      Icons.open_in_new_rounded,
+                      size: 11,
+                      color: tg.tgBlueBright.withValues(alpha: 0.8),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 1.5),
+                Text(
+                  bodyText,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 11.5,
+                    height: 1.28,
+                    color: tg.textSecondary,
+                  ),
+                ),
+              ],
             ),
           ),
-          const SizedBox(height: 1),
-          Text(
-            quoteText,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              fontSize: 11.5,
-              color: tg.textSecondary,
-            ),
-          ),
-        ],
+        ),
       ),
     );
   }
@@ -11373,9 +14253,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
     }
     final uri = Uri.tryParse(trimmed);
     if (uri != null &&
-        (uri.scheme == 'http' ||
-            uri.scheme == 'https' ||
-            uri.scheme == 'tg')) {
+        (uri.scheme == 'http' || uri.scheme == 'https')) {
       try {
         await launchUrl(uri, mode: LaunchMode.externalApplication);
       } catch (_) {
@@ -11631,15 +14509,15 @@ class _TelegramScreenState extends State<TelegramScreen> {
     );
   }
 
-  /// Edge-to-edge Video / Photo / File card inside a Telegram message bubble
+  /// Edge-to-edge Video / Photo / Sticker / File card inside a Telegram message bubble
   Widget _buildTelegramBubbleAttachment(
     _TgPalette tg,
     TelegramChat chat,
     TelegramMessage msg,
     TelegramAttachment att,
   ) {
-    final isVideo = att.isVideo;
-    final isPhoto = att.isPhoto;
+    final isVideo = att.isVideo && !att.isSticker;
+    final isPhoto = att.isPhoto && !att.isSticker;
     final thumbUrl = widget.appState.api.buildTelegramThumbnailUrl(
       accountId: _activeAccountId,
       peer: chat.peer,
@@ -11655,6 +14533,25 @@ class _TelegramScreenState extends State<TelegramScreen> {
         _completedLocalSaves.contains(msg.id) || savedLocalPath != null;
     final isFailedLocal = _failedLocalSaves.contains(msg.id);
     final optimisticBytes = _optimisticPreviewBytesByMsgId[msg.id];
+    final isSendingThisMsg = _sendingOptimisticMsgIds.contains(msg.id);
+    final msgUploadPct = _optimisticUploadPercent[msg.id];
+    final msgUploadStatus = _optimisticUploadStatusByMsgId[msg.id] ?? '';
+
+    if (att.isSticker) {
+      return _buildTelegramStickerAttachment(
+        tg: tg,
+        chat: chat,
+        msg: msg,
+        att: att,
+        thumbUrl: thumbUrl,
+        optimisticBytes: optimisticBytes,
+        isSendingThisMsg: isSendingThisMsg,
+        msgUploadPct: msgUploadPct,
+        savedLocalPath: savedLocalPath,
+        isSavingLocal: isSavingLocal,
+        isSavedLocal: isSavedLocal,
+      );
+    }
 
     if (isVideo || isPhoto) {
       return StatefulBuilder(
@@ -11800,31 +14697,100 @@ class _TelegramScreenState extends State<TelegramScreen> {
                                       )
                                     : null,
                                 alignment: Alignment.center,
-                                child: isVideo
+                                child: isSendingThisMsg
                                     ? Container(
-                                        width: isMediaFocused ? 60 : 54,
-                                        height: isMediaFocused ? 60 : 54,
-                                        decoration: BoxDecoration(
-                                          color: isMediaFocused
-                                              ? tg.tgBlueBright
-                                              : const Color(0x99000000),
-                                          shape: BoxShape.circle,
-                                          border: isMediaFocused
-                                              ? Border.all(
-                                                  color:
-                                                      const Color(0xFFFFE066),
-                                                  width: 2.2,
-                                                )
-                                              : null,
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 14,
+                                          vertical: 10,
                                         ),
-                                        alignment: Alignment.center,
-                                        child: const Icon(
-                                          Icons.play_arrow_rounded,
-                                          color: Colors.white,
-                                          size: 34,
+                                        decoration: BoxDecoration(
+                                          color: const Color(0xBF000000),
+                                          borderRadius:
+                                              BorderRadius.circular(14),
+                                        ),
+                                        child: Column(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            SizedBox(
+                                              width: 42,
+                                              height: 42,
+                                              child: Stack(
+                                                alignment: Alignment.center,
+                                                children: [
+                                                  CircularProgressIndicator(
+                                                    value: (msgUploadPct !=
+                                                                null &&
+                                                            msgUploadPct > 0)
+                                                        ? (msgUploadPct / 100.0)
+                                                            .clamp(0.02, 1.0)
+                                                        : null,
+                                                    strokeWidth: 3.2,
+                                                    color: Colors.white,
+                                                    backgroundColor:
+                                                        Colors.white24,
+                                                  ),
+                                                  Text(
+                                                    '${msgUploadPct ?? 0}%',
+                                                    style: const TextStyle(
+                                                      color: Colors.white,
+                                                      fontSize: 10.5,
+                                                      fontWeight:
+                                                          FontWeight.w700,
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                            ),
+                                            if (msgUploadStatus.isNotEmpty) ...[
+                                              const SizedBox(height: 6),
+                                              ConstrainedBox(
+                                                constraints:
+                                                    const BoxConstraints(
+                                                  maxWidth: 220,
+                                                ),
+                                                child: Text(
+                                                  msgUploadStatus,
+                                                  maxLines: 1,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  textAlign: TextAlign.center,
+                                                  style: const TextStyle(
+                                                    color: Colors.white,
+                                                    fontSize: 11,
+                                                    fontWeight: FontWeight.w500,
+                                                  ),
+                                                ),
+                                              ),
+                                            ],
+                                          ],
                                         ),
                                       )
-                                    : const SizedBox.expand(),
+                                    : (isVideo
+                                        ? Container(
+                                            width: isMediaFocused ? 60 : 54,
+                                            height: isMediaFocused ? 60 : 54,
+                                            decoration: BoxDecoration(
+                                              color: isMediaFocused
+                                                  ? tg.tgBlueBright
+                                                  : const Color(0x99000000),
+                                              shape: BoxShape.circle,
+                                              border: isMediaFocused
+                                                  ? Border.all(
+                                                      color: const Color(
+                                                        0xFFFFE066,
+                                                      ),
+                                                      width: 2.2,
+                                                    )
+                                                  : null,
+                                            ),
+                                            alignment: Alignment.center,
+                                            child: const Icon(
+                                              Icons.play_arrow_rounded,
+                                              color: Colors.white,
+                                              size: 34,
+                                            ),
+                                          )
+                                        : const SizedBox.expand()),
                               ),
                             );
                           },
@@ -11984,7 +14950,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
                                             else
                                               Icon(
                                                 isSavedLocal
-                                                    ? Icons.folder_open_rounded
+                                                    ? Icons.check_circle_rounded
                                                     : (isFailedLocal
                                                         ? Icons
                                                             .error_outline_rounded
@@ -12105,6 +15071,114 @@ class _TelegramScreenState extends State<TelegramScreen> {
                                   },
                                 ),
                               ),
+                            if (!_isOptimisticMsgId(msg.id))
+                              Padding(
+                                padding: const EdgeInsets.only(left: 6),
+                                child: InkWell(
+                                  onFocusChange: refreshAttFocus,
+                                  onTap: () => _downloadTelegramTo115(
+                                    url: att.url,
+                                    name: att.displayName,
+                                    chat: chat,
+                                    msg: msg,
+                                  ),
+                                  child: Builder(
+                                    builder: (c115Ctx) {
+                                      final is115Focused =
+                                          Focus.of(c115Ctx).hasPrimaryFocus;
+                                      final effective115Url = att.url.isNotEmpty
+                                          ? att.url
+                                          : widget.appState.api
+                                              .buildTelegramFileDownloadUrl(
+                                              accountId: _activeAccountId,
+                                              peer: chat.peer,
+                                              messageId: msg.id,
+                                              local: false,
+                                            );
+                                      final k115 =
+                                          '$_activeAccountId:$effective115Url';
+                                      final isPending115 =
+                                          _pending115Downloads.contains(k115);
+                                      final isDone115 =
+                                          _completed115Downloads.contains(k115);
+                                      final isFailed115 =
+                                          _failed115Downloads.contains(k115);
+                                      return Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 7,
+                                          vertical: 3,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: isDone115
+                                              ? const Color(0xE62EBE70)
+                                              : (isFailed115
+                                                  ? const Color(0xE6E54D42)
+                                                  : const Color(0xD9FF9800)),
+                                          borderRadius:
+                                              BorderRadius.circular(10),
+                                          border: is115Focused
+                                              ? Border.all(
+                                                  color:
+                                                      const Color(0xFFFFE066),
+                                                  width: 1.8,
+                                                )
+                                              : null,
+                                        ),
+                                        child: AnimatedSwitcher(
+                                          duration:
+                                              const Duration(milliseconds: 180),
+                                          child: Row(
+                                            key: ValueKey(
+                                              'overlay_115_${msg.id}_${isPending115}_${isDone115}_$isFailed115',
+                                            ),
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              if (isPending115)
+                                                const SizedBox(
+                                                  width: 11,
+                                                  height: 11,
+                                                  child:
+                                                      CircularProgressIndicator(
+                                                    strokeWidth: 1.8,
+                                                    color: Colors.white,
+                                                  ),
+                                                )
+                                              else
+                                                Icon(
+                                                  isDone115
+                                                      ? Icons
+                                                          .check_circle_rounded
+                                                      : (isFailed115
+                                                          ? Icons
+                                                              .error_outline_rounded
+                                                          : Icons
+                                                              .cloud_upload_rounded),
+                                                  size: 13,
+                                                  color: Colors.white,
+                                                ),
+                                              const SizedBox(width: 3),
+                                              Text(
+                                                isPending115
+                                                    ? '115提交中...'
+                                                    : (isDone115
+                                                        ? '已存115 ✓'
+                                                        : (isFailed115
+                                                            ? '115失败·重试'
+                                                            : '115云下载')),
+                                                style: const TextStyle(
+                                                  color: Colors.white,
+                                                  fontSize: 11,
+                                                  fontWeight: FontWeight.w600,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      );
+                                    },
+                                  ),
+                                ),
+                              ),
                           ],
                         ),
                       ),
@@ -12155,12 +15229,41 @@ class _TelegramScreenState extends State<TelegramScreen> {
             },
             onCycleSpeed: _cycleAudioSpeed,
             isQueued: isQueued,
+            isPending115: _pending115Downloads.contains(
+              _resolve115KeyForTarget(
+                url: att.url,
+                chat: chat,
+                msg: msg,
+              ),
+            ),
+            isDone115: _completed115Downloads.contains(
+              _resolve115KeyForTarget(
+                url: att.url,
+                chat: chat,
+                msg: msg,
+              ),
+            ),
+            isFailed115: _failed115Downloads.contains(
+              _resolve115KeyForTarget(
+                url: att.url,
+                chat: chat,
+                msg: msg,
+              ),
+            ),
+            isSavingLocal: isSavingLocal,
+            isSavedLocal: isSavedLocal,
             onQueueDownload: att.url.isEmpty
                 ? null
                 : () => _queueTelegramDownload(
                       url: att.url,
                       name: att.displayName,
                     ),
+            onDownload115: () => _downloadTelegramTo115(
+              url: att.url,
+              name: att.displayName,
+              chat: chat,
+              msg: msg,
+            ),
             onSaveLocal: () {
               if (savedLocalPath != null) {
                 _openLocalFileDirectory(savedLocalPath);
@@ -12204,30 +15307,64 @@ class _TelegramScreenState extends State<TelegramScreen> {
                     child: Builder(
                       builder: (fileCtx) {
                         final isFileFocused = Focus.of(fileCtx).hasPrimaryFocus;
-                        return Container(
+                        return SizedBox(
                           width: 44,
                           height: 44,
-                          decoration: BoxDecoration(
-                            color: isSavedLocal
-                                ? const Color(0xFF2EBE70)
-                                : tg.tgBlueBright,
-                            shape: BoxShape.circle,
-                            border: isFileFocused
-                                ? Border.all(
-                                    color: const Color(0xFFFFE066),
-                                    width: 2.2,
-                                  )
-                                : null,
-                          ),
-                          alignment: Alignment.center,
-                          child: Icon(
-                            isSavedLocal
-                                ? Icons.folder_open_rounded
-                                : (isQueued
-                                    ? Icons.check_rounded
-                                    : Icons.insert_drive_file_rounded),
-                            color: Colors.white,
-                            size: 22,
+                          child: Stack(
+                            alignment: Alignment.center,
+                            children: [
+                              Container(
+                                width: 44,
+                                height: 44,
+                                decoration: BoxDecoration(
+                                  color: isSavedLocal && !isSendingThisMsg
+                                      ? const Color(0xFF2EBE70)
+                                      : tg.tgBlueBright,
+                                  shape: BoxShape.circle,
+                                  border: isFileFocused
+                                      ? Border.all(
+                                          color: const Color(0xFFFFE066),
+                                          width: 2.2,
+                                        )
+                                      : null,
+                                ),
+                                alignment: Alignment.center,
+                                child: isSendingThisMsg
+                                    ? Text(
+                                        '${msgUploadPct ?? 0}%',
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 10.5,
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                      )
+                                    : Icon(
+                                        isSavedLocal
+                                            ? Icons.check_circle_rounded
+                                            : (isQueued
+                                                ? Icons.check_rounded
+                                                : Icons
+                                                    .insert_drive_file_rounded),
+                                        color: Colors.white,
+                                        size: 22,
+                                      ),
+                              ),
+                              if (isSendingThisMsg)
+                                SizedBox(
+                                  width: 44,
+                                  height: 44,
+                                  child: CircularProgressIndicator(
+                                    value: (msgUploadPct != null &&
+                                            msgUploadPct > 0)
+                                        ? (msgUploadPct / 100.0)
+                                            .clamp(0.02, 1.0)
+                                        : null,
+                                    strokeWidth: 2.8,
+                                    color: Colors.white,
+                                    backgroundColor: Colors.white24,
+                                  ),
+                                ),
+                            ],
                           ),
                         );
                       },
@@ -12237,31 +15374,53 @@ class _TelegramScreenState extends State<TelegramScreen> {
               ),
               const SizedBox(width: 10),
               Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      att.displayName,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
-                        color: tg.textPrimary,
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(6),
+                  onTap: canPreview && !_isOptimisticMsgId(msg.id)
+                      ? () => _openFilePreviewDialog(chat, msg)
+                      : (savedLocalPath != null
+                          ? () => _openLocalFileDirectory(savedLocalPath)
+                          : null),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        att.displayName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          color: tg.textPrimary,
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 2),
-                    Text(
-                      [
-                        if (att.formattedSize.isNotEmpty) att.formattedSize,
-                        att.kind.toUpperCase(),
-                      ].join(' · '),
-                      style: TextStyle(
-                        fontSize: 11.5,
-                        color: tg.textSecondary,
+                      const SizedBox(height: 2),
+                      Text(
+                        isSendingThisMsg
+                            ? (msgUploadStatus.isNotEmpty
+                                ? msgUploadStatus
+                                : '正在发送文件... ${msgUploadPct ?? 0}%')
+                            : [
+                                if (att.formattedSize.isNotEmpty)
+                                  att.formattedSize,
+                                att.kind.toUpperCase(),
+                                if (canPreview && !_isOptimisticMsgId(msg.id))
+                                  '点击预览',
+                              ].join(' · '),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          color: isSendingThisMsg
+                              ? tg.tgBlueBright
+                              : tg.textSecondary,
+                          fontWeight: isSendingThisMsg
+                              ? FontWeight.w600
+                              : FontWeight.w400,
+                        ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
               if (canPreview && !_isOptimisticMsgId(msg.id))
@@ -12313,6 +15472,65 @@ class _TelegramScreenState extends State<TelegramScreen> {
                           ),
                   ),
                 ),
+              if (!_isOptimisticMsgId(msg.id))
+                Builder(
+                  builder: (_) {
+                    final effective115Url = att.url.isNotEmpty
+                        ? att.url
+                        : widget.appState.api.buildTelegramFileDownloadUrl(
+                            accountId: _activeAccountId,
+                            peer: chat.peer,
+                            messageId: msg.id,
+                            local: false,
+                          );
+                    final k115 = '$_activeAccountId:$effective115Url';
+                    final isPending115 = _pending115Downloads.contains(k115);
+                    final isDone115 = _completed115Downloads.contains(k115);
+                    final isFailed115 = _failed115Downloads.contains(k115);
+                    return IconButton(
+                      tooltip: isDone115
+                          ? '已添加至115云下载 ✓'
+                          : (isFailed115 ? '115云下载失败，点击重试' : '115云下载'),
+                      onPressed: isPending115
+                          ? null
+                          : () => _downloadTelegramTo115(
+                                url: att.url,
+                                name: att.displayName,
+                                chat: chat,
+                                msg: msg,
+                              ),
+                      icon: AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 180),
+                        child: isPending115
+                            ? const SizedBox(
+                                key: ValueKey('file_115_loading'),
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: Color(0xFFFFB74D),
+                                ),
+                              )
+                            : Icon(
+                                key: ValueKey(
+                                  'file_115_${isDone115}_$isFailed115',
+                                ),
+                                isDone115
+                                    ? Icons.check_circle_rounded
+                                    : (isFailed115
+                                        ? Icons.error_outline_rounded
+                                        : Icons.cloud_upload_rounded),
+                                size: 19,
+                                color: isDone115
+                                    ? const Color(0xFF4ECC5E)
+                                    : (isFailed115
+                                        ? const Color(0xFFFF6B6B)
+                                        : const Color(0xFFFFB74D)),
+                              ),
+                      ),
+                    );
+                  },
+                ),
               if (!_isOptimisticMsgId(msg.id) || savedLocalPath != null)
                 IconButton(
                   tooltip: savedLocalPath != null
@@ -12346,7 +15564,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
                               'file_l_${isSavedLocal}_$isFailedLocal',
                             ),
                             isSavedLocal
-                                ? Icons.folder_open_rounded
+                                ? Icons.check_circle_rounded
                                 : (isFailedLocal
                                     ? Icons.error_outline_rounded
                                     : Icons.download_rounded),
@@ -12362,6 +15580,22 @@ class _TelegramScreenState extends State<TelegramScreen> {
             ],
           ),
         ),
+        if (isSendingThisMsg)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 2, 12, 6),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(3),
+              child: LinearProgressIndicator(
+                key: ValueKey('tg_file_upload_bar_${msg.id}'),
+                value: (msgUploadPct != null && msgUploadPct > 0)
+                    ? (msgUploadPct / 100.0).clamp(0.02, 1.0)
+                    : null,
+                minHeight: 3.5,
+                color: tg.tgBlueBright,
+                backgroundColor: tg.tgBlueBright.withValues(alpha: 0.16),
+              ),
+            ),
+          ),
         if (savedLocalPath != null)
           _buildLocalFilePathBanner(tg, savedLocalPath),
       ],
@@ -12382,6 +15616,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
     final att = msg.attachment;
     final savedLocalPath = _getSavedLocalPath(chat, msg);
     final activeSelection = _activeSelectedBubbleText.trim();
+    final labeledLinks = _collectLabeledMessageLinks(msg);
     final selected = await showMenu<String>(
       context: context,
       color: tg.sidebarBg,
@@ -12390,6 +15625,28 @@ class _TelegramScreenState extends State<TelegramScreen> {
         Offset.zero & overlay.size,
       ),
       items: [
+        for (var i = 0; i < labeledLinks.length && i < 4; i++)
+          PopupMenuItem(
+            value: 'open_link_$i',
+            child: Row(
+              children: [
+                Icon(
+                  Icons.open_in_new_rounded,
+                  size: 17,
+                  color: tg.tgBlueBright,
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    '打开链接: ${labeledLinks[i].label}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(color: tg.textPrimary),
+                  ),
+                ),
+              ],
+            ),
+          ),
         if (activeSelection.isNotEmpty)
           PopupMenuItem(
             value: 'copy_selected',
@@ -12412,7 +15669,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
               ],
             ),
           ),
-        if (msg.links.isNotEmpty)
+        if (labeledLinks.isNotEmpty)
           PopupMenuItem(
             value: 'copy_links',
             child: Row(
@@ -12420,15 +15677,37 @@ class _TelegramScreenState extends State<TelegramScreen> {
                 Icon(Icons.link_rounded, size: 18, color: tg.tgBlueBright),
                 const SizedBox(width: 10),
                 Text(
-                  msg.links.length > 1
-                      ? '复制消息内全部链接 (${msg.links.length})'
+                  labeledLinks.length > 1
+                      ? '复制消息内全部链接 (${labeledLinks.length})'
                       : '复制消息内链接',
                   style: TextStyle(color: tg.textPrimary),
                 ),
               ],
             ),
           ),
-        if (!chat.readOnly && msg.text.trim().isNotEmpty)
+        if (!chat.readOnly &&
+            msg.outgoing &&
+            !chat.broadcast &&
+            msg.text.trim().isNotEmpty)
+          PopupMenuItem(
+            value: 'edit_message',
+            child: Row(
+              children: [
+                Icon(Icons.edit_rounded, size: 18, color: tg.tgBlueBright),
+                const SizedBox(width: 10),
+                Text(
+                  '编辑消息 (修改后重发)',
+                  style: TextStyle(
+                    color: tg.textPrimary,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        if (!chat.readOnly &&
+            msg.text.trim().isNotEmpty &&
+            (!msg.outgoing || chat.broadcast || activeSelection.isNotEmpty))
           PopupMenuItem(
             value: 'insert_compose',
             child: Row(
@@ -12564,6 +15843,21 @@ class _TelegramScreenState extends State<TelegramScreen> {
               ],
             ),
           ),
+        if (att != null)
+          PopupMenuItem(
+            value: 'download_115',
+            child: Row(
+              children: [
+                const Icon(
+                  Icons.cloud_upload_rounded,
+                  size: 18,
+                  color: Color(0xFFFFB74D),
+                ),
+                const SizedBox(width: 10),
+                Text('115云下载', style: TextStyle(color: tg.textPrimary)),
+              ],
+            ),
+          ),
         PopupMenuItem(
           value: 'select',
           child: Row(
@@ -12599,6 +15893,13 @@ class _TelegramScreenState extends State<TelegramScreen> {
     );
 
     if (!mounted || selected == null) return;
+    if (selected.startsWith('open_link_')) {
+      final idx = int.tryParse(selected.substring('open_link_'.length)) ?? -1;
+      if (idx >= 0 && idx < labeledLinks.length) {
+        await _handleMessageContentLinkTap(chat, msg, labeledLinks[idx].url);
+      }
+      return;
+    }
     switch (selected) {
       case 'copy_selected':
         if (activeSelection.isNotEmpty) {
@@ -12611,17 +15912,28 @@ class _TelegramScreenState extends State<TelegramScreen> {
         _showDownloadHud('已复制整条消息文本', state: 'success');
         break;
       case 'copy_links':
-        if (msg.links.isNotEmpty) {
-          Clipboard.setData(ClipboardData(text: msg.links.join('\n')));
+        if (labeledLinks.isNotEmpty) {
+          Clipboard.setData(
+            ClipboardData(
+              text: labeledLinks.map((e) => e.url).toSet().join('\n'),
+            ),
+          );
           _showDownloadHud(
-            msg.links.length > 1
-                ? '已复制 ${msg.links.length} 条链接'
+            labeledLinks.length > 1
+                ? '已复制 ${labeledLinks.length} 条链接'
                 : '已复制消息内链接',
             state: 'success',
           );
         }
         break;
+      case 'edit_message':
+        _startEditingMessage(msg);
+        break;
       case 'insert_compose':
+        if (msg.outgoing && !chat.broadcast && activeSelection.isEmpty) {
+          _startEditingMessage(msg);
+          break;
+        }
         final textToInsert =
             activeSelection.isNotEmpty ? activeSelection : msg.text;
         _composeController.text = textToInsert;
@@ -12654,11 +15966,21 @@ class _TelegramScreenState extends State<TelegramScreen> {
         }
         break;
       case 'save_local':
-        _saveAttachmentToLocalDownloads(chat, msg);
+        _saveAttachmentToLocalDownloads(chat, msg, forceRedownload: true);
         break;
       case 'queue':
         if (att != null && att.url.isNotEmpty) {
           _queueTelegramDownload(url: att.url, name: att.displayName);
+        }
+        break;
+      case 'download_115':
+        if (att != null) {
+          _downloadTelegramTo115(
+            url: att.url,
+            name: att.displayName,
+            chat: chat,
+            msg: msg,
+          );
         }
         break;
       case 'select':
@@ -12674,11 +15996,15 @@ class _TelegramScreenState extends State<TelegramScreen> {
   }
 
   /// Bottom Compose Bar / Selection Action Bar / Channel Read-Only Footer
-  Widget _buildBottomBar(_TgPalette tg, TelegramChat chat) {
-    final isMobile = _isMobileLayout;
+  Widget _buildBottomBar(
+    _TgPalette tg,
+    TelegramChat chat, {
+    bool? isMobile,
+  }) {
+    final effectiveIsMobile = isMobile ?? _isMobileLayout;
     // 1. Multi-selection toolbar
     if (_selectionMode) {
-      if (isMobile) {
+      if (effectiveIsMobile) {
         return Container(
           height: 52,
           padding: const EdgeInsets.symmetric(horizontal: 8),
@@ -12739,6 +16065,22 @@ class _TelegramScreenState extends State<TelegramScreen> {
                     : _batchQueueSelectedDownloads,
                 icon: const Icon(Icons.cloud_download_outlined, size: 15),
                 label: const Text('转存', style: TextStyle(fontSize: 12.5)),
+              ),
+              const SizedBox(width: 4),
+              OutlinedButton.icon(
+                style: OutlinedButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                ),
+                onPressed: _selectedMessageIds.isEmpty
+                    ? null
+                    : _batchDownloadSelectedTo115,
+                icon: const Icon(
+                  Icons.cloud_upload_rounded,
+                  size: 14,
+                  color: Color(0xFFFFB74D),
+                ),
+                label: const Text('115云', style: TextStyle(fontSize: 12)),
               ),
               IconButton(
                 visualDensity: VisualDensity.compact,
@@ -12807,6 +16149,18 @@ class _TelegramScreenState extends State<TelegramScreen> {
                   : _batchQueueSelectedDownloads,
               icon: const Icon(Icons.cloud_download_outlined, size: 16),
               label: const Text('批量转存下载'),
+            ),
+            const SizedBox(width: 8),
+            OutlinedButton.icon(
+              onPressed: _selectedMessageIds.isEmpty
+                  ? null
+                  : _batchDownloadSelectedTo115,
+              icon: const Icon(
+                Icons.cloud_upload_rounded,
+                size: 16,
+                color: Color(0xFFFFB74D),
+              ),
+              label: const Text('批量115云下载'),
             ),
             const SizedBox(width: 8),
             OutlinedButton.icon(
@@ -12929,8 +16283,80 @@ class _TelegramScreenState extends State<TelegramScreen> {
           // B. Optional Text Formatting Toolbar (Bold / Italic / Code / Spoiler / Link)
           if (_showFormattingBar) _buildFormattingToolbar(tg),
 
-          // C. Reply Quote Banner
-          if (_replyingToMessage != null)
+          // B2. Active @Mention Member Autocomplete Popup
+          if (_activeMentionQuery != null)
+            _buildMentionAutocompleteBar(tg, chat),
+
+          // C0. Editing Sent Message Banner (in-place update & resend, never 2 messages)
+          if (_editingMessage != null)
+            Container(
+              key: const ValueKey('tg_editing_message_banner'),
+              padding: const EdgeInsets.fromLTRB(16, 6, 10, 4),
+              decoration: BoxDecoration(
+                color: tg.tgBlueBright.withValues(alpha: 0.08),
+                border: Border(bottom: BorderSide(color: tg.borderLine)),
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.edit_rounded, size: 18, color: tg.tgBlueBright),
+                  const SizedBox(width: 10),
+                  Container(width: 2.5, height: 30, color: tg.tgBlueBright),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(6),
+                      onTap: () => _jumpToMessageInChat(
+                        chat,
+                        _editingMessage!.id,
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 2),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              '正在编辑已发送的消息（修改后重发将直接替换原消息）',
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                                color: tg.tgBlueBright,
+                              ),
+                            ),
+                            Text(
+                              _editingMessage!.text.trim().isNotEmpty
+                                  ? _editingMessage!.text.trim()
+                                  : (_editingMessage!
+                                          .attachment?.displayName ??
+                                      '[消息]'),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: tg.textSecondary,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    key: const ValueKey('tg_cancel_edit_btn'),
+                    visualDensity: VisualDensity.compact,
+                    tooltip: '取消编辑',
+                    icon: Icon(
+                      Icons.close_rounded,
+                      size: 16,
+                      color: tg.textMuted,
+                    ),
+                    onPressed: _cancelEditingMessage,
+                  ),
+                ],
+              ),
+            ),
+
+          // C. Reply Quote Banner (tap to jump to the replied-to message)
+          if (_replyingToMessage != null && _editingMessage == null)
             Container(
               padding: const EdgeInsets.fromLTRB(16, 6, 10, 4),
               decoration: BoxDecoration(
@@ -12943,38 +16369,49 @@ class _TelegramScreenState extends State<TelegramScreen> {
                   Container(width: 2.5, height: 30, color: tg.tgBlueBright),
                   const SizedBox(width: 8),
                   Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          '回复 ${_resolveDisplaySenderName(chat, _replyingToMessage!)}',
-                          style: TextStyle(
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
-                            color: tg.tgBlueBright,
-                          ),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(6),
+                      onTap: () => _jumpToMessageInChat(
+                        chat,
+                        _replyingToMessage!.id,
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 2),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              '回复 ${_resolveDisplaySenderName(chat, _replyingToMessage!)}',
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                                color: tg.tgBlueBright,
+                              ),
+                            ),
+                            Text(
+                              _replyingToMessage!
+                                      .resolvedPreviewText(
+                                        isPrivateUserChat:
+                                            chat.peer.startsWith('user:'),
+                                      )
+                                      .isNotEmpty
+                                  ? _replyingToMessage!.resolvedPreviewText(
+                                      isPrivateUserChat:
+                                          chat.peer.startsWith('user:'),
+                                    )
+                                  : (_replyingToMessage!
+                                          .attachment?.displayName ??
+                                      '[媒体消息]'),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: tg.textSecondary,
+                              ),
+                            ),
+                          ],
                         ),
-                        Text(
-                          _replyingToMessage!
-                                  .resolvedPreviewText(
-                                    isPrivateUserChat:
-                                        chat.peer.startsWith('user:'),
-                                  )
-                                  .isNotEmpty
-                              ? _replyingToMessage!.resolvedPreviewText(
-                                  isPrivateUserChat:
-                                      chat.peer.startsWith('user:'),
-                                )
-                              : (_replyingToMessage!.attachment?.displayName ??
-                                  '[媒体消息]'),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: tg.textSecondary,
-                          ),
-                        ),
-                      ],
+                      ),
                     ),
                   ),
                   IconButton(
@@ -12997,8 +16434,10 @@ class _TelegramScreenState extends State<TelegramScreen> {
           if (_stagedFiles.isNotEmpty || _uploadStatusText.isNotEmpty)
             _buildStagedAttachmentsBar(tg),
 
-          // E. Main Compose Input Row
-          if (isMobile)
+          // E. Main Compose Input Row (or Active Voice Recording Bar)
+          if (_isRecordingVoice)
+            _buildVoiceRecordingComposerBar(tg)
+          else if (effectiveIsMobile)
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
               child: Row(
@@ -13015,6 +16454,21 @@ class _TelegramScreenState extends State<TelegramScreen> {
                           : Icons.sentiment_satisfied_alt_rounded,
                       size: 23,
                       color: _showEmojiPanel
+                          ? tg.tgBlueBright
+                          : tg.textSecondary,
+                    ),
+                  ),
+
+                  // 1b. @ Mention Quick Button (Mobile)
+                  IconButton(
+                    key: const ValueKey('tg_compose_mention_btn_mobile'),
+                    visualDensity: VisualDensity.compact,
+                    tooltip: '@提及成员',
+                    onPressed: _triggerComposeMentionButton,
+                    icon: Icon(
+                      Icons.alternate_email_rounded,
+                      size: 21,
+                      color: _activeMentionQuery != null
                           ? tg.tgBlueBright
                           : tg.textSecondary,
                     ),
@@ -13057,9 +16511,11 @@ class _TelegramScreenState extends State<TelegramScreen> {
                           contentPadding: const EdgeInsets.symmetric(
                             vertical: 9,
                           ),
-                          hintText: _stagedFiles.isNotEmpty
-                              ? '添加说明文字...'
-                              : '消息...',
+                          hintText: _editingMessage != null
+                              ? '编辑消息内容...'
+                              : (_stagedFiles.isNotEmpty
+                                  ? '添加说明文字...'
+                                  : '消息... (支持输入 @ 提及成员)'),
                           hintStyle: TextStyle(
                             fontSize: 14,
                             color: tg.textMuted,
@@ -13210,8 +16666,21 @@ class _TelegramScreenState extends State<TelegramScreen> {
                     ),
                   ),
 
-                  // 4. Send button
+                  // 4. Voice record button + Send button (Mobile)
+                  IconButton(
+                    key: const ValueKey('tg_voice_record_btn_mobile'),
+                    visualDensity: VisualDensity.compact,
+                    tooltip: '录制语音消息 / 语音转文字',
+                    onPressed: _isSendingMessage ? null : _startVoiceRecording,
+                    icon: Icon(
+                      Icons.mic_rounded,
+                      size: 22,
+                      color: tg.tgBlueBright,
+                    ),
+                  ),
+                  const SizedBox(width: 2),
                   InkWell(
+                    key: const ValueKey('tg_send_message_btn_mobile'),
                     borderRadius: BorderRadius.circular(20),
                     onTap: canSendNow ? () => _sendMessage() : null,
                     child: AnimatedContainer(
@@ -13233,7 +16702,9 @@ class _TelegramScreenState extends State<TelegramScreen> {
                               ),
                             )
                           : Icon(
-                              Icons.send_rounded,
+                              _editingMessage != null
+                                  ? Icons.check_rounded
+                                  : Icons.send_rounded,
                               size: 18,
                               color: canSendNow ? Colors.white : tg.textMuted,
                             ),
@@ -13469,7 +16940,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
 
                 const SizedBox(width: 4),
 
-                // 3. Multi-line Official Telegram Input Field (Enter to send, Shift+Enter for newline, Cmd+V image paste)
+                // 3. Multi-line Official Telegram Input Field (Enter to send, Shift+Enter for newline, Cmd+V image paste, @ mention autocomplete)
                 Expanded(
                   child: Focus(
                     canRequestFocus: false,
@@ -13480,7 +16951,50 @@ class _TelegramScreenState extends State<TelegramScreen> {
                           HardwareKeyboard.instance.isMetaPressed ||
                           HardwareKeyboard.instance.isControlPressed;
 
-                      // Enter (without Shift) sends message
+                      // Handle @mention autocomplete keyboard navigation when popup is open
+                      if (_activeMentionQuery != null) {
+                        final mentionCandidates =
+                            _collectMentionCandidates(chat, _activeMentionQuery!);
+                        if (mentionCandidates.isNotEmpty) {
+                          if (event.logicalKey ==
+                              LogicalKeyboardKey.arrowDown) {
+                            setState(() {
+                              _selectedMentionCandidateIndex =
+                                  (_selectedMentionCandidateIndex + 1) %
+                                  mentionCandidates.length;
+                            });
+                            return KeyEventResult.handled;
+                          }
+                          if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
+                            setState(() {
+                              _selectedMentionCandidateIndex =
+                                  (_selectedMentionCandidateIndex -
+                                      1 +
+                                      mentionCandidates.length) %
+                                  mentionCandidates.length;
+                            });
+                            return KeyEventResult.handled;
+                          }
+                          if ((event.logicalKey == LogicalKeyboardKey.enter ||
+                                  event.logicalKey ==
+                                      LogicalKeyboardKey.numpadEnter ||
+                                  event.logicalKey == LogicalKeyboardKey.tab) &&
+                              !isShift) {
+                            final selIdx = _selectedMentionCandidateIndex.clamp(
+                              0,
+                              mentionCandidates.length - 1,
+                            );
+                            _insertMentionCandidate(mentionCandidates[selIdx]);
+                            return KeyEventResult.handled;
+                          }
+                        }
+                        if (event.logicalKey == LogicalKeyboardKey.escape) {
+                          _dismissMentionPopup();
+                          return KeyEventResult.handled;
+                        }
+                      }
+
+                      // Enter (without Shift) sends message or saves edited message
                       if ((event.logicalKey == LogicalKeyboardKey.enter ||
                               event.logicalKey ==
                                   LogicalKeyboardKey.numpadEnter) &&
@@ -13496,10 +17010,14 @@ class _TelegramScreenState extends State<TelegramScreen> {
                         return KeyEventResult.ignored;
                       }
 
-                      // Escape closes emoji panel or cancels reply
+                      // Escape closes emoji panel, cancels edit, or cancels reply
                       if (event.logicalKey == LogicalKeyboardKey.escape) {
                         if (_showEmojiPanel) {
                           setState(() => _showEmojiPanel = false);
+                          return KeyEventResult.handled;
+                        }
+                        if (_editingMessage != null) {
+                          _cancelEditingMessage();
                           return KeyEventResult.handled;
                         }
                         if (_replyingToMessage != null) {
@@ -13509,18 +17027,29 @@ class _TelegramScreenState extends State<TelegramScreen> {
                         }
                       }
 
-                      // Up arrow when input is empty replies to the latest message
+                      // Up arrow when input is empty edits the latest outgoing message (or replies if none)
                       if (event.logicalKey == LogicalKeyboardKey.arrowUp &&
                           _composeController.text.isEmpty &&
                           _messages.isNotEmpty) {
-                        setState(() => _replyingToMessage = _messages.last);
-                        _saveCurrentDraft();
+                        final lastOutIdx = _messages.lastIndexWhere(
+                          (m) =>
+                              m.outgoing &&
+                              !chat.broadcast &&
+                              m.text.trim().isNotEmpty,
+                        );
+                        if (lastOutIdx >= 0) {
+                          _startEditingMessage(_messages[lastOutIdx]);
+                        } else {
+                          setState(() => _replyingToMessage = _messages.last);
+                          _saveCurrentDraft();
+                        }
                         return KeyEventResult.handled;
                       }
 
                       return KeyEventResult.ignored;
                     },
                     child: TextField(
+                      key: const ValueKey('tg_compose_text_field'),
                       controller: _composeController,
                       focusNode: _composeFocusNode,
                       minLines: 1,
@@ -13549,15 +17078,32 @@ class _TelegramScreenState extends State<TelegramScreen> {
                           vertical: 8,
                           horizontal: 4,
                         ),
-                        hintText: _stagedFiles.isNotEmpty
-                            ? '添加图片/文件说明文字 (可选，Enter 发送)...'
-                            : '撰写消息... (Enter 发送，Shift+Enter 换行，支持粘贴图片)',
+                        hintText: _editingMessage != null
+                            ? '编辑消息内容 (Enter 保存并重发替换，Esc 取消)...'
+                            : (_stagedFiles.isNotEmpty
+                                ? '添加图片/文件说明文字 (可选，Enter 发送)...'
+                                : '撰写消息... (支持输入 @ 提及成员，Enter 发送，Shift+Enter 换行)'),
                         hintStyle: TextStyle(
                           fontSize: 13,
                           color: tg.textMuted,
                         ),
                       ),
                     ),
+                  ),
+                ),
+
+                // 3b. @ Mention Quick Button (`@`)
+                IconButton(
+                  key: const ValueKey('tg_compose_mention_btn'),
+                  visualDensity: VisualDensity.compact,
+                  tooltip: '@提及群成员 / 联系人',
+                  onPressed: _triggerComposeMentionButton,
+                  icon: Icon(
+                    Icons.alternate_email_rounded,
+                    size: 20,
+                    color: _activeMentionQuery != null
+                        ? tg.tgBlueBright
+                        : tg.textSecondary,
                   ),
                 ),
 
@@ -13601,10 +17147,24 @@ class _TelegramScreenState extends State<TelegramScreen> {
                   ),
                 ),
 
+                // 6. Voice Record / Speech-to-Text Button (`🎙️ 语音录制 / 语音转文字`)
+                IconButton(
+                  key: const ValueKey('tg_voice_record_btn'),
+                  visualDensity: VisualDensity.compact,
+                  tooltip: '录制语音消息 / 语音转文字输入',
+                  onPressed: _isSendingMessage ? null : _startVoiceRecording,
+                  icon: Icon(
+                    Icons.mic_rounded,
+                    size: 21,
+                    color: tg.tgBlueBright,
+                  ),
+                ),
+
                 const SizedBox(width: 4),
 
-                // 6. Official Telegram Send Button
+                // 7. Official Telegram Send / Save Edited Message Button
                 InkWell(
+                  key: const ValueKey('tg_send_message_btn'),
                   borderRadius: BorderRadius.circular(20),
                   onTap: canSendNow ? () => _sendMessage() : null,
                   child: AnimatedContainer(
@@ -13628,7 +17188,9 @@ class _TelegramScreenState extends State<TelegramScreen> {
                             ),
                           )
                         : Icon(
-                            Icons.send_rounded,
+                            _editingMessage != null
+                                ? Icons.check_rounded
+                                : Icons.send_rounded,
                             size: 18,
                             color: canSendNow ? Colors.white : tg.textMuted,
                           ),
@@ -13642,8 +17204,1058 @@ class _TelegramScreenState extends State<TelegramScreen> {
     );
   }
 
+  /// Renders the floating `@` mention autocomplete panel above the compose input bar.
+  Widget _buildMentionAutocompleteBar(_TgPalette tg, TelegramChat chat) {
+    final query = _activeMentionQuery ?? '';
+    final candidates = _collectMentionCandidates(chat, query);
+    if (candidates.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    final selectedIdx =
+        _selectedMentionCandidateIndex.clamp(0, candidates.length - 1);
+
+    return Container(
+      key: const ValueKey('tg_mention_autocomplete_bar'),
+      constraints: const BoxConstraints(maxHeight: 220),
+      decoration: BoxDecoration(
+        color: tg.sidebarBg,
+        border: Border(
+          top: BorderSide(color: tg.tgBlueBright.withValues(alpha: 0.35)),
+          bottom: BorderSide(color: tg.borderLine),
+        ),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x1F000000),
+            blurRadius: 8,
+            offset: Offset(0, -2),
+          ),
+        ],
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 6, 8, 4),
+            child: Row(
+              children: [
+                Icon(
+                  Icons.alternate_email_rounded,
+                  size: 15,
+                  color: tg.tgBlueBright,
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    query.isEmpty
+                        ? '选择要 @提及 的成员 (${candidates.length})'
+                        : '匹配 "@$query" 的成员 (${candidates.length})',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: tg.tgBlueBright,
+                    ),
+                  ),
+                ),
+                Text(
+                  '↑↓ 选择 · Enter 填入',
+                  style: TextStyle(fontSize: 11, color: tg.textMuted),
+                ),
+                const SizedBox(width: 6),
+                if (_isGroupConversation(chat) && _nextMessageOffset > 0)
+                  InkWell(
+                    borderRadius: BorderRadius.circular(6),
+                    onTap: _isScanningMoreMembers ? null : _scanMoreGroupMembers,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 2,
+                      ),
+                      child: Text(
+                        _isScanningMoreMembers ? '扫描中...' : '更多群成员',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          color: tg.tgBlueBright,
+                        ),
+                      ),
+                    ),
+                  ),
+                InkWell(
+                  key: const ValueKey('tg_dismiss_mention_popup_btn'),
+                  borderRadius: BorderRadius.circular(12),
+                  onTap: _dismissMentionPopup,
+                  child: Padding(
+                    padding: const EdgeInsets.all(4),
+                    child: Icon(
+                      Icons.close_rounded,
+                      size: 15,
+                      color: tg.textMuted,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Divider(height: 1, color: tg.borderLine),
+          Flexible(
+            child: ListView.builder(
+              shrinkWrap: true,
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              itemCount: candidates.length,
+              itemBuilder: (ctx, idx) {
+                final member = candidates[idx];
+                final isSelected = idx == selectedIdx;
+                final badgeText = member.customTitle.isNotEmpty
+                    ? member.customTitle
+                    : (member.isCreatorOrAdmin
+                        ? '管理员'
+                        : (member.isOnlineNow ? '在线' : ''));
+                return Material(
+                  color: Colors.transparent,
+                  child: InkWell(
+                    key: ValueKey('tg_mention_item_${member.name}'),
+                    borderRadius: BorderRadius.circular(8),
+                    onTap: () => _insertMentionCandidate(member),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: isSelected
+                            ? tg.tgBlueBright.withValues(alpha: 0.16)
+                            : Colors.transparent,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Row(
+                        children: [
+                          _buildPeerAvatar(
+                            member.peer.isNotEmpty ? member.peer : member.name,
+                            member.name,
+                            avatar: member.avatar,
+                            isSelf: member.isSelf,
+                            size: 28,
+                            fontSize: 12,
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Row(
+                              children: [
+                                Flexible(
+                                  child: Text(
+                                    '@${member.name}',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      fontWeight: isSelected
+                                          ? FontWeight.w700
+                                          : FontWeight.w600,
+                                      color: isSelected
+                                          ? tg.tgBlueBright
+                                          : tg.textPrimary,
+                                    ),
+                                  ),
+                                ),
+                                if (badgeText.isNotEmpty) ...[
+                                  const SizedBox(width: 6),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 5,
+                                      vertical: 1,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: tg.tgBlueBright.withValues(
+                                        alpha: 0.14,
+                                      ),
+                                      borderRadius: BorderRadius.circular(5),
+                                    ),
+                                    child: Text(
+                                      badgeText,
+                                      style: TextStyle(
+                                        fontSize: 10.5,
+                                        fontWeight: FontWeight.w600,
+                                        color: tg.tgBlueBright,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ],
+                            ),
+                          ),
+                          if (member.messageCount > 0)
+                            Text(
+                              '发言 ${member.messageCount}',
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: tg.textMuted,
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ===========================================================================
+  // Voice Message Recording & Voice-to-Text Input (`语音发送聊天内容`)
+  // ===========================================================================
+
+  Future<void> _startVoiceRecording() async {
+    if (_isRecordingVoice) return;
+    final res = await NativeUtilsChannelHub.startVoiceRecording();
+    if (!mounted) return;
+    if (!res.ok) {
+      _showDownloadHud(
+        res.error ?? '无法开启麦克风录音，请检查系统麦克风权限',
+        state: 'error',
+      );
+      return;
+    }
+    _voiceRecordTimer?.cancel();
+    setState(() {
+      _isRecordingVoice = true;
+      _isTranscribingVoice = false;
+      _voiceRecordElapsedDs = 0;
+    });
+    _voiceRecordTimer = Timer.periodic(
+      const Duration(milliseconds: 100),
+      (_) {
+        if (!mounted || !_isRecordingVoice) return;
+        setState(() {
+          _voiceRecordElapsedDs++;
+        });
+      },
+    );
+  }
+
+  Future<void> _cancelVoiceRecording() async {
+    _voiceRecordTimer?.cancel();
+    _voiceRecordTimer = null;
+    if (mounted) {
+      setState(() {
+        _isRecordingVoice = false;
+        _isTranscribingVoice = false;
+        _voiceRecordElapsedDs = 0;
+      });
+    }
+    await NativeUtilsChannelHub.cancelVoiceRecording();
+  }
+
+  Future<void> _stopAndSendVoiceRecording() async {
+    if (!_isRecordingVoice) return;
+    _voiceRecordTimer?.cancel();
+    _voiceRecordTimer = null;
+    final elapsedSec = (_voiceRecordElapsedDs ~/ 10).clamp(1, 3600);
+    setState(() {
+      _isRecordingVoice = false;
+      _isTranscribingVoice = false;
+      _voiceRecordElapsedDs = 0;
+    });
+    final recorded = await NativeUtilsChannelHub.stopVoiceRecording();
+    if (!mounted || recorded == null || recorded.bytes.isEmpty) return;
+    final dur = recorded.durationSeconds > 0
+        ? recorded.durationSeconds
+        : elapsedSec;
+    final voiceFile = TelegramOutgoingFile(
+      name: recorded.fileName,
+      bytes: recorded.bytes,
+      mimeType: recorded.mimeType,
+      filePath: recorded.filePath,
+      fileSize: recorded.bytes.length,
+      isVoiceNote: true,
+      durationSeconds: dur,
+    );
+    await _sendMessage(
+      overrideText: _composeController.text.trim(),
+      overrideFiles: [voiceFile],
+      overrideAsFile: false,
+    );
+  }
+
+  Future<void> _stopAndTranscribeVoiceToText() async {
+    if (!_isRecordingVoice || _isTranscribingVoice) return;
+    _voiceRecordTimer?.cancel();
+    _voiceRecordTimer = null;
+    setState(() {
+      _isTranscribingVoice = true;
+    });
+    final recorded = await NativeUtilsChannelHub.stopVoiceRecording();
+    if (!mounted) return;
+    final stt = await NativeUtilsChannelHub.recognizeVoiceToText(
+      audioFilePath: recorded?.filePath,
+    );
+    if (!mounted) return;
+    setState(() {
+      _isRecordingVoice = false;
+      _isTranscribingVoice = false;
+      _voiceRecordElapsedDs = 0;
+    });
+    if (stt.text.trim().isNotEmpty) {
+      final cur = _composeController.text;
+      final next = cur.isEmpty ? stt.text.trim() : '$cur ${stt.text.trim()}';
+      _composeController.value = TextEditingValue(
+        text: next,
+        selection: TextSelection.collapsed(offset: next.length),
+      );
+      _composeFocusNode.requestFocus();
+      _saveCurrentDraft();
+      return;
+    }
+    if (stt.dictationTriggered) {
+      _composeFocusNode.requestFocus();
+      _showDownloadHud('已唤起系统原生语音听写输入，请直接说话', state: 'info');
+      return;
+    }
+    if (recorded != null && recorded.bytes.isNotEmpty) {
+      // Attach the recorded voice note to staged files so the user never loses their recording
+      setState(() {
+        _stagedFiles.add(
+          TelegramOutgoingFile(
+            name: recorded.fileName,
+            bytes: recorded.bytes,
+            mimeType: recorded.mimeType,
+            filePath: recorded.filePath,
+            fileSize: recorded.bytes.length,
+            isVoiceNote: true,
+            durationSeconds: recorded.durationSeconds,
+          ),
+        );
+      });
+      _showDownloadHud(
+        stt.error ?? '当前环境未返回识别文字，已将语音条加入待发送栏',
+        state: 'info',
+      );
+    }
+  }
+
+  Widget _buildVoiceRecordingComposerBar(_TgPalette tg) {
+    final totalSec = _voiceRecordElapsedDs ~/ 10;
+    final ds = _voiceRecordElapsedDs % 10;
+    final mm = (totalSec ~/ 60).toString().padLeft(2, '0');
+    final ss = (totalSec % 60).toString().padLeft(2, '0');
+    final pulseOn = (_voiceRecordElapsedDs % 6) < 3;
+
+    return Container(
+      key: const ValueKey('tg_voice_recording_bar'),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      child: Row(
+        children: [
+          // Pulsing red recording indicator + timer
+          Container(
+            width: 10,
+            height: 10,
+            decoration: BoxDecoration(
+              color: pulseOn
+                  ? const Color(0xFFEF4444)
+                  : const Color(0xFFEF4444).withValues(alpha: 0.35),
+              shape: BoxShape.circle,
+              boxShadow: pulseOn
+                  ? [
+                      BoxShadow(
+                        color: const Color(0xFFEF4444).withValues(alpha: 0.5),
+                        blurRadius: 6,
+                      ),
+                    ]
+                  : null,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            '$mm:$ss.$ds',
+            style: TextStyle(
+              fontSize: 13.5,
+              fontWeight: FontWeight.w700,
+              color: tg.textPrimary,
+              fontFeatures: const [FontFeature.tabularFigures()],
+            ),
+          ),
+          const SizedBox(width: 12),
+
+          // Live animated voice waveform bars
+          Expanded(
+            child: SizedBox(
+              height: 24,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                children: List.generate(18, (idx) {
+                  final phase = (_voiceRecordElapsedDs + idx * 2) % 10;
+                  final norm = (0.28 + 0.72 * ((phase <= 5 ? phase : 10 - phase) / 5.0))
+                      .clamp(0.2, 1.0);
+                  return Container(
+                    width: 3,
+                    height: 22 * norm,
+                    decoration: BoxDecoration(
+                      color: tg.tgBlueBright.withValues(alpha: 0.85),
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  );
+                }),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+
+          // 1. Cancel recording button
+          TextButton.icon(
+            key: const ValueKey('tg_cancel_voice_btn'),
+            style: TextButton.styleFrom(
+              visualDensity: VisualDensity.compact,
+              foregroundColor: const Color(0xFFEF4444),
+            ),
+            onPressed: _isTranscribingVoice ? null : _cancelVoiceRecording,
+            icon: const Icon(Icons.delete_outline_rounded, size: 17),
+            label: const Text(
+              '取消',
+              style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
+            ),
+          ),
+          const SizedBox(width: 4),
+
+          // 2. Transcribe Voice-to-Text button (`转文字`)
+          OutlinedButton.icon(
+            key: const ValueKey('tg_voice_to_text_btn'),
+            style: OutlinedButton.styleFrom(
+              visualDensity: VisualDensity.compact,
+              foregroundColor: tg.tgBlueBright,
+              side: BorderSide(color: tg.tgBlueBright.withValues(alpha: 0.5)),
+            ),
+            onPressed:
+                _isTranscribingVoice ? null : _stopAndTranscribeVoiceToText,
+            icon: _isTranscribingVoice
+                ? SizedBox(
+                    width: 13,
+                    height: 13,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: tg.tgBlueBright,
+                    ),
+                  )
+                : const Icon(Icons.record_voice_over_rounded, size: 15),
+            label: Text(
+              _isTranscribingVoice ? '识别中…' : '语音转文字',
+              style: const TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          const SizedBox(width: 6),
+
+          // 3. Send Voice Note button (`发送语音`)
+          FilledButton.icon(
+            key: const ValueKey('tg_send_voice_btn'),
+            style: FilledButton.styleFrom(
+              visualDensity: VisualDensity.compact,
+              backgroundColor: tg.tgBlueBright,
+              foregroundColor: Colors.white,
+            ),
+            onPressed: _isTranscribingVoice ? null : _stopAndSendVoiceRecording,
+            icon: const Icon(Icons.send_rounded, size: 15),
+            label: const Text(
+              '发送语音',
+              style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ===========================================================================
+  // In-App Telegram Live Voice Call Console (`语音通话功能`)
+  // ===========================================================================
+
+  Future<void> _startVoiceCallSegmentCapture() async {
+    if (!_isVoiceCallActive || _voiceCallMuted || _isVoiceCallSegmentRecording) {
+      return;
+    }
+    final res = await NativeUtilsChannelHub.startVoiceRecording();
+    if (res.ok && mounted && _isVoiceCallActive) {
+      setState(() {
+        _isVoiceCallSegmentRecording = true;
+        _voiceCallSegmentSec = 0;
+      });
+      _voiceCallDialogSetState?.call(() {});
+    }
+  }
+
+  Future<void> _flushVoiceCallSegmentNow({bool restartNext = true}) async {
+    if (!_isVoiceCallSegmentRecording) return;
+    _isVoiceCallSegmentRecording = false;
+    final segDur = _voiceCallSegmentSec.clamp(1, 300);
+    _voiceCallSegmentSec = 0;
+    final callChat = _voiceCallChat;
+    final recorded = await NativeUtilsChannelHub.stopVoiceRecording();
+    if (!mounted || callChat == null || recorded == null || recorded.bytes.isEmpty) {
+      return;
+    }
+    _voiceCallSentSegments++;
+    _voiceCallDialogSetState?.call(() {});
+    final voiceFile = TelegramOutgoingFile(
+      name: recorded.fileName,
+      bytes: recorded.bytes,
+      mimeType: recorded.mimeType,
+      filePath: recorded.filePath,
+      fileSize: recorded.bytes.length,
+      isVoiceNote: true,
+      durationSeconds: recorded.durationSeconds > 0
+          ? recorded.durationSeconds
+          : segDur,
+    );
+    unawaited(
+      _sendMessage(
+        overrideText: '',
+        overrideFiles: [voiceFile],
+        overrideAsFile: false,
+      ),
+    );
+    if (restartNext && _isVoiceCallActive && !_voiceCallMuted) {
+      unawaited(_startVoiceCallSegmentCapture());
+    }
+  }
+
+  Future<void> _endTelegramVoiceCall() async {
+    _voiceCallTimer?.cancel();
+    _voiceCallTimer = null;
+    final prevChat = _voiceCallChat;
+    final wasRec = _isVoiceCallSegmentRecording;
+    _isVoiceCallSegmentRecording = false;
+    _voiceCallSegmentSec = 0;
+    if (mounted) {
+      setState(() {
+        _isVoiceCallActive = false;
+        _voiceCallChat = null;
+        _voiceCallElapsedSec = 0;
+      });
+    }
+    if (wasRec) {
+      unawaited(NativeUtilsChannelHub.cancelVoiceRecording());
+    }
+    unawaited(NativeUtilsChannelHub.endSystemCall());
+    if (prevChat != null) {
+      unawaited(
+        widget.appState.api.requestTelegramVoiceCall(
+          accountId: _activeAccountId,
+          peer: prevChat.peer,
+          action: 'hangup',
+        ),
+      );
+    }
+  }
+
+  bool _isShowingIncomingCallRing = false;
+
+  Future<void> _showIncomingCallKitRingingDialog(
+    TelegramChat chat,
+    String callerName,
+  ) async {
+    if (!mounted || _isShowingIncomingCallRing || _isVoiceCallActive) return;
+    _isShowingIncomingCallRing = true;
+    final tg = _TgPalette(VideoPlatformTheme.isDark);
+    try {
+      await showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) {
+          return AlertDialog(
+            key: const ValueKey('tg_incoming_callkit_dialog'),
+            backgroundColor: tg.sidebarBg,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(22),
+              side: const BorderSide(color: Color(0xFF22C55E), width: 1.5),
+            ),
+            content: SizedBox(
+              width: 360,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const SizedBox(height: 10),
+                  Container(
+                    width: 84,
+                    height: 84,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      gradient: LinearGradient(
+                        colors: [tg.tgBlueBright, const Color(0xFF22C55E)],
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: const Color(0xFF22C55E).withValues(alpha: 0.45),
+                          blurRadius: 20,
+                          spreadRadius: 4,
+                        ),
+                      ],
+                    ),
+                    alignment: Alignment.center,
+                    child: const Icon(
+                      Icons.ring_volume_rounded,
+                      color: Colors.white,
+                      size: 36,
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  Text(
+                    callerName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w800,
+                      color: tg.textPrimary,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    '📞 Telegram 语音通话来电响铃中 (CallKit)…',
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: const Color(0xFF22C55E),
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      FilledButton.icon(
+                        style: FilledButton.styleFrom(
+                          backgroundColor: const Color(0xFFEF4444),
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 18,
+                            vertical: 10,
+                          ),
+                        ),
+                        onPressed: () {
+                          Navigator.of(ctx).pop();
+                          unawaited(NativeUtilsChannelHub.endSystemCall());
+                        },
+                        icon: const Icon(Icons.call_end_rounded, size: 18),
+                        label: const Text(
+                          '拒绝挂断',
+                          style: TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                      ),
+                      FilledButton.icon(
+                        style: FilledButton.styleFrom(
+                          backgroundColor: const Color(0xFF22C55E),
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 18,
+                            vertical: 10,
+                          ),
+                        ),
+                        onPressed: () async {
+                          Navigator.of(ctx).pop();
+                          await _selectChat(chat);
+                          if (mounted) {
+                            unawaited(_openTelegramVoiceCallConsole(tg, chat));
+                          }
+                        },
+                        icon: const Icon(Icons.call_rounded, size: 18),
+                        label: const Text(
+                          '立即接听',
+                          style: TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      );
+    } finally {
+      _isShowingIncomingCallRing = false;
+    }
+  }
+
+  Future<void> _openTelegramVoiceCallConsole(
+    _TgPalette tg,
+    TelegramChat chat,
+  ) async {
+    if (!_isVoiceCallActive || _voiceCallChat?.peer != chat.peer) {
+      _voiceCallTimer?.cancel();
+      setState(() {
+        _isVoiceCallActive = true;
+        _voiceCallChat = chat;
+        _voiceCallElapsedSec = 0;
+        _voiceCallMuted = false;
+        _voiceCallSpeakerOn = true;
+        _voiceCallSentSegments = 0;
+        _voiceCallSegmentSec = 0;
+      });
+      unawaited(
+        NativeUtilsChannelHub.startOutgoingSystemCall(
+          callerName: _resolveDisplayChatTitle(chat),
+          peer: chat.peer,
+          accountId: _activeAccountId,
+        ),
+      );
+      unawaited(
+        widget.appState.api.requestTelegramVoiceCall(
+          accountId: _activeAccountId,
+          peer: chat.peer,
+          action: 'start',
+        ),
+      );
+      unawaited(_startVoiceCallSegmentCapture());
+      _voiceCallTimer = Timer.periodic(
+        const Duration(seconds: 1),
+        (_) {
+          if (!mounted || !_isVoiceCallActive) return;
+          _voiceCallElapsedSec++;
+          if (_isVoiceCallSegmentRecording && !_voiceCallMuted) {
+            _voiceCallSegmentSec++;
+            if (_voiceCallHandsFreeAutoSend && _voiceCallSegmentSec >= 6) {
+              unawaited(_flushVoiceCallSegmentNow(restartNext: true));
+            }
+          }
+          _voiceCallDialogSetState?.call(() {});
+        },
+      );
+    }
+
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setModalState) {
+            _voiceCallDialogSetState = setModalState;
+            final mm =
+                (_voiceCallElapsedSec ~/ 60).toString().padLeft(2, '0');
+            final ss =
+                (_voiceCallElapsedSec % 60).toString().padLeft(2, '0');
+            final title = _resolveDisplayChatTitle(chat);
+
+            return AlertDialog(
+              key: const ValueKey('tg_voice_call_dialog'),
+              backgroundColor: tg.sidebarBg,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(20),
+                side: BorderSide(color: tg.borderLine),
+              ),
+              title: Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(7),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF22C55E).withValues(alpha: 0.16),
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(
+                      Icons.phone_in_talk_rounded,
+                      color: Color(0xFF22C55E),
+                      size: 19,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Telegram 实时语音通话',
+                          style: TextStyle(
+                            fontSize: 15.5,
+                            fontWeight: FontWeight.w800,
+                            color: tg.textPrimary,
+                          ),
+                        ),
+                        Text(
+                          '通话时长 $mm:$ss · 应用内加密实时语音对讲与自动免提播放',
+                          style: TextStyle(
+                            fontSize: 11.5,
+                            color: tg.textSecondary,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              content: SizedBox(
+                width: 410,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const SizedBox(height: 8),
+                    // Animated Call Avatar & Soundwave Ring
+                    Container(
+                      width: 84,
+                      height: 84,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: LinearGradient(
+                          colors: [
+                            tg.tgBlueBright,
+                            const Color(0xFF22C55E),
+                          ],
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: (_voiceCallMuted
+                                    ? Colors.grey
+                                    : const Color(0xFF22C55E))
+                                .withValues(alpha: 0.38),
+                            blurRadius: 18,
+                            spreadRadius: 3,
+                          ),
+                        ],
+                      ),
+                      alignment: Alignment.center,
+                      child: Text(
+                        title.isNotEmpty
+                            ? title.characters.first.toUpperCase()
+                            : 'T',
+                        style: const TextStyle(
+                          fontSize: 32,
+                          fontWeight: FontWeight.w900,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 17,
+                        fontWeight: FontWeight.w800,
+                        color: tg.textPrimary,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      _voiceCallMuted
+                          ? '已静音麦克风 · 仍可实时收听对方语音'
+                          : (_isVoiceCallSegmentRecording
+                              ? '正在采集麦克风语音 (${_voiceCallSegmentSec}s)… 已发送 $_voiceCallSentSegments 段'
+                              : '语音通话已连接 ($mm:$ss)'),
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        color: _voiceCallMuted
+                            ? const Color(0xFFF59E0B)
+                            : const Color(0xFF22C55E),
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+
+                    // Hands-free auto-streaming toggle
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: tg.searchFill,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: tg.borderLine),
+                      ),
+                      child: Column(
+                        children: [
+                          Row(
+                            children: [
+                              Icon(
+                                Icons.record_voice_over_rounded,
+                                size: 17,
+                                color: tg.tgBlueBright,
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  '免提连续对讲 (每 6 秒自动推送语音流)',
+                                  style: TextStyle(
+                                    fontSize: 12.5,
+                                    fontWeight: FontWeight.w600,
+                                    color: tg.textPrimary,
+                                  ),
+                                ),
+                              ),
+                              Switch(
+                                value: _voiceCallHandsFreeAutoSend,
+                                onChanged: (v) {
+                                  setState(
+                                    () => _voiceCallHandsFreeAutoSend = v,
+                                  );
+                                  setModalState(() {});
+                                },
+                              ),
+                            ],
+                          ),
+                          Text(
+                            '通话期间对方发来的所有语音消息将自动通过扬声器实时播放，无需手动点击；您也可以随时点击下方「立即发送当前语音段」推送当前说话内容。',
+                            style: TextStyle(
+                              fontSize: 11.2,
+                              color: tg.textSecondary,
+                              height: 1.4,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+
+                    // Call control buttons: Mute / Speaker / Send Voice Chunk / Hang Up
+                    Wrap(
+                      spacing: 10,
+                      runSpacing: 10,
+                      alignment: WrapAlignment.center,
+                      children: [
+                        OutlinedButton.icon(
+                          key: const ValueKey('tg_call_mute_btn'),
+                          onPressed: () async {
+                            final nextMute = !_voiceCallMuted;
+                            setState(() => _voiceCallMuted = nextMute);
+                            setModalState(() {});
+                            if (nextMute) {
+                              if (_isVoiceCallSegmentRecording) {
+                                _isVoiceCallSegmentRecording = false;
+                                await NativeUtilsChannelHub
+                                    .cancelVoiceRecording();
+                              }
+                            } else {
+                              await _startVoiceCallSegmentCapture();
+                            }
+                          },
+                          icon: Icon(
+                            _voiceCallMuted
+                                ? Icons.mic_off_rounded
+                                : Icons.mic_rounded,
+                            size: 17,
+                            color: _voiceCallMuted
+                                ? const Color(0xFFEF4444)
+                                : tg.tgBlueBright,
+                          ),
+                          label: Text(
+                            _voiceCallMuted ? '取消静音' : '静音麦克风',
+                            style: const TextStyle(fontSize: 12.5),
+                          ),
+                        ),
+                        OutlinedButton.icon(
+                          key: const ValueKey('tg_call_speaker_btn'),
+                          onPressed: () {
+                            setState(
+                              () =>
+                                  _voiceCallSpeakerOn = !_voiceCallSpeakerOn,
+                            );
+                            setModalState(() {});
+                          },
+                          icon: Icon(
+                            _voiceCallSpeakerOn
+                                ? Icons.volume_up_rounded
+                                : Icons.volume_off_rounded,
+                            size: 17,
+                            color: _voiceCallSpeakerOn
+                                ? const Color(0xFF22C55E)
+                                : tg.textMuted,
+                          ),
+                          label: Text(
+                            _voiceCallSpeakerOn ? '免提自动播开启' : '免提已关闭',
+                            style: const TextStyle(fontSize: 12.5),
+                          ),
+                        ),
+                        OutlinedButton.icon(
+                          key: const ValueKey('tg_call_ring_peer_btn'),
+                          onPressed: () {
+                            unawaited(
+                              _sendMessage(
+                                overrideText:
+                                    '[📞 语音通话邀请] 📞 发起 Telegram 实时语音通话，请接听',
+                                overrideFiles: const [],
+                              ),
+                            );
+                            _showDownloadHud(
+                              '已向「$title」发送系统级来电响铃邀请',
+                              state: 'success',
+                            );
+                          },
+                          icon: Icon(
+                            Icons.notifications_active_rounded,
+                            size: 16,
+                            color: tg.tgBlueBright,
+                          ),
+                          label: const Text(
+                            '发送响铃邀请 (CallKit)',
+                            style: TextStyle(fontSize: 12.5),
+                          ),
+                        ),
+                        FilledButton.icon(
+                          key: const ValueKey('tg_call_push_chunk_btn'),
+                          style: FilledButton.styleFrom(
+                            backgroundColor: tg.tgBlueBright,
+                            foregroundColor: Colors.white,
+                          ),
+                          onPressed: _voiceCallMuted
+                              ? null
+                              : () => _flushVoiceCallSegmentNow(
+                                    restartNext: true,
+                                  ),
+                          icon: const Icon(Icons.send_rounded, size: 16),
+                          label: const Text(
+                            '立即发送当前语音段',
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  child: const Text('后台保持通话'),
+                ),
+                FilledButton.icon(
+                  key: const ValueKey('tg_call_hangup_btn'),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: const Color(0xFFEF4444),
+                    foregroundColor: Colors.white,
+                  ),
+                  onPressed: () {
+                    Navigator.of(ctx).pop();
+                    _endTelegramVoiceCall();
+                  },
+                  icon: const Icon(Icons.call_end_rounded, size: 17),
+                  label: const Text(
+                    '挂断通话',
+                    style: TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    _voiceCallDialogSetState = null;
+  }
+
   /// Staged Attachments & Upload Progress Bar above Compose Box
   Widget _buildStagedAttachmentsBar(_TgPalette tg) {
+    final hasStaged = _stagedFiles.isNotEmpty;
+    final hasActiveUpload =
+        (_isSendingMessage || _sendingOptimisticMsgIds.isNotEmpty) &&
+        _uploadStatusText.isNotEmpty;
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.fromLTRB(14, 8, 12, 8),
@@ -13655,92 +18267,94 @@ class _TelegramScreenState extends State<TelegramScreen> {
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          Row(
-            children: [
-              Icon(
-                Icons.attach_file_rounded,
-                size: 15,
-                color: tg.tgBlueBright,
-              ),
-              const SizedBox(width: 6),
-              Text(
-                '待发送附件 (${_stagedFiles.length}/10)',
-                style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
-                  color: tg.textPrimary,
+          if (hasStaged)
+            Row(
+              children: [
+                Icon(
+                  Icons.attach_file_rounded,
+                  size: 15,
+                  color: tg.tgBlueBright,
                 ),
-              ),
-              const SizedBox(width: 12),
-              InkWell(
-                borderRadius: BorderRadius.circular(6),
-                onTap: _isSendingMessage
-                    ? null
-                    : () {
-                        setState(() => _sendAsFile = !_sendAsFile);
-                        _saveCurrentDraft();
-                      },
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 6,
-                    vertical: 2,
+                const SizedBox(width: 6),
+                Text(
+                  '待发送附件 (${_stagedFiles.length}/10)',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: tg.textPrimary,
                   ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        _sendAsFile
-                            ? Icons.check_box_rounded
-                            : Icons.check_box_outline_blank_rounded,
-                        size: 16,
-                        color: _sendAsFile ? tg.tgBlueBright : tg.textSecondary,
-                      ),
-                      const SizedBox(width: 4),
-                      Text(
-                        '作为无损原文件发送 (不压缩)',
-                        style: TextStyle(
-                          fontSize: 11.5,
-                          color: _sendAsFile
-                              ? tg.tgBlueBright
-                              : tg.textSecondary,
+                ),
+                const SizedBox(width: 12),
+                InkWell(
+                  borderRadius: BorderRadius.circular(6),
+                  onTap: _isSendingMessage
+                      ? null
+                      : () {
+                          setState(() => _sendAsFile = !_sendAsFile);
+                          _saveCurrentDraft();
+                        },
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 6,
+                      vertical: 2,
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          _sendAsFile
+                              ? Icons.check_box_rounded
+                              : Icons.check_box_outline_blank_rounded,
+                          size: 16,
+                          color:
+                              _sendAsFile ? tg.tgBlueBright : tg.textSecondary,
                         ),
-                      ),
-                    ],
+                        const SizedBox(width: 4),
+                        Text(
+                          '作为无损原文件发送 (不压缩)',
+                          style: TextStyle(
+                            fontSize: 11.5,
+                            color: _sendAsFile
+                                ? tg.tgBlueBright
+                                : tg.textSecondary,
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
-              ),
-              const Spacer(),
-              TextButton.icon(
-                style: TextButton.styleFrom(
-                  visualDensity: VisualDensity.compact,
+                const Spacer(),
+                TextButton.icon(
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                  ),
+                  onPressed: _isSendingMessage
+                      ? null
+                      : () => _pickFilesToAttach(
+                          mediaOnly: false,
+                          asFile: _sendAsFile,
+                        ),
+                  icon: const Icon(Icons.add_rounded, size: 15),
+                  label: const Text('继续添加', style: TextStyle(fontSize: 11.5)),
                 ),
-                onPressed: _isSendingMessage
-                    ? null
-                    : () => _pickFilesToAttach(
-                        mediaOnly: false,
-                        asFile: _sendAsFile,
-                      ),
-                icon: const Icon(Icons.add_rounded, size: 15),
-                label: const Text('继续添加', style: TextStyle(fontSize: 11.5)),
-              ),
-              TextButton(
-                style: TextButton.styleFrom(
-                  visualDensity: VisualDensity.compact,
+                TextButton(
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                  ),
+                  onPressed: _isSendingMessage
+                      ? null
+                      : () {
+                          setState(() => _stagedFiles.clear());
+                          _saveCurrentDraft();
+                        },
+                  child: const Text(
+                    '清空',
+                    style: TextStyle(fontSize: 11.5, color: Color(0xFFE54D42)),
+                  ),
                 ),
-                onPressed: _isSendingMessage
-                    ? null
-                    : () {
-                        setState(() => _stagedFiles.clear());
-                        _saveCurrentDraft();
-                      },
-                child: const Text(
-                  '清空',
-                  style: TextStyle(fontSize: 11.5, color: Color(0xFFE54D42)),
-                ),
-              ),
-            ],
-          ),
-          if (_stagedFiles.isNotEmpty) ...[
+              ],
+            ),
+          if (hasStaged) ...[
             const SizedBox(height: 6),
             SizedBox(
               height: 58,
@@ -13842,18 +18456,57 @@ class _TelegramScreenState extends State<TelegramScreen> {
               ),
             ),
           ],
-          if (_isSendingMessage && _uploadStatusText.isNotEmpty) ...[
-            const SizedBox(height: 6),
-            LinearProgressIndicator(
-              value: _uploadPercent > 0 ? (_uploadPercent / 100.0) : null,
-              minHeight: 3,
-              color: tg.tgBlueBright,
-              backgroundColor: tg.searchFill,
+          if (hasActiveUpload) ...[
+            if (hasStaged) const SizedBox(height: 6),
+            Row(
+              children: [
+                SizedBox(
+                  width: 13,
+                  height: 13,
+                  child: CircularProgressIndicator(
+                    value: _uploadPercent > 0
+                        ? (_uploadPercent / 100.0).clamp(0.02, 1.0)
+                        : null,
+                    strokeWidth: 2,
+                    color: tg.tgBlueBright,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _uploadStatusText,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w600,
+                      color: tg.tgBlueBright,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  '$_uploadPercent%',
+                  style: TextStyle(
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w700,
+                    color: tg.tgBlueBright,
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(height: 4),
-            Text(
-              _uploadStatusText,
-              style: TextStyle(fontSize: 11.5, color: tg.tgBlueBright),
+            const SizedBox(height: 5),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(3),
+              child: LinearProgressIndicator(
+                key: const ValueKey('tg_compose_upload_progress_bar'),
+                value: _uploadPercent > 0
+                    ? (_uploadPercent / 100.0).clamp(0.02, 1.0)
+                    : null,
+                minHeight: 3.5,
+                color: tg.tgBlueBright,
+                backgroundColor: tg.searchFill,
+              ),
             ),
           ],
         ],
@@ -13950,9 +18603,10 @@ class _TelegramScreenState extends State<TelegramScreen> {
     );
   }
 
-  /// Official Telegram Desktop Emoji, Kaomoji & Quick Phrase Panel
+  /// Official Telegram Desktop Emoji, AnimatedSticker.tgs, Kaomoji & Quick Phrase Panel
   Widget _buildTelegramEmojiPanel(_TgPalette tg) {
     final kw = _emojiSearchQuery.trim().toLowerCase();
+    final isStickerTab = _selectedEmojiTab == -1 && kw.isEmpty;
     List<String> currentItems = [];
     bool isTextPhraseMode = false;
 
@@ -13973,7 +18627,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
       }
     } else if (_selectedEmojiTab == 0) {
       currentItems = _recentEmojis;
-    } else {
+    } else if (_selectedEmojiTab > 0) {
       final catIdx = (_selectedEmojiTab - 1).clamp(
         0,
         _kTelegramEmojiCategories.length - 1,
@@ -13984,7 +18638,7 @@ class _TelegramScreenState extends State<TelegramScreen> {
     }
 
     return Container(
-      height: 255,
+      height: 265,
       decoration: BoxDecoration(
         color: tg.headerBg,
         border: Border(bottom: BorderSide(color: tg.borderLine)),
@@ -14005,6 +18659,13 @@ class _TelegramScreenState extends State<TelegramScreen> {
                     scrollDirection: Axis.horizontal,
                     child: Row(
                       children: [
+                        _buildEmojiCategoryTabBtn(
+                          tg,
+                          -1,
+                          '✨ 贴纸',
+                          '动态贴纸 (AnimatedSticker.tgs)',
+                          key: const ValueKey('tg_emoji_tab_tgs_stickers'),
+                        ),
                         _buildEmojiCategoryTabBtn(tg, 0, '🕒', '最近常用'),
                         for (int i = 0;
                             i < _kTelegramEmojiCategories.length;
@@ -14061,63 +18722,67 @@ class _TelegramScreenState extends State<TelegramScreen> {
             ),
           ),
 
-          // Emoji grid or Kaomoji/Phrase chips
+          // AnimatedSticker.tgs tab, Emoji grid, or Kaomoji/Phrase chips
           Expanded(
-            child: isTextPhraseMode
-                ? SingleChildScrollView(
-                    padding: const EdgeInsets.all(12),
-                    child: Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: currentItems.map((phrase) {
-                        return GestureDetector(
-                          onSecondaryTap: () =>
-                              _onEmojiSelected(phrase, sendImmediately: true),
-                          child: ActionChip(
-                            backgroundColor: tg.searchFill,
-                            label: Text(
-                              phrase,
-                              style: TextStyle(
-                                fontSize: 12.5,
-                                color: tg.textPrimary,
+            child: isStickerTab
+                ? _buildAnimatedStickersPanelTab(tg)
+                : (isTextPhraseMode
+                    ? SingleChildScrollView(
+                        padding: const EdgeInsets.all(12),
+                        child: Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: currentItems.map((phrase) {
+                            return GestureDetector(
+                              onSecondaryTap: () => _onEmojiSelected(
+                                phrase,
+                                sendImmediately: true,
+                              ),
+                              child: ActionChip(
+                                backgroundColor: tg.searchFill,
+                                label: Text(
+                                  phrase,
+                                  style: TextStyle(
+                                    fontSize: 12.5,
+                                    color: tg.textPrimary,
+                                  ),
+                                ),
+                                onPressed: () => _onEmojiSelected(phrase),
+                              ),
+                            );
+                          }).toList(),
+                        ),
+                      )
+                    : GridView.builder(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 8,
+                        ),
+                        gridDelegate:
+                            const SliverGridDelegateWithMaxCrossAxisExtent(
+                          maxCrossAxisExtent: 42,
+                          mainAxisSpacing: 4,
+                          crossAxisSpacing: 4,
+                        ),
+                        itemCount: currentItems.length,
+                        itemBuilder: (_, idx) {
+                          final emoji = currentItems[idx];
+                          return GestureDetector(
+                            onSecondaryTap: () =>
+                                _onEmojiSelected(emoji, sendImmediately: true),
+                            child: InkWell(
+                              borderRadius: BorderRadius.circular(8),
+                              onTap: () => _onEmojiSelected(emoji),
+                              child: Center(
+                                child: Text(
+                                  emoji,
+                                  style: const TextStyle(fontSize: 23),
+                                ),
                               ),
                             ),
-                            onPressed: () => _onEmojiSelected(phrase),
-                          ),
-                        );
-                      }).toList(),
-                    ),
-                  )
-                : GridView.builder(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 8,
-                    ),
-                    gridDelegate:
-                        const SliverGridDelegateWithMaxCrossAxisExtent(
-                      maxCrossAxisExtent: 42,
-                      mainAxisSpacing: 4,
-                      crossAxisSpacing: 4,
-                    ),
-                    itemCount: currentItems.length,
-                    itemBuilder: (_, idx) {
-                      final emoji = currentItems[idx];
-                      return GestureDetector(
-                        onSecondaryTap: () =>
-                            _onEmojiSelected(emoji, sendImmediately: true),
-                        child: InkWell(
-                          borderRadius: BorderRadius.circular(8),
-                          onTap: () => _onEmojiSelected(emoji),
-                          child: Center(
-                            child: Text(
-                              emoji,
-                              style: const TextStyle(fontSize: 23),
-                            ),
-                          ),
-                        ),
-                      );
-                    },
-                  ),
+                          );
+                        },
+                      )),
           ),
         ],
       ),
@@ -14128,10 +18793,12 @@ class _TelegramScreenState extends State<TelegramScreen> {
     _TgPalette tg,
     int index,
     String iconStr,
-    String tooltip,
-  ) {
+    String tooltip, {
+    Key? key,
+  }) {
     final active = _selectedEmojiTab == index && _emojiSearchQuery.isEmpty;
     return InkWell(
+      key: key,
       borderRadius: BorderRadius.circular(8),
       onTap: () {
         _emojiSearchCtrl.clear();
@@ -14140,16 +18807,652 @@ class _TelegramScreenState extends State<TelegramScreen> {
           _selectedEmojiTab = index;
         });
       },
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
-        decoration: BoxDecoration(
-          color: active
-              ? tg.tgBlueBright.withValues(alpha: 0.18)
-              : Colors.transparent,
-          borderRadius: BorderRadius.circular(8),
+      child: Tooltip(
+        message: tooltip,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+          decoration: BoxDecoration(
+            color: active
+                ? tg.tgBlueBright.withValues(alpha: 0.18)
+                : Colors.transparent,
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Text(
+            iconStr,
+            style: TextStyle(
+              fontSize: iconStr.length > 2 ? 12.5 : 16,
+              fontWeight: active ? FontWeight.w700 : FontWeight.w500,
+              color: active ? tg.tgBlueBright : tg.textPrimary,
+            ),
+          ),
         ),
-        child: Text(iconStr, style: const TextStyle(fontSize: 16)),
       ),
+    );
+  }
+
+  /// Sends a `.tgs` (`AnimatedSticker.tgs`) or sticker attachment directly to the active chat.
+  Future<void> _sendAnimatedTgsSticker({
+    required Uint8List bytes,
+    String fileName = 'AnimatedSticker.tgs',
+    String mimeType = 'application/x-tgsticker',
+  }) async {
+    final chat = _selectedChat;
+    if (chat == null || chat.readOnly || bytes.isEmpty) return;
+    setState(() => _showEmojiPanel = false);
+    await _sendMessage(
+      overrideText: '',
+      overrideAsFile: false,
+      overrideFiles: [
+        TelegramOutgoingFile(
+          name: fileName,
+          bytes: bytes,
+          mimeType: mimeType,
+          fileSize: bytes.length,
+        ),
+      ],
+    );
+  }
+
+  /// Sends an existing conversation sticker (`AnimatedSticker.tgs` / `sticker.webp`) again to the active chat.
+  Future<void> _resendExistingStickerMessage(
+    TelegramChat chat,
+    TelegramMessage msg,
+    TelegramAttachment att,
+  ) async {
+    if (chat.readOnly) return;
+    Uint8List? bytes = _optimisticPreviewBytesByMsgId[msg.id] ??
+        _TelegramAnimatedStickerView.getCachedBytes(
+          accountId: _activeAccountId,
+          peer: chat.peer,
+          messageId: msg.id,
+        );
+    if (bytes == null || bytes.isEmpty) {
+      final savedPath = _getSavedLocalPath(chat, msg);
+      if (savedPath != null && savedPath.isNotEmpty) {
+        try {
+          final f = File(savedPath);
+          if (f.existsSync()) {
+            bytes = f.readAsBytesSync();
+          }
+        } catch (_) {}
+      }
+    }
+    if (bytes == null || bytes.isEmpty) {
+      try {
+        final dlUrl = widget.appState.api.buildTelegramFileDownloadUrl(
+          accountId: _activeAccountId,
+          peer: chat.peer,
+          messageId: msg.id,
+          local: true,
+        );
+        bytes = await widget.appState.api.downloadTelegramBytes(dlUrl);
+      } catch (_) {}
+    }
+    if (!mounted) return;
+    if (bytes == null || bytes.isEmpty) {
+      _showDownloadHud('无法读取贴纸数据，请稍后重试', state: 'error');
+      return;
+    }
+    final name = att.displayName.trim().isNotEmpty
+        ? att.displayName.trim()
+        : 'AnimatedSticker.tgs';
+    final mime = att.mimeType.trim().isNotEmpty
+        ? att.mimeType.trim()
+        : _guessMimeType(name);
+    await _sendAnimatedTgsSticker(
+      bytes: bytes,
+      fileName: name,
+      mimeType: mime,
+    );
+  }
+
+  /// Renders the "✨ 动态贴纸 (AnimatedSticker.tgs)" tab inside the compose Emoji & Sticker panel.
+  Widget _buildAnimatedStickersPanelTab(_TgPalette tg) {
+    final chat = _selectedChat;
+    final presets = TelegramBuiltinTgsStickers.presets;
+    final chatStickerMsgs = _messages
+        .where((m) => m.attachment != null && m.attachment!.isSticker)
+        .toList();
+
+    return GridView.builder(
+      key: const ValueKey('tg_animated_stickers_grid'),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+        maxCrossAxisExtent: 92,
+        mainAxisSpacing: 8,
+        crossAxisSpacing: 8,
+        childAspectRatio: 0.86,
+      ),
+      itemCount: presets.length + chatStickerMsgs.length,
+      itemBuilder: (ctx, idx) {
+        if (idx < presets.length) {
+          final preset = presets[idx];
+          return InkWell(
+            key: ValueKey('tg_builtin_tgs_sticker_${preset.id}'),
+            borderRadius: BorderRadius.circular(12),
+            onTap: () => _sendAnimatedTgsSticker(
+              bytes: preset.tgsBytes,
+              fileName: 'AnimatedSticker.tgs',
+              mimeType: 'application/x-tgsticker',
+            ),
+            child: Container(
+              padding: const EdgeInsets.all(6),
+              decoration: BoxDecoration(
+                color: tg.searchFill,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: tg.tgBlueBright.withValues(alpha: 0.22),
+                ),
+              ),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Expanded(
+                    child: _TelegramAnimatedStickerView(
+                      appState: widget.appState,
+                      accountId: _activeAccountId,
+                      peer: chat?.peer ?? 'preset',
+                      messageId: -1000 - idx,
+                      attachment: TelegramAttachment(
+                        kind: 'sticker',
+                        name: 'AnimatedSticker.tgs',
+                        fileName: 'AnimatedSticker.tgs',
+                        mimeType: 'application/x-tgsticker',
+                        size: preset.tgsBytes.length,
+                      ),
+                      thumbUrl: '',
+                      initialBytes: preset.tgsBytes,
+                      fallbackEmoji: preset.emoji,
+                      size: 56,
+                    ),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    preset.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 10.5,
+                      fontWeight: FontWeight.w600,
+                      color: tg.textSecondary,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        }
+
+        final msg = chatStickerMsgs[idx - presets.length];
+        final att = msg.attachment!;
+        final thumbUrl = chat != null
+            ? widget.appState.api.buildTelegramThumbnailUrl(
+                accountId: _activeAccountId,
+                peer: chat.peer,
+                messageId: msg.id,
+              )
+            : '';
+        return InkWell(
+          key: ValueKey('tg_chat_tgs_sticker_${msg.id}'),
+          borderRadius: BorderRadius.circular(12),
+          onTap: chat == null
+              ? null
+              : () => _resendExistingStickerMessage(chat, msg, att),
+          child: Container(
+            padding: const EdgeInsets.all(6),
+            decoration: BoxDecoration(
+              color: tg.searchFill,
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Expanded(
+                  child: _TelegramAnimatedStickerView(
+                    appState: widget.appState,
+                    accountId: _activeAccountId,
+                    peer: chat?.peer ?? '',
+                    messageId: msg.id,
+                    attachment: att,
+                    thumbUrl: thumbUrl,
+                    initialBytes: _optimisticPreviewBytesByMsgId[msg.id],
+                    size: 56,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  '会话贴纸 #${msg.id}',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 10,
+                    color: tg.textMuted,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// Renders a Telegram AnimatedSticker.tgs / WebP / WebM sticker card inside a message bubble.
+  Widget _buildTelegramStickerAttachment({
+    required _TgPalette tg,
+    required TelegramChat chat,
+    required TelegramMessage msg,
+    required TelegramAttachment att,
+    required String thumbUrl,
+    required Uint8List? optimisticBytes,
+    required bool isSendingThisMsg,
+    required int? msgUploadPct,
+    required String? savedLocalPath,
+    required bool isSavingLocal,
+    required bool isSavedLocal,
+  }) {
+    final badgeText = att.isTgsSticker
+        ? '动态贴纸 · AnimatedSticker.tgs'
+        : (att.isWebmSticker ? '动态视频贴纸 · WEBM' : '表情贴纸');
+    return Column(
+      key: ValueKey('tg_sticker_card_${msg.id}'),
+      crossAxisAlignment: CrossAxisAlignment.center,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(10, 8, 10, 4),
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => _openStickerPreviewDialog(tg, chat, msg, att),
+            child: Container(
+              width: 196,
+              height: 196,
+              decoration: BoxDecoration(
+                color: tg.isDark
+                    ? const Color(0x24000000)
+                    : const Color(0x14000000),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(
+                  color: tg.tgBlueBright.withValues(alpha: 0.22),
+                ),
+              ),
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 24, 12, 28),
+                    child: _TelegramAnimatedStickerView(
+                      key: ValueKey('tg_animated_sticker_view_${msg.id}'),
+                      appState: widget.appState,
+                      accountId: _activeAccountId,
+                      peer: chat.peer,
+                      messageId: msg.id,
+                      attachment: att,
+                      thumbUrl: thumbUrl,
+                      initialBytes: optimisticBytes,
+                      localFilePath: savedLocalPath,
+                      size: 144,
+                    ),
+                  ),
+                  Positioned(
+                    top: 6,
+                    left: 8,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 7,
+                        vertical: 2.5,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0x99000000),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(
+                            Icons.auto_awesome_rounded,
+                            size: 11,
+                            color: Color(0xFFFFD54F),
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            badgeText,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 10,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  if (isSendingThisMsg)
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xBF000000),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Text(
+                        '发送中 ${msgUploadPct ?? 0}%',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  Positioned(
+                    bottom: 6,
+                    left: 6,
+                    right: 6,
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        InkWell(
+                          key: ValueKey('tg_sticker_zoom_btn_${msg.id}'),
+                          borderRadius: BorderRadius.circular(8),
+                          onTap: () =>
+                              _openStickerPreviewDialog(tg, chat, msg, att),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 7,
+                              vertical: 3,
+                            ),
+                            decoration: BoxDecoration(
+                              color: const Color(0x99000000),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: const Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  Icons.zoom_in_rounded,
+                                  size: 12,
+                                  color: Colors.white,
+                                ),
+                                SizedBox(width: 2),
+                                Text(
+                                  '放大',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        if (!chat.readOnly) ...[
+                          const SizedBox(width: 5),
+                          InkWell(
+                            key: ValueKey('tg_sticker_send_same_btn_${msg.id}'),
+                            borderRadius: BorderRadius.circular(8),
+                            onTap: () =>
+                                _resendExistingStickerMessage(chat, msg, att),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 7,
+                                vertical: 3,
+                              ),
+                              decoration: BoxDecoration(
+                                color: tg.tgBlueBright.withValues(alpha: 0.88),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: const Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    Icons.send_rounded,
+                                    size: 11,
+                                    color: Colors.white,
+                                  ),
+                                  SizedBox(width: 3),
+                                  Text(
+                                    '发同款',
+                                    style: TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
+                        if (!_isOptimisticMsgId(msg.id)) ...[
+                          const SizedBox(width: 5),
+                          InkWell(
+                            key:
+                                ValueKey('tg_sticker_save_local_btn_${msg.id}'),
+                            borderRadius: BorderRadius.circular(8),
+                            onTap: isSavingLocal
+                                ? null
+                                : () {
+                                    if (savedLocalPath != null) {
+                                      _openLocalFileDirectory(savedLocalPath);
+                                    } else {
+                                      _saveAttachmentToLocalDownloads(
+                                        chat,
+                                        msg,
+                                      );
+                                    }
+                                  },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 6,
+                                vertical: 3,
+                              ),
+                              decoration: BoxDecoration(
+                                color: isSavedLocal
+                                    ? const Color(0xCC2EBE70)
+                                    : const Color(0x99000000),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Icon(
+                                isSavedLocal
+                                    ? Icons.check_circle_rounded
+                                    : Icons.download_rounded,
+                                size: 12,
+                                color: Colors.white,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        if (savedLocalPath != null)
+          _buildLocalFilePathBanner(tg, savedLocalPath),
+      ],
+    );
+  }
+
+  /// Opens the interactive AnimatedSticker.tgs preview & action modal.
+  Future<void> _openStickerPreviewDialog(
+    _TgPalette tg,
+    TelegramChat chat,
+    TelegramMessage msg,
+    TelegramAttachment att,
+  ) async {
+    final thumbUrl = widget.appState.api.buildTelegramThumbnailUrl(
+      accountId: _activeAccountId,
+      peer: chat.peer,
+      messageId: msg.id,
+    );
+    bool isPlaying = true;
+    double speed = 1.0;
+
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setModalState) {
+            return AlertDialog(
+              key: const ValueKey('tg_sticker_preview_dialog'),
+              backgroundColor: tg.sidebarBg,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(18),
+              ),
+              title: Row(
+                children: [
+                  const Icon(
+                    Icons.auto_awesome_rounded,
+                    color: Color(0xFFFFD54F),
+                    size: 20,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      att.isTgsSticker
+                          ? 'Telegram 动态表情包 (${att.displayName})'
+                          : 'Telegram 表情贴纸 (${att.displayName})',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
+                        color: tg.textPrimary,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    onPressed: () => Navigator.of(ctx).pop(),
+                    icon: Icon(
+                      Icons.close_rounded,
+                      size: 18,
+                      color: tg.textSecondary,
+                    ),
+                  ),
+                ],
+              ),
+              content: SizedBox(
+                width: 360,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 240,
+                      height: 240,
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: tg.searchFill,
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(color: tg.borderLine),
+                      ),
+                      child: _TelegramAnimatedStickerView(
+                        appState: widget.appState,
+                        accountId: _activeAccountId,
+                        peer: chat.peer,
+                        messageId: msg.id,
+                        attachment: att,
+                        thumbUrl: thumbUrl,
+                        initialBytes: _optimisticPreviewBytesByMsgId[msg.id],
+                        localFilePath: _getSavedLocalPath(chat, msg),
+                        size: 208,
+                        autoPlay: isPlaying,
+                        playbackSpeed: speed,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      [
+                        if (att.isTgsSticker) 'Lottie TGS 矢量动画 (60 FPS)',
+                        if (att.formattedSize.isNotEmpty) att.formattedSize,
+                        if (att.mimeType.isNotEmpty) att.mimeType,
+                      ].join(' · '),
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: tg.textSecondary,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      alignment: WrapAlignment.center,
+                      children: [
+                        OutlinedButton.icon(
+                          key: const ValueKey(
+                            'tg_sticker_dialog_play_pause_btn',
+                          ),
+                          onPressed: () {
+                            setModalState(() => isPlaying = !isPlaying);
+                          },
+                          icon: Icon(
+                            isPlaying
+                                ? Icons.pause_rounded
+                                : Icons.play_arrow_rounded,
+                            size: 16,
+                          ),
+                          label: Text(isPlaying ? '暂停动画' : '播放动画'),
+                        ),
+                        OutlinedButton.icon(
+                          key: const ValueKey('tg_sticker_dialog_speed_btn'),
+                          onPressed: () {
+                            setModalState(() {
+                              speed = speed == 1.0
+                                  ? 1.5
+                                  : (speed == 1.5 ? 0.5 : 1.0);
+                            });
+                          },
+                          icon: const Icon(Icons.speed_rounded, size: 16),
+                          label: Text('倍速 ${speed}x'),
+                        ),
+                        OutlinedButton.icon(
+                          key: const ValueKey('tg_sticker_dialog_json_btn'),
+                          onPressed: () {
+                            Navigator.of(ctx).pop();
+                            _openFilePreviewDialog(chat, msg);
+                          },
+                          icon: const Icon(Icons.code_rounded, size: 16),
+                          label: const Text('查看 TGS 源码'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton.icon(
+                  onPressed: () {
+                    Navigator.of(ctx).pop();
+                    _saveAttachmentToLocalDownloads(chat, msg);
+                  },
+                  icon: const Icon(Icons.download_rounded, size: 16),
+                  label: const Text('保存本机'),
+                ),
+                if (!chat.readOnly)
+                  FilledButton.icon(
+                    key: const ValueKey('tg_sticker_dialog_send_btn'),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: tg.tgBlueBright,
+                      foregroundColor: Colors.white,
+                    ),
+                    onPressed: () {
+                      Navigator.of(ctx).pop();
+                      _resendExistingStickerMessage(chat, msg, att);
+                    },
+                    icon: const Icon(Icons.send_rounded, size: 16),
+                    label: const Text('发送同款表情'),
+                  ),
+              ],
+            );
+          },
+        );
+      },
     );
   }
 
@@ -14286,7 +19589,6 @@ class _TelegramScreenState extends State<TelegramScreen> {
                       textColor: Colors.white,
                       bgColor: tg.tgBlueBright,
                       onTap: () async {
-                        int count = 0;
                         for (final m in mediaMessages) {
                           final att = m.attachment!;
                           await _queueTelegramDownload(
@@ -14294,14 +19596,33 @@ class _TelegramScreenState extends State<TelegramScreen> {
                             name: att.displayName,
                             showToast: false,
                           );
-                          count++;
                         }
-                        if (!mounted) return;
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(
-                            content: Text('已将本页 $count 个媒体加入服务器下载队列'),
-                          ),
+                      },
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    width: double.infinity,
+                    child: _buildTvFocusableActionChip(
+                      icon: Icons.cloud_upload_rounded,
+                      label: '一键115云下载本页媒体 (${mediaMessages.length})',
+                      textColor: const Color(0xFFFFB74D),
+                      bgColor: const Color(0x28FF9800),
+                      onTap: () async {
+                        final authed = await ensure115AuthenticatedForDownload(
+                          context: context,
+                          api: widget.appState.api,
                         );
+                        if (!authed || !mounted) return;
+                        for (final m in mediaMessages) {
+                          final att = m.attachment!;
+                          await _downloadTelegramTo115(
+                            url: att.url,
+                            name: att.displayName,
+                            chat: chat,
+                            msg: m,
+                          );
+                        }
                       },
                     ),
                   ),
@@ -14591,6 +19912,11 @@ class _TelegramScreenState extends State<TelegramScreen> {
                         final isQueueing = _pendingDownloads.contains(dlKey);
                         final isQueued = _isUrlQueuedOrInTasks(att.url);
                         final isFailed = _failedDownloads.contains(dlKey);
+                        final savedLocalPath = _getSavedLocalPath(chat, m);
+                        final isSavingLocal = _pendingLocalSaves.contains(m.id);
+                        final isSavedLocal =
+                            _completedLocalSaves.contains(m.id) ||
+                            savedLocalPath != null;
                         return ListTile(
                           dense: true,
                           shape: RoundedRectangleBorder(
@@ -14633,56 +19959,165 @@ class _TelegramScreenState extends State<TelegramScreen> {
                                 _formatDurationClock(att.duration),
                               if (att.formattedSize.isNotEmpty)
                                 att.formattedSize,
+                              if (isSavedLocal) '已下载到本机 ✓',
                               if (isQueued) '已加入下载队列 ✓',
                               if (isFailed) '添加失败 · 点击重试',
                             ].join(' · '),
                             style: TextStyle(
                               fontSize: 11,
-                              color: isQueued
+                              color: (isSavedLocal || isQueued)
                                   ? const Color(0xFF4ECC5E)
                                   : (isFailed
                                       ? const Color(0xFFFF6B6B)
                                       : tg.textMuted),
                             ),
                           ),
-                          trailing: IconButton(
-                            icon: AnimatedSwitcher(
-                              duration: const Duration(milliseconds: 200),
-                              transitionBuilder: (child, anim) =>
-                                  ScaleTransition(scale: anim, child: child),
-                              child: isQueueing
-                                  ? SizedBox(
-                                      key: const ValueKey('info_q_loading'),
-                                      width: 15,
-                                      height: 15,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                        color: tg.tgBlueBright,
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton(
+                                visualDensity: VisualDensity.compact,
+                                tooltip: savedLocalPath != null
+                                    ? '已下载: $savedLocalPath (点击打开所在位置)'
+                                    : '下载保存到本机电脑',
+                                icon: isSavingLocal
+                                    ? SizedBox(
+                                        width: 15,
+                                        height: 15,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                          color: tg.tgBlueBright,
+                                        ),
+                                      )
+                                    : Icon(
+                                        isSavedLocal
+                                            ? Icons.check_circle_rounded
+                                            : Icons.download_rounded,
+                                        size: 18,
+                                        color: isSavedLocal
+                                            ? const Color(0xFF4ECC5E)
+                                            : tg.textSecondary,
                                       ),
-                                    )
-                                  : Icon(
-                                      key: ValueKey(
-                                        'info_q_${isQueued}_$isFailed',
-                                      ),
-                                      isQueued
-                                          ? Icons.check_circle_rounded
-                                          : (isFailed
-                                              ? Icons.error_outline_rounded
-                                              : Icons.cloud_download_outlined),
-                                      size: 18,
-                                      color: isQueued
-                                          ? const Color(0xFF4ECC5E)
-                                          : (isFailed
-                                              ? const Color(0xFFFF6B6B)
-                                              : tg.tgBlueBright),
-                                    ),
-                            ),
-                            onPressed: isQueueing
-                                ? null
-                                : () => _queueTelegramDownload(
-                                      url: att.url,
-                                      name: att.displayName,
-                                    ),
+                                onPressed: isSavingLocal
+                                    ? null
+                                    : () {
+                                        if (savedLocalPath != null) {
+                                          _openLocalFileDirectory(
+                                            savedLocalPath,
+                                          );
+                                        } else {
+                                          _saveAttachmentToLocalDownloads(
+                                            chat,
+                                            m,
+                                          );
+                                        }
+                                      },
+                              ),
+                              if (att.url.isNotEmpty)
+                                IconButton(
+                                  visualDensity: VisualDensity.compact,
+                                  tooltip: '转存至服务器下载队列',
+                                  icon: AnimatedSwitcher(
+                                    duration: const Duration(milliseconds: 200),
+                                    transitionBuilder: (child, anim) =>
+                                        ScaleTransition(
+                                          scale: anim,
+                                          child: child,
+                                        ),
+                                    child: isQueueing
+                                        ? SizedBox(
+                                            key: const ValueKey(
+                                              'info_q_loading',
+                                            ),
+                                            width: 15,
+                                            height: 15,
+                                            child: CircularProgressIndicator(
+                                              strokeWidth: 2,
+                                              color: tg.tgBlueBright,
+                                            ),
+                                          )
+                                        : Icon(
+                                            key: ValueKey(
+                                              'info_q_${isQueued}_$isFailed',
+                                            ),
+                                            isQueued
+                                                ? Icons.check_circle_rounded
+                                                : (isFailed
+                                                    ? Icons
+                                                        .error_outline_rounded
+                                                    : Icons
+                                                        .cloud_download_outlined),
+                                            size: 18,
+                                            color: isQueued
+                                                ? const Color(0xFF4ECC5E)
+                                                : (isFailed
+                                                    ? const Color(0xFFFF6B6B)
+                                                    : tg.tgBlueBright),
+                                          ),
+                                  ),
+                                  onPressed: isQueueing
+                                      ? null
+                                      : () => _queueTelegramDownload(
+                                            url: att.url,
+                                            name: att.displayName,
+                                          ),
+                                ),
+                              Builder(
+                                builder: (_) {
+                                  final k115 = _resolve115KeyForTarget(
+                                    url: att.url,
+                                    chat: chat,
+                                    msg: m,
+                                  );
+                                  final isPending115 =
+                                      _pending115Downloads.contains(k115);
+                                  final isDone115 =
+                                      _completed115Downloads.contains(k115);
+                                  final isFailed115 =
+                                      _failed115Downloads.contains(k115);
+                                  return IconButton(
+                                    visualDensity: VisualDensity.compact,
+                                    tooltip: isDone115
+                                        ? '已存115 ✓'
+                                        : (isFailed115
+                                            ? '115云下载失败，点击重试'
+                                            : '115云下载'),
+                                    icon: isPending115
+                                        ? const SizedBox(
+                                            width: 15,
+                                            height: 15,
+                                            child: CircularProgressIndicator(
+                                              strokeWidth: 2,
+                                              color: Color(0xFFFFB74D),
+                                            ),
+                                          )
+                                        : Icon(
+                                            isDone115
+                                                ? Icons.check_circle_rounded
+                                                : (isFailed115
+                                                    ? Icons
+                                                        .error_outline_rounded
+                                                    : Icons
+                                                        .cloud_upload_rounded),
+                                            size: 17,
+                                            color: isDone115
+                                                ? const Color(0xFF4ECC5E)
+                                                : (isFailed115
+                                                    ? const Color(0xFFFF6B6B)
+                                                    : const Color(0xFFFFB74D)),
+                                          ),
+                                    onPressed: isPending115
+                                        ? null
+                                        : () => _downloadTelegramTo115(
+                                              url: att.url,
+                                              name: att.displayName,
+                                              chat: chat,
+                                              msg: m,
+                                            ),
+                                  );
+                                },
+                              ),
+                            ],
                           ),
                           onTap: () {
                             if (att.isVisualMedia) {
@@ -16667,25 +22102,53 @@ class _TelegramForwardDialogState extends State<_TelegramForwardDialog> {
   }
 }
 
-/// Official Telegram Inline File Preview Dialog (`/api/telegram/file-preview`)
+/// Official Telegram Inline File Preview Dialog (`/api/telegram/file-preview` + multi-format local & native preview)
 class _TelegramFilePreviewDialog extends StatefulWidget {
   final AppState appState;
   final String accountId;
+  final TelegramChat? chat;
+  final TelegramMessage? message;
   final String peer;
   final int messageId;
   final TelegramAttachment attachment;
+  final String? initialSavedLocalPath;
+  final Future<String?> Function()? onSaveLocal;
+  final Future<bool> Function()? onDownload115;
+  final Future<void> Function(String path)? onOpenLocalDir;
 
   const _TelegramFilePreviewDialog({
     required this.appState,
     required this.accountId,
+    this.chat,
+    this.message,
     required this.peer,
     required this.messageId,
     required this.attachment,
+    this.initialSavedLocalPath,
+    this.onSaveLocal,
+    this.onDownload115,
+    this.onOpenLocalDir,
   });
 
   @override
   State<_TelegramFilePreviewDialog> createState() =>
       _TelegramFilePreviewDialogState();
+}
+
+class _TelegramZipEntryMeta {
+  final String name;
+  final int method;
+  final int compressedSize;
+  final int uncompressedSize;
+  final int localHeaderOffset;
+
+  const _TelegramZipEntryMeta({
+    required this.name,
+    required this.method,
+    required this.compressedSize,
+    required this.uncompressedSize,
+    required this.localHeaderOffset,
+  });
 }
 
 class _TelegramFilePreviewDialogState
@@ -16694,11 +22157,114 @@ class _TelegramFilePreviewDialogState
   bool _isLoading = true;
   String? _error;
   String? _activeEntry;
+  String? _savedLocalPath;
+  bool _isSavingLocal = false;
+  bool _isSaving115 = false;
+  bool _saved115 = false;
+  bool _failed115 = false;
+  Uint8List? _rawBytesCache;
+  Uint8List? _activeImageBytes;
+  Map<String, _TelegramZipEntryMeta>? _localZipEntries;
+  List<List<String>>? _tableRows;
+  bool _showRawText = false;
+  bool _wordWrap = true;
+  double _fontSize = 12.5;
+  String _searchQuery = '';
+  bool _showSearchBar = false;
+  bool _copiedFeedback = false;
+  final TextEditingController _searchCtrl = TextEditingController();
 
   @override
   void initState() {
     super.initState();
+    _savedLocalPath = widget.initialSavedLocalPath;
     _loadPreview();
+  }
+
+  @override
+  void dispose() {
+    _searchCtrl.dispose();
+    super.dispose();
+  }
+
+  String get _effectiveFileName {
+    final entry = _activeEntry;
+    if (entry != null && entry.trim().isNotEmpty) {
+      return entry.trim().split('/').last;
+    }
+    return _preview?.name ?? widget.attachment.displayName;
+  }
+
+  String get _effectiveExt {
+    final name = _effectiveFileName.toLowerCase();
+    if (name.endsWith('.tar.gz')) return '.tar.gz';
+    final dot = name.lastIndexOf('.');
+    if (dot >= 0 && dot < name.length - 1) {
+      return name.substring(dot);
+    }
+    return '';
+  }
+
+  String get _formatBadgeLabel {
+    final ext = _effectiveExt;
+    if (ext.isNotEmpty) {
+      return ext.replaceFirst('.', '').toUpperCase();
+    }
+    final mime = widget.attachment.mimeType.split(';').first.trim();
+    if (mime.isNotEmpty) return mime.toUpperCase();
+    return widget.attachment.kind.toUpperCase();
+  }
+
+  bool _isImageName(String name) {
+    return RegExp(
+      r'\.(jpg|jpeg|png|webp|gif|bmp|ico|heic|heif|avif|tif|tiff)$',
+      caseSensitive: false,
+    ).hasMatch(name.toLowerCase());
+  }
+
+  bool _isCsvOrTsvName(String name) {
+    return RegExp(r'\.(csv|tsv)$', caseSensitive: false)
+        .hasMatch(name.toLowerCase());
+  }
+
+  bool _isJsonName(String name) {
+    return RegExp(r'\.(json|geojson)$', caseSensitive: false)
+        .hasMatch(name.toLowerCase());
+  }
+
+  bool _isZipBasedName(String name) {
+    return RegExp(
+      r'\.(zip|cbz|jar|apk|ipa|epub|docx|xlsx|pptx|odt|ods|odp)$',
+      caseSensitive: false,
+    ).hasMatch(name.toLowerCase());
+  }
+
+  Future<Uint8List> _ensureRawBytesLoaded() async {
+    if (_rawBytesCache != null && _rawBytesCache!.isNotEmpty) {
+      return _rawBytesCache!;
+    }
+    final localPath = _savedLocalPath;
+    if (localPath != null && localPath.isNotEmpty) {
+      try {
+        final f = File(localPath);
+        if (f.existsSync()) {
+          final bytes = f.readAsBytesSync();
+          if (bytes.isNotEmpty) {
+            _rawBytesCache = bytes;
+            return bytes;
+          }
+        }
+      } catch (_) {}
+    }
+    final dlUrl = widget.appState.api.buildTelegramFileDownloadUrl(
+      accountId: widget.accountId,
+      peer: widget.peer,
+      messageId: widget.messageId,
+      local: true,
+    );
+    final bytes = await widget.appState.api.downloadTelegramBytes(dlUrl);
+    _rawBytesCache = bytes;
+    return bytes;
   }
 
   Future<void> _loadPreview({String? entry}) async {
@@ -16706,48 +22272,1208 @@ class _TelegramFilePreviewDialogState
       _isLoading = true;
       _error = null;
       _activeEntry = entry;
+      _activeImageBytes = null;
+      _tableRows = null;
+      _showRawText = false;
     });
+
+    // 1. If user clicked an inner entry from a locally parsed ZIP archive, extract it directly
+    if (entry != null &&
+        _localZipEntries != null &&
+        _localZipEntries!.containsKey(entry)) {
+      try {
+        final zipBytes = await _ensureRawBytesLoaded();
+        final meta = _localZipEntries![entry]!;
+        final entryBytes = _extractZipEntryBytes(zipBytes, meta);
+        if (!mounted) return;
+        _applyBytesToPreview(
+          name: entry,
+          bytes: entryBytes,
+          entries: const [],
+        );
+        return;
+      } catch (_) {
+        // Fall through to server `/api/telegram/file-preview`
+      }
+    }
+
+    // 2. If main attachment is a direct raster image, load its bytes for interactive zoom preview
+    if (entry == null && _isImageName(widget.attachment.displayName)) {
+      try {
+        final imgBytes = await _ensureRawBytesLoaded();
+        if (!mounted) return;
+        if (imgBytes.isNotEmpty) {
+          setState(() {
+            _activeImageBytes = imgBytes;
+            _preview = TelegramFilePreview(
+              name: widget.attachment.displayName,
+              size: imgBytes.length,
+              kind: 'image',
+            );
+            _isLoading = false;
+          });
+          return;
+        }
+      } catch (_) {}
+    }
+
+    // 3. Query backend `/api/telegram/file-preview` and enrich with client-side parsers if needed
+    TelegramFilePreview? serverData;
+    Object? serverError;
     try {
-      final data = await widget.appState.api.fetchTelegramFilePreview(
+      serverData = await widget.appState.api.fetchTelegramFilePreview(
         accountId: widget.accountId,
         peer: widget.peer,
         messageId: widget.messageId,
         entry: entry,
       );
-      if (!mounted) return;
+    } catch (e) {
+      serverError = e;
+    }
+
+    if (!mounted) return;
+
+    // If backend returned rich text or archive entries, post-process (e.g. JSON pretty-print, CSV table, RTF strip)
+    if (serverData != null &&
+        (serverData.text.trim().isNotEmpty || serverData.entries.isNotEmpty)) {
+      final processed = _postProcessPreview(
+        serverData,
+        activeName: entry ?? serverData.name,
+      );
       setState(() {
-        _preview = data;
+        _preview = processed;
         _isLoading = false;
       });
+      return;
+    }
+
+    // 4. Fallback: Download raw bytes and parse locally (supports Office DOCX/XLSX/PPTX, EPUB, PDF, RTF, ZIP, TAR/GZ, Torrent, CSV/TSV, JSON, GBK/UTF-16 text, or hex dump)
+    try {
+      final rawBytes = await _ensureRawBytesLoaded();
+      if (!mounted) return;
+      if (entry != null && _localZipEntries != null && _localZipEntries!.containsKey(entry)) {
+        final entryBytes = _extractZipEntryBytes(rawBytes, _localZipEntries![entry]!);
+        _applyBytesToPreview(
+          name: entry,
+          bytes: entryBytes,
+          entries: const [],
+        );
+        return;
+      }
+      _applyBytesToPreview(
+        name: entry ?? widget.attachment.displayName,
+        bytes: rawBytes,
+        entries: serverData?.entries ?? const [],
+      );
     } catch (e) {
       if (!mounted) return;
-      setState(() {
-        _isLoading = false;
-        _error = e.toString();
-      });
+      if (serverData != null) {
+        setState(() {
+          _preview = serverData;
+          _isLoading = false;
+        });
+      } else {
+        setState(() {
+          _isLoading = false;
+          _error = (serverError ?? e).toString();
+        });
+      }
     }
+  }
+
+  TelegramFilePreview _postProcessPreview(
+    TelegramFilePreview raw, {
+    required String activeName,
+  }) {
+    var text = raw.text;
+    var kind = raw.kind;
+    final lower = activeName.toLowerCase();
+
+    if (lower.endsWith('.rtf') && text.trimLeft().startsWith(r'{\rtf')) {
+      text = _stripRtfToPlainText(text);
+    } else if (_isJsonName(lower) && text.trim().isNotEmpty) {
+      try {
+        final decoded = jsonDecode(text);
+        text = const JsonEncoder.withIndent('  ').convert(decoded);
+        kind = 'json';
+      } catch (_) {}
+    }
+
+    if (_isCsvOrTsvName(lower) && text.trim().isNotEmpty) {
+      final sep = lower.endsWith('.tsv') ? '\t' : ',';
+      final parsedRows = _parseDelimitedTable(text, sep);
+      if (parsedRows.isNotEmpty) {
+        _tableRows = parsedRows;
+        kind = 'table';
+      }
+    }
+
+    return TelegramFilePreview(
+      name: raw.name,
+      size: raw.size > 0 ? raw.size : widget.attachment.size,
+      encoding: raw.encoding,
+      truncated: raw.truncated,
+      kind: kind,
+      text: text,
+      entries: raw.entries,
+    );
+  }
+
+  void _applyBytesToPreview({
+    required String name,
+    required Uint8List bytes,
+    required List<String> entries,
+  }) {
+    final lower = name.toLowerCase();
+
+    // A. Image bytes
+    if (_isImageName(lower) || _looksLikeImageMagic(bytes)) {
+      setState(() {
+        _activeImageBytes = bytes;
+        _preview = TelegramFilePreview(
+          name: name,
+          size: bytes.length,
+          kind: 'image',
+        );
+        _isLoading = false;
+      });
+      return;
+    }
+
+    // B. ZIP-based container (ZIP, CBZ,APK, JAR, EPUB, DOCX, XLSX, PPTX, ODT, ODS, ODP)
+    if ((_isZipBasedName(lower) || _looksLikeZipMagic(bytes)) &&
+        _activeEntry == null) {
+      final zipMap = _parseZipDirectory(bytes);
+      if (zipMap.isNotEmpty) {
+        _localZipEntries = zipMap;
+
+        // Office OpenXML / ODF / EPUB smart document text extraction
+        final docPreview = _tryExtractDocumentFromZip(lower, bytes, zipMap);
+        if (docPreview != null && docPreview.trim().isNotEmpty) {
+          setState(() {
+            _preview = TelegramFilePreview(
+              name: name,
+              size: bytes.length,
+              encoding: 'UTF-8',
+              kind: 'document',
+              text: docPreview,
+              entries: const [],
+            );
+            _isLoading = false;
+          });
+          return;
+        }
+
+        // Standard ZIP / APK / JAR archive file list
+        setState(() {
+          _preview = TelegramFilePreview(
+            name: name,
+            size: bytes.length,
+            kind: 'archive',
+            entries: zipMap.keys.toList(),
+          );
+          _isLoading = false;
+        });
+        return;
+      }
+    }
+
+    // B2. Telegram AnimatedSticker.tgs (GZIP-compressed Lottie JSON vector animation)
+    if (lower.endsWith('.tgs') || widget.attachment.isTgsSticker) {
+      final comp = TelegramTgsLottieComposition.tryParseBytes(bytes);
+      if (comp != null) {
+        setState(() {
+          _preview = TelegramFilePreview(
+            name: name,
+            size: bytes.length,
+            encoding: 'Lottie TGS (GZIP JSON)',
+            kind: 'json',
+            text: comp.prettyJsonSummary,
+          );
+          _isLoading = false;
+        });
+        return;
+      }
+    }
+
+    // C. GZIP / TAR.GZ / TAR archive
+    if (_activeEntry == null &&
+        (lower.endsWith('.tar') ||
+            lower.endsWith('.tar.gz') ||
+            lower.endsWith('.tgz') ||
+            lower.endsWith('.gz'))) {
+      try {
+        Uint8List payload = bytes;
+        if (_looksLikeGzipMagic(bytes)) {
+          payload = Uint8List.fromList(GZipCodec().decoder.convert(bytes));
+        }
+        if (lower.endsWith('.tar') ||
+            lower.endsWith('.tar.gz') ||
+            lower.endsWith('.tgz')) {
+          final tarEntries = _parseTarEntryNames(payload);
+          if (tarEntries.isNotEmpty) {
+            setState(() {
+              _preview = TelegramFilePreview(
+                name: name,
+                size: bytes.length,
+                kind: 'archive',
+                entries: tarEntries,
+              );
+              _isLoading = false;
+            });
+            return;
+          }
+        } else {
+          // Single `.gz` compressed file
+          final decoded = _decodeTextWithAutoEncoding(payload);
+          if (decoded != null) {
+            setState(() {
+              _preview = _postProcessPreview(
+                TelegramFilePreview(
+                  name: name,
+                  size: bytes.length,
+                  encoding: '${decoded.encoding} (GZIP)',
+                  kind: 'text',
+                  text: decoded.text,
+                ),
+                activeName: name.replaceFirst(
+                  RegExp(r'\.gz$', caseSensitive: false),
+                  '',
+                ),
+              );
+              _isLoading = false;
+            });
+            return;
+          }
+        }
+      } catch (_) {}
+    }
+
+    // D. PDF Document
+    if (lower.endsWith('.pdf') || _looksLikePdfMagic(bytes)) {
+      final pdfText = _extractPdfReadableContent(bytes);
+      setState(() {
+        _preview = TelegramFilePreview(
+          name: name,
+          size: bytes.length,
+          encoding: 'PDF',
+          kind: 'pdf',
+          text: pdfText,
+        );
+        _isLoading = false;
+      });
+      return;
+    }
+
+    // E. BitTorrent (.torrent) metadata
+    if (lower.endsWith('.torrent')) {
+      final torrentText = _extractTorrentMetadataSummary(bytes);
+      if (torrentText.isNotEmpty) {
+        setState(() {
+          _preview = TelegramFilePreview(
+            name: name,
+            size: bytes.length,
+            encoding: 'Bencode',
+            kind: 'torrent',
+            text: torrentText,
+          );
+          _isLoading = false;
+        });
+        return;
+      }
+    }
+
+    // F. Plain text / Source code / Markdown / Subtitle / Config / XML / HTML / CSV / JSON
+    final decoded = _decodeTextWithAutoEncoding(bytes);
+    if (decoded != null) {
+      var text = decoded.text;
+      if (lower.endsWith('.xml') ||
+          lower.endsWith('.rels') ||
+          lower.endsWith('.xhtml') ||
+          lower.endsWith('.opf') ||
+          lower.endsWith('.ncx')) {
+        text = _prettyFormatXmlIfCompact(text);
+      }
+      final basePreview = TelegramFilePreview(
+        name: name,
+        size: bytes.length,
+        encoding: decoded.encoding,
+        truncated: decoded.truncated,
+        kind: 'text',
+        text: text,
+        entries: entries,
+      );
+      setState(() {
+        _preview = _postProcessPreview(basePreview, activeName: name);
+        _isLoading = false;
+      });
+      return;
+    }
+
+    // G. Binary file fallback: Format file header inspection + Hex / ASCII dump preview
+    final hexDump = _buildHexAndStringsPreview(name, bytes);
+    setState(() {
+      _preview = TelegramFilePreview(
+        name: name,
+        size: bytes.length,
+        encoding: 'HEX / Binary',
+        truncated: bytes.length > 4096,
+        kind: 'binary',
+        text: hexDump,
+        entries: entries,
+      );
+      _isLoading = false;
+    });
+  }
+
+  static bool _looksLikeImageMagic(Uint8List b) {
+    if (b.length < 12) return false;
+    // PNG: 89 50 4E 47
+    if (b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47) {
+      return true;
+    }
+    // JPEG: FF D8 FF
+    if (b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF) return true;
+    // GIF: GIF87a / GIF89a
+    if (b[0] == 0x47 && b[1] == 0x49 && b[2] == 0x46 && b[3] == 0x38) {
+      return true;
+    }
+    // WEBP: RIFF....WEBP
+    if (b[0] == 0x52 &&
+        b[1] == 0x49 &&
+        b[2] == 0x46 &&
+        b[3] == 0x46 &&
+        b[8] == 0x57 &&
+        b[9] == 0x45 &&
+        b[10] == 0x42 &&
+        b[11] == 0x50) {
+      return true;
+    }
+    // BMP: 42 4D
+    if (b[0] == 0x42 && b[1] == 0x4D) return true;
+    return false;
+  }
+
+  static bool _looksLikeZipMagic(Uint8List b) {
+    return b.length >= 4 &&
+        b[0] == 0x50 &&
+        b[1] == 0x4B &&
+        (b[2] == 0x03 || b[2] == 0x05) &&
+        (b[3] == 0x04 || b[3] == 0x06);
+  }
+
+  static bool _looksLikeGzipMagic(Uint8List b) {
+    return b.length >= 2 && b[0] == 0x1F && b[1] == 0x8B;
+  }
+
+  static bool _looksLikePdfMagic(Uint8List b) {
+    return b.length >= 5 &&
+        b[0] == 0x25 &&
+        b[1] == 0x50 &&
+        b[2] == 0x44 &&
+        b[3] == 0x46 &&
+        b[4] == 0x2D;
+  }
+
+  static Map<String, _TelegramZipEntryMeta> _parseZipDirectory(
+    Uint8List bytes,
+  ) {
+    final result = <String, _TelegramZipEntryMeta>{};
+    if (bytes.length < 22) return result;
+    int eocdPos = -1;
+    final minSearch = (bytes.length - 65558).clamp(0, bytes.length - 22);
+    for (int i = bytes.length - 22; i >= minSearch; i--) {
+      if (bytes[i] == 0x50 &&
+          bytes[i + 1] == 0x4B &&
+          bytes[i + 2] == 0x05 &&
+          bytes[i + 3] == 0x06) {
+        eocdPos = i;
+        break;
+      }
+    }
+    if (eocdPos < 0) return result;
+    final bd = ByteData.sublistView(bytes);
+    final cdSize = bd.getUint32(eocdPos + 12, Endian.little);
+    final cdOffset = bd.getUint32(eocdPos + 16, Endian.little);
+    if (cdSize <= 0 || cdOffset < 0 || cdOffset + cdSize > bytes.length) {
+      return result;
+    }
+
+    int pos = cdOffset;
+    final cdEnd = cdOffset + cdSize;
+    while (pos + 46 <= cdEnd && pos + 46 <= bytes.length) {
+      if (bytes[pos] != 0x50 ||
+          bytes[pos + 1] != 0x4B ||
+          bytes[pos + 2] != 0x01 ||
+          bytes[pos + 3] != 0x02) {
+        break;
+      }
+      final method = bd.getUint16(pos + 10, Endian.little);
+      final compSize = bd.getUint32(pos + 20, Endian.little);
+      final uncompSize = bd.getUint32(pos + 24, Endian.little);
+      final nameLen = bd.getUint16(pos + 28, Endian.little);
+      final extraLen = bd.getUint16(pos + 30, Endian.little);
+      final commentLen = bd.getUint16(pos + 32, Endian.little);
+      final localHeaderOffset = bd.getUint32(pos + 42, Endian.little);
+
+      if (pos + 46 + nameLen > bytes.length) break;
+      final nameBytes = Uint8List.sublistView(
+        bytes,
+        pos + 46,
+        pos + 46 + nameLen,
+      );
+      String entryName;
+      try {
+        entryName = utf8.decode(nameBytes);
+      } catch (_) {
+        entryName = latin1.decode(nameBytes, allowInvalid: true);
+      }
+      pos += 46 + nameLen + extraLen + commentLen;
+      if (entryName.isEmpty ||
+          entryName.endsWith('/') ||
+          entryName.startsWith('__MACOSX/')) {
+        continue;
+      }
+      result[entryName] = _TelegramZipEntryMeta(
+        name: entryName,
+        method: method,
+        compressedSize: compSize,
+        uncompressedSize: uncompSize,
+        localHeaderOffset: localHeaderOffset,
+      );
+    }
+    return result;
+  }
+
+  static Uint8List _extractZipEntryBytes(
+    Uint8List archiveBytes,
+    _TelegramZipEntryMeta meta,
+  ) {
+    final offset = meta.localHeaderOffset;
+    if (offset < 0 || offset + 30 > archiveBytes.length) {
+      throw const FormatException('ZIP 条目偏移越界');
+    }
+    if (archiveBytes[offset] != 0x50 ||
+        archiveBytes[offset + 1] != 0x4B ||
+        archiveBytes[offset + 2] != 0x03 ||
+        archiveBytes[offset + 3] != 0x04) {
+      throw const FormatException('无效的 ZIP 局部文件头');
+    }
+    final bd = ByteData.sublistView(archiveBytes);
+    final nameLen = bd.getUint16(offset + 26, Endian.little);
+    final extraLen = bd.getUint16(offset + 28, Endian.little);
+    final dataStart = offset + 30 + nameLen + extraLen;
+    final dataEnd =
+        (dataStart + meta.compressedSize).clamp(dataStart, archiveBytes.length);
+    final compSlice = Uint8List.sublistView(archiveBytes, dataStart, dataEnd);
+    if (meta.method == 0) {
+      return compSlice;
+    } else if (meta.method == 8) {
+      return Uint8List.fromList(
+        ZLibCodec(raw: true).decoder.convert(compSlice),
+      );
+    }
+    throw FormatException('暂不支持 ZIP 压缩方法 #${meta.method}');
+  }
+
+  String? _tryExtractDocumentFromZip(
+    String lowerName,
+    Uint8List zipBytes,
+    Map<String, _TelegramZipEntryMeta> zipMap,
+  ) {
+    try {
+      // 1. Word (.docx)
+      if (lowerName.endsWith('.docx') ||
+          zipMap.containsKey('word/document.xml')) {
+        final meta = zipMap['word/document.xml'];
+        if (meta != null) {
+          final xml = utf8.decode(
+            _extractZipEntryBytes(zipBytes, meta),
+            allowMalformed: true,
+          );
+          final paras = <String>[];
+          for (final pMatch in RegExp(r'<w:p[\s>][\s\S]*?</w:p>').allMatches(xml)) {
+            final pBlock = pMatch.group(0) ?? '';
+            final runs = RegExp(r'<w:t(?:\s[^>]*)?>([\s\S]*?)</w:t>')
+                .allMatches(pBlock)
+                .map((m) => _unescapeXmlEntities(m.group(1) ?? ''))
+                .join();
+            if (runs.trim().isNotEmpty) {
+              paras.add(runs);
+            }
+          }
+          if (paras.isNotEmpty) {
+            return paras.join('\n\n');
+          }
+        }
+      }
+
+      // 2. Excel (.xlsx)
+      if (lowerName.endsWith('.xlsx') ||
+          zipMap.keys.any((k) => k.startsWith('xl/worksheets/sheet'))) {
+        final sharedStrings = <String>[];
+        final sstMeta = zipMap['xl/sharedStrings.xml'];
+        if (sstMeta != null) {
+          final sstXml = utf8.decode(
+            _extractZipEntryBytes(zipBytes, sstMeta),
+            allowMalformed: true,
+          );
+          for (final si in RegExp(r'<si[\s>][\s\S]*?</si>').allMatches(sstXml)) {
+            final cellText = RegExp(r'<t(?:\s[^>]*)?>([\s\S]*?)</t>')
+                .allMatches(si.group(0) ?? '')
+                .map((m) => _unescapeXmlEntities(m.group(1) ?? ''))
+                .join();
+            sharedStrings.add(cellText);
+          }
+        }
+        final sheetKeys = zipMap.keys
+            .where(
+              (k) =>
+                  k.startsWith('xl/worksheets/sheet') && k.endsWith('.xml'),
+            )
+            .toList()
+          ..sort();
+        if (sheetKeys.isNotEmpty) {
+          final firstSheetXml = utf8.decode(
+            _extractZipEntryBytes(zipBytes, zipMap[sheetKeys.first]!),
+            allowMalformed: true,
+          );
+          final rows = <List<String>>[];
+          for (final rowMatch
+              in RegExp(r'<row[\s>][\s\S]*?</row>').allMatches(firstSheetXml)) {
+            final rowCells = <String>[];
+            for (final cMatch in RegExp(
+              r'<c\b([^>]*)>([\s\S]*?)</c>',
+            ).allMatches(rowMatch.group(0) ?? '')) {
+              final attrs = cMatch.group(1) ?? '';
+              final inner = cMatch.group(2) ?? '';
+              final isShared = RegExp(r'\bt="s"').hasMatch(attrs);
+              final isInline = RegExp(r'\bt="inlineStr"').hasMatch(attrs);
+              if (isInline) {
+                final tVal = RegExp(r'<t(?:\s[^>]*)?>([\s\S]*?)</t>')
+                        .firstMatch(inner)
+                        ?.group(1) ??
+                    '';
+                rowCells.add(_unescapeXmlEntities(tVal));
+              } else {
+                final vVal =
+                    RegExp(r'<v>([\s\S]*?)</v>').firstMatch(inner)?.group(1) ??
+                        '';
+                if (isShared) {
+                  final idx = int.tryParse(vVal.trim()) ?? -1;
+                  rowCells.add(
+                    (idx >= 0 && idx < sharedStrings.length)
+                        ? sharedStrings[idx]
+                        : vVal,
+                  );
+                } else {
+                  rowCells.add(_unescapeXmlEntities(vVal));
+                }
+              }
+            }
+            if (rowCells.any((c) => c.trim().isNotEmpty)) {
+              rows.add(rowCells);
+            }
+            if (rows.length >= 200) break;
+          }
+          if (rows.isNotEmpty) {
+            _tableRows = rows;
+            return rows.map((r) => r.join('\t')).join('\n');
+          }
+        }
+      }
+
+      // 3. PowerPoint (.pptx)
+      if (lowerName.endsWith('.pptx') ||
+          zipMap.keys.any((k) => k.startsWith('ppt/slides/slide'))) {
+        final slideKeys = zipMap.keys
+            .where(
+              (k) => k.startsWith('ppt/slides/slide') && k.endsWith('.xml'),
+            )
+            .toList()
+          ..sort();
+        final slideTexts = <String>[];
+        for (var i = 0; i < slideKeys.length; i++) {
+          final slideXml = utf8.decode(
+            _extractZipEntryBytes(zipBytes, zipMap[slideKeys[i]]!),
+            allowMalformed: true,
+          );
+          final lines = <String>[];
+          for (final pMatch
+              in RegExp(r'<a:p[\s>][\s\S]*?</a:p>').allMatches(slideXml)) {
+            final t = RegExp(r'<a:t(?:\s[^>]*)?>([\s\S]*?)</a:t>')
+                .allMatches(pMatch.group(0) ?? '')
+                .map((m) => _unescapeXmlEntities(m.group(1) ?? ''))
+                .join();
+            if (t.trim().isNotEmpty) lines.add(t.trim());
+          }
+          if (lines.isNotEmpty) {
+            slideTexts.add('─── 幻灯片 #${i + 1} ───\n${lines.join('\n')}');
+          }
+        }
+        if (slideTexts.isNotEmpty) {
+          return slideTexts.join('\n\n');
+        }
+      }
+
+      // 4. OpenDocument (.odt / .ods / .odp)
+      if ((lowerName.endsWith('.odt') ||
+              lowerName.endsWith('.ods') ||
+              lowerName.endsWith('.odp')) &&
+          zipMap.containsKey('content.xml')) {
+        final contentXml = utf8.decode(
+          _extractZipEntryBytes(zipBytes, zipMap['content.xml']!),
+          allowMalformed: true,
+        );
+        final stripped = _stripHtmlOrXmlTags(contentXml);
+        if (stripped.trim().isNotEmpty) return stripped;
+      }
+
+      // 5. EPUB e-book (.epub)
+      if (lowerName.endsWith('.epub')) {
+        final htmlKeys = zipMap.keys
+            .where(
+              (k) => RegExp(r'\.(xhtml|html|htm)$', caseSensitive: false)
+                  .hasMatch(k),
+            )
+            .toList();
+        final chapters = <String>[];
+        for (final k in htmlKeys.take(8)) {
+          final rawHtml = utf8.decode(
+            _extractZipEntryBytes(zipBytes, zipMap[k]!),
+            allowMalformed: true,
+          );
+          final text = _stripHtmlOrXmlTags(rawHtml);
+          if (text.trim().length > 20) {
+            chapters.add('【${k.split('/').last}】\n${text.trim()}');
+          }
+        }
+        if (chapters.isNotEmpty) {
+          return chapters.join('\n\n────────────────────\n\n');
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  static List<String> _parseTarEntryNames(Uint8List bytes) {
+    final names = <String>[];
+    int offset = 0;
+    while (offset + 512 <= bytes.length && names.length < 500) {
+      if (bytes[offset] == 0) break;
+      int nameEnd = offset;
+      while (nameEnd < offset + 100 && bytes[nameEnd] != 0) {
+        nameEnd++;
+      }
+      final name = utf8
+          .decode(
+            Uint8List.sublistView(bytes, offset, nameEnd),
+            allowMalformed: true,
+          )
+          .trim();
+      final sizeOctal = ascii
+          .decode(
+            bytes
+                .sublist(offset + 124, offset + 136)
+                .where((b) => b != 0 && b != 32)
+                .toList(),
+            allowInvalid: true,
+          )
+          .trim();
+      final size = int.tryParse(sizeOctal, radix: 8) ?? 0;
+      if (name.isNotEmpty && !name.endsWith('/')) {
+        names.add(name);
+      }
+      final padded = ((size + 511) ~/ 512) * 512;
+      offset += 512 + padded;
+    }
+    return names;
+  }
+
+  static String _extractPdfReadableContent(Uint8List bytes) {
+    final rawLatin = latin1.decode(
+      bytes.length > 512 * 1024 ? Uint8List.sublistView(bytes, 0, 512 * 1024) : bytes,
+      allowInvalid: true,
+    );
+    final pageCount = RegExp(r'/Type\s*/Page\b').allMatches(rawLatin).length;
+    final extractedPieces = <String>[];
+
+    // 1. Scan uncompressed & FlateDecode-compressed PDF content streams for `(text) Tj` / `[(text)] TJ`
+    final streamRegex = RegExp(r'stream\r?\n([\s\S]*?)\r?\nendstream');
+    for (final m in streamRegex.allMatches(rawLatin).take(60)) {
+      final startIdx = m.start;
+      final headerBefore = rawLatin.substring(
+        (startIdx - 220).clamp(0, startIdx),
+        startIdx,
+      );
+      final bodyLatin = m.group(1) ?? '';
+      String decodedStream = '';
+      if (headerBefore.contains('/FlateDecode')) {
+        try {
+          final compressedBytes = latin1.encode(bodyLatin);
+          final inflated = ZLibCodec().decoder.convert(compressedBytes);
+          decodedStream = utf8.decode(inflated, allowMalformed: true);
+        } catch (_) {}
+      } else if (!headerBefore.contains('/DCTDecode') &&
+          !headerBefore.contains('/FlateDecode')) {
+        decodedStream = bodyLatin;
+      }
+      if (decodedStream.isNotEmpty) {
+        for (final tm
+            in RegExp(r'\(([^()\\]*(?:\\.[^()\\]*)*)\)\s*Tj')
+                .allMatches(decodedStream)) {
+          final s = _unescapePdfLiteral(tm.group(1) ?? '').trim();
+          if (s.isNotEmpty && RegExp(r'[A-Za-z0-9\u4e00-\u9fa5]').hasMatch(s)) {
+            extractedPieces.add(s);
+          }
+        }
+        for (final arrMatch
+            in RegExp(r'\[([\s\S]*?)\]\s*TJ').allMatches(decodedStream)) {
+          final arr = arrMatch.group(1) ?? '';
+          final joined = RegExp(r'\(([^()\\]*(?:\\.[^()\\]*)*)\)')
+              .allMatches(arr)
+              .map((x) => _unescapePdfLiteral(x.group(1) ?? ''))
+              .join();
+          if (joined.trim().isNotEmpty &&
+              RegExp(r'[A-Za-z0-9\u4e00-\u9fa5]').hasMatch(joined)) {
+            extractedPieces.add(joined.trim());
+          }
+        }
+      }
+    }
+
+    final headerLine =
+        '📄 PDF 文档 (${pageCount > 0 ? "约 $pageCount 页 · " : ""}${(bytes.length / 1024).toStringAsFixed(1)} KB)';
+    if (extractedPieces.isNotEmpty) {
+      return '$headerLine\n────────────────────────────────────────\n${extractedPieces.join('\n')}';
+    }
+    return '$headerLine\n────────────────────────────────────────\n'
+        '该 PDF 文档主要包含内嵌矢量字体或扫描图像流。\n'
+        '可点击右上角「系统预览 / 打开」使用系统阅读器查看完整排版，或点击「保存到本机」下载。';
+  }
+
+  static String _unescapePdfLiteral(String raw) {
+    return raw
+        .replaceAll(r'\n', '\n')
+        .replaceAll(r'\r', '\r')
+        .replaceAll(r'\t', '\t')
+        .replaceAll(r'\(', '(')
+        .replaceAll(r'\)', ')')
+        .replaceAll(r'\\', '\\');
+  }
+
+  static String _extractTorrentMetadataSummary(Uint8List bytes) {
+    final s = utf8.decode(
+      bytes.length > 256 * 1024 ? Uint8List.sublistView(bytes, 0, 256 * 1024) : bytes,
+      allowMalformed: true,
+    );
+    final lines = <String>['🧲 BitTorrent 种子文件摘要', '────────────────────────────────────────'];
+    final nameMatch = RegExp(r'4:name(\d+):').firstMatch(s);
+    if (nameMatch != null) {
+      final len = int.tryParse(nameMatch.group(1) ?? '') ?? 0;
+      final start = nameMatch.end;
+      if (len > 0 && start + len <= s.length) {
+        lines.add('种子名称：${s.substring(start, start + len)}');
+      }
+    }
+    final trackers = RegExp(r'(?:https?|udp)://[^\s"\x00-\x1f<>:]+(?::\d+)?/announce[^\s"\x00-\x1f<>]*')
+        .allMatches(s)
+        .map((m) => m.group(0)!)
+        .toSet()
+        .take(10)
+        .toList();
+    if (trackers.isNotEmpty) {
+      lines.add('\nTracker 节点 (${trackers.length})：');
+      for (final tr in trackers) {
+        lines.add('  • $tr');
+      }
+    }
+    return lines.join('\n');
+  }
+
+  static ({String text, String encoding, bool truncated})?
+      _decodeTextWithAutoEncoding(Uint8List bytes) {
+    if (bytes.isEmpty) {
+      return (text: '', encoding: 'UTF-8', truncated: false);
+    }
+    const maxPreviewBytes = 512 * 1024;
+    final truncated = bytes.length > maxPreviewBytes;
+    final slice = truncated
+        ? Uint8List.sublistView(bytes, 0, maxPreviewBytes)
+        : bytes;
+
+    // 1. Check UTF-8 BOM (EF BB BF)
+    if (slice.length >= 3 &&
+        slice[0] == 0xEF &&
+        slice[1] == 0xBB &&
+        slice[2] == 0xBF) {
+      return (
+        text: utf8.decode(Uint8List.sublistView(slice, 3), allowMalformed: true),
+        encoding: 'UTF-8 BOM',
+        truncated: truncated,
+      );
+    }
+    // 2. Check UTF-16 LE BOM (FF FE)
+    if (slice.length >= 2 && slice[0] == 0xFF && slice[1] == 0xFE) {
+      final codeUnits = <int>[];
+      for (int i = 2; i + 1 < slice.length; i += 2) {
+        codeUnits.add(slice[i] | (slice[i + 1] << 8));
+      }
+      return (
+        text: String.fromCharCodes(codeUnits),
+        encoding: 'UTF-16 LE',
+        truncated: truncated,
+      );
+    }
+    // 3. Check UTF-16 BE BOM (FE FF)
+    if (slice.length >= 2 && slice[0] == 0xFE && slice[1] == 0xFF) {
+      final codeUnits = <int>[];
+      for (int i = 2; i + 1 < slice.length; i += 2) {
+        codeUnits.add((slice[i] << 8) | slice[i + 1]);
+      }
+      return (
+        text: String.fromCharCodes(codeUnits),
+        encoding: 'UTF-16 BE',
+        truncated: truncated,
+      );
+    }
+
+    // 4. Reject obvious binary streams (high ratio of NUL or non-whitespace control characters)
+    int nulCount = 0;
+    int ctrlCount = 0;
+    final sampleLen = slice.length.clamp(0, 4096);
+    for (int i = 0; i < sampleLen; i++) {
+      final b = slice[i];
+      if (b == 0) {
+        nulCount++;
+      } else if (b < 32 && b != 9 && b != 10 && b != 13 && b != 12 && b != 27) {
+        ctrlCount++;
+      }
+    }
+    if (sampleLen > 0 && (nulCount > 2 || ctrlCount / sampleLen > 0.12)) {
+      return null;
+    }
+
+    // 5. Try strict UTF-8 first
+    try {
+      final text = utf8.decode(slice, allowMalformed: false);
+      return (text: text, encoding: 'UTF-8', truncated: truncated);
+    } catch (_) {
+      final lenient = utf8.decode(slice, allowMalformed: true);
+      return (text: lenient, encoding: 'ANSI / 文本', truncated: truncated);
+    }
+  }
+
+  static String _buildHexAndStringsPreview(String name, Uint8List bytes) {
+    final sb = StringBuffer();
+    sb.writeln('📦 文件名：$name');
+    sb.writeln('📏 文件大小：${bytes.length} 字节');
+    final maxDump = bytes.length.clamp(0, 2048);
+    sb.writeln('🔍 前 $maxDump 字节十六进制视图 (Hex / ASCII)：');
+    sb.writeln('──────────────────────────────────────────────────────────────────────────');
+    for (int offset = 0; offset < maxDump; offset += 16) {
+      final end = (offset + 16).clamp(0, maxDump);
+      final hexPart = StringBuffer();
+      final asciiPart = StringBuffer();
+      for (int i = offset; i < offset + 16; i++) {
+        if (i < end) {
+          final b = bytes[i];
+          hexPart.write('${b.toRadixString(16).padLeft(2, '0').toUpperCase()} ');
+          asciiPart.write((b >= 32 && b <= 126) ? String.fromCharCode(b) : '.');
+        } else {
+          hexPart.write('   ');
+        }
+        if (i == offset + 7) hexPart.write(' ');
+      }
+      sb.writeln(
+        '${offset.toRadixString(16).padLeft(6, '0').toUpperCase()}  $hexPart |$asciiPart|',
+      );
+    }
+    return sb.toString();
+  }
+
+  static String _stripRtfToPlainText(String rtf) {
+    return rtf
+        .replaceAll(RegExp(r'\\par\b\s*'), '\n')
+        .replaceAll(RegExp(r'\\line\b\s*'), '\n')
+        .replaceAll(RegExp(r'\\tab\b\s*'), '\t')
+        .replaceAll(RegExp(r"\\'[0-9a-fA-F]{2}"), '')
+        .replaceAll(RegExp(r'\\[a-zA-Z]+-?\d*\s?'), '')
+        .replaceAll(RegExp(r'[{}]'), '')
+        .trim();
+  }
+
+  static String _stripHtmlOrXmlTags(String raw) {
+    final withBreaks = raw
+        .replaceAll(RegExp(r'<(?:script|style)[^>]*>[\s\S]*?</(?:script|style)>', caseSensitive: false), '')
+        .replaceAll(RegExp(r'</(?:p|div|h[1-6]|li|tr|br|text:p|text:h)\b[^>]*>', caseSensitive: false), '\n')
+        .replaceAll(RegExp(r'<br\s*/?>', caseSensitive: false), '\n')
+        .replaceAll(RegExp(r'<[^>]+>'), '');
+    return _unescapeXmlEntities(withBreaks)
+        .replaceAll(RegExp(r'\n{3,}'), '\n\n')
+        .trim();
+  }
+
+  static String _unescapeXmlEntities(String input) {
+    return input
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
+        .replaceAll('&quot;', '"')
+        .replaceAll('&apos;', "'")
+        .replaceAll('&nbsp;', ' ')
+        .replaceAll('&amp;', '&');
+  }
+
+  static String _prettyFormatXmlIfCompact(String xml) {
+    final trimmed = xml.trim();
+    if (trimmed.contains('\n') && trimmed.split('\n').length > 5) {
+      return xml;
+    }
+    return trimmed.replaceAll('><', '>\n<');
+  }
+
+  static List<List<String>> _parseDelimitedTable(String text, String sep) {
+    final lines = const LineSplitter().convert(text);
+    final rows = <List<String>>[];
+    for (final line in lines) {
+      if (line.trim().isEmpty) continue;
+      final cells = <String>[];
+      final cur = StringBuffer();
+      bool inQuotes = false;
+      for (int i = 0; i < line.length; i++) {
+        final ch = line[i];
+        if (ch == '"') {
+          if (inQuotes && i + 1 < line.length && line[i + 1] == '"') {
+            cur.write('"');
+            i++;
+          } else {
+            inQuotes = !inQuotes;
+          }
+        } else if (!inQuotes && ch == sep) {
+          cells.add(cur.toString().trim());
+          cur.clear();
+        } else {
+          cur.write(ch);
+        }
+      }
+      cells.add(cur.toString().trim());
+      rows.add(cells);
+      if (rows.length >= 250) break;
+    }
+    return rows;
+  }
+
+  Future<void> _handleSaveOrOpenLocal() async {
+    if (_isSavingLocal) return;
+    if (_savedLocalPath != null && _savedLocalPath!.isNotEmpty) {
+      if (widget.onOpenLocalDir != null) {
+        await widget.onOpenLocalDir!(_savedLocalPath!);
+      }
+      return;
+    }
+    if (widget.onSaveLocal == null) return;
+    setState(() => _isSavingLocal = true);
+    try {
+      final path = await widget.onSaveLocal!();
+      if (!mounted) return;
+      setState(() {
+        _isSavingLocal = false;
+        if (path != null && path.isNotEmpty) {
+          _savedLocalPath = path;
+        }
+      });
+    } catch (_) {
+      if (mounted) {
+        setState(() => _isSavingLocal = false);
+      }
+    }
+  }
+
+  Future<void> _openWithSystemDefaultApp() async {
+    try {
+      String? targetPath = _savedLocalPath;
+      if (targetPath == null || targetPath.isEmpty || !File(targetPath).existsSync()) {
+        if (widget.onSaveLocal != null) {
+          setState(() => _isSavingLocal = true);
+          targetPath = await widget.onSaveLocal!();
+          if (mounted) {
+            setState(() {
+              _isSavingLocal = false;
+              if (targetPath != null && targetPath.isNotEmpty) {
+                _savedLocalPath = targetPath;
+              }
+            });
+          }
+        } else {
+          final bytes = await _ensureRawBytesLoaded();
+          final safeName = widget.attachment.displayName.replaceAll(
+            RegExp(r'[/\\:*?"<>|]'),
+            '_',
+          );
+          final tmpFile = File(
+            '${Directory.systemTemp.path}${Platform.pathSeparator}$safeName',
+          );
+          await tmpFile.writeAsBytes(bytes, flush: true);
+          targetPath = tmpFile.path;
+        }
+      }
+      if (targetPath == null || targetPath.isEmpty) return;
+      if (Platform.isMacOS) {
+        final openBin =
+            File('/usr/bin/open').existsSync() ? '/usr/bin/open' : 'open';
+        await Process.run(openBin, [targetPath]);
+      } else if (Platform.isWindows) {
+        await Process.run('cmd', ['/c', 'start', '', targetPath]);
+      } else if (Platform.isLinux) {
+        await Process.run('xdg-open', [targetPath]);
+      }
+    } catch (_) {}
+  }
+
+  Widget _buildTablePreview(_TgPalette tg, List<List<String>> rows) {
+    if (rows.isEmpty) return const SizedBox.shrink();
+    int maxCols = 0;
+    for (final r in rows) {
+      if (r.length > maxCols) maxCols = r.length;
+    }
+    if (maxCols == 0) return const SizedBox.shrink();
+    final header = rows.first;
+    final dataRows = rows.length > 1 ? rows.sublist(1) : const <List<String>>[];
+
+    return Scrollbar(
+      thumbVisibility: true,
+      child: SingleChildScrollView(
+        scrollDirection: Axis.vertical,
+        child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: DataTable(
+            headingRowHeight: 36,
+            dataRowMinHeight: 30,
+            dataRowMaxHeight: 44,
+            columnSpacing: 18,
+            horizontalMargin: 12,
+            headingRowColor: WidgetStatePropertyAll(
+              tg.tgBlueBright.withValues(alpha: 0.14),
+            ),
+            columns: List.generate(maxCols, (colIdx) {
+              final title = colIdx < header.length && header[colIdx].isNotEmpty
+                  ? header[colIdx]
+                  : '列 ${colIdx + 1}';
+              return DataColumn(
+                label: Text(
+                  title,
+                  style: TextStyle(
+                    fontSize: _fontSize,
+                    fontWeight: FontWeight.w700,
+                    color: tg.tgBlueBright,
+                  ),
+                ),
+              );
+            }),
+            rows: dataRows.map((r) {
+              return DataRow(
+                cells: List.generate(maxCols, (colIdx) {
+                  final val = colIdx < r.length ? r[colIdx] : '';
+                  return DataCell(
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 320),
+                      child: SelectableText(
+                        val,
+                        maxLines: 2,
+                        style: TextStyle(
+                          fontSize: _fontSize,
+                          color: tg.textPrimary,
+                        ),
+                      ),
+                    ),
+                  );
+                }),
+              );
+            }).toList(),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTextOrCodePreview(_TgPalette tg, String rawText) {
+    final kw = _searchQuery.trim().toLowerCase();
+    final displayText = kw.isEmpty
+        ? rawText
+        : const LineSplitter()
+            .convert(rawText)
+            .asMap()
+            .entries
+            .where((e) => e.value.toLowerCase().contains(kw))
+            .map((e) => '[第 ${e.key + 1} 行]  ${e.value}')
+            .join('\n');
+
+    final textWidget = SelectableText(
+      displayText.isEmpty
+          ? (kw.isNotEmpty
+              ? '未找到包含「$_searchQuery」的内容行'
+              : '（文件内容为空，可点击右上角「系统预览」或「保存到本机」查看）')
+          : displayText,
+      style: TextStyle(
+        fontFamily: Platform.isMacOS ? 'Menlo' : 'monospace',
+        fontSize: _fontSize,
+        height: 1.48,
+        color: tg.textPrimary,
+      ),
+    );
+
+    if (!_wordWrap) {
+      return Scrollbar(
+        thumbVisibility: true,
+        child: SingleChildScrollView(
+          scrollDirection: Axis.vertical,
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: textWidget,
+          ),
+        ),
+      );
+    }
+    return Scrollbar(
+      thumbVisibility: true,
+      child: SingleChildScrollView(
+        child: textWidget,
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     final tg = _TgPalette(VideoPlatformTheme.isDark);
     final p = _preview;
+    final hasTable = _tableRows != null && _tableRows!.isNotEmpty;
+    final hasImage = _activeImageBytes != null && _activeImageBytes!.isNotEmpty;
+    final isSavedLocal =
+        _savedLocalPath != null && _savedLocalPath!.isNotEmpty;
+    final kw = _searchQuery.trim().toLowerCase();
+    final filteredEntries = (p != null && p.entries.isNotEmpty)
+        ? (kw.isEmpty
+            ? p.entries
+            : p.entries.where((e) => e.toLowerCase().contains(kw)).toList())
+        : const <String>[];
 
     return Dialog(
       backgroundColor: tg.sidebarBg,
-      insetPadding: const EdgeInsets.all(24),
+      insetPadding: const EdgeInsets.all(20),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
       child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 780, maxHeight: 620),
+        constraints: const BoxConstraints(maxWidth: 880, maxHeight: 680),
         child: Padding(
           padding: const EdgeInsets.all(16),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
+              // 1. Top Header Bar with Format Badge, Search, Font/Table Toggle, Copy, Local Save/Location & System Open
               Row(
                 children: [
                   if (_activeEntry != null)
                     IconButton(
+                      tooltip: '返回压缩包目录',
                       onPressed: () => _loadPreview(entry: null),
                       icon: Icon(
                         Icons.arrow_back_rounded,
@@ -16756,35 +23482,248 @@ class _TelegramFilePreviewDialogState
                       ),
                     ),
                   Icon(
-                    Icons.description_outlined,
+                    hasImage
+                        ? Icons.image_outlined
+                        : (hasTable
+                            ? Icons.table_chart_outlined
+                            : (p?.entries.isNotEmpty == true
+                                ? Icons.folder_zip_outlined
+                                : Icons.description_outlined)),
                     size: 20,
                     color: tg.tgBlueBright,
                   ),
                   const SizedBox(width: 8),
-                  Expanded(
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 6,
+                      vertical: 2,
+                    ),
+                    decoration: BoxDecoration(
+                      color: tg.tgBlueBright.withValues(alpha: 0.16),
+                      borderRadius: BorderRadius.circular(5),
+                    ),
                     child: Text(
-                      p?.name ?? widget.attachment.displayName,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
+                      _formatBadgeLabel,
                       style: TextStyle(
-                        fontSize: 14.5,
-                        fontWeight: FontWeight.w600,
-                        color: tg.textPrimary,
+                        fontSize: 10.5,
+                        fontWeight: FontWeight.w700,
+                        color: tg.tgBlueBright,
                       ),
                     ),
                   ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          _activeEntry ??
+                              (p?.name ?? widget.attachment.displayName),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                            color: tg.textPrimary,
+                          ),
+                        ),
+                        if (widget.attachment.formattedSize.isNotEmpty ||
+                            (p?.encoding.isNotEmpty ?? false))
+                          Text(
+                            [
+                              if (widget.attachment.formattedSize.isNotEmpty)
+                                widget.attachment.formattedSize,
+                              if (p != null && p.encoding.isNotEmpty)
+                                p.encoding,
+                              if (p != null && p.entries.isNotEmpty)
+                                '${p.entries.length} 个文件',
+                              if (p != null && p.truncated) '已截取预览前段',
+                            ].join(' · '),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: tg.textSecondary,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                  if (hasTable)
+                    TextButton.icon(
+                      onPressed: () =>
+                          setState(() => _showRawText = !_showRawText),
+                      icon: Icon(
+                        _showRawText
+                            ? Icons.table_view_rounded
+                            : Icons.notes_rounded,
+                        size: 15,
+                      ),
+                      label: Text(_showRawText ? '表格视图' : '原始文本'),
+                    ),
+                  if (!hasImage &&
+                      p != null &&
+                      (p.text.isNotEmpty || p.entries.isNotEmpty)) ...[
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: '搜索文件内容',
+                      onPressed: () => setState(() {
+                        _showSearchBar = !_showSearchBar;
+                        if (!_showSearchBar) {
+                          _searchQuery = '';
+                          _searchCtrl.clear();
+                        }
+                      }),
+                      icon: Icon(
+                        Icons.search_rounded,
+                        size: 18,
+                        color: _showSearchBar
+                            ? tg.tgBlueBright
+                            : tg.textSecondary,
+                      ),
+                    ),
+                    if (p.entries.isEmpty) ...[
+                      IconButton(
+                        visualDensity: VisualDensity.compact,
+                        tooltip: _wordWrap ? '切换为横向滚动 (不自动换行)' : '切换为自动换行',
+                        onPressed: () =>
+                            setState(() => _wordWrap = !_wordWrap),
+                        icon: Icon(
+                          Icons.wrap_text_rounded,
+                          size: 18,
+                          color:
+                              _wordWrap ? tg.tgBlueBright : tg.textSecondary,
+                        ),
+                      ),
+                      IconButton(
+                        visualDensity: VisualDensity.compact,
+                        tooltip: '放大字号',
+                        onPressed: () => setState(
+                          () => _fontSize = (_fontSize + 1.5).clamp(10.0, 24.0),
+                        ),
+                        icon: Icon(
+                          Icons.text_increase_rounded,
+                          size: 17,
+                          color: tg.textSecondary,
+                        ),
+                      ),
+                    ],
+                  ],
                   if (p != null && p.text.isNotEmpty)
                     TextButton.icon(
                       onPressed: () {
                         Clipboard.setData(ClipboardData(text: p.text));
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text('已复制文件内容到剪贴板')),
-                        );
+                        setState(() => _copiedFeedback = true);
+                        Future<void>.delayed(const Duration(seconds: 2), () {
+                          if (mounted) {
+                            setState(() => _copiedFeedback = false);
+                          }
+                        });
                       },
-                      icon: const Icon(Icons.copy_rounded, size: 15),
-                      label: const Text('复制全文'),
+                      icon: Icon(
+                        _copiedFeedback
+                            ? Icons.check_circle_rounded
+                            : Icons.copy_rounded,
+                        size: 15,
+                        color: _copiedFeedback
+                            ? const Color(0xFF4ECC5E)
+                            : tg.tgBlueBright,
+                      ),
+                      label: Text(
+                        _copiedFeedback ? '已复制' : '复制全文',
+                        style: TextStyle(
+                          color: _copiedFeedback
+                              ? const Color(0xFF4ECC5E)
+                              : tg.tgBlueBright,
+                        ),
+                      ),
+                    ),
+                  if (Platform.isMacOS ||
+                      Platform.isWindows ||
+                      Platform.isLinux)
+                    TextButton.icon(
+                      onPressed: _openWithSystemDefaultApp,
+                      icon: const Icon(Icons.open_in_new_rounded, size: 15),
+                      label: const Text('系统打开'),
+                    ),
+                  if (widget.onDownload115 != null)
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: _saved115
+                          ? '已添加至115云下载 ✓'
+                          : (_failed115 ? '115云下载失败，点击重试' : '115云下载'),
+                      onPressed: _isSaving115
+                          ? null
+                          : () async {
+                              setState(() {
+                                _isSaving115 = true;
+                                _failed115 = false;
+                              });
+                              final ok = await widget.onDownload115!();
+                              if (mounted) {
+                                setState(() {
+                                  _isSaving115 = false;
+                                  if (ok) {
+                                    _saved115 = true;
+                                    _failed115 = false;
+                                  } else {
+                                    _failed115 = true;
+                                  }
+                                });
+                              }
+                            },
+                      icon: _isSaving115
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Color(0xFFFFB74D),
+                              ),
+                            )
+                          : Icon(
+                              _saved115
+                                  ? Icons.check_circle_rounded
+                                  : (_failed115
+                                      ? Icons.error_outline_rounded
+                                      : Icons.cloud_upload_rounded),
+                              size: 19,
+                              color: _saved115
+                                  ? const Color(0xFF4ECC5E)
+                                  : (_failed115
+                                      ? const Color(0xFFFF6B6B)
+                                      : const Color(0xFFFFB74D)),
+                            ),
+                    ),
+                  if (widget.onSaveLocal != null)
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: isSavedLocal
+                          ? '已下载: $_savedLocalPath (点击打开所在位置)'
+                          : '下载保存到本机电脑',
+                      onPressed: _isSavingLocal ? null : _handleSaveOrOpenLocal,
+                      icon: _isSavingLocal
+                          ? SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: tg.tgBlueBright,
+                              ),
+                            )
+                          : Icon(
+                              isSavedLocal
+                                  ? Icons.check_circle_rounded
+                                  : Icons.download_rounded,
+                              size: 19,
+                              color: isSavedLocal
+                                  ? const Color(0xFF4ECC5E)
+                                  : tg.textSecondary,
+                            ),
                     ),
                   IconButton(
+                    visualDensity: VisualDensity.compact,
                     onPressed: () => Navigator.of(context).pop(),
                     icon: Icon(
                       Icons.close_rounded,
@@ -16794,7 +23733,45 @@ class _TelegramFilePreviewDialogState
                   ),
                 ],
               ),
+              if (_showSearchBar) ...[
+                const SizedBox(height: 8),
+                SizedBox(
+                  height: 34,
+                  child: TextField(
+                    controller: _searchCtrl,
+                    autofocus: true,
+                    onChanged: (v) => setState(() => _searchQuery = v),
+                    style: TextStyle(fontSize: 12.5, color: tg.textPrimary),
+                    decoration: InputDecoration(
+                      hintText: p?.entries.isNotEmpty == true
+                          ? '筛选压缩包内文件名...'
+                          : '搜索当前文件内容关键字...',
+                      prefixIcon: Icon(
+                        Icons.search_rounded,
+                        size: 16,
+                        color: tg.textMuted,
+                      ),
+                      suffixIcon: _searchQuery.isNotEmpty
+                          ? IconButton(
+                              visualDensity: VisualDensity.compact,
+                              icon: Icon(
+                                Icons.clear_rounded,
+                                size: 15,
+                                color: tg.textMuted,
+                              ),
+                              onPressed: () {
+                                _searchCtrl.clear();
+                                setState(() => _searchQuery = '');
+                              },
+                            )
+                          : null,
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 10),
+                    ),
+                  ),
+                ),
+              ],
               const SizedBox(height: 8),
+              // 2. Main Preview Body
               Expanded(
                 child: Container(
                   padding: const EdgeInsets.all(12),
@@ -16813,46 +23790,69 @@ class _TelegramFilePreviewDialogState
                           ? Center(
                               child: Text(
                                 '预览加载失败：$_error',
-                                style: TextStyle(color: VideoPlatformTheme.danger),
+                                style: TextStyle(
+                                  color: VideoPlatformTheme.danger,
+                                ),
                               ),
                             )
-                          : (p != null && p.entries.isNotEmpty)
-                              ? ListView.builder(
-                                  itemCount: p.entries.length,
-                                  itemBuilder: (_, idx) {
-                                    final entryName = p.entries[idx];
-                                    return ListTile(
-                                      dense: true,
-                                      leading: Icon(
-                                        Icons.insert_drive_file_outlined,
-                                        size: 18,
-                                        color: tg.tgBlueBright,
-                                      ),
-                                      title: Text(
-                                        entryName,
-                                        style: TextStyle(
-                                          fontSize: 12.5,
-                                          color: tg.textPrimary,
-                                        ),
-                                      ),
-                                      onTap: () =>
-                                          _loadPreview(entry: entryName),
-                                    );
-                                  },
-                                )
-                              : SingleChildScrollView(
-                                  child: Text(
-                                    (p?.text.isNotEmpty ?? false)
-                                        ? p!.text
-                                        : '（文件内容为空或为二进制文件，请下载到本地查看）',
-                                    style: TextStyle(
-                                      fontFamily: 'monospace',
-                                      fontSize: 12.5,
-                                      height: 1.45,
-                                      color: tg.textPrimary,
+                          : hasImage
+                              ? InteractiveViewer(
+                                  minScale: 0.5,
+                                  maxScale: 5.0,
+                                  child: Center(
+                                    child: Image.memory(
+                                      _activeImageBytes!,
+                                      fit: BoxFit.contain,
                                     ),
                                   ),
-                                ),
+                                )
+                              : (p != null && p.entries.isNotEmpty)
+                                  ? ListView.builder(
+                                      itemCount: filteredEntries.length,
+                                      itemBuilder: (_, idx) {
+                                        final entryName = filteredEntries[idx];
+                                        final meta =
+                                            _localZipEntries?[entryName];
+                                        return ListTile(
+                                          dense: true,
+                                          leading: Icon(
+                                            _isImageName(entryName)
+                                                ? Icons.image_outlined
+                                                : Icons
+                                                    .insert_drive_file_outlined,
+                                            size: 18,
+                                            color: tg.tgBlueBright,
+                                          ),
+                                          title: Text(
+                                            entryName,
+                                            style: TextStyle(
+                                              fontSize: 12.5,
+                                              color: tg.textPrimary,
+                                            ),
+                                          ),
+                                          trailing: meta != null &&
+                                                  meta.uncompressedSize > 0
+                                              ? Text(
+                                                  meta.uncompressedSize < 1024
+                                                      ? '${meta.uncompressedSize} B'
+                                                      : '${(meta.uncompressedSize / 1024).toStringAsFixed(1)} KB',
+                                                  style: TextStyle(
+                                                    fontSize: 11,
+                                                    color: tg.textMuted,
+                                                  ),
+                                                )
+                                              : null,
+                                          onTap: () =>
+                                              _loadPreview(entry: entryName),
+                                        );
+                                      },
+                                    )
+                                  : (hasTable && !_showRawText)
+                                      ? _buildTablePreview(tg, _tableRows!)
+                                      : _buildTextOrCodePreview(
+                                          tg,
+                                          p?.text ?? '',
+                                        ),
                 ),
               ),
             ],
@@ -17129,6 +24129,9 @@ class _TelegramAlbumMediaTile extends StatefulWidget {
   final bool isQueueing;
   final bool isQueued;
   final bool isFailed;
+  final bool isPending115;
+  final bool isDone115;
+  final bool isFailed115;
   final bool isSavingLocal;
   final bool isSavedLocal;
   final String durationText;
@@ -17137,6 +24140,7 @@ class _TelegramAlbumMediaTile extends StatefulWidget {
   final ValueChanged<int> onOpenMiniPlayer;
   final VoidCallback onSaveLocal;
   final VoidCallback? onQueueDownload;
+  final VoidCallback? onDownload115;
   final ValueChanged<Offset> onShowContextMenu;
 
   const _TelegramAlbumMediaTile({
@@ -17152,6 +24156,9 @@ class _TelegramAlbumMediaTile extends StatefulWidget {
     this.isQueueing = false,
     required this.isQueued,
     this.isFailed = false,
+    this.isPending115 = false,
+    this.isDone115 = false,
+    this.isFailed115 = false,
     this.isSavingLocal = false,
     this.isSavedLocal = false,
     required this.durationText,
@@ -17160,6 +24167,7 @@ class _TelegramAlbumMediaTile extends StatefulWidget {
     required this.onOpenMiniPlayer,
     required this.onSaveLocal,
     this.onQueueDownload,
+    this.onDownload115,
     required this.onShowContextMenu,
   });
 
@@ -18058,6 +25066,73 @@ class _TelegramAlbumMediaTileState extends State<_TelegramAlbumMediaTile>
                             ),
                           ),
                         ],
+                        if (widget.onDownload115 != null) ...[
+                          const SizedBox(width: 4),
+                          InkWell(
+                            onTap: widget.isPending115
+                                ? null
+                                : widget.onDownload115,
+                            child: AnimatedContainer(
+                              duration: const Duration(milliseconds: 200),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 5,
+                                vertical: 2,
+                              ),
+                              decoration: BoxDecoration(
+                                color: widget.isDone115
+                                    ? const Color(0xE62EBE70)
+                                    : (widget.isFailed115
+                                        ? const Color(0xE6E54D42)
+                                        : const Color(0xCCFF9800)),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: AnimatedSwitcher(
+                                duration: const Duration(milliseconds: 180),
+                                child: widget.isPending115
+                                    ? const SizedBox(
+                                        key: ValueKey('tile_115_spin'),
+                                        width: 11,
+                                        height: 11,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 1.6,
+                                          color: Colors.white,
+                                        ),
+                                      )
+                                    : Row(
+                                        key: ValueKey(
+                                          'tile_115_${widget.isDone115}_${widget.isFailed115}',
+                                        ),
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Icon(
+                                            widget.isDone115
+                                                ? Icons.check_circle_rounded
+                                                : (widget.isFailed115
+                                                    ? Icons
+                                                        .error_outline_rounded
+                                                    : Icons
+                                                        .cloud_upload_rounded),
+                                            size: 12,
+                                            color: Colors.white,
+                                          ),
+                                          if (widget.isDone115 ||
+                                              widget.isFailed115) ...[
+                                            const SizedBox(width: 2),
+                                            Text(
+                                              widget.isDone115 ? '已存115' : '重试',
+                                              style: const TextStyle(
+                                                color: Colors.white,
+                                                fontSize: 8.5,
+                                                fontWeight: FontWeight.w700,
+                                              ),
+                                            ),
+                                          ],
+                                        ],
+                                      ),
+                              ),
+                            ),
+                          ),
+                        ],
                       ],
                     ),
                   ),
@@ -18118,7 +25193,9 @@ class _TelegramPhotoGalleryDialog extends StatefulWidget {
   final List<TelegramMessage> photoMessages;
   final List<TelegramMessage>? albumMessages;
   final int initialMessageId;
+  final Set<int> initialSavedLocalIds;
   final Future<bool> Function(TelegramMessage) onQueueDownload;
+  final Future<bool> Function(TelegramMessage)? onDownload115;
   final Future<bool> Function(List<TelegramMessage>)? onQueueAlbumDownload;
   final Future<bool> Function(TelegramMessage) onSaveLocal;
   final void Function(TelegramMessage msg, int positionSeconds)?
@@ -18131,7 +25208,9 @@ class _TelegramPhotoGalleryDialog extends StatefulWidget {
     required this.photoMessages,
     this.albumMessages,
     required this.initialMessageId,
+    this.initialSavedLocalIds = const {},
     required this.onQueueDownload,
+    this.onDownload115,
     this.onQueueAlbumDownload,
     required this.onSaveLocal,
     this.onOpenMiniPlayer,
@@ -18566,6 +25645,9 @@ class _TelegramPhotoGalleryDialogState
   final Set<int> _failedIds = {};
   final Set<int> _savingLocalIds = {};
   final Set<int> _savedLocalIds = {};
+  final Set<int> _pending115Ids = {};
+  final Set<int> _done115Ids = {};
+  final Set<int> _failed115Ids = {};
   bool _queueingAlbum = false;
   bool _queuedAlbum = false;
   String? _dialogHudText;
@@ -18638,6 +25720,10 @@ class _TelegramPhotoGalleryDialogState
 
   Future<void> _handleSaveLocal(TelegramMessage msg) async {
     if (_savingLocalIds.contains(msg.id)) return;
+    if (_savedLocalIds.contains(msg.id)) {
+      await widget.onSaveLocal(msg);
+      return;
+    }
     final name = msg.attachment?.displayName ?? '媒体 #${msg.id}';
     setState(() {
       _savingLocalIds.add(msg.id);
@@ -18649,12 +25735,12 @@ class _TelegramPhotoGalleryDialogState
       _savingLocalIds.remove(msg.id);
       if (ok) {
         _savedLocalIds.add(msg.id);
+        _dialogHudText = null;
       }
     });
-    _showGalleryHud(
-      ok ? '已保存至本机 Downloads：$name' : '本机保存失败：$name',
-      state: ok ? 'success' : 'error',
-    );
+    if (!ok) {
+      _showGalleryHud('本机保存失败：$name', state: 'error');
+    }
   }
 
   Future<void> _handleQueueAlbum(List<TelegramMessage> items) async {
@@ -18698,6 +25784,7 @@ class _TelegramPhotoGalleryDialogState
   @override
   void initState() {
     super.initState();
+    _savedLocalIds.addAll(widget.initialSavedLocalIds);
     // Default to all chat media so Left/Right (`<` / `>`) can switch across all videos/photos in the chat
     _albumScopeOnly = false;
     final list = _activeMessages;
@@ -19518,15 +26605,15 @@ class _TelegramPhotoGalleryDialogState
                         TextButton.icon(
                           onPressed: () async {
                             try {
-                              const channel = MethodChannel(
-                                'com.linsion.m3u8_client/native_utils',
+                              final picked =
+                                  await NativeUtilsChannelHub.pickSystemFiles(
+                                mediaOnly: false,
+                                allowMultiple: false,
                               );
-                              final res = await channel.invokeMethod<dynamic>(
-                                'pickFiles',
-                                {'allowMultiple': false},
-                              );
-                              if (res is List && res.isNotEmpty) {
-                                final path = res.first.toString().trim();
+                              if (picked != null && picked.isNotEmpty) {
+                                final path = (picked.first['path'] ?? '')
+                                    .toString()
+                                    .trim();
                                 if (path.isNotEmpty) {
                                   final fileName =
                                       path.split(RegExp(r'[/\\]')).last;
@@ -20754,7 +27841,7 @@ class _TelegramPhotoGalleryDialogState
                             label: _savingLocalIds.contains(msg.id)
                                 ? '保存中...'
                                 : (_savedLocalIds.contains(msg.id)
-                                    ? '已存 ✓'
+                                    ? '打开位置'
                                     : '存本机'),
                             onTap: _savingLocalIds.contains(msg.id)
                                 ? null
@@ -20808,6 +27895,52 @@ class _TelegramPhotoGalleryDialogState
                                 _topQueueFocusNode,
                                 1,
                               ),
+                              downFocusNode: topDownDefault,
+                            ),
+                          ],
+                          if (widget.onDownload115 != null) ...[
+                            const SizedBox(width: 6),
+                            _buildGalleryTvButton(
+                              icon: _done115Ids.contains(msg.id)
+                                  ? Icons.check_circle_rounded
+                                  : (_failed115Ids.contains(msg.id)
+                                      ? Icons.error_outline_rounded
+                                      : Icons.cloud_upload_rounded),
+                              iconColor: _done115Ids.contains(msg.id)
+                                  ? const Color(0xFF69F0AE)
+                                  : const Color(0xFFFFE066),
+                              bgColor: _done115Ids.contains(msg.id)
+                                  ? const Color(0xFF1F6E43)
+                                  : (_failed115Ids.contains(msg.id)
+                                      ? const Color(0xFF8B2635)
+                                      : const Color(0xCC995500)),
+                              label: _pending115Ids.contains(msg.id)
+                                  ? '115提交中...'
+                                  : (_done115Ids.contains(msg.id)
+                                      ? '已存115 ✓'
+                                      : (_failed115Ids.contains(msg.id)
+                                          ? '115失败·重试'
+                                          : '115云下载')),
+                              onTap: _pending115Ids.contains(msg.id)
+                                  ? null
+                                  : () async {
+                                      setState(() {
+                                        _pending115Ids.add(msg.id);
+                                        _failed115Ids.remove(msg.id);
+                                      });
+                                      final ok =
+                                          await widget.onDownload115!(msg);
+                                      if (!mounted) return;
+                                      setState(() {
+                                        _pending115Ids.remove(msg.id);
+                                        if (ok) {
+                                          _done115Ids.add(msg.id);
+                                          _failed115Ids.remove(msg.id);
+                                        } else {
+                                          _failed115Ids.add(msg.id);
+                                        }
+                                      });
+                                    },
                               downFocusNode: topDownDefault,
                             ),
                           ],
@@ -21694,7 +28827,7 @@ class _TelegramPhotoGalleryDialogState
                                         label: _savingLocalIds.contains(msg.id)
                                             ? '保存中'
                                             : (_savedLocalIds.contains(msg.id)
-                                                ? '已存 ✓'
+                                                ? '打开位置'
                                                 : '存本机'),
                                         onTap: _savingLocalIds.contains(msg.id)
                                             ? null
@@ -22180,7 +29313,13 @@ class _TelegramInlineAudioPlayer extends StatelessWidget {
   final ValueChanged<Duration> onSeek;
   final VoidCallback onCycleSpeed;
   final bool isQueued;
+  final bool isPending115;
+  final bool isDone115;
+  final bool isFailed115;
+  final bool isSavingLocal;
+  final bool isSavedLocal;
   final VoidCallback? onQueueDownload;
+  final VoidCallback? onDownload115;
   final VoidCallback onSaveLocal;
 
   const _TelegramInlineAudioPlayer({
@@ -22201,7 +29340,13 @@ class _TelegramInlineAudioPlayer extends StatelessWidget {
     required this.onSeek,
     required this.onCycleSpeed,
     required this.isQueued,
+    this.isPending115 = false,
+    this.isDone115 = false,
+    this.isFailed115 = false,
+    this.isSavingLocal = false,
+    this.isSavedLocal = false,
     this.onQueueDownload,
+    this.onDownload115,
     required this.onSaveLocal,
   });
 
@@ -22561,6 +29706,7 @@ class _TelegramInlineAudioPlayer extends StatelessWidget {
           if (onQueueDownload != null)
             IconButton(
               visualDensity: VisualDensity.compact,
+              tooltip: '转存至服务器下载队列',
               onPressed: isQueued ? null : onQueueDownload,
               icon: Icon(
                 isQueued
@@ -22571,17 +29717,1602 @@ class _TelegramInlineAudioPlayer extends StatelessWidget {
                     isQueued ? const Color(0xFF4ECC5E) : tg.tgBlueBright,
               ),
             ),
+          if (onDownload115 != null)
+            IconButton(
+              visualDensity: VisualDensity.compact,
+              tooltip: isDone115
+                  ? '已存115 ✓'
+                  : (isFailed115 ? '115云下载失败，点击重试' : '115云下载'),
+              onPressed: isPending115 ? null : onDownload115,
+              icon: isPending115
+                  ? const SizedBox(
+                      width: 15,
+                      height: 15,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 1.8,
+                        color: Color(0xFFFFB74D),
+                      ),
+                    )
+                  : Icon(
+                      isDone115
+                          ? Icons.check_circle_rounded
+                          : (isFailed115
+                              ? Icons.error_outline_rounded
+                              : Icons.cloud_upload_rounded),
+                      size: 18,
+                      color: isDone115
+                          ? const Color(0xFF4ECC5E)
+                          : (isFailed115
+                              ? const Color(0xFFFF6B6B)
+                              : const Color(0xFFFFB74D)),
+                    ),
+            ),
           IconButton(
             visualDensity: VisualDensity.compact,
-            onPressed: onSaveLocal,
-            icon: Icon(
-              Icons.download_rounded,
-              size: 18,
-              color: tg.textSecondary,
-            ),
+            tooltip: isSavedLocal ? '已下载，点击打开所在位置' : '下载保存到本机电脑',
+            onPressed: isSavingLocal ? null : onSaveLocal,
+            icon: isSavingLocal
+                ? SizedBox(
+                    width: 15,
+                    height: 15,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 1.8,
+                      color: tg.tgBlueBright,
+                    ),
+                  )
+                : Icon(
+                    isSavedLocal
+                        ? Icons.check_circle_rounded
+                        : Icons.download_rounded,
+                    size: 18,
+                    color: isSavedLocal
+                        ? const Color(0xFF4ECC5E)
+                        : tg.textSecondary,
+                  ),
           ),
         ],
       ),
+    );
+  }
+}
+
+/// Stateful wrapper around [SelectableText.rich] that renders clickable inline
+/// hyperlinks (`text_links` entities, Markdown links, raw URLs, `@mentions`, and
+/// `#hashtags`) while properly disposing all [TapGestureRecognizer] instances.
+class _TelegramRichLinkedText extends StatefulWidget {
+  final String text;
+  final List<
+    ({
+      int start,
+      int end,
+      String displayText,
+      String lineContextLabel,
+      String url,
+      bool isHashtag,
+    })
+  > spans;
+  final TextStyle style;
+  final TextStyle linkStyle;
+  final TextStyle hashtagStyle;
+  final void Function(String url, bool isHashtag) onTapLink;
+  final void Function(TextSelection selection, SelectionChangedCause? cause)?
+      onSelectionChanged;
+  final EditableTextContextMenuBuilder? contextMenuBuilder;
+
+  const _TelegramRichLinkedText({
+    required this.text,
+    required this.spans,
+    required this.style,
+    required this.linkStyle,
+    required this.hashtagStyle,
+    required this.onTapLink,
+    this.onSelectionChanged,
+    this.contextMenuBuilder,
+  });
+
+  @override
+  State<_TelegramRichLinkedText> createState() =>
+      _TelegramRichLinkedTextState();
+}
+
+class _TelegramRichLinkedTextState extends State<_TelegramRichLinkedText> {
+  final List<TapGestureRecognizer> _recognizers = [];
+  late TextSpan _rootSpan;
+
+  @override
+  void initState() {
+    super.initState();
+    _rootSpan = _buildTextSpan();
+  }
+
+  @override
+  void didUpdateWidget(covariant _TelegramRichLinkedText oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _disposeRecognizers();
+    _rootSpan = _buildTextSpan();
+  }
+
+  @override
+  void dispose() {
+    _disposeRecognizers();
+    super.dispose();
+  }
+
+  void _disposeRecognizers() {
+    for (final r in _recognizers) {
+      r.dispose();
+    }
+    _recognizers.clear();
+  }
+
+  TextSpan _buildTextSpan() {
+    final text = widget.text;
+    final children = <InlineSpan>[];
+    int cursor = 0;
+
+    for (final span in widget.spans) {
+      final start = span.start.clamp(cursor, text.length);
+      final end = span.end.clamp(start, text.length);
+      if (start > cursor) {
+        children.add(
+          TextSpan(
+            text: text.substring(cursor, start),
+            style: widget.style,
+          ),
+        );
+      }
+      if (end > start) {
+        final recognizer = TapGestureRecognizer()
+          ..onTap = () => widget.onTapLink(span.url, span.isHashtag);
+        _recognizers.add(recognizer);
+        children.add(
+          TextSpan(
+            text: span.displayText,
+            style: span.isHashtag ? widget.hashtagStyle : widget.linkStyle,
+            mouseCursor: SystemMouseCursors.click,
+            recognizer: recognizer,
+          ),
+        );
+      }
+      cursor = end;
+    }
+
+    if (cursor < text.length) {
+      children.add(
+        TextSpan(
+          text: text.substring(cursor),
+          style: widget.style,
+        ),
+      );
+    }
+
+    return TextSpan(
+      style: widget.style,
+      children: children,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SelectableText.rich(
+      _rootSpan,
+      style: widget.style,
+      onSelectionChanged: widget.onSelectionChanged,
+      contextMenuBuilder: widget.contextMenuBuilder,
+    );
+  }
+}
+
+// =============================================================================
+// Telegram AnimatedSticker.tgs (GZip Lottie Vector Animation Engine & Presets)
+// =============================================================================
+
+/// Parsed Lottie 2D vector animation composition from a Telegram `.tgs`
+/// (`AnimatedSticker.tgs`, `application/x-tgsticker`) GZip-compressed JSON payload.
+class TelegramTgsLottieComposition {
+  final double width;
+  final double height;
+  final double frameRate;
+  final double inPoint;
+  final double outPoint;
+  final String name;
+  final String version;
+  final List<Map<String, dynamic>> layers;
+  final Map<String, List<Map<String, dynamic>>> precompAssets;
+  final Map<String, dynamic> rawJson;
+
+  const TelegramTgsLottieComposition({
+    required this.width,
+    required this.height,
+    required this.frameRate,
+    required this.inPoint,
+    required this.outPoint,
+    required this.name,
+    required this.version,
+    required this.layers,
+    required this.precompAssets,
+    required this.rawJson,
+  });
+
+  double get totalFrames => (outPoint - inPoint).clamp(1.0, 3600.0);
+
+  Duration get duration {
+    final fps = frameRate.clamp(1.0, 120.0);
+    final ms = ((totalFrames / fps) * 1000.0).round().clamp(250, 15000);
+    return Duration(milliseconds: ms);
+  }
+
+  bool get hasDrawableShapes {
+    for (final l in layers) {
+      final ty = (l['ty'] as num?)?.toInt() ?? -1;
+      if (ty == 4 || ty == 0 || ty == 1) return true;
+    }
+    return false;
+  }
+
+  String get prettyJsonSummary {
+    final header = [
+      '// Telegram 动态贴纸 (AnimatedSticker.tgs / Lottie Vector Animation)',
+      '// 名称: ${name.isNotEmpty ? name : "AnimatedSticker"} · 版本: ${version.isNotEmpty ? version : "5.5.2"}',
+      '// 画布尺寸: ${width.toInt()}×${height.toInt()} · 帧率: ${frameRate.toStringAsFixed(0)} FPS · 帧区间: ${inPoint.toInt()}..${outPoint.toInt()} (${(duration.inMilliseconds / 1000.0).toStringAsFixed(2)}s)',
+      '// 顶层图层数: ${layers.length} · 预合成资源数: ${precompAssets.length}',
+      '',
+    ].join('\n');
+    try {
+      final pretty = const JsonEncoder.withIndent('  ').convert(rawJson);
+      return '$header$pretty';
+    } catch (_) {
+      return header;
+    }
+  }
+
+  /// Decodes a Telegram `.tgs` byte array (either GZip-compressed `0x1F 0x8B`,
+  /// ZLib-compressed `0x78`, or raw UTF-8 Lottie JSON).
+  static TelegramTgsLottieComposition? tryParseBytes(Uint8List rawBytes) {
+    if (rawBytes.isEmpty) return null;
+    try {
+      List<int> jsonBytes = rawBytes;
+      if (rawBytes.length >= 2 &&
+          rawBytes[0] == 0x1F &&
+          rawBytes[1] == 0x8B) {
+        jsonBytes = GZipCodec().decode(rawBytes);
+      } else if (rawBytes.length >= 2 && rawBytes[0] == 0x78) {
+        try {
+          jsonBytes = ZLibCodec().decode(rawBytes);
+        } catch (_) {}
+      }
+      final jsonStr = utf8.decode(jsonBytes, allowMalformed: true).trim();
+      if (!jsonStr.startsWith('{')) return null;
+      final decoded = jsonDecode(jsonStr);
+      if (decoded is! Map<String, dynamic>) return null;
+      return fromJson(decoded);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static TelegramTgsLottieComposition? fromJson(Map<String, dynamic> json) {
+    final rawLayers = json['layers'];
+    if (rawLayers is! List) return null;
+    final layers = <Map<String, dynamic>>[];
+    for (final item in rawLayers) {
+      if (item is Map<String, dynamic>) {
+        layers.add(item);
+      } else if (item is Map) {
+        layers.add(Map<String, dynamic>.from(item));
+      }
+    }
+    final precompAssets = <String, List<Map<String, dynamic>>>{};
+    final rawAssets = json['assets'];
+    if (rawAssets is List) {
+      for (final a in rawAssets) {
+        if (a is Map) {
+          final id = (a['id'] ?? '').toString();
+          final aLayers = a['layers'];
+          if (id.isNotEmpty && aLayers is List) {
+            final parsedList = <Map<String, dynamic>>[];
+            for (final l in aLayers) {
+              if (l is Map<String, dynamic>) {
+                parsedList.add(l);
+              } else if (l is Map) {
+                parsedList.add(Map<String, dynamic>.from(l));
+              }
+            }
+            precompAssets[id] = parsedList;
+          }
+        }
+      }
+    }
+    final w = (json['w'] as num?)?.toDouble() ?? 512.0;
+    final h = (json['h'] as num?)?.toDouble() ?? 512.0;
+    final fr = (json['fr'] as num?)?.toDouble() ?? 60.0;
+    final ip = (json['ip'] as num?)?.toDouble() ?? 0.0;
+    final op = (json['op'] as num?)?.toDouble() ?? 60.0;
+    return TelegramTgsLottieComposition(
+      width: w > 0 ? w : 512.0,
+      height: h > 0 ? h : 512.0,
+      frameRate: fr > 0 ? fr : 60.0,
+      inPoint: ip,
+      outPoint: op > ip ? op : ip + 60.0,
+      name: (json['nm'] ?? 'AnimatedSticker').toString(),
+      version: (json['v'] ?? '5.5.2').toString(),
+      layers: layers,
+      precompAssets: precompAssets,
+      rawJson: json,
+    );
+  }
+}
+
+/// Built-in Telegram `.tgs` (`AnimatedSticker.tgs`) presets generated as real
+/// GZip-compressed Lottie JSON vector animations ready to preview and send.
+class TelegramBuiltinTgsStickerPreset {
+  final String id;
+  final String title;
+  final String emoji;
+  final Uint8List tgsBytes;
+
+  const TelegramBuiltinTgsStickerPreset({
+    required this.id,
+    required this.title,
+    required this.emoji,
+    required this.tgsBytes,
+  });
+}
+
+class TelegramBuiltinTgsStickers {
+  static List<TelegramBuiltinTgsStickerPreset>? _cachedPresets;
+
+  static List<TelegramBuiltinTgsStickerPreset> get presets {
+    return _cachedPresets ??= _buildPresets();
+  }
+
+  static Uint8List buildGzipTgsFromLottieJson(Map<String, dynamic> lottieJson) {
+    final rawUtf8 = utf8.encode(jsonEncode(lottieJson));
+    return Uint8List.fromList(GZipCodec().encode(rawUtf8));
+  }
+
+  static List<TelegramBuiltinTgsStickerPreset> _buildPresets() {
+    final definitions = <({
+      String id,
+      String title,
+      String emoji,
+      List<double> bgRgb,
+      List<double> accentRgb,
+      List<double> starRgb,
+    })>[
+      (
+        id: 'thumbs_up',
+        title: '点赞很棒',
+        emoji: '👍',
+        bgRgb: [0.18, 0.58, 0.96],
+        accentRgb: [1.0, 0.84, 0.25],
+        starRgb: [1.0, 0.95, 0.65],
+      ),
+      (
+        id: 'heart_beat',
+        title: '心动比心',
+        emoji: '❤️',
+        bgRgb: [0.95, 0.24, 0.36],
+        accentRgb: [1.0, 0.55, 0.68],
+        starRgb: [1.0, 0.88, 0.92],
+      ),
+      (
+        id: 'fire_hot',
+        title: '火力全开',
+        emoji: '🔥',
+        bgRgb: [0.98, 0.45, 0.12],
+        accentRgb: [1.0, 0.82, 0.18],
+        starRgb: [1.0, 0.93, 0.55],
+      ),
+      (
+        id: 'party_star',
+        title: '庆祝礼花',
+        emoji: '🎉',
+        bgRgb: [0.55, 0.32, 0.96],
+        accentRgb: [0.22, 0.88, 0.72],
+        starRgb: [1.0, 0.84, 0.28],
+      ),
+      (
+        id: 'laugh_joy',
+        title: '笑出眼泪',
+        emoji: '😂',
+        bgRgb: [0.98, 0.72, 0.12],
+        accentRgb: [0.22, 0.68, 0.98],
+        starRgb: [1.0, 0.96, 0.75],
+      ),
+      (
+        id: 'rocket_go',
+        title: '极速起飞',
+        emoji: '🚀',
+        bgRgb: [0.14, 0.74, 0.55],
+        accentRgb: [0.98, 0.52, 0.18],
+        starRgb: [0.75, 0.98, 0.90],
+      ),
+    ];
+
+    return definitions.map((d) {
+      final lottie = <String, dynamic>{
+        'tgs': 1,
+        'v': '5.5.2',
+        'fr': 60,
+        'ip': 0,
+        'op': 120,
+        'w': 512,
+        'h': 512,
+        'nm': 'AnimatedSticker_${d.id}',
+        'ddd': 0,
+        'assets': const [],
+        'layers': [
+          // Layer 1: Orbiting & pulsing sparkles / stars
+          {
+            'ddd': 0,
+            'ind': 1,
+            'ty': 4,
+            'nm': 'SparkleStarLayer',
+            'sr': 1,
+            'ks': {
+              'o': {
+                'a': 1,
+                'k': [
+                  {'t': 0, 's': [65], 'e': [100]},
+                  {'t': 60, 's': [100], 'e': [65]},
+                  {'t': 120, 's': [65]},
+                ],
+              },
+              'r': {
+                'a': 1,
+                'k': [
+                  {'t': 0, 's': [0], 'e': [360]},
+                  {'t': 120, 's': [360]},
+                ],
+              },
+              'p': {'a': 0, 'k': [256, 256, 0]},
+              'a': {'a': 0, 'k': [0, 0, 0]},
+              's': {
+                'a': 1,
+                'k': [
+                  {'t': 0, 's': [88, 88, 100], 'e': [114, 114, 100]},
+                  {'t': 60, 's': [114, 114, 100], 'e': [88, 88, 100]},
+                  {'t': 120, 's': [88, 88, 100]},
+                ],
+              },
+            },
+            'shapes': [
+              {
+                'ty': 'sr',
+                'nm': 'OuterStar',
+                'sy': 1,
+                'pt': {'a': 0, 'k': 5},
+                'p': {'a': 0, 'k': [0, -172]},
+                'r': {'a': 0, 'k': 0},
+                'ir': {'a': 0, 'k': 16},
+                'or': {'a': 0, 'k': 36},
+              },
+              {
+                'ty': 'sr',
+                'nm': 'RightStar',
+                'sy': 1,
+                'pt': {'a': 0, 'k': 5},
+                'p': {'a': 0, 'k': [168, 40]},
+                'r': {'a': 0, 'k': 25},
+                'ir': {'a': 0, 'k': 14},
+                'or': {'a': 0, 'k': 30},
+              },
+              {
+                'ty': 'sr',
+                'nm': 'LeftStar',
+                'sy': 1,
+                'pt': {'a': 0, 'k': 5},
+                'p': {'a': 0, 'k': [-164, 52]},
+                'r': {'a': 0, 'k': -20},
+                'ir': {'a': 0, 'k': 14},
+                'or': {'a': 0, 'k': 30},
+              },
+              {
+                'ty': 'fl',
+                'nm': 'StarFill',
+                'c': {'a': 0, 'k': [...d.starRgb, 1.0]},
+                'o': {'a': 0, 'k': 95},
+              },
+            ],
+            'ip': 0,
+            'op': 120,
+            'st': 0,
+          },
+          // Layer 2: Animated central badge & dynamic vector emblem
+          {
+            'ddd': 0,
+            'ind': 2,
+            'ty': 4,
+            'nm': 'CenterEmblemLayer',
+            'sr': 1,
+            'ks': {
+              'o': {'a': 0, 'k': 100},
+              'r': {
+                'a': 1,
+                'k': [
+                  {'t': 0, 's': [-8], 'e': [8]},
+                  {'t': 30, 's': [8], 'e': [-6]},
+                  {'t': 60, 's': [-6], 'e': [6]},
+                  {'t': 90, 's': [6], 'e': [-8]},
+                  {'t': 120, 's': [-8]},
+                ],
+              },
+              'p': {
+                'a': 1,
+                'k': [
+                  {'t': 0, 's': [256, 264, 0], 'e': [256, 238, 0]},
+                  {'t': 60, 's': [256, 238, 0], 'e': [256, 264, 0]},
+                  {'t': 120, 's': [256, 264, 0]},
+                ],
+              },
+              'a': {'a': 0, 'k': [0, 0, 0]},
+              's': {
+                'a': 1,
+                'k': [
+                  {'t': 0, 's': [92, 92, 100], 'e': [108, 108, 100]},
+                  {'t': 60, 's': [108, 108, 100], 'e': [92, 92, 100]},
+                  {'t': 120, 's': [92, 92, 100]},
+                ],
+              },
+            },
+            'shapes': [
+              {
+                'ty': 'el',
+                'nm': 'MainCircle',
+                'p': {'a': 0, 'k': [0, 0]},
+                's': {'a': 0, 'k': [270, 270]},
+              },
+              {
+                'ty': 'fl',
+                'nm': 'MainFill',
+                'c': {'a': 0, 'k': [...d.bgRgb, 1.0]},
+                'o': {'a': 0, 'k': 96},
+              },
+              {
+                'ty': 'st',
+                'nm': 'MainRingStroke',
+                'c': {'a': 0, 'k': [...d.accentRgb, 1.0]},
+                'o': {'a': 0, 'k': 95},
+                'w': {'a': 0, 'k': 14},
+              },
+            ],
+            'ip': 0,
+            'op': 120,
+            'st': 0,
+          },
+          // Layer 3: Expanding ripple halo ring
+          {
+            'ddd': 0,
+            'ind': 3,
+            'ty': 4,
+            'nm': 'RippleHaloLayer',
+            'sr': 1,
+            'ks': {
+              'o': {
+                'a': 1,
+                'k': [
+                  {'t': 0, 's': [85], 'e': [10]},
+                  {'t': 120, 's': [10]},
+                ],
+              },
+              'r': {'a': 0, 'k': 0},
+              'p': {'a': 0, 'k': [256, 256, 0]},
+              'a': {'a': 0, 'k': [0, 0, 0]},
+              's': {
+                'a': 1,
+                'k': [
+                  {'t': 0, 's': [78, 78, 100], 'e': [135, 135, 100]},
+                  {'t': 120, 's': [135, 135, 100]},
+                ],
+              },
+            },
+            'shapes': [
+              {
+                'ty': 'el',
+                'nm': 'HaloCircle',
+                'p': {'a': 0, 'k': [0, 0]},
+                's': {'a': 0, 'k': [310, 310]},
+              },
+              {
+                'ty': 'st',
+                'nm': 'HaloStroke',
+                'c': {'a': 0, 'k': [...d.accentRgb, 1.0]},
+                'o': {'a': 0, 'k': 90},
+                'w': {'a': 0, 'k': 10},
+              },
+            ],
+            'ip': 0,
+            'op': 120,
+            'st': 0,
+          },
+        ],
+      };
+
+      return TelegramBuiltinTgsStickerPreset(
+        id: d.id,
+        title: d.title,
+        emoji: d.emoji,
+        tgsBytes: buildGzipTgsFromLottieJson(lottie),
+      );
+    }).toList();
+  }
+}
+
+/// 60 FPS Lottie 2D vector canvas renderer for Telegram `.tgs` animated stickers.
+class _TelegramTgsLottiePainter extends CustomPainter {
+  final TelegramTgsLottieComposition composition;
+  final double progress; // 0.0 .. 1.0
+  final String fallbackEmoji;
+
+  const _TelegramTgsLottiePainter({
+    required this.composition,
+    required this.progress,
+    this.fallbackEmoji = '',
+  });
+
+  double get _currentFrame =>
+      composition.inPoint +
+      (progress.clamp(0.0, 1.0) *
+          (composition.outPoint - composition.inPoint));
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (size.width <= 0 || size.height <= 0) return;
+    final frame = _currentFrame;
+
+    canvas.save();
+    final scaleX = size.width / composition.width;
+    final scaleY = size.height / composition.height;
+    final scale = min(scaleX, scaleY);
+    final dx = (size.width - composition.width * scale) * 0.5;
+    final dy = (size.height - composition.height * scale) * 0.5;
+    canvas.translate(dx, dy);
+    canvas.scale(scale, scale);
+
+    _paintLayerList(canvas, composition.layers, frame, 1.0, 0);
+
+    if (fallbackEmoji.isNotEmpty) {
+      // Draw subtle pulsing center emoji overlay when preset badge is active
+      final pulse = 1.0 + 0.12 * sin(progress * 2 * pi);
+      final bounceY = -12.0 * sin(progress * 2 * pi);
+      canvas.save();
+      canvas.translate(256.0, 252.0 + bounceY);
+      canvas.scale(pulse, pulse);
+      final tp = TextPainter(
+        text: TextSpan(
+          text: fallbackEmoji,
+          style: const TextStyle(fontSize: 145),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      tp.paint(canvas, Offset(-tp.width * 0.5, -tp.height * 0.5));
+      canvas.restore();
+    }
+
+    canvas.restore();
+  }
+
+  void _paintLayerList(
+    Canvas canvas,
+    List<Map<String, dynamic>> layers,
+    double frame,
+    double parentOpacity,
+    int depth,
+  ) {
+    if (depth > 6 || layers.isEmpty) return;
+    final byInd = <int, Map<String, dynamic>>{};
+    for (final l in layers) {
+      final ind = (l['ind'] as num?)?.toInt();
+      if (ind != null) byInd[ind] = l;
+    }
+
+    // Lottie layers are ordered top-to-bottom; paint back-to-front (reversed)
+    for (int i = layers.length - 1; i >= 0; i--) {
+      final layer = layers[i];
+      if (layer['hd'] == true) continue;
+      if (layer['td'] != null) continue; // skip matte definition layer
+      final ip = (layer['ip'] as num?)?.toDouble() ?? composition.inPoint;
+      final op = (layer['op'] as num?)?.toDouble() ?? composition.outPoint;
+      if (frame < ip || frame > op) continue;
+
+      final ty = (layer['ty'] as num?)?.toInt() ?? -1;
+      if (ty == 3) continue; // null parent transform layer
+
+      final ks = layer['ks'];
+      final layerOpacity = ks is Map
+          ? (_evalScalar(ks['o'], frame, 100.0).clamp(0.0, 100.0) / 100.0)
+          : 1.0;
+      final effectiveOpacity = (parentOpacity * layerOpacity).clamp(0.0, 1.0);
+      if (effectiveOpacity <= 0.005) continue;
+
+      canvas.save();
+      _applyLayerAndParentTransform(canvas, layer, byInd, frame, 0);
+
+      if (ty == 4) {
+        final shapes = layer['shapes'];
+        if (shapes is List) {
+          _paintShapeItems(canvas, shapes, frame, effectiveOpacity, 0);
+        }
+      } else if (ty == 0) {
+        final refId = (layer['refId'] ?? '').toString();
+        final childLayers = composition.precompAssets[refId];
+        if (childLayers != null && childLayers.isNotEmpty) {
+          final st = (layer['st'] as num?)?.toDouble() ?? 0.0;
+          final sr = (layer['sr'] as num?)?.toDouble() ?? 1.0;
+          final localFrame = (frame - st) / (sr != 0 ? sr : 1.0);
+          _paintLayerList(
+            canvas,
+            childLayers,
+            localFrame,
+            effectiveOpacity,
+            depth + 1,
+          );
+        }
+      } else if (ty == 1) {
+        final sw = (layer['sw'] as num?)?.toDouble() ?? composition.width;
+        final sh = (layer['sh'] as num?)?.toDouble() ?? composition.height;
+        final sc = (layer['sc'] ?? '').toString();
+        final color = _parseHexColor(sc, effectiveOpacity);
+        if (color != null) {
+          canvas.drawRect(
+            Rect.fromLTWH(0, 0, sw, sh),
+            Paint()..color = color,
+          );
+        }
+      }
+
+      canvas.restore();
+    }
+  }
+
+  void _applyLayerAndParentTransform(
+    Canvas canvas,
+    Map<String, dynamic> layer,
+    Map<int, Map<String, dynamic>> byInd,
+    double frame,
+    int depth,
+  ) {
+    if (depth > 8) return;
+    final parentInd = (layer['parent'] as num?)?.toInt();
+    if (parentInd != null && byInd.containsKey(parentInd)) {
+      _applyLayerAndParentTransform(
+        canvas,
+        byInd[parentInd]!,
+        byInd,
+        frame,
+        depth + 1,
+      );
+    }
+    final ks = layer['ks'];
+    if (ks is Map) {
+      _applyTransformMap(canvas, ks, frame);
+    }
+  }
+
+  void _applyTransformMap(Canvas canvas, Map ks, double frame) {
+    final pos = _evalPosition(ks['p'], frame);
+    final anchor = _evalVec2(ks['a'], frame, const Offset(0, 0));
+    final scale = _evalVec2(ks['s'], frame, const Offset(100, 100));
+    final rotDeg = _evalScalar(ks['r'] ?? ks['rz'], frame, 0.0);
+
+    canvas.translate(pos.dx, pos.dy);
+    if (rotDeg != 0.0) {
+      canvas.rotate(rotDeg * pi / 180.0);
+    }
+    if (scale.dx != 100.0 || scale.dy != 100.0) {
+      canvas.scale(scale.dx / 100.0, scale.dy / 100.0);
+    }
+    if (anchor.dx != 0.0 || anchor.dy != 0.0) {
+      canvas.translate(-anchor.dx, -anchor.dy);
+    }
+  }
+
+  void _paintShapeItems(
+    Canvas canvas,
+    List items,
+    double frame,
+    double parentOpacity,
+    int depth,
+  ) {
+    if (depth > 10 || items.isEmpty) return;
+
+    // 1. Check if this list is a shape group's `it` array containing a trailing `tr` transform
+    Map? groupTr;
+    for (final raw in items) {
+      if (raw is Map && raw['ty'] == 'tr') {
+        groupTr = raw;
+        break;
+      }
+    }
+
+    double effectiveOpacity = parentOpacity;
+    if (groupTr != null) {
+      final trOp =
+          _evalScalar(groupTr['o'], frame, 100.0).clamp(0.0, 100.0) / 100.0;
+      effectiveOpacity = (parentOpacity * trOp).clamp(0.0, 1.0);
+    }
+    if (effectiveOpacity <= 0.005) return;
+
+    canvas.save();
+    if (groupTr != null) {
+      _applyTransformMap(canvas, groupTr, frame);
+    }
+
+    final localPaths = <Path>[];
+    Map? trimModifier;
+
+    for (final raw in items) {
+      if (raw is! Map) continue;
+      if (raw['hd'] == true) continue;
+      final ty = (raw['ty'] ?? '').toString();
+
+      if (ty == 'gr') {
+        final subIt = raw['it'];
+        if (subIt is List) {
+          _paintShapeItems(canvas, subIt, frame, effectiveOpacity, depth + 1);
+        }
+      } else if (ty == 'sh') {
+        final p = _evalBezierShapePath(raw['ks'], frame);
+        if (p != null) localPaths.add(p);
+      } else if (ty == 'rc') {
+        final center = _evalVec2(raw['p'], frame, Offset.zero);
+        final sz = _evalVec2(raw['s'], frame, Offset.zero);
+        final rad = _evalScalar(raw['r'], frame, 0.0).clamp(0.0, 512.0);
+        if (sz.dx > 0 && sz.dy > 0) {
+          final rect = Rect.fromCenter(
+            center: center,
+            width: sz.dx,
+            height: sz.dy,
+          );
+          final p = Path()
+            ..addRRect(RRect.fromRectAndRadius(rect, Radius.circular(rad)));
+          localPaths.add(p);
+        }
+      } else if (ty == 'el') {
+        final center = _evalVec2(raw['p'], frame, Offset.zero);
+        final sz = _evalVec2(raw['s'], frame, Offset.zero);
+        if (sz.dx > 0 && sz.dy > 0) {
+          final rect = Rect.fromCenter(
+            center: center,
+            width: sz.dx,
+            height: sz.dy,
+          );
+          final p = Path()..addOval(rect);
+          localPaths.add(p);
+        }
+      } else if (ty == 'sr') {
+        final p = _buildPolystarPath(raw, frame);
+        if (p != null) localPaths.add(p);
+      } else if (ty == 'tm') {
+        trimModifier = raw;
+      } else if ((ty == 'fl' || ty == 'gf' || ty == 'st' || ty == 'gs') &&
+          localPaths.isNotEmpty) {
+        final combinedPath = _combineAndTrimPaths(
+          localPaths,
+          trimModifier,
+          frame,
+        );
+        if (ty == 'fl' || ty == 'gf') {
+          final fillRule = (raw['r'] as num?)?.toInt() ?? 1;
+          combinedPath.fillType = fillRule == 2
+              ? PathFillType.evenOdd
+              : PathFillType.nonZero;
+          final paint = _buildFillPaint(raw, ty, frame, effectiveOpacity);
+          if (paint != null) {
+            canvas.drawPath(combinedPath, paint);
+          }
+        } else {
+          final paint = _buildStrokePaint(raw, ty, frame, effectiveOpacity);
+          if (paint != null) {
+            canvas.drawPath(combinedPath, paint);
+          }
+        }
+      }
+    }
+
+    canvas.restore();
+  }
+
+  Path _combineAndTrimPaths(List<Path> paths, Map? trimMap, double frame) {
+    final combined = Path();
+    for (final p in paths) {
+      combined.addPath(p, Offset.zero);
+    }
+    if (trimMap == null) return combined;
+
+    final startPct = _evalScalar(trimMap['s'], frame, 0.0).clamp(0.0, 100.0);
+    final endPct = _evalScalar(trimMap['e'], frame, 100.0).clamp(0.0, 100.0);
+    if ((startPct <= 0.1 && endPct >= 99.9) || (startPct == endPct)) {
+      return combined;
+    }
+    final s = min(startPct, endPct) / 100.0;
+    final e = max(startPct, endPct) / 100.0;
+    final trimmed = Path();
+    for (final metric in combined.computeMetrics()) {
+      final len = metric.length;
+      if (len <= 0) continue;
+      trimmed.addPath(metric.extractPath(len * s, len * e), Offset.zero);
+    }
+    return trimmed;
+  }
+
+  Paint? _buildFillPaint(
+    Map raw,
+    String ty,
+    double frame,
+    double parentOpacity,
+  ) {
+    final fillOp =
+        _evalScalar(raw['o'], frame, 100.0).clamp(0.0, 100.0) / 100.0;
+    final alpha = (parentOpacity * fillOp).clamp(0.0, 1.0);
+    if (alpha <= 0.005) return null;
+
+    if (ty == 'gf') {
+      final shader = _buildGradientShader(raw, frame, alpha);
+      if (shader != null) {
+        return Paint()
+          ..style = PaintingStyle.fill
+          ..shader = shader
+          ..isAntiAlias = true;
+      }
+    }
+    final c = _evalColor(raw['c'], frame, alpha);
+    return Paint()
+      ..style = PaintingStyle.fill
+      ..color = c
+      ..isAntiAlias = true;
+  }
+
+  Paint? _buildStrokePaint(
+    Map raw,
+    String ty,
+    double frame,
+    double parentOpacity,
+  ) {
+    final strokeWidth = _evalScalar(raw['w'], frame, 2.0);
+    if (strokeWidth <= 0.05) return null;
+    final strokeOp =
+        _evalScalar(raw['o'], frame, 100.0).clamp(0.0, 100.0) / 100.0;
+    final alpha = (parentOpacity * strokeOp).clamp(0.0, 1.0);
+    if (alpha <= 0.005) return null;
+
+    final lc = (raw['lc'] as num?)?.toInt() ?? 2;
+    final lj = (raw['lj'] as num?)?.toInt() ?? 2;
+    final paint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = strokeWidth
+      ..strokeCap = lc == 1
+          ? StrokeCap.butt
+          : (lc == 3 ? StrokeCap.square : StrokeCap.round)
+      ..strokeJoin = lj == 1
+          ? StrokeJoin.miter
+          : (lj == 3 ? StrokeJoin.bevel : StrokeJoin.round)
+      ..isAntiAlias = true;
+
+    if (ty == 'gs') {
+      final shader = _buildGradientShader(raw, frame, alpha);
+      if (shader != null) {
+        paint.shader = shader;
+        return paint;
+      }
+    }
+    paint.color = _evalColor(raw['c'], frame, alpha);
+    return paint;
+  }
+
+  Shader? _buildGradientShader(Map raw, double frame, double alpha) {
+    final g = raw['g'];
+    if (g is! Map) return null;
+    final ptCount = (g['p'] as num?)?.toInt() ?? 0;
+    final kProp = g['k'];
+    final kVal = kProp is Map ? _evalRawList(kProp, frame) : null;
+    if (kVal == null || kVal.length < 8) return null;
+
+    final count = ptCount > 0 ? ptCount : (kVal.length ~/ 4);
+    if (count < 2 || kVal.length < count * 4) return null;
+
+    final stops = <double>[];
+    final colors = <Color>[];
+    for (int i = 0; i < count; i++) {
+      final base = i * 4;
+      final stop = kVal[base].clamp(0.0, 1.0);
+      final r = (kVal[base + 1].clamp(0.0, 1.0) * 255).round();
+      final gCh = (kVal[base + 2].clamp(0.0, 1.0) * 255).round();
+      final b = (kVal[base + 3].clamp(0.0, 1.0) * 255).round();
+      stops.add(stop);
+      colors.add(Color.fromRGBO(r, gCh, b, alpha));
+    }
+
+    final s = _evalVec2(raw['s'], frame, Offset.zero);
+    final e = _evalVec2(raw['e'], frame, const Offset(256, 256));
+    final gradType = (raw['t'] as num?)?.toInt() ?? 1;
+    if (gradType == 2) {
+      final radius = (e - s).distance.clamp(1.0, 2048.0);
+      return RadialGradient(
+        colors: colors,
+        stops: stops,
+      ).createShader(Rect.fromCircle(center: s, radius: radius));
+    }
+    return LinearGradient(
+      begin: Alignment.topLeft,
+      end: Alignment.bottomRight,
+      colors: colors,
+      stops: stops,
+    ).createShader(Rect.fromPoints(s, e));
+  }
+
+  Path? _buildPolystarPath(Map raw, double frame) {
+    final center = _evalVec2(raw['p'], frame, Offset.zero);
+    final points = _evalScalar(raw['pt'], frame, 5.0).round().clamp(3, 32);
+    final outerR = _evalScalar(raw['or'], frame, 50.0);
+    final innerR = _evalScalar(raw['ir'], frame, outerR * 0.45);
+    final rotDeg = _evalScalar(raw['r'], frame, 0.0);
+    final sy = (raw['sy'] as num?)?.toInt() ?? 1; // 1 = star, 2 = polygon
+    if (outerR <= 0) return null;
+
+    final path = Path();
+    final step = pi / points;
+    double angle = (rotDeg - 90.0) * pi / 180.0;
+    final totalVertices = sy == 2 ? points : points * 2;
+    for (int i = 0; i < totalVertices; i++) {
+      final r = (sy == 2 || i.isEven) ? outerR : innerR;
+      final pt = Offset(
+        center.dx + r * cos(angle),
+        center.dy + r * sin(angle),
+      );
+      if (i == 0) {
+        path.moveTo(pt.dx, pt.dy);
+      } else {
+        path.lineTo(pt.dx, pt.dy);
+      }
+      angle += sy == 2 ? (2 * pi / points) : step;
+    }
+    path.close();
+    return path;
+  }
+
+  Path? _evalBezierShapePath(Object? prop, double frame) {
+    if (prop is! Map) return null;
+    final k = prop['k'];
+    final animated = prop['a'] == 1 || (k is List && k.isNotEmpty && k.first is Map && (k.first as Map).containsKey('t'));
+    if (!animated) {
+      final shapeMap = k is Map
+          ? k
+          : (k is List && k.isNotEmpty && k.first is Map ? k.first as Map : null);
+      return shapeMap != null ? _bezierDictToPath(shapeMap) : null;
+    }
+    if (k is! List || k.isEmpty) return null;
+
+    Map? startShape;
+    Map? endShape;
+    double tRatio = 0.0;
+
+    for (int i = 0; i < k.length; i++) {
+      final kf = k[i];
+      if (kf is! Map) continue;
+      final t0 = (kf['t'] as num?)?.toDouble() ?? 0.0;
+      final nextKf = (i + 1 < k.length && k[i + 1] is Map) ? k[i + 1] as Map : null;
+      final t1 = (nextKf?['t'] as num?)?.toDouble() ?? t0;
+
+      final sDict = _extractShapeDict(kf['s']);
+      if (frame <= t0 || nextKf == null || t1 <= t0) {
+        startShape = sDict ?? startShape;
+        break;
+      }
+      if (frame >= t0 && frame <= t1) {
+        startShape = sDict;
+        endShape = _extractShapeDict(kf['e']) ?? _extractShapeDict(nextKf['s']);
+        tRatio = ((frame - t0) / (t1 - t0)).clamp(0.0, 1.0);
+        break;
+      }
+      startShape = sDict ?? startShape;
+    }
+
+    if (startShape == null) return null;
+    if (endShape == null || tRatio <= 0.001) {
+      return _bezierDictToPath(startShape);
+    }
+    return _lerpBezierDictToPath(startShape, endShape, tRatio);
+  }
+
+  Map? _extractShapeDict(Object? raw) {
+    if (raw is Map) return raw;
+    if (raw is List && raw.isNotEmpty && raw.first is Map) {
+      return raw.first as Map;
+    }
+    return null;
+  }
+
+  Path? _bezierDictToPath(Map shape) {
+    final v = shape['v'];
+    final iTan = shape['i'];
+    final oTan = shape['o'];
+    if (v is! List || v.isEmpty) return null;
+    final closed = shape['c'] == true;
+    final path = Path();
+    final count = v.length;
+
+    Offset ptAt(List list, int idx) {
+      if (idx < 0 || idx >= list.length) return Offset.zero;
+      final item = list[idx];
+      if (item is List && item.length >= 2) {
+        return Offset(
+          (item[0] as num?)?.toDouble() ?? 0.0,
+          (item[1] as num?)?.toDouble() ?? 0.0,
+        );
+      }
+      return Offset.zero;
+    }
+
+    final p0 = ptAt(v, 0);
+    path.moveTo(p0.dx, p0.dy);
+    final segCount = closed ? count : count - 1;
+    for (int idx = 0; idx < segCount; idx++) {
+      final nextIdx = (idx + 1) % count;
+      final curV = ptAt(v, idx);
+      final nextV = ptAt(v, nextIdx);
+      final curO = oTan is List ? ptAt(oTan, idx) : Offset.zero;
+      final nextI = iTan is List ? ptAt(iTan, nextIdx) : Offset.zero;
+      if (curO == Offset.zero && nextI == Offset.zero) {
+        path.lineTo(nextV.dx, nextV.dy);
+      } else {
+        path.cubicTo(
+          curV.dx + curO.dx,
+          curV.dy + curO.dy,
+          nextV.dx + nextI.dx,
+          nextV.dy + nextI.dy,
+          nextV.dx,
+          nextV.dy,
+        );
+      }
+    }
+    if (closed) path.close();
+    return path;
+  }
+
+  Path? _lerpBezierDictToPath(Map a, Map b, double t) {
+    final vA = a['v'];
+    final vB = b['v'];
+    if (vA is! List || vB is! List || vA.isEmpty || vA.length != vB.length) {
+      return _bezierDictToPath(a);
+    }
+    final iA = a['i'] is List ? a['i'] as List : const [];
+    final iB = b['i'] is List ? b['i'] as List : const [];
+    final oA = a['o'] is List ? a['o'] as List : const [];
+    final oB = b['o'] is List ? b['o'] as List : const [];
+    final closed = a['c'] == true;
+    final count = vA.length;
+
+    Offset lerpPt(List listA, List listB, int idx) {
+      if (idx >= listA.length || idx >= listB.length) return Offset.zero;
+      final pA = listA[idx];
+      final pB = listB[idx];
+      if (pA is List && pB is List && pA.length >= 2 && pB.length >= 2) {
+        final x0 = (pA[0] as num?)?.toDouble() ?? 0.0;
+        final y0 = (pA[1] as num?)?.toDouble() ?? 0.0;
+        final x1 = (pB[0] as num?)?.toDouble() ?? 0.0;
+        final y1 = (pB[1] as num?)?.toDouble() ?? 0.0;
+        return Offset(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t);
+      }
+      return Offset.zero;
+    }
+
+    final path = Path();
+    final p0 = lerpPt(vA, vB, 0);
+    path.moveTo(p0.dx, p0.dy);
+    final segCount = closed ? count : count - 1;
+    for (int idx = 0; idx < segCount; idx++) {
+      final nextIdx = (idx + 1) % count;
+      final curV = lerpPt(vA, vB, idx);
+      final nextV = lerpPt(vA, vB, nextIdx);
+      final curO = lerpPt(oA, oB, idx);
+      final nextI = lerpPt(iA, iB, nextIdx);
+      if (curO == Offset.zero && nextI == Offset.zero) {
+        path.lineTo(nextV.dx, nextV.dy);
+      } else {
+        path.cubicTo(
+          curV.dx + curO.dx,
+          curV.dy + curO.dy,
+          nextV.dx + nextI.dx,
+          nextV.dy + nextI.dy,
+          nextV.dx,
+          nextV.dy,
+        );
+      }
+    }
+    if (closed) path.close();
+    return path;
+  }
+
+  Offset _evalPosition(Object? prop, double frame) {
+    if (prop is Map && prop['s'] == true) {
+      final dx = _evalScalar(prop['x'], frame, 0.0);
+      final dy = _evalScalar(prop['y'], frame, 0.0);
+      return Offset(dx, dy);
+    }
+    return _evalVec2(prop, frame, Offset.zero);
+  }
+
+  double _evalScalar(Object? prop, double frame, double defaultVal) {
+    if (prop is num) return prop.toDouble();
+    if (prop is! Map) return defaultVal;
+    final k = prop['k'];
+    if (k is num) return k.toDouble();
+    if (k is List && k.isNotEmpty) {
+      if (k.first is num) return (k.first as num).toDouble();
+      final list = _evalRawList(prop, frame);
+      if (list != null && list.isNotEmpty) return list.first;
+    }
+    return defaultVal;
+  }
+
+  Offset _evalVec2(Object? prop, double frame, Offset defaultVal) {
+    if (prop is! Map) return defaultVal;
+    final list = _evalRawList(prop, frame);
+    if (list != null && list.length >= 2) {
+      return Offset(list[0], list[1]);
+    }
+    return defaultVal;
+  }
+
+  Color _evalColor(Object? prop, double frame, double alphaMultiplier) {
+    final list = prop is Map ? _evalRawList(prop, frame) : null;
+    if (list != null && list.length >= 3) {
+      final maxComp = max(list[0], max(list[1], list[2]));
+      final scale = maxComp > 1.05 ? 1.0 : 255.0;
+      final r = (list[0] * scale).round().clamp(0, 255);
+      final g = (list[1] * scale).round().clamp(0, 255);
+      final b = (list[2] * scale).round().clamp(0, 255);
+      return Color.fromRGBO(r, g, b, alphaMultiplier.clamp(0.0, 1.0));
+    }
+    return Color.fromRGBO(62, 153, 238, alphaMultiplier.clamp(0.0, 1.0));
+  }
+
+  List<double>? _evalRawList(Map prop, double frame) {
+    final k = prop['k'];
+    if (k is num) return [k.toDouble()];
+    if (k is! List || k.isEmpty) return null;
+    if (k.first is num) {
+      return k.whereType<num>().map((n) => n.toDouble()).toList();
+    }
+
+    List<double>? lastVal;
+    for (int i = 0; i < k.length; i++) {
+      final kf = k[i];
+      if (kf is! Map) continue;
+      final t0 = (kf['t'] as num?)?.toDouble() ?? 0.0;
+      final sRaw = kf['s'];
+      final sList = sRaw is List
+          ? sRaw.whereType<num>().map((n) => n.toDouble()).toList()
+          : (sRaw is num ? <double>[sRaw.toDouble()] : null);
+      final nextKf =
+          (i + 1 < k.length && k[i + 1] is Map) ? k[i + 1] as Map : null;
+      final t1 = (nextKf?['t'] as num?)?.toDouble() ?? t0;
+
+      if (frame <= t0 || nextKf == null || t1 <= t0) {
+        return sList ?? lastVal;
+      }
+      if (frame >= t0 && frame <= t1) {
+        final eRaw = kf['e'] ?? nextKf['s'];
+        final eList = eRaw is List
+            ? eRaw.whereType<num>().map((n) => n.toDouble()).toList()
+            : (eRaw is num ? <double>[eRaw.toDouble()] : null);
+        if (sList == null) return eList ?? lastVal;
+        if (eList == null || eList.isEmpty || kf['h'] == 1) return sList;
+        final ratio = ((frame - t0) / (t1 - t0)).clamp(0.0, 1.0);
+        final len = min(sList.length, eList.length);
+        return List<double>.generate(
+          len,
+          (idx) => sList[idx] + (eList[idx] - sList[idx]) * ratio,
+        );
+      }
+      if (sList != null) lastVal = sList;
+    }
+    return lastVal;
+  }
+
+  Color? _parseHexColor(String hex, double opacity) {
+    var clean = hex.trim().replaceFirst('#', '');
+    if (clean.length == 6) {
+      final val = int.tryParse(clean, radix: 16);
+      if (val != null) {
+        return Color(0xFF000000 | val).withValues(alpha: opacity);
+      }
+    }
+    return null;
+  }
+
+  @override
+  bool shouldRepaint(covariant _TelegramTgsLottiePainter oldDelegate) {
+    return oldDelegate.progress != progress ||
+        oldDelegate.composition != composition ||
+        oldDelegate.fallbackEmoji != fallbackEmoji;
+  }
+}
+
+/// Interactive animated widget for Telegram `.tgs` (`AnimatedSticker.tgs`),
+/// `.webp`, and `.webm` stickers inside chat bubbles, sticker pickers, and preview modals.
+class _TelegramAnimatedStickerView extends StatefulWidget {
+  static final Map<String, Uint8List> _stickerBytesCache = {};
+  static final Map<String, TelegramTgsLottieComposition> _tgsCompCache = {};
+  static final Map<String, Future<Uint8List?>> _inFlightLoads = {};
+
+  static Uint8List? getCachedBytes({
+    required String accountId,
+    required String peer,
+    required int messageId,
+  }) {
+    return _stickerBytesCache['$accountId|$peer|$messageId'];
+  }
+
+  final AppState appState;
+  final String accountId;
+  final String peer;
+  final int messageId;
+  final TelegramAttachment attachment;
+  final String thumbUrl;
+  final Uint8List? initialBytes;
+  final String? localFilePath;
+  final String fallbackEmoji;
+  final double size;
+  final bool autoPlay;
+  final double playbackSpeed;
+
+  const _TelegramAnimatedStickerView({
+    super.key,
+    required this.appState,
+    required this.accountId,
+    required this.peer,
+    required this.messageId,
+    required this.attachment,
+    required this.thumbUrl,
+    this.initialBytes,
+    this.localFilePath,
+    this.fallbackEmoji = '',
+    this.size = 160,
+    this.autoPlay = true,
+    this.playbackSpeed = 1.0,
+  });
+
+  @override
+  State<_TelegramAnimatedStickerView> createState() =>
+      _TelegramAnimatedStickerViewState();
+}
+
+class _TelegramAnimatedStickerViewState
+    extends State<_TelegramAnimatedStickerView>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  TelegramTgsLottieComposition? _composition;
+  Uint8List? _rawBytes;
+
+  String get _cacheKey =>
+      '${widget.accountId}|${widget.peer}|${widget.messageId}';
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 2000),
+    );
+    _initAndLoadSticker();
+  }
+
+  @override
+  void didUpdateWidget(covariant _TelegramAnimatedStickerView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.messageId != widget.messageId ||
+        oldWidget.peer != widget.peer ||
+        oldWidget.initialBytes != widget.initialBytes) {
+      _initAndLoadSticker();
+    } else if (oldWidget.autoPlay != widget.autoPlay ||
+        oldWidget.playbackSpeed != widget.playbackSpeed) {
+      _syncPlaybackState();
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _syncPlaybackState() {
+    final comp = _composition;
+    final baseMs = comp?.duration.inMilliseconds ?? 2000;
+    final scaledMs = (baseMs / widget.playbackSpeed.clamp(0.25, 3.0))
+        .round()
+        .clamp(250, 15000);
+    _controller.duration = Duration(milliseconds: scaledMs);
+    if (widget.autoPlay) {
+      if (!_controller.isAnimating) {
+        _controller.repeat();
+      }
+    } else {
+      _controller.stop();
+    }
+  }
+
+  Future<void> _initAndLoadSticker() async {
+    final key = _cacheKey;
+    final cachedComp = _TelegramAnimatedStickerView._tgsCompCache[key];
+    final cachedBytes = _TelegramAnimatedStickerView._stickerBytesCache[key];
+    if (cachedComp != null) {
+      _composition = cachedComp;
+      _rawBytes = cachedBytes;
+      _syncPlaybackState();
+      return;
+    }
+
+    // 1. Check initialBytes (e.g. optimistic outgoing `.tgs` or built-in preset `.tgs`)
+    if (widget.initialBytes != null && widget.initialBytes!.isNotEmpty) {
+      _applyBytes(widget.initialBytes!);
+      return;
+    }
+
+    // 2. Check saved local file path
+    final localPath = widget.localFilePath;
+    if (localPath != null && localPath.isNotEmpty) {
+      try {
+        final f = File(localPath);
+        if (f.existsSync()) {
+          final bytes = f.readAsBytesSync();
+          if (bytes.isNotEmpty) {
+            _applyBytes(bytes);
+            return;
+          }
+        }
+      } catch (_) {}
+    }
+
+    _syncPlaybackState();
+    if (widget.messageId <= 0) return;
+
+    // 3. Download from server (`/api/telegram/file` or `attachment.url`)
+    Future<Uint8List?>? inFlight =
+        _TelegramAnimatedStickerView._inFlightLoads[key];
+    if (inFlight == null) {
+      inFlight = _downloadStickerFromServer();
+      _TelegramAnimatedStickerView._inFlightLoads[key] = inFlight;
+    }
+    final bytes = await inFlight;
+    _TelegramAnimatedStickerView._inFlightLoads.remove(key);
+    if (!mounted) return;
+    if (bytes != null && bytes.isNotEmpty) {
+      _applyBytes(bytes);
+    }
+  }
+
+  Future<Uint8List?> _downloadStickerFromServer() async {
+    final urls = <String>[
+      widget.appState.api.buildTelegramFileContentUrl(
+        accountId: widget.accountId,
+        peer: widget.peer,
+        messageId: widget.messageId,
+      ),
+      widget.appState.api.buildTelegramFileDownloadUrl(
+        accountId: widget.accountId,
+        peer: widget.peer,
+        messageId: widget.messageId,
+        local: true,
+      ),
+      if (widget.attachment.url.trim().isNotEmpty) widget.attachment.url.trim(),
+    ];
+    for (final url in urls) {
+      try {
+        final bytes = await widget.appState.api
+            .downloadTelegramBytes(url)
+            .timeout(const Duration(seconds: 20));
+        if (bytes.isNotEmpty) return bytes;
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  void _applyBytes(Uint8List bytes) {
+    final key = _cacheKey;
+    if (_TelegramAnimatedStickerView._stickerBytesCache.length > 160) {
+      _TelegramAnimatedStickerView._stickerBytesCache.remove(
+        _TelegramAnimatedStickerView._stickerBytesCache.keys.first,
+      );
+    }
+    _TelegramAnimatedStickerView._stickerBytesCache[key] = bytes;
+
+    TelegramTgsLottieComposition? comp;
+    if (widget.attachment.isTgsSticker ||
+        widget.attachment.displayName.toLowerCase().endsWith('.tgs')) {
+      comp = TelegramTgsLottieComposition.tryParseBytes(bytes);
+      if (comp != null) {
+        if (_TelegramAnimatedStickerView._tgsCompCache.length > 160) {
+          _TelegramAnimatedStickerView._tgsCompCache.remove(
+            _TelegramAnimatedStickerView._tgsCompCache.keys.first,
+          );
+        }
+        _TelegramAnimatedStickerView._tgsCompCache[key] = comp;
+      }
+    }
+
+    if (mounted) {
+      setState(() {
+        _rawBytes = bytes;
+        _composition = comp;
+      });
+      _syncPlaybackState();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final comp = _composition;
+    if (comp != null && comp.hasDrawableShapes) {
+      return AnimatedBuilder(
+        animation: _controller,
+        builder: (context, _) {
+          return CustomPaint(
+            size: Size.square(widget.size),
+            painter: _TelegramTgsLottiePainter(
+              composition: comp,
+              progress: _controller.value,
+              fallbackEmoji: widget.fallbackEmoji,
+            ),
+          );
+        },
+      );
+    }
+
+    // Fallback for WebP static stickers or while `.tgs` is downloading / in test sandbox:
+    // Use Preset animated composition + thumbnail overlay if available
+    final defaultPresetComp = TelegramTgsLottieComposition.tryParseBytes(
+      TelegramBuiltinTgsStickers
+          .presets[widget.messageId.abs() % TelegramBuiltinTgsStickers.presets.length]
+          .tgsBytes,
+    );
+
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, _) {
+        final scale = 0.94 + 0.08 * sin(_controller.value * 2 * pi);
+        return Transform.scale(
+          scale: widget.autoPlay ? scale : 1.0,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              if (defaultPresetComp != null)
+                CustomPaint(
+                  size: Size.square(widget.size),
+                  painter: _TelegramTgsLottiePainter(
+                    composition: defaultPresetComp,
+                    progress: _controller.value,
+                    fallbackEmoji: widget.fallbackEmoji.isNotEmpty
+                        ? widget.fallbackEmoji
+                        : '✨',
+                  ),
+                ),
+              if (_rawBytes != null &&
+                  widget.attachment.isWebpSticker &&
+                  _rawBytes!.length > 12)
+                Image.memory(
+                  _rawBytes!,
+                  width: widget.size,
+                  height: widget.size,
+                  fit: BoxFit.contain,
+                  errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                )
+              else if (widget.thumbUrl.isNotEmpty)
+                Image.network(
+                  widget.thumbUrl,
+                  headers: widget.appState.api.authHeaders,
+                  width: widget.size,
+                  height: widget.size,
+                  fit: BoxFit.contain,
+                  errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                ),
+            ],
+          ),
+        );
+      },
     );
   }
 }

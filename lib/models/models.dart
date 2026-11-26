@@ -912,6 +912,8 @@ class DownloadTask {
   final String outputFile;
   final String error;
   final String duplicateOfTaskId;
+  final bool uploaded115;
+  final bool uploading115;
   final DateTime? createdAt;
 
   const DownloadTask({
@@ -927,6 +929,8 @@ class DownloadTask {
     this.outputFile = '',
     this.error = '',
     this.duplicateOfTaskId = '',
+    this.uploaded115 = false,
+    this.uploading115 = false,
     this.createdAt,
   });
 
@@ -984,6 +988,10 @@ class DownloadTask {
       outputFile: (json['output_file'] ?? '').toString(),
       error: (json['error'] ?? '').toString(),
       duplicateOfTaskId: (json['duplicate_of_task_id'] ?? '').toString(),
+      uploaded115: json['uploaded_115'] == true,
+      uploading115:
+          json['uploading_115'] == true ||
+          (json['status'] ?? '').toString() == 'Uploading',
       createdAt: json['created_at'] != null
           ? DateTime.tryParse(json['created_at'].toString())
           : null,
@@ -1783,6 +1791,7 @@ class TelegramChat {
   final bool broadcast;
   final bool self;
   final bool contact;
+  final bool pinned;
   final bool muted;
   final int topMessageId;
   final int readOutboxMaxId;
@@ -1801,6 +1810,7 @@ class TelegramChat {
     this.broadcast = false,
     this.self = false,
     this.contact = false,
+    this.pinned = false,
     this.muted = false,
     this.topMessageId = 0,
     this.readOutboxMaxId = 0,
@@ -1850,6 +1860,7 @@ class TelegramChat {
     bool? broadcast,
     bool? self,
     bool? contact,
+    bool? pinned,
     bool? muted,
     int? topMessageId,
     int? readOutboxMaxId,
@@ -1868,6 +1879,7 @@ class TelegramChat {
       broadcast: broadcast ?? this.broadcast,
       self: self ?? this.self,
       contact: contact ?? this.contact,
+      pinned: pinned ?? this.pinned,
       muted: muted ?? this.muted,
       topMessageId: topMessageId ?? this.topMessageId,
       readOutboxMaxId: readOutboxMaxId ?? this.readOutboxMaxId,
@@ -1895,6 +1907,7 @@ class TelegramChat {
       broadcast: json['broadcast'] == true,
       self: json['self'] == true,
       contact: json['contact'] == true,
+      pinned: json['pinned'] == true || json['is_pinned'] == true,
       muted: json['muted'] == true ||
           json['notification_muted'] == true ||
           json['silent'] == true,
@@ -1952,7 +1965,7 @@ class TelegramAttachment {
     if (m.startsWith('video/')) return true;
     final lowerName = displayName.toLowerCase();
     return RegExp(
-      r'\.(mp4|mkv|mov|webm|m4v|avi|flv|ts)$',
+      r'\.(mp4|mkv|mov|webm|m4v|avi|flv|ts|m2ts|mts|rmvb|rm|wmv|3gp|mpg|mpeg|vob|ogv)$',
     ).hasMatch(lowerName);
   }
 
@@ -1963,7 +1976,7 @@ class TelegramAttachment {
     if (m.startsWith('image/')) return true;
     final lowerName = displayName.toLowerCase();
     return RegExp(
-      r'\.(jpg|jpeg|png|webp|gif|bmp)$',
+      r'\.(jpg|jpeg|png|webp|gif|bmp|heic|heif|avif|ico|tif|tiff)$',
     ).hasMatch(lowerName);
   }
 
@@ -1974,17 +1987,20 @@ class TelegramAttachment {
     if (m.startsWith('audio/')) return true;
     final lowerName = displayName.toLowerCase();
     return RegExp(
-      r'\.(mp3|m4a|aac|ogg|oga|opus|wav|wave|flac|wma|ape|mac|alac|aiff|aif|dsf|dff|wv|tta|mka)$',
+      r'\.(mp3|m4a|aac|ogg|oga|opus|wav|wave|flac|wma|ape|mac|alac|aiff|aif|aifc|dsf|dff|wv|tta|tak|ac3|dts|mka|amr|mid|midi)$',
     ).hasMatch(lowerName);
   }
 
-  /// True for voice notes (Telegram voice messages: `.ogg`/`.oga`/`.opus` without ID3 track title/performer, or `voice == true`).
+  /// True for voice notes (Telegram voice messages: `.ogg`/`.oga`/`.opus`/`.m4a`/`.wav` recorded voice notes, or `voice == true`).
   bool get isVoiceMessage {
     if (!isAudio) return false;
     if (voice || kind.toLowerCase() == 'voice') return true;
     if (title.trim().isNotEmpty || performer.trim().isNotEmpty) return false;
     final m = mimeType.toLowerCase();
     final lowerName = displayName.toLowerCase();
+    if (lowerName.startsWith('voice_') || lowerName.startsWith('voice-')) {
+      return true;
+    }
     if (m.contains('ogg') ||
         m.contains('opus') ||
         RegExp(r'\.(ogg|oga|opus)$').hasMatch(lowerName)) {
@@ -2000,6 +2016,47 @@ class TelegramAttachment {
 
   /// True for music tracks (songs / audio files with ID3 metadata or standard music formats like MP3/FLAC/M4A/WAV).
   bool get isMusic => isAudio && !isVoiceMessage;
+
+  /// True for Telegram `.tgs` animated Lottie stickers (`AnimatedSticker.tgs`, `application/x-tgsticker`).
+  bool get isTgsSticker {
+    final k = kind.toLowerCase();
+    final m = mimeType.toLowerCase();
+    final lowerName = displayName.toLowerCase();
+    return m == 'application/x-tgsticker' ||
+        lowerName.endsWith('.tgs') ||
+        lowerName == 'animatedsticker.tgs' ||
+        (k == 'sticker' &&
+            (m.contains('tgsticker') || lowerName.endsWith('.tgs')));
+  }
+
+  /// True for Telegram `.webm` video stickers (`AnimatedSticker.webm`, `sticker.webm`).
+  bool get isWebmSticker {
+    final k = kind.toLowerCase();
+    final lowerName = displayName.toLowerCase();
+    return lowerName == 'animatedsticker.webm' ||
+        lowerName == 'sticker.webm' ||
+        (k == 'sticker' && lowerName.endsWith('.webm')) ||
+        (lowerName.contains('sticker') && lowerName.endsWith('.webm'));
+  }
+
+  /// True for Telegram `.webp` static stickers (`sticker.webp`).
+  bool get isWebpSticker {
+    final k = kind.toLowerCase();
+    final m = mimeType.toLowerCase();
+    final lowerName = displayName.toLowerCase();
+    return lowerName == 'sticker.webp' ||
+        lowerName == 'animatedsticker.webp' ||
+        (k == 'sticker' &&
+            (lowerName.endsWith('.webp') || m == 'image/webp')) ||
+        (lowerName.contains('sticker') && lowerName.endsWith('.webp'));
+  }
+
+  /// True for any Telegram sticker (`.tgs` animated Lottie sticker, `.webm` video sticker, or `.webp` sticker).
+  bool get isSticker =>
+      isTgsSticker ||
+      isWebmSticker ||
+      isWebpSticker ||
+      kind.toLowerCase() == 'sticker';
 
   /// Official Telegram music title resolution:
   /// 1. ID3 `title` if present
@@ -2146,6 +2203,45 @@ class TelegramButtonActionResult {
   }
 }
 
+class TelegramTextLink {
+  final int offset;
+  final int length;
+  final String url;
+
+  const TelegramTextLink({
+    required this.offset,
+    required this.length,
+    required this.url,
+  });
+
+  bool get isValid => offset >= 0 && length > 0 && url.trim().isNotEmpty;
+
+  static String sanitizeUrl(String raw) {
+    var u = raw.trim();
+    if (u.isEmpty) return '';
+    // Strip unclosed trailing Chinese parenthesis annotation e.g. `https://api.cottoken.com（无免费额度，支持`
+    final openParenIdx = u.indexOf('（');
+    if (openParenIdx > 0 && !u.substring(openParenIdx).contains('）')) {
+      u = u.substring(0, openParenIdx).trim();
+    }
+    return u;
+  }
+
+  factory TelegramTextLink.fromJson(Map<String, dynamic> json) {
+    return TelegramTextLink(
+      offset: int.tryParse((json['offset'] ?? -1).toString()) ?? -1,
+      length: int.tryParse((json['length'] ?? 0).toString()) ?? 0,
+      url: sanitizeUrl((json['url'] ?? '').toString()),
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'offset': offset,
+        'length': length,
+        'url': url,
+      };
+}
+
 class TelegramMessage {
   final int id;
   final int date;
@@ -2156,7 +2252,10 @@ class TelegramMessage {
   final bool silent;
   final String groupedId;
   final int replyToId;
+  final String replyToSender;
+  final String replyToText;
   final List<String> links;
+  final List<TelegramTextLink> textLinks;
   final List<List<TelegramMessageButton>> buttons;
   final TelegramAttachment? attachment;
   final String actionType;
@@ -2174,7 +2273,10 @@ class TelegramMessage {
     this.silent = false,
     this.groupedId = '',
     this.replyToId = 0,
+    this.replyToSender = '',
+    this.replyToText = '',
     this.links = const [],
+    this.textLinks = const [],
     this.buttons = const [],
     this.attachment,
     this.actionType = '',
@@ -2337,6 +2439,9 @@ class TelegramMessage {
     }
     if (t.isNotEmpty) return t;
     if (attachment != null && attachment!.isValid) {
+      if (attachment!.isSticker) {
+        return attachment!.isTgsSticker ? '[动态贴纸]' : '[表情贴纸]';
+      }
       if (attachment!.isVideo) return '[视频] ${attachment!.displayName}';
       if (attachment!.isPhoto) return '[图片] ${attachment!.displayName}';
       if (attachment!.isVoiceMessage) return '[语音消息]';
@@ -2351,6 +2456,7 @@ class TelegramMessage {
       (attachment != null && attachment!.isValid) ||
       hasButtons ||
       links.isNotEmpty ||
+      textLinks.isNotEmpty ||
       isPhoneCall ||
       isServiceMessage;
 
@@ -2364,7 +2470,10 @@ class TelegramMessage {
     bool? silent,
     String? groupedId,
     int? replyToId,
+    String? replyToSender,
+    String? replyToText,
     List<String>? links,
+    List<TelegramTextLink>? textLinks,
     List<List<TelegramMessageButton>>? buttons,
     TelegramAttachment? attachment,
     String? actionType,
@@ -2382,7 +2491,10 @@ class TelegramMessage {
       silent: silent ?? this.silent,
       groupedId: groupedId ?? this.groupedId,
       replyToId: replyToId ?? this.replyToId,
+      replyToSender: replyToSender ?? this.replyToSender,
+      replyToText: replyToText ?? this.replyToText,
       links: links ?? this.links,
+      textLinks: textLinks ?? this.textLinks,
       buttons: buttons ?? this.buttons,
       attachment: attachment ?? this.attachment,
       actionType: actionType ?? this.actionType,
@@ -2446,19 +2558,27 @@ class TelegramMessage {
 
   factory TelegramMessage.fromJson(Map<String, dynamic> json) {
     final links = <String>[];
+    final textLinks = <TelegramTextLink>[];
     final rawLinks = json['links'];
     if (rawLinks is List) {
       for (final l in rawLinks) {
-        final s = l?.toString().trim() ?? '';
+        final s = TelegramTextLink.sanitizeUrl(l?.toString() ?? '');
         if (s.isNotEmpty && !links.contains(s)) links.add(s);
       }
     }
-    final rawTextLinks = json['text_links'];
+    final rawTextLinks = json['text_links'] ?? json['entities'];
     if (rawTextLinks is List) {
       for (final item in rawTextLinks) {
         if (item is Map) {
-          final u = (item['url'] ?? '').toString().trim();
-          if (u.isNotEmpty && !links.contains(u)) links.add(u);
+          final tl = TelegramTextLink.fromJson(Map<String, dynamic>.from(item));
+          if (tl.isValid) {
+            textLinks.add(tl);
+            if (!links.contains(tl.url)) {
+              links.add(tl.url);
+            }
+          } else if (tl.url.isNotEmpty && !links.contains(tl.url)) {
+            links.add(tl.url);
+          }
         }
       }
     }
@@ -2471,6 +2591,56 @@ class TelegramMessage {
     final buttons = _parseButtonRows(
       json['buttons'] ?? json['reply_markup'] ?? json['inline_keyboard'],
     );
+    final rawReplyTo = json['reply_to'];
+    int parsedReplyToId =
+        int.tryParse(
+          (json['reply_to_id'] ?? json['reply_to_msg_id'] ?? 0).toString(),
+        ) ??
+        0;
+    String parsedReplySender =
+        (json['reply_to_sender'] ?? json['reply_sender'] ?? '')
+            .toString()
+            .trim();
+    String parsedReplyText =
+        (json['reply_to_text'] ??
+                json['reply_text'] ??
+                json['quote_text'] ??
+                json['quote'] ??
+                '')
+            .toString()
+            .trim();
+    if (rawReplyTo is num || rawReplyTo is String) {
+      if (parsedReplyToId <= 0) {
+        parsedReplyToId = int.tryParse(rawReplyTo.toString()) ?? 0;
+      }
+    } else if (rawReplyTo is Map) {
+      if (parsedReplyToId <= 0) {
+        parsedReplyToId =
+            int.tryParse(
+              (rawReplyTo['id'] ??
+                      rawReplyTo['reply_to_msg_id'] ??
+                      rawReplyTo['message_id'] ??
+                      0)
+                  .toString(),
+            ) ??
+            0;
+      }
+      if (parsedReplySender.isEmpty) {
+        parsedReplySender =
+            (rawReplyTo['sender'] ?? rawReplyTo['author'] ?? '')
+                .toString()
+                .trim();
+      }
+      if (parsedReplyText.isEmpty) {
+        parsedReplyText =
+            (rawReplyTo['text'] ??
+                    rawReplyTo['quote_text'] ??
+                    rawReplyTo['preview'] ??
+                    '')
+                .toString()
+                .trim();
+      }
+    }
     return TelegramMessage(
       id: int.tryParse((json['id'] ?? 0).toString()) ?? 0,
       date: int.tryParse((json['date'] ?? 0).toString()) ?? 0,
@@ -2484,8 +2654,11 @@ class TelegramMessage {
       outgoing: json['outgoing'] == true,
       silent: json['silent'] == true,
       groupedId: (json['grouped_id'] ?? '').toString(),
-      replyToId: int.tryParse((json['reply_to_id'] ?? 0).toString()) ?? 0,
+      replyToId: parsedReplyToId,
+      replyToSender: TelegramChat.normalizePeerIdentifier(parsedReplySender),
+      replyToText: parsedReplyText,
       links: links,
+      textLinks: textLinks,
       buttons: buttons,
       attachment: (parsedAtt != null && parsedAtt.isValid) ? parsedAtt : null,
       actionType: (json['action'] ?? json['service_type'] ?? json['kind'] ?? '')
@@ -2506,6 +2679,8 @@ class TelegramOutgoingFile {
   final String mimeType;
   final String? filePath;
   final int? fileSize;
+  final bool isVoiceNote;
+  final int durationSeconds;
 
   const TelegramOutgoingFile({
     required this.name,
@@ -2513,6 +2688,8 @@ class TelegramOutgoingFile {
     this.mimeType = 'application/octet-stream',
     this.filePath,
     this.fileSize,
+    this.isVoiceNote = false,
+    this.durationSeconds = 0,
   });
 
   int get size =>

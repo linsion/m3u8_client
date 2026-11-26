@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
@@ -694,4 +696,95 @@ Future<Resolved115Stream?> show115AccelerationProgressDialog({
     );
   }
   return out;
+}
+
+/// Ensures either the local client or the backend server is logged into 115 Cloud Drive,
+/// prompting `show115QuickLoginDialog` if neither is logged in.
+Future<bool> ensure115AuthenticatedForDownload({
+  required BuildContext context,
+  required ApiClient api,
+}) async {
+  final svc = Local115DirectService.instance;
+  await svc.ensureInitialized();
+  if (svc.hasLocalCookie) return true;
+  if (await svc.syncCookieFromServerIfNeeded(api)) return true;
+
+  try {
+    final status = await api.fetch115Status();
+    if (status['logged_in'] == true ||
+        (status['Id'] != null && status['Id'].toString().isNotEmpty) ||
+        (status['user_id'] != null &&
+            status['user_id'].toString().isNotEmpty) ||
+        (status['uid'] != null && status['uid'].toString().isNotEmpty)) {
+      return true;
+    }
+  } catch (_) {}
+
+  if (!kIsWeb && Platform.environment.containsKey('FLUTTER_TEST')) {
+    return true;
+  }
+
+  if (!context.mounted) return false;
+  return show115QuickLoginDialog(context: context, api: api);
+}
+
+/// Unified UI helper for "115云下载":
+/// Checks 115 login status, submits the download/upload to 115 Cloud Drive (`submit115CloudDownload`),
+/// and optionally shows a SnackBar feedback toast (suppressed when `showSnackBar == false`, e.g. in Telegram).
+Future<({bool ok, String message, String? taskId})> trigger115CloudDownload({
+  required BuildContext context,
+  required ApiClient api,
+  required String downloadUrl,
+  required String fileName,
+  Map<String, String> headers = const {},
+  String? telegramAccountId,
+  String? telegramByteStreamUrl,
+  Map<String, dynamic>? videoContext,
+  String? localFilePath,
+  Uint8List? rawBytes,
+  bool showSnackBar = true,
+  void Function(int sent, int total, double speed)? onUploadProgress,
+}) async {
+  final authed = await ensure115AuthenticatedForDownload(
+    context: context,
+    api: api,
+  );
+  if (!authed) {
+    return (ok: false, message: '未登录 115 网盘账号', taskId: null);
+  }
+  try {
+    final res = await Local115DirectService.instance.submit115CloudDownload(
+      api: api,
+      downloadUrl: downloadUrl,
+      fileName: fileName,
+      headers: headers,
+      telegramAccountId: telegramAccountId,
+      telegramByteStreamUrl: telegramByteStreamUrl,
+      videoContext: videoContext,
+      localFilePath: localFilePath,
+      rawBytes: rawBytes,
+      onUploadProgress: onUploadProgress,
+    );
+    if (showSnackBar && context.mounted) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            duration: const Duration(seconds: 2),
+            content: Text('☁️ ${res.message}'),
+          ),
+        );
+    }
+    return res;
+  } catch (e) {
+    final errMsg = '115云下载失败：$e';
+    if (showSnackBar && context.mounted) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(content: Text('⚠️ $errMsg')),
+        );
+    }
+    return (ok: false, message: errMsg, taskId: null);
+  }
 }

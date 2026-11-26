@@ -37,9 +37,6 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
   static const String _prefBookmarksKey = 'm3u8_media_folder_bookmarks_v2';
   static const String _prefMountsKey = 'm3u8_storage_mounts_v1';
   static const String _prefGridViewKey = 'm3u8_media_grid_view_v1';
-  static const MethodChannel _nativeUtilsChannel = MethodChannel(
-    'com.linsion.m3u8_client/native_utils',
-  );
 
   // Built-in + Custom AList / OpenList / WebDAV Storage Mounts
   List<StorageMount> _mounts = const [];
@@ -988,38 +985,29 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
     final filesToUpload =
         <({String name, String? path, Uint8List? bytes, int size})>[];
 
-    if (Platform.isMacOS || Platform.isWindows) {
-      try {
-        final rawList = await _nativeUtilsChannel.invokeMethod<dynamic>(
-          'pickFiles',
-          {'mediaOnly': false},
-        );
-        if (rawList is List) {
-          for (final item in rawList) {
-            if (item is Map) {
-              final name = (item['name'] ?? '文件').toString();
-              final path = item['path']?.toString();
-              final rawB = item['bytes'];
-              final bytes =
-                  (rawB is Uint8List && rawB.isNotEmpty) ? rawB : null;
-              final size =
-                  (item['size'] as num?)?.toInt() ?? (bytes?.length ?? 0);
-              if ((path != null && path.isNotEmpty) ||
-                  (bytes != null && bytes.isNotEmpty)) {
-                filesToUpload.add((
-                  name: name,
-                  path: path,
-                  bytes: bytes,
-                  size: size,
-                ));
-              }
-            }
-          }
+    final nativeList = await NativeUtilsChannelHub.pickSystemFiles(
+      mediaOnly: false,
+      allowMultiple: true,
+    );
+    if (nativeList != null) {
+      if (nativeList.isEmpty) return;
+      for (final item in nativeList) {
+        final name = (item['name'] ?? '文件').toString();
+        final path = item['path']?.toString();
+        final rawB = item['bytes'];
+        final bytes = (rawB is Uint8List && rawB.isNotEmpty) ? rawB : null;
+        final size = (item['size'] as num?)?.toInt() ?? (bytes?.length ?? 0);
+        if ((path != null && path.isNotEmpty) ||
+            (bytes != null && bytes.isNotEmpty)) {
+          filesToUpload.add((
+            name: name,
+            path: path,
+            bytes: bytes,
+            size: size,
+          ));
         }
-      } catch (_) {}
-    }
-
-    if (filesToUpload.isEmpty) {
+      }
+    } else {
       if (!mounted) return;
       final selectedPaths = await showDialog<List<String>>(
         context: context,
@@ -2228,42 +2216,112 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
   Future<void> _showRemoteUrlDownloadDialog() async {
     final urlCtrl = TextEditingController();
     final nameCtrl = TextEditingController();
+    bool isSubmitting115 = false;
+    String? dialogError;
     await showDialog<void>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: VideoPlatformTheme.bgElevated,
-        title: const Text('远程链接离线下载 (支持 HTTP / M3U8 / 磁力链)', style: TextStyle(fontSize: 15.5)),
-        content: SizedBox(
-          width: 480,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: urlCtrl,
-                autofocus: true,
-                decoration: const InputDecoration(
-                  labelText: '下载链接 (https://... 或 .m3u8 或 magnet:?xt=...)',
-                ),
-              ),
-              const SizedBox(height: 10),
-              TextField(
-                controller: nameCtrl,
-                decoration: const InputDecoration(
-                  labelText: '保存文件名（选填，留空自动识别）',
-                ),
-              ),
-            ],
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          backgroundColor: VideoPlatformTheme.bgElevated,
+          title: const Text(
+            '远程链接离线下载 (支持 HTTP / M3U8 / 磁力链)',
+            style: TextStyle(fontSize: 15.5),
           ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('取消'),
+          content: SizedBox(
+            width: 480,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  controller: urlCtrl,
+                  autofocus: true,
+                  decoration: const InputDecoration(
+                    labelText: '下载链接 (https://... 或 .m3u8 或 magnet:?xt=...)',
+                  ),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: nameCtrl,
+                  decoration: const InputDecoration(
+                    labelText: '保存文件名（选填，留空自动识别）',
+                  ),
+                ),
+                if (dialogError != null) ...[
+                  const SizedBox(height: 10),
+                  Text(
+                    dialogError!,
+                    style: TextStyle(
+                      color: VideoPlatformTheme.danger,
+                      fontSize: 12,
+                    ),
+                  ),
+                ],
+              ],
+            ),
           ),
-          FilledButton.icon(
-            onPressed: () async {
-              final rawUrl = urlCtrl.text.trim();
-              if (rawUrl.isEmpty) return;
+          actions: [
+            TextButton(
+              onPressed:
+                  isSubmitting115 ? null : () => Navigator.of(ctx).pop(),
+              child: const Text('取消'),
+            ),
+            OutlinedButton.icon(
+              onPressed: isSubmitting115
+                  ? null
+                  : () async {
+                      final rawUrl = urlCtrl.text.trim();
+                      if (rawUrl.isEmpty) {
+                        setDialogState(() => dialogError = '请输入下载链接');
+                        return;
+                      }
+                      final customName = nameCtrl.text.trim();
+                      final resolvedName = customName.isNotEmpty
+                          ? customName
+                          : (Uri.tryParse(rawUrl)?.pathSegments.lastOrNull ??
+                              '离线下载_${DateTime.now().millisecondsSinceEpoch ~/ 1000}');
+                      setDialogState(() {
+                        isSubmitting115 = true;
+                        dialogError = null;
+                      });
+                      final res = await trigger115CloudDownload(
+                        context: context,
+                        api: widget.appState.api,
+                        downloadUrl: rawUrl,
+                        fileName: resolvedName,
+                      );
+                      if (res.ok) {
+                        await widget.appState.refreshDownloadTasks(
+                          silent: true,
+                        );
+                        if (ctx.mounted) Navigator.of(ctx).pop();
+                      } else {
+                        if (ctx.mounted) {
+                          setDialogState(() {
+                            isSubmitting115 = false;
+                            dialogError = res.message;
+                          });
+                        }
+                      }
+                    },
+              icon: isSubmitting115
+                  ? const SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.cloud_download_rounded, size: 16),
+              label: Text(isSubmitting115 ? '115提交中...' : '115云下载'),
+            ),
+            FilledButton.icon(
+              onPressed: isSubmitting115
+                  ? null
+                  : () async {
+                      final rawUrl = urlCtrl.text.trim();
+                      if (rawUrl.isEmpty) {
+                        setDialogState(() => dialogError = '请输入下载链接');
+                        return;
+                      }
               final customName = nameCtrl.text.trim();
               Navigator.of(ctx).pop();
               final resolvedName = customName.isNotEmpty
@@ -2312,6 +2370,7 @@ class _MediaLibraryScreenState extends State<MediaLibraryScreen> {
             label: const Text('开始下载'),
           ),
         ],
+        ),
       ),
     );
   }
@@ -5638,12 +5697,12 @@ class _MediaFilePlayerDialogState extends State<_MediaFilePlayerDialog> {
 
   Future<void> _pickExternalSubtitleFile(BuildContext sheetCtx) async {
     try {
-      const channel = MethodChannel('com.linsion.m3u8_client/native_utils');
-      final res = await channel.invokeMethod<dynamic>('pickFiles', {
-        'allowMultiple': false,
-      });
-      if (res is List && res.isNotEmpty) {
-        final path = res.first.toString().trim();
+      final res = await NativeUtilsChannelHub.pickSystemFiles(
+        mediaOnly: false,
+        allowMultiple: false,
+      );
+      if (res != null && res.isNotEmpty) {
+        final path = (res.first['path'] ?? '').toString().trim();
         if (path.isNotEmpty) {
           final name = path.split(RegExp(r'[/\\]')).last;
           final sub = SubtitleTrack.uri(
